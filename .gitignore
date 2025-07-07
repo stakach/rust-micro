@@ -1,0 +1,5 @@
+# Generated files
+/target/
+
+bootboot.efi
+disk.img
