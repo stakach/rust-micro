@@ -4,6 +4,7 @@
 
 sudo apt install lld
 sudo apt install dosfstools
+sudo apt install mtools
 sudo apt install ovmf
 sudo apt install qemu-system-x86
 
