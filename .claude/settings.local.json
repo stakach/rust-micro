@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./scripts/build_kernel.sh:*)",
+      "Bash(mv:*)",
+      "Bash(./scripts/run_specs.sh:*)",
+      "Bash(./scripts/make_image.sh:*)",
+      "Bash(grep:*)"
+    ],
+    "deny": []
+  }
+}

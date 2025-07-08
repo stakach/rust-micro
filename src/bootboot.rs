@@ -89,3 +89,10 @@ pub struct arch_aarch64 {
     pub unused3: u64,
     pub unused4: u64,
 }
+
+/// Get the bootstrap processor ID from the BOOTBOOT structure
+/// This is architecture-agnostic as it's provided by the bootloader
+pub fn get_bootstrap_processor_id() -> u16 {
+    let bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
+    bootboot_r.bspid
+}

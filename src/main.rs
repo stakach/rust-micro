@@ -26,14 +26,34 @@ fn _start() -> ! {
     use bootboot::*;
 
     // use the BOOTBOOT_INFO as a pointer, dereference it and immediately borrow it.
-    let bootboot_r = unsafe { & (*(BOOTBOOT_INFO as *const BOOTBOOT)) };
+    let _bootboot_r = unsafe { & (*(BOOTBOOT_INFO as *const BOOTBOOT)) };
 
-    arch::init_serial();
-    arch::log("Serial initialized!\n");
-
-    #[cfg(feature = "spec")]
-    spec::test_main();
-    loop {}
+    // Only initialize on the bootstrap processor
+    // Check if current APIC ID matches the BOOTBOOT BSP ID
+    let current_apic_id = arch::get_cpu_id();
+    let bootboot_bsp_id = bootboot::get_bootstrap_processor_id() as arch::CpuId;
+    
+    if current_apic_id == bootboot_bsp_id {
+        arch::init_serial();
+        arch::log("Serial initialized!\n");
+        
+        arch::log("Initializing interrupts...\n");
+        arch::init_interrupts();
+        
+        arch::log("Initializing exception handlers...\n");
+        arch::init_exceptions();
+        
+        arch::log("Kernel initialization complete on BSP\n");
+        
+        #[cfg(feature = "spec")]
+        spec::test_main();
+        
+        loop {}
+    } else {
+        // Non-bootstrap processors should halt until needed
+        arch::halt_cpu();
+        loop {}
+    }
 }
 
 use core::panic::PanicInfo;
