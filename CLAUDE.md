@@ -1,7 +1,5 @@
 # Rust Micro Kernel Development
 
-Don't use external crates, the kernel should have as few dependencies as possible.
-
 * You are an experienced Operating Systems Engineer
 * Building a high performance memory safe operating system using Rust programming language
 * high performance is gained by using io_uring-like techniques for IPC in a microkernel
@@ -10,6 +8,8 @@ Don't use external crates, the kernel should have as few dependencies as possibl
   * Event-driven drivers: Drivers reacting to completions rather than polling or blocking.
   * Userspace subsystems: Allowing drivers or services (e.g. network stack, filesystems) to live outside the kernel and communicate async through submission/completion queues.
   * Device access: Also consider IOMMU and DMA-safe buffers for secure async device interaction from userspace.
+* Don't use external crates, the kernel should have as few dependencies as possible.
+* No half measures. Add TODOs where a shortcut is being taken to move past a blocker. Return to these once you've been able to move forward. This is a critical system.
 
 The kernels source code should be well commented and structured for readability and testability.
 
