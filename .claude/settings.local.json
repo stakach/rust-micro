@@ -5,7 +5,9 @@
       "Bash(mv:*)",
       "Bash(./scripts/run_specs.sh:*)",
       "Bash(./scripts/make_image.sh:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(echo $?)",
+      "Bash(timeout:*)"
     ],
     "deny": []
   }

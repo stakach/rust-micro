@@ -14,3 +14,5 @@ cargo +nightly build -Z build-std=core \
       --release --features "$FEATURES"
 
 echo "Kernel built: target/mykernel-x86/release/mykernel-rust"
+
+./scripts/make_image.sh
