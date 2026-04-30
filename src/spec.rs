@@ -17,6 +17,7 @@ pub fn test_main() {
     crate::untyped::spec::test_untyped();
     crate::tcb::spec::test_tcb();
     crate::scheduler::spec::test_scheduler();
+    crate::syscall_handler::spec::test_syscall_handler();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);

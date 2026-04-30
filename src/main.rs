@@ -48,6 +48,12 @@ mod tcb;
 // Priority scheduler over the TCB slab.
 mod scheduler;
 
+// Unified KResult / KException error type.
+mod error;
+
+// Syscall dispatcher (handle_syscall + handle_unknown_syscall).
+mod syscall_handler;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;
