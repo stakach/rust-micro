@@ -14,6 +14,8 @@ pub fn test_main() {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall_entry::spec::test_syscall_msrs();
     #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::paging::spec::test_paging();
+    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::lapic::spec::test_lapic();
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::pit::spec::test_pit();
@@ -30,6 +32,9 @@ pub fn test_main() {
     crate::untyped::spec::test_untyped();
     crate::tcb::spec::test_tcb();
     crate::scheduler::spec::test_scheduler();
+    crate::kernel::spec::test_kernel_state();
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::context::spec::test_context_switch();
     crate::syscall_handler::spec::test_syscall_handler();
     crate::endpoint::spec::test_endpoint();
     crate::notification::spec::test_notification();

@@ -96,6 +96,27 @@ pub const MAX_PRIORITY: u8 = (NUM_PRIORITIES - 1) as u8;
 /// register set in arch-side `tcbContext` instead.
 pub const SCRATCH_MSG_LEN: usize = 8;
 
+/// Per-TCB kernel stack size. seL4 uses 4 KiB; we match that.
+pub const KERNEL_STACK_BYTES: usize = 4096;
+
+/// Architecture-private CPU context. Mirrors `tcbContext` in seL4.
+/// On x86_64 we store the kernel stack pointer (used by the
+/// switch_context primitive in `arch::x86_64::context`) and the
+/// CR3 the thread runs against.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct CpuContext {
+    /// Kernel-stack pointer at the moment this thread was last
+    /// switched out. The switch primitive saves callee-saved
+    /// registers onto the stack first; reading the regs back is
+    /// implicit in `pop` after the swap.
+    pub ksp: u64,
+    /// Page-table root the CPU loads when this thread is scheduled
+    /// (CR3 on x86_64). Zero means "no per-thread vspace, keep
+    /// whatever's loaded".
+    pub cr3: u64,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Tcb {
     pub state: ThreadStateType,
@@ -135,6 +156,8 @@ pub struct Tcb {
     /// IPC badge stamped onto the message during a badged-send. The
     /// receiver reads it as the seL4 `badge` syscall return.
     pub ipc_badge: Word,
+    /// Architecture context for context-switching.
+    pub cpu_context: CpuContext,
 }
 
 impl Default for Tcb {
@@ -155,6 +178,7 @@ impl Default for Tcb {
             ipc_length: 0,
             msg_regs: [0; SCRATCH_MSG_LEN],
             ipc_badge: 0,
+            cpu_context: CpuContext { ksp: 0, cr3: 0 },
         }
     }
 }

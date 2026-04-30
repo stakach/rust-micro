@@ -48,6 +48,9 @@ mod tcb;
 // Priority scheduler over the TCB slab.
 mod scheduler;
 
+// Static kernel state singleton (current TCB pointer, scheduler).
+mod kernel;
+
 // Unified KResult / KException error type.
 mod error;
 
