@@ -13,6 +13,8 @@ pub fn test_main() {
     crate::arch::x86_64::gdt::spec::test_gdt();
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall_entry::spec::test_syscall_msrs();
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::lapic::spec::test_lapic();
     structures_tests::test_structures();
     abi_layout_tests::test_abi_layout();
     crate::cap::spec::test_cap_roundtrip();

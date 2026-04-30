@@ -12,6 +12,8 @@ pub const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 pub const IA32_GS_BASE: u32 = 0xC000_0101;
 pub const IA32_FS_BASE: u32 = 0xC000_0100;
 
+pub const IA32_APIC_BASE_MSR: u32 = 0x1B;
+
 pub const EFER_SCE: u64 = 1 << 0;
 pub const EFER_LME: u64 = 1 << 8;
 pub const EFER_NXE: u64 = 1 << 11;

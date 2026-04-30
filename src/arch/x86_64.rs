@@ -7,6 +7,7 @@ pub mod cpu;
 pub mod exceptions;
 pub mod gdt;
 pub mod interrupts;
+pub mod lapic;
 pub mod msr;
 pub mod syscall_entry;
 
