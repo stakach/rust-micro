@@ -2,7 +2,8 @@
 name = "mykernel-rust"
 version = "0.0.1"
 authors = ["Vinay Chandra"]
-edition = "2018"
+edition = "2021"
+build = "build.rs"
 
 [dependencies]
 rlibc = "1.0"
@@ -12,4 +13,3 @@ default = ["arch-x86_64"]
 spec = []
 arch-x86_64 = []
 arch-aarch64 = []
-

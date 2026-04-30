@@ -13,6 +13,15 @@ extern crate rlibc;
 // Loads the appropriate architecture code
 mod arch;
 
+// Generated bitfield types from codegen/structures_64.bf — see build.rs.
+mod structures;
+
+// Generated syscall and invocation-label enums.
+mod syscalls;
+
+// Hand-coded public ABI types matching libsel4 layouts byte-for-byte.
+mod types;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;

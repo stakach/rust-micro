@@ -3,3 +3,8 @@
 /.tmp/
 bootboot.efi
 disk.img
+
+# Upstream seL4 reference checkout — kept locally as a read-only
+# reference but never committed. The .bf and .xml inputs we depend on
+# are pinned under codegen/.
+/seL4/
