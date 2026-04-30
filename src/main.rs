@@ -42,6 +42,12 @@ mod object_type;
 // Untyped retype — kernel object allocator.
 mod untyped;
 
+// Thread Control Block + slab allocator.
+mod tcb;
+
+// Priority scheduler over the TCB slab.
+mod scheduler;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;

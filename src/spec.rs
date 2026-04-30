@@ -15,6 +15,8 @@ pub fn test_main() {
     crate::region::spec::test_region();
     crate::object_type::spec::test_object_type();
     crate::untyped::spec::test_untyped();
+    crate::tcb::spec::test_tcb();
+    crate::scheduler::spec::test_scheduler();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);

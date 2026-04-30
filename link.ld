@@ -34,7 +34,12 @@ mmio        = 0xfffffffff8000000;              /* these are configurable for lev
 fb          = 0xfffffffffc000000;
 bootboot    = 0xffffffffffe00000;
 environment = 0xffffffffffe01000;
-initstack = 4096;
+/* Bumped from BOOTBOOT's default 4 KiB to 64 KiB. Kernel data
+ * structures (Scheduler, TcbSlab, ready queues) easily exceed 4 KiB
+ * once we hold them on the stack inside specs. 64 KiB is comfortable
+ * for the foreseeable future and small enough to remain a one-page
+ * concern for the BOOTBOOT loader. */
+initstack = 65536;
 
 KERNEL_OFFSET = 0xffffffffffe02000;
 

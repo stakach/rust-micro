@@ -1,0 +1,241 @@
+//! Thread Control Block — kernel-side state of a single thread.
+//!
+//! Mirrors `seL4/include/object/structures.h::tcb_t` (the
+//! arch-independent fields). This phase keeps the struct simple
+//! enough that the scheduler can act on it; arch register state,
+//! IPC buffer pointer, and the bound-notification linkage land in
+//! later phases as those features come online.
+//!
+//! TCBs live in a fixed-size slab (`TcbSlab` below). Every reference
+//! into the slab is by `TcbId` rather than raw pointer — that lets
+//! us implement intrusive scheduler links without `unsafe` and
+//! without lifetime gymnastics. In the production kernel a TCB
+//! lives at a fixed kernel-half address and is reachable via a
+//! `PPtr<Tcb>`; bridging the two representations is the job of a
+//! tiny `unsafe` accessor in a later phase.
+
+use crate::region::align_up;
+use crate::types::seL4_Word as Word;
+
+// ---------------------------------------------------------------------------
+// Discriminants must match `enum _thread_state` in
+// seL4/include/object/structures.h byte-for-byte so the values we
+// store in the `ThreadState` bitfield match what userspace
+// introspection expects.
+// ---------------------------------------------------------------------------
+
+#[repr(u64)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum ThreadStateType {
+    #[default]
+    Inactive = 0,
+    Running = 1,
+    Restart = 2,
+    BlockedOnReceive = 3,
+    BlockedOnSend = 4,
+    BlockedOnReply = 5,
+    BlockedOnNotification = 6,
+    /// VTX-only — kept here so the discriminant matches seL4 even
+    /// though we never enter this state without VT-x support.
+    RunningVM = 7,
+    Idle = 8,
+}
+
+impl ThreadStateType {
+    /// True if this thread is eligible to run on the CPU. The
+    /// scheduler only enqueues threads whose state is runnable.
+    pub const fn is_runnable(self) -> bool {
+        matches!(self, ThreadStateType::Running | ThreadStateType::Restart)
+    }
+
+    pub const fn from_u64(v: u64) -> Option<Self> {
+        match v {
+            0 => Some(Self::Inactive),
+            1 => Some(Self::Running),
+            2 => Some(Self::Restart),
+            3 => Some(Self::BlockedOnReceive),
+            4 => Some(Self::BlockedOnSend),
+            5 => Some(Self::BlockedOnReply),
+            6 => Some(Self::BlockedOnNotification),
+            7 => Some(Self::RunningVM),
+            8 => Some(Self::Idle),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TcbId — slab index. Deliberately small (u16) so `Option<TcbId>` is
+// 4 bytes via niche optimisation only when wrapped manually; we keep
+// the explicit `Option<TcbId>` form for clarity.
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
+#[repr(transparent)]
+pub struct TcbId(pub u16);
+
+impl TcbId {
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The TCB itself. Fields are public so the scheduler / IPC paths can
+// mutate them directly; we don't hide behind setters because every
+// kernel module is part of the same trust boundary.
+// ---------------------------------------------------------------------------
+
+pub const NUM_PRIORITIES: usize = 256;
+pub const MAX_PRIORITY: u8 = (NUM_PRIORITIES - 1) as u8;
+
+#[derive(Copy, Clone, Debug)]
+pub struct Tcb {
+    pub state: ThreadStateType,
+    /// Priority used for scheduling decisions. 0..255.
+    pub priority: u8,
+    /// Maximum-controllable-priority — caps what one thread can
+    /// raise another's priority to via `TCB::SetPriority`. Mirrors
+    /// `tcbMCP` in seL4.
+    pub mcp: u8,
+    /// Single domain only for now. `tcbDomain` in seL4.
+    pub domain: u8,
+    /// Remaining timeslice in scheduler ticks (non-MCS).
+    pub time_slice: u32,
+    /// Fault handler CPtr. 0 = no handler.
+    pub fault_handler: Word,
+    /// User-mode IPC-buffer virtual address.
+    pub ipc_buffer: Word,
+    /// Intrusive scheduler-list links. `None` for a thread that
+    /// isn't currently enqueued.
+    pub sched_next: Option<TcbId>,
+    pub sched_prev: Option<TcbId>,
+}
+
+impl Default for Tcb {
+    fn default() -> Self {
+        Self {
+            state: ThreadStateType::Inactive,
+            priority: 0,
+            mcp: 0,
+            domain: 0,
+            time_slice: 0,
+            fault_handler: 0,
+            ipc_buffer: 0,
+            sched_next: None,
+            sched_prev: None,
+        }
+    }
+}
+
+impl Tcb {
+    pub const fn is_runnable(&self) -> bool {
+        self.state.is_runnable()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slab — fixed-size pool of TCBs addressed by `TcbId`.
+// ---------------------------------------------------------------------------
+
+/// Maximum live TCBs in the kernel. Picks a small bound so the
+/// slab is BSS-allocatable without alloc(). Production seL4 uses
+/// real Untyped retypes for TCBs and there is no upper bound, but
+/// we don't need that flexibility before Phase 7+.
+pub const MAX_TCBS: usize = 64;
+
+#[derive(Copy, Clone, Debug)]
+pub struct TcbSlab {
+    pub entries: [Option<Tcb>; MAX_TCBS],
+}
+
+impl TcbSlab {
+    pub const fn new() -> Self {
+        Self { entries: [None; MAX_TCBS] }
+    }
+
+    /// Insert a TCB at the next free slot. Returns the assigned id,
+    /// or `None` if the slab is full.
+    pub fn alloc(&mut self, tcb: Tcb) -> Option<TcbId> {
+        for (i, slot) in self.entries.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(tcb);
+                return Some(TcbId(i as u16));
+            }
+        }
+        None
+    }
+
+    pub fn get(&self, id: TcbId) -> &Tcb {
+        self.entries[id.0 as usize]
+            .as_ref()
+            .expect("TcbSlab::get on empty slot")
+    }
+
+    pub fn get_mut(&mut self, id: TcbId) -> &mut Tcb {
+        self.entries[id.0 as usize]
+            .as_mut()
+            .expect("TcbSlab::get_mut on empty slot")
+    }
+
+    pub fn free(&mut self, id: TcbId) {
+        self.entries[id.0 as usize] = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers shared with the scheduler.
+// ---------------------------------------------------------------------------
+
+/// Round a virtual address up to the natural alignment of a TCB
+/// block (`1 << TCB_SIZE_BITS` bytes). Used by the boot/rootserver
+/// placement code in a later phase.
+pub fn tcb_align_up(addr: Word) -> Word {
+    align_up(addr, crate::object_type::TCB_SIZE_BITS)
+}
+
+#[cfg(feature = "spec")]
+pub mod spec {
+    use super::*;
+    use crate::arch;
+
+    pub fn test_tcb() {
+        arch::log("Running TCB tests...\n");
+        thread_state_runnable();
+        slab_alloc_get_free();
+        arch::log("TCB tests completed\n");
+    }
+
+    fn thread_state_runnable() {
+        assert!(ThreadStateType::Running.is_runnable());
+        assert!(ThreadStateType::Restart.is_runnable());
+        assert!(!ThreadStateType::Inactive.is_runnable());
+        assert!(!ThreadStateType::BlockedOnReceive.is_runnable());
+        assert!(!ThreadStateType::BlockedOnNotification.is_runnable());
+        assert!(!ThreadStateType::Idle.is_runnable());
+        // from_u64 rejects out-of-range.
+        assert_eq!(ThreadStateType::from_u64(99), None);
+        // and accepts every valid discriminant.
+        for v in 0u64..=8 {
+            assert!(ThreadStateType::from_u64(v).is_some());
+        }
+        arch::log("  ✓ thread state runnability matches seL4 convention\n");
+    }
+
+    fn slab_alloc_get_free() {
+        let mut slab = TcbSlab::new();
+        let mut tcb = Tcb::default();
+        tcb.priority = 42;
+        tcb.state = ThreadStateType::Running;
+        let id = slab.alloc(tcb).unwrap();
+        assert_eq!(id, TcbId(0));
+        assert_eq!(slab.get(id).priority, 42);
+        slab.get_mut(id).priority = 99;
+        assert_eq!(slab.get(id).priority, 99);
+        slab.free(id);
+        // After free, the slot is empty and re-allocation reuses it.
+        let id2 = slab.alloc(Tcb::default()).unwrap();
+        assert_eq!(id2, TcbId(0));
+        arch::log("  ✓ TcbSlab alloc / get_mut / free\n");
+    }
+}
