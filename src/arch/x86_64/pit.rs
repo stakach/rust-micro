@@ -133,6 +133,54 @@ unsafe fn inb(port: u16) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Tick counter + IRQ 0 handler. The handler increments
+// `TICK_COUNT` and EOIs the PIC. Userspace will eventually drive
+// preemption from this; for now it's a smoke test that the PIT →
+// PIC → IDT path actually delivers interrupts.
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+#[no_mangle]
+pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Naked entry — pushes a dummy error code so the iretq frame is
+/// consistent with `interrupt!`-shaped exception handlers, calls
+/// the Rust ISR, EOIs the PIC, returns.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn pit_irq_entry() {
+    core::arch::naked_asm!(
+        "push 0",
+        "push 0",
+        "call {handler}",
+        "add rsp, 16",
+        "iretq",
+        handler = sym pit_isr,
+    );
+}
+
+extern "C" fn pit_isr() {
+    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    super::pic::eoi(0);
+}
+
+/// Wire the PIT IRQ end-to-end:
+///   1. install pit_irq_entry at IDT vector PIC1_VECTOR_BASE+0
+///   2. program the PIT for `hz` rate-generator
+///   3. unmask IRQ 0 on the master PIC
+pub fn enable_periodic_irq(hz: u32) {
+    use super::interrupts::{IdtEntry, IDT};
+    use super::pic;
+    let vector = pic::PIC1_VECTOR_BASE as usize;
+    unsafe {
+        IDT[vector] = IdtEntry::new(pit_irq_entry as u64, 0x08, 0, 0x8E);
+    }
+    program_periodic_hz(hz);
+    pic::unmask_irq(0);
+}
+
+// ---------------------------------------------------------------------------
 // Specs
 // ---------------------------------------------------------------------------
 
@@ -146,6 +194,7 @@ pub mod spec {
         cmd_byte_layout();
         oneshot_count_decrements();
         periodic_divisor_picks_sane_value();
+        live_irq_increments_tick_count();
         arch::log("PIT tests completed\n");
     }
 
@@ -182,6 +231,35 @@ pub mod spec {
             "PIT count should have decremented (a={a}, b={b})",
         );
         arch::log("  ✓ PIT one-shot count decrements over a busy wait\n");
+    }
+
+    #[inline(never)]
+    fn live_irq_increments_tick_count() {
+        // PIC must be initialised first; init_pic is idempotent so
+        // we call it again here to be safe.
+        super::super::pic::init_pic();
+
+        let before = TICK_COUNT.load(Ordering::Relaxed);
+        // 1000 Hz → 1ms per tick. Burn ~10ms.
+        enable_periodic_irq(1000);
+        // Spin long enough for several ticks. The qemu boot is fast
+        // and our spinloop steps are cheap, so allow a generous
+        // count.
+        for _ in 0..50_000_000 {
+            core::hint::spin_loop();
+            // Bail early once we see ticks.
+            if TICK_COUNT.load(Ordering::Relaxed) > before + 5 {
+                break;
+            }
+        }
+        // Mask IRQ 0 again so subsequent specs aren't perturbed.
+        super::super::pic::mask_all();
+        let after = TICK_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "PIT IRQ should have fired at least once (before={before}, after={after})",
+        );
+        arch::log("  ✓ PIT IRQ delivers via PIC → IDT → ISR\n");
     }
 
     #[inline(never)]
