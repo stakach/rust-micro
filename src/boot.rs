@@ -311,6 +311,77 @@ pub fn read_bootboot_mmap(out: &mut [MemEntry]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Top-level boot orchestration. Mirrors the high-level shape of
+// seL4's `init_kernel()`: read the loader's memory map, build the
+// free + reserved-region lists, place the rootserver. Userspace
+// launch and BootInfo population follow once we have the page-table
+// installer.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+pub fn kernel_init() -> Result<RootserverMem, BootError> {
+    use crate::arch;
+
+    arch::log("boot: reading BOOTBOOT memory map\n");
+    let mut entries = [MemEntry { region: PRegion::new(0, 0), kind: MemKind::Used };
+        MAX_FREEMEM_REGIONS];
+    let n = read_bootboot_mmap(&mut entries);
+    arch::log("boot:   ");
+    log_count(n);
+    arch::log(" map entries\n");
+
+    let mut free = extract_free(&entries[..n])?;
+    arch::log("boot: free regions after sort+coalesce: ");
+    log_count(free.len);
+    arch::log("\n");
+
+    // Reserve the kernel image. Linker symbols `__text_start` /
+    // `__bss_end` would let us bound it; for now we don't have
+    // explicit symbols, so we trust BOOTBOOT to report the kernel's
+    // physical pages as MMAP_USED rather than MMAP_FREE.
+    let layout = RootserverLayout::default_x86_64();
+    let mem = place_rootserver(&mut free, &layout)?;
+
+    arch::log("boot: rootserver placed:\n");
+    arch::log("  cnode @0x"); log_hex64(mem.cnode); arch::log("\n");
+    arch::log("  tcb   @0x"); log_hex64(mem.tcb); arch::log("\n");
+    arch::log("  ipc   @0x"); log_hex64(mem.ipc_buf); arch::log("\n");
+    arch::log("  bi    @0x"); log_hex64(mem.boot_info); arch::log("\n");
+    Ok(mem)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn log_count(n: usize) {
+    let mut buf = [b'0'; 4];
+    let mut v = n;
+    let mut i = 4;
+    if v == 0 {
+        crate::arch::log("0");
+        return;
+    }
+    while v > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        crate::arch::log(s);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn log_hex64(v: u64) {
+    let mut buf = [b'0'; 16];
+    for i in 0..16 {
+        let nyb = ((v >> ((15 - i) * 4)) & 0xF) as u8;
+        buf[i] = if nyb < 10 { b'0' + nyb } else { b'a' + (nyb - 10) };
+    }
+    if let Ok(s) = core::str::from_utf8(&buf) {
+        crate::arch::log(s);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Specs
 // ---------------------------------------------------------------------------
 

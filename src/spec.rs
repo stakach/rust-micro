@@ -48,5 +48,7 @@ pub fn test_main() {
     crate::vcpu::spec::test_vcpu();
 
     arch::log("All specs passed!\n");
-    arch::qemu_exit(0);
+    // Don't `qemu_exit` here — control returns to `main` so the
+    // real-hardware boot path (Phase 12d's `boot::kernel_init`)
+    // gets exercised before we leave QEMU.
 }

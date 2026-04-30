@@ -129,10 +129,32 @@ fn _start() -> ! {
         arch::init_syscall_msrs();
 
         arch::log("Kernel initialization complete on BSP\n");
-        
+
         #[cfg(feature = "spec")]
         spec::test_main();
-        
+
+        // Real boot orchestration: read the loader's memory map,
+        // place the rootserver. Phase 12d runs this on the live
+        // BOOTBOOT-supplied state — useful as an end-to-end smoke
+        // test that the boot code that's been spec'd in synthetic
+        // form actually copes with real-hardware data.
+        #[cfg(target_arch = "x86_64")]
+        match boot::kernel_init() {
+            Ok(_) => arch::log("boot: kernel_init succeeded\n"),
+            Err(e) => {
+                arch::log("boot: kernel_init failed: ");
+                match e {
+                    boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
+                    boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
+                    boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
+                }
+                arch::log("\n");
+            }
+        }
+
+        #[cfg(feature = "spec")]
+        arch::qemu_exit(0);
+
         loop {}
     } else {
         // Non-bootstrap processors should halt until needed
