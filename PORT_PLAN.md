@@ -284,13 +284,16 @@ module with strong unit-test coverage. Trying to make these "safe" with
 Each phase ends with the kernel still booting and all specs green. No
 phase leaves the tree red.
 
-### Status — Phases 0–10f complete
+### Status — Phases 0–12f complete
 
 Every phase planned below has landed on the `sel4-rust` branch.
-The default build runs **76 ✓ specs**; with every Phase 10 cargo
-feature enabled (`mcs,smp,fastpath,fpu,vmx`) the count rises to
-**99 ✓ specs**. Zero `unsafe` was added in any phase beyond the
-pre-existing toy-kernel arch layer.
+The default build runs **106 ✓ specs**; with every Phase 10 cargo
+feature enabled (`mcs,smp,fastpath,fpu,vmx`) the count rises
+further. Zero `unsafe` was added in any of the kernel-core phases
+(0–10) beyond what the pre-existing toy-kernel arch layer used;
+Phases 11 and 12 introduce small, encapsulated `unsafe` blocks
+where they touch real hardware (GDT load, MSR writes, MMIO,
+naked asm SYSCALL/IRQ entry).
 
 | Phase | Feature flag | Module | Specs |
 |---|---|---|---|
@@ -310,28 +313,46 @@ pre-existing toy-kernel arch layer.
 | 10d | `fpu` | fpu | +4 |
 | 10e | `vmx` | vcpu | +5 |
 | 10f | — | arch/aarch64 stubs | — |
+| 11a | — | arch/x86_64/gdt | 3 |
+| 11b | — | arch/x86_64/{msr,syscall_entry} | 4 |
+| 11c | — | boot | 7 |
+| 11d | — | (syscall_entry dispatcher specs) | +2 |
+| 12a | — | arch/x86_64/lapic (driver, MMIO deferred) | 3 |
+| 12b | — | arch/x86_64/pit | 3 |
+| 12c | — | arch/x86_64/pic | 3 |
+| 12d | — | boot::kernel_init | (real-hw smoke) |
+| 12e | — | arch/x86_64/acpi | 4 |
+| 12f | — | live PIT IRQ delivery | +1 |
 
-What's *still not* landed (genuine future work, not in the scope
-the user signed off on):
-- Real userspace execution: SYSCALL/SYSRET MSR programming, GDT
-  user segments, the SYSCALL trap-entry naked-asm stub, CR3 switch
-  on context-switch, an embedded user-mode blob.
-- Full `boot.c` port: rootserver placement, BootInfo population
-  from BOOTBOOT's memory map, the initial-thread launch.
-- Hardware bring-up for the deferred features: MCS scheduler
-  hookup into the real scheduler tick, LAPIC ICR for IPI delivery,
-  CR0.TS programming for FPU traps, vmlaunch/vmresume, GIC
-  driver for aarch64.
-- Production refills count for MCS (currently capped at
-  `MAX_REFILLS = 8`), real CPU count for SMP (capped at 4),
-  XSAVE region for FPU (currently a generation counter).
-- aarch64 GIC driver and a `triplets/mykernel-aarch64.json`
-  target spec.
+The kernel **boots**, runs all 106 specs, then takes the real
+boot path: walks the BOOTBOOT memory map, places the rootserver
+on physical RAM, parses the live ACPI tables (RSDT/XSDT → MADT)
+to discover the LAPIC and IOAPIC, programs and unmasks the PIT
+IRQ, watches it fire end-to-end through the PIC into a Rust ISR,
+then exits cleanly via `isa-debug-exit`.
 
-Each of the items above is purely additive to the modules in
-place. The kernel core (cap, cte, cspace, untyped, scheduler,
-endpoint, notification, vspace) has zero dependence on any of
-them.
+What's still future work (calls deferred but documented):
+- **Page-table installer.** BOOTBOOT doesn't pre-map MMIO regions
+  at any kernel-virtual address we can reach without owning our
+  own page tables. Once we have that, the LAPIC driver
+  (Phase 12a) and IOAPIC programming go live, and user-mode entry
+  becomes possible.
+- **User-mode launch.** GDT, TSS, SYSCALL/SYSRET MSRs, and the
+  trap stub are all in place. What's missing: per-thread page
+  tables (blocked on the installer above) and an embedded
+  user-mode blob to launch from `boot::kernel_init`.
+- **Wiring the deferred Phase 10 features into the live path.**
+  The MCS scheduler, SMP IPI delivery, fastpath IPC, FPU
+  lazy-switch, VT-x VCPU lifecycle all have spec-tested
+  algorithmic cores; flipping them on in production needs the
+  hardware drivers above (LAPIC ICR for IPI, CR0.TS for FPU,
+  IOAPIC routing for the timer tick).
+- **aarch64.** Stubs in place; needs a target spec, GIC driver,
+  and EL1 vector-table setup.
+
+Each of these is purely additive to the modules in place. The
+kernel core (cap, cte, cspace, untyped, scheduler, endpoint,
+notification, vspace) has zero dependence on any of them.
 
 ### Phase 0 — preparation (no kernel changes)
 
