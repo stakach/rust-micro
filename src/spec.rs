@@ -9,6 +9,8 @@ pub fn test_main() {
     arch::log("Starting kernel specs...\n");
 
     arch_tests::test_architecture();
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::gdt::spec::test_gdt();
     structures_tests::test_structures();
     abi_layout_tests::test_abi_layout();
     crate::cap::spec::test_cap_roundtrip();

@@ -112,13 +112,16 @@ fn _start() -> ! {
     if current_apic_id == bootboot_bsp_id {
         arch::init_serial();
         arch::log("Serial initialized!\n");
-        
+
+        arch::log("Initializing GDT/TSS...\n");
+        arch::init_gdt();
+
         arch::log("Initializing interrupts...\n");
         arch::init_interrupts();
-        
+
         arch::log("Initializing exception handlers...\n");
         arch::init_exceptions();
-        
+
         arch::log("Kernel initialization complete on BSP\n");
         
         #[cfg(feature = "spec")]

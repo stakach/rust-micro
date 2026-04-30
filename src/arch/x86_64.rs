@@ -4,9 +4,11 @@ pub mod serial;
 pub mod qemu;
 
 pub mod cpu;
-pub mod interrupts;
 pub mod exceptions;
+pub mod gdt;
+pub mod interrupts;
 
 pub use cpu::{get_cpu_id, halt_cpu};
-pub use interrupts::init_interrupts;
 pub use exceptions::init_exceptions;
+pub use gdt::init_gdt;
+pub use interrupts::init_interrupts;
