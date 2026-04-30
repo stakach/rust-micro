@@ -186,8 +186,11 @@ pub unsafe extern "C" fn syscall_entry() {
 /// raw syscall number + UserContext into a `Syscall` and delegates
 /// to the existing `syscall_handler::handle_syscall`. The serial
 /// driver doubles as the DebugSink for now.
+///
+/// Public so specs (and a future user-mode integration test) can
+/// invoke the same path the trap entry calls.
 #[no_mangle]
-extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
+pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
     use crate::arch;
     use crate::syscall_handler::{handle_syscall, DebugSink, SyscallArgs};
     use crate::syscalls::Syscall;
@@ -243,6 +246,8 @@ pub mod spec {
         star_kernel_user_pair();
         lstar_points_at_entry();
         fmask_clears_interrupt_flag();
+        dispatcher_emits_byte_for_sys_debug_put_char();
+        dispatcher_signals_unknown_via_max_rax();
         arch::log("SYSCALL MSR tests completed\n");
     }
 
@@ -277,5 +282,37 @@ pub mod spec {
         assert!(mask & (1 << 9) != 0, "FMASK must clear IF on entry");
         assert!(mask & (1 << 10) != 0, "FMASK must clear DF on entry");
         arch::log("  ✓ FMASK clears IF and DF on entry\n");
+    }
+
+    /// Phase 11d — integration test of the dispatcher. Builds a
+    /// UserContext as the trap stub would and calls
+    /// rust_syscall_dispatch directly. We can't trigger an actual
+    /// SYSCALL from kernel mode and survive the sysretq (it'd land
+    /// in ring 3 at a kernel RIP), so we exercise the same code
+    /// path one frame higher up. Identical to what the entry stub
+    /// does after register save.
+    #[inline(never)]
+    pub fn dispatcher_emits_byte_for_sys_debug_put_char() {
+        // SysDebugPutChar = -9. ABI: rdi = arg0 (the byte).
+        let mut ctx = UserContext::default();
+        ctx.rdi = b'!' as u64;
+        // Pre-flight rax sentinel; the dispatcher writes the
+        // syscall result back here.
+        ctx.rax = 0xDEAD_BEEF;
+
+        super::rust_syscall_dispatch(-9i64 as u64, &mut ctx);
+
+        // Successful syscall stamps rax = 0.
+        assert_eq!(ctx.rax, 0, "dispatcher should set rax=0 on success");
+        arch::log("  ✓ rust_syscall_dispatch handles SysDebugPutChar\n");
+    }
+
+    #[inline(never)]
+    pub fn dispatcher_signals_unknown_via_max_rax() {
+        let mut ctx = UserContext::default();
+        ctx.rax = 0;
+        super::rust_syscall_dispatch(99u64, &mut ctx);
+        assert_eq!(ctx.rax, u64::MAX, "unknown syscall returns -1");
+        arch::log("  ✓ rust_syscall_dispatch flags unknown syscalls\n");
     }
 }
