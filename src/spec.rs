@@ -19,6 +19,8 @@ pub fn test_main() {
     crate::arch::x86_64::pit::spec::test_pit();
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::pic::spec::test_pic();
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::acpi::spec::test_acpi();
     structures_tests::test_structures();
     abi_layout_tests::test_abi_layout();
     crate::cap::spec::test_cap_roundtrip();

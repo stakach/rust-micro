@@ -3,6 +3,7 @@ pub mod serial;
 #[cfg(feature = "spec")]
 pub mod qemu;
 
+pub mod acpi;
 pub mod cpu;
 pub mod exceptions;
 pub mod gdt;
