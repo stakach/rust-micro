@@ -63,6 +63,9 @@ mod notification;
 // IRQ → notification dispatch.
 mod interrupt;
 
+// x86_64 virtual-address-space helpers (paging algorithm).
+mod vspace;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;

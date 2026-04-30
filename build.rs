@@ -47,6 +47,12 @@ fn main() {
     let rust = bf::generate(&bf_src).unwrap_or_else(|e| panic!("bf codegen: {e}"));
     fs::write(out_dir.join("structures.rs"), rust).expect("write structures.rs");
 
+    // arch x86_64 .bf -> structures_arch.rs
+    let bf_arch = read("structures_x86_64.bf");
+    let rust = bf::generate(&bf_arch)
+        .unwrap_or_else(|e| panic!("arch bf codegen: {e}"));
+    fs::write(out_dir.join("structures_arch.rs"), rust).expect("write structures_arch.rs");
+
     // syscall.xml -> syscalls.rs
     let syscall_xml = read("syscall.xml");
     let rust = xml::generate_syscalls(&syscall_xml)

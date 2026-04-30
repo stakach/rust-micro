@@ -21,6 +21,7 @@ pub fn test_main() {
     crate::endpoint::spec::test_endpoint();
     crate::notification::spec::test_notification();
     crate::interrupt::spec::test_interrupt();
+    crate::vspace::spec::test_vspace();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);

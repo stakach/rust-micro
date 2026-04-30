@@ -12,3 +12,10 @@
 #![allow(dead_code)]
 
 include!(concat!(env!("OUT_DIR"), "/structures.rs"));
+
+/// Arch-specific bitfield types (x86_64): frame_cap, page_table_cap,
+/// page_directory_cap, pdpt_cap, pml4_cap, asid_pool_cap, io_port_cap,
+/// plus PTE/PDE/PDPTE/PML4E and GDT/IDT/TSS layouts.
+pub mod arch {
+    include!(concat!(env!("OUT_DIR"), "/structures_arch.rs"));
+}

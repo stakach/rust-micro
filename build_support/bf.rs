@@ -90,6 +90,24 @@ pub fn preprocess(src: &str, cfg: &HashMap<String, bool>) -> String {
             cond_stack.pop();
             continue;
         }
+        // The arch .bf files start with `#include <config.h>` and an
+        // `#include <object/structures_64.bf>` (so the included
+        // blocks are visible to the tagged_union declaration). We
+        // don't act on either: configs are passed in via `cfg`, and
+        // we generate the included file separately.
+        if trimmed.starts_with("#include") {
+            continue;
+        }
+        // `base 64(48,1)` / `base 64(51,0)` set the word and
+        // canonical sizes for blocks that follow. We only consume
+        // x86_64 (canonical_size = 48) blocks today and the few PTE
+        // blocks under `base 64(51,0)` use only `field` / `field_high`,
+        // neither of which depend on canonical_size — so the
+        // directive can be safely ignored. Re-visit when we add a
+        // `field_ptr` consumer at canonical_size != 48.
+        if trimmed.starts_with("base ") {
+            continue;
+        }
 
         if *emit_stack.last().unwrap() {
             out.push_str(line_no_comment);
@@ -601,7 +619,11 @@ fn render_block(s: &mut String, b: &LoweredBlock) {
 
     for f in &b.fields {
         let Some(name) = &f.name else { continue };
-        emit_getter(s, f, name);
+        // Getter: bare method named after the field — needs `r#`
+        // when the field name is a Rust keyword.
+        // Setter: prefixed with `with_` so the resulting identifier
+        // is never a keyword; pass the raw name through.
+        emit_getter(s, f, &field_ident(name));
         emit_setter(s, f, name);
     }
 
@@ -613,10 +635,13 @@ fn render_block(s: &mut String, b: &LoweredBlock) {
     } else {
         visible.iter().map(|f| f.name.clone().unwrap()).collect()
     };
+    // Argument identifiers (parameters in the function signature)
+    // must escape keywords; the `with_X` method name does not.
+    let arg_idents: Vec<String> = arg_names.iter().map(|n| field_ident(n)).collect();
 
     write!(s, "    pub const fn new(").unwrap();
     let mut first = true;
-    for arg in &arg_names {
+    for arg in &arg_idents {
         if !first {
             s.push_str(", ");
         }
@@ -625,8 +650,14 @@ fn render_block(s: &mut String, b: &LoweredBlock) {
     }
     s.push_str(") -> Self {\n");
     writeln!(s, "        let mut this = Self::zeroed();").unwrap();
-    for arg in &arg_names {
-        writeln!(s, "        this = this.with_{name}({name});", name = arg).unwrap();
+    for (raw, ident) in arg_names.iter().zip(arg_idents.iter()) {
+        writeln!(
+            s,
+            "        this = this.with_{method}({arg});",
+            method = raw,
+            arg = ident,
+        )
+        .unwrap();
     }
     writeln!(s, "        this").unwrap();
     writeln!(s, "    }}").unwrap();
@@ -709,6 +740,19 @@ fn emit_setter(s: &mut String, f: &LoweredField, name: &str) {
     .unwrap();
     writeln!(s, "        self").unwrap();
     writeln!(s, "    }}").unwrap();
+}
+
+/// Some .bf files use names that are reserved Rust keywords
+/// (notably `type`). Wrap them in raw-identifier syntax so the
+/// emitted code compiles. The list is tiny — extend as we run into
+/// more.
+fn field_ident(name: &str) -> String {
+    let raw_keywords = ["type", "fn", "in", "ref", "match", "loop", "move", "use", "where", "yield", "self", "super", "crate", "pub", "as", "let", "mut", "static", "const", "if", "else", "while", "for", "return", "true", "false"];
+    if raw_keywords.contains(&name) {
+        format!("r#{}", name)
+    } else {
+        name.to_string()
+    }
 }
 
 fn type_name(bf_name: &str) -> String {
