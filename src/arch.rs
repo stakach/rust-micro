@@ -28,6 +28,7 @@ pub use aarch64::qemu::qemu_exit;
 pub use x86_64::{
     serial::init_serial, serial::log,
     get_cpu_id, halt_cpu, init_gdt, init_interrupts, init_exceptions,
+    init_syscall_msrs,
 };
 
 #[cfg(all(target_arch = "aarch64"))]
@@ -35,3 +36,8 @@ pub use aarch64::{
     serial::init_serial, serial::log,
     get_cpu_id, halt_cpu, init_interrupts, init_exceptions,
 };
+
+/// aarch64 doesn't have IA32 MSRs. Stub so portable bootstrap can
+/// call this unconditionally.
+#[cfg(all(target_arch = "aarch64"))]
+pub fn init_syscall_msrs() {}

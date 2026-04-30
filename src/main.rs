@@ -122,6 +122,9 @@ fn _start() -> ! {
         arch::log("Initializing exception handlers...\n");
         arch::init_exceptions();
 
+        arch::log("Initializing SYSCALL MSRs...\n");
+        arch::init_syscall_msrs();
+
         arch::log("Kernel initialization complete on BSP\n");
         
         #[cfg(feature = "spec")]
