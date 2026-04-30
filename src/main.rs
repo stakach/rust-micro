@@ -57,6 +57,12 @@ mod syscall_handler;
 // Endpoint state machine (slowpath IPC).
 mod endpoint;
 
+// Notification state machine (signal/wait).
+mod notification;
+
+// IRQ → notification dispatch.
+mod interrupt;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;
