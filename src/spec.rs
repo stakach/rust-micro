@@ -2,6 +2,7 @@ use crate::arch;
 
 mod abi_layout_tests;
 mod arch_tests;
+mod integration_tests;
 mod structures_tests;
 
 pub fn test_main() {
@@ -22,6 +23,7 @@ pub fn test_main() {
     crate::notification::spec::test_notification();
     crate::interrupt::spec::test_interrupt();
     crate::vspace::spec::test_vspace();
+    integration_tests::test_integration();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);

@@ -284,6 +284,23 @@ module with strong unit-test coverage. Trying to make these "safe" with
 Each phase ends with the kernel still booting and all specs green. No
 phase leaves the tree red.
 
+### Status — Phases 0–9 complete
+
+All nine forward phases below are landed on the `sel4-rust` branch.
+76 ✓s pass on real boot across architecture, generated bitfield types,
+ABI layout, capability round-trip, CSpace lookup, region/object types,
+untyped retype, TCB+scheduler, syscall dispatch, endpoint IPC,
+notification, IRQ dispatch, vspace/paging, and 5 cross-subsystem
+integration scenarios. Zero `unsafe` was added in any of these phases
+beyond the pre-existing toy-kernel arch layer.
+
+What's *not* landed (deferred to Phase 10+, see §1 scope):
+- Real userspace execution (SYSCALL/SYSRET, GDT user segments, page-
+  table CR3 switch, an embedded user blob).
+- Full rootserver placement / boot.c port.
+- MCS scheduler, SMP, fastpath, FPU, VT-x.
+- aarch64 / riscv arch ports.
+
 ### Phase 0 — preparation (no kernel changes)
 
 - ✅ macOS toolchain and scripts (this conversation).
