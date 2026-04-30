@@ -27,6 +27,8 @@ pub fn test_main() {
 
     #[cfg(feature = "mcs")]
     crate::sched_context::spec::test_sched_context();
+    #[cfg(feature = "smp")]
+    crate::smp::spec::test_smp();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);

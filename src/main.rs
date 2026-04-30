@@ -72,6 +72,10 @@ mod vspace;
 #[cfg(feature = "mcs")]
 mod sched_context;
 
+// Phase 10b — multi-CPU support: per-CPU NodeState + IPI dispatch.
+#[cfg(feature = "smp")]
+mod smp;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;
