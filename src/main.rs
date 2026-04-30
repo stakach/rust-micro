@@ -22,6 +22,17 @@ mod syscalls;
 // Hand-coded public ABI types matching libsel4 layouts byte-for-byte.
 mod types;
 
+// Idiomatic Rust capability enum and round-trip with the on-the-wire
+// encoding emitted by the generated bitfield types.
+mod cap;
+
+// Capability Table Entry — single-cell storage for one cap plus its
+// MDB bookkeeping.
+mod cte;
+
+// CSpace lookup — resolveAddressBits, lookupCap, lookupSlot.
+mod cspace;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;
