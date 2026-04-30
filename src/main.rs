@@ -54,6 +54,9 @@ mod error;
 // Syscall dispatcher (handle_syscall + handle_unknown_syscall).
 mod syscall_handler;
 
+// Endpoint state machine (slowpath IPC).
+mod endpoint;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;

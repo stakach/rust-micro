@@ -89,6 +89,13 @@ impl TcbId {
 pub const NUM_PRIORITIES: usize = 256;
 pub const MAX_PRIORITY: u8 = (NUM_PRIORITIES - 1) as u8;
 
+/// Maximum number of message-register words we model in this phase.
+/// seL4's `seL4_MsgMaxLength` is 120 — we keep the full ABI value as
+/// a constant in `types.rs` but cap the in-kernel staging buffer to
+/// keep TCB size sane during specs. Production TCB stores the full
+/// register set in arch-side `tcbContext` instead.
+pub const SCRATCH_MSG_LEN: usize = 8;
+
 #[derive(Copy, Clone, Debug)]
 pub struct Tcb {
     pub state: ThreadStateType,
@@ -110,6 +117,24 @@ pub struct Tcb {
     /// isn't currently enqueued.
     pub sched_next: Option<TcbId>,
     pub sched_prev: Option<TcbId>,
+    /// Intrusive endpoint-queue links. Used while the thread is
+    /// blocked on an Endpoint or Notification. `None` when not
+    /// queued. Mirrors `tcbEPNext` / `tcbEPPrev` in seL4.
+    pub ep_next: Option<TcbId>,
+    pub ep_prev: Option<TcbId>,
+    /// Message info for the in-flight IPC (label / length / extra
+    /// caps). Set on send-side, read on receive-side.
+    pub ipc_label: Word,
+    pub ipc_length: u32,
+    /// Tiny in-kernel message register buffer. Long messages use the
+    /// per-thread IPC buffer page (mapped at `ipc_buffer`); the
+    /// short fast-path uses just these registers. Staged here so
+    /// specs can verify the byte-by-byte transfer without setting up
+    /// real virtual memory.
+    pub msg_regs: [Word; SCRATCH_MSG_LEN],
+    /// IPC badge stamped onto the message during a badged-send. The
+    /// receiver reads it as the seL4 `badge` syscall return.
+    pub ipc_badge: Word,
 }
 
 impl Default for Tcb {
@@ -124,6 +149,12 @@ impl Default for Tcb {
             ipc_buffer: 0,
             sched_next: None,
             sched_prev: None,
+            ep_next: None,
+            ep_prev: None,
+            ipc_label: 0,
+            ipc_length: 0,
+            msg_regs: [0; SCRATCH_MSG_LEN],
+            ipc_badge: 0,
         }
     }
 }
@@ -139,10 +170,13 @@ impl Tcb {
 // ---------------------------------------------------------------------------
 
 /// Maximum live TCBs in the kernel. Picks a small bound so the
-/// slab is BSS-allocatable without alloc(). Production seL4 uses
-/// real Untyped retypes for TCBs and there is no upper bound, but
-/// we don't need that flexibility before Phase 7+.
-pub const MAX_TCBS: usize = 64;
+/// slab is BSS-allocatable without alloc() and a `Scheduler` value
+/// fits on a 16 KiB BOOTBOOT stack with margin. Production seL4
+/// uses real Untyped retypes for TCBs and there is no upper bound;
+/// raising this here costs ~128 bytes per TCB in BSS plus stack
+/// when a Scheduler is constructed in a spec, so we keep it modest
+/// until phases that actually need more.
+pub const MAX_TCBS: usize = 16;
 
 #[derive(Copy, Clone, Debug)]
 pub struct TcbSlab {

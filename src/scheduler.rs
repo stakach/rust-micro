@@ -295,6 +295,7 @@ pub mod spec {
         t
     }
 
+    #[inline(never)]
     fn bitmap_basics() {
         let mut bm = PrioBitmap::new();
         assert!(bm.is_empty());
@@ -312,6 +313,7 @@ pub mod spec {
         arch::log("  ✓ priority bitmap highest/set/clear\n");
     }
 
+    #[inline(never)]
     fn chooses_highest_priority() {
         let mut s = Scheduler::new();
         let _low = s.admit(runnable(10));
@@ -322,6 +324,7 @@ pub mod spec {
         arch::log("  ✓ choose_thread picks the highest-priority runnable\n");
     }
 
+    #[inline(never)]
     fn round_robin_within_priority() {
         // Three threads at the same priority — choose_thread cycles
         // through them in admission order, then back to the first.
@@ -337,6 +340,7 @@ pub mod spec {
         arch::log("  ✓ round-robin within a priority class\n");
     }
 
+    #[inline(never)]
     fn block_then_unblock() {
         let mut s = Scheduler::new();
         let a = s.admit(runnable(50));
@@ -357,6 +361,7 @@ pub mod spec {
         arch::log("  ✓ block / make_runnable updates queue and current\n");
     }
 
+    #[inline(never)]
     fn empty_falls_back_to_idle() {
         let mut s = Scheduler::new();
         // Idle thread (priority 0, runnable but never enqueued by us).
@@ -370,6 +375,7 @@ pub mod spec {
         arch::log("  ✓ empty queues fall through to the idle thread\n");
     }
 
+    #[inline(never)]
     fn preempt_only_strictly_higher() {
         let mut s = Scheduler::new();
         let a = s.admit(runnable(100));

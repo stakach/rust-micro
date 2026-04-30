@@ -18,6 +18,7 @@ pub fn test_main() {
     crate::tcb::spec::test_tcb();
     crate::scheduler::spec::test_scheduler();
     crate::syscall_handler::spec::test_syscall_handler();
+    crate::endpoint::spec::test_endpoint();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);
