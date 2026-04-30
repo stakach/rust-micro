@@ -9,6 +9,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod lapic;
 pub mod msr;
+pub mod pic;
 pub mod pit;
 pub mod syscall_entry;
 
