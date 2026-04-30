@@ -29,6 +29,8 @@ pub fn test_main() {
     crate::sched_context::spec::test_sched_context();
     #[cfg(feature = "smp")]
     crate::smp::spec::test_smp();
+    #[cfg(feature = "fastpath")]
+    crate::fastpath::spec::test_fastpath();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);

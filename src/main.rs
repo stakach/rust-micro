@@ -76,6 +76,11 @@ mod sched_context;
 #[cfg(feature = "smp")]
 mod smp;
 
+// Phase 10c — IPC fastpath bypassing the slowpath book-keeping for
+// the common-case Call / ReplyRecv shape.
+#[cfg(feature = "fastpath")]
+mod fastpath;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;
