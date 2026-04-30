@@ -66,6 +66,12 @@ mod interrupt;
 // x86_64 virtual-address-space helpers (paging algorithm).
 mod vspace;
 
+// Phase 10a — MCS scheduling-context object (gated behind cargo
+// `mcs` feature). Adds sporadic-server refill bookkeeping on top of
+// the classic scheduler.
+#[cfg(feature = "mcs")]
+mod sched_context;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;

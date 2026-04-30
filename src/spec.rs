@@ -25,6 +25,9 @@ pub fn test_main() {
     crate::vspace::spec::test_vspace();
     integration_tests::test_integration();
 
+    #[cfg(feature = "mcs")]
+    crate::sched_context::spec::test_sched_context();
+
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);
 }

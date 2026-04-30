@@ -13,3 +13,14 @@ default = ["arch-x86_64"]
 spec = []
 arch-x86_64 = []
 arch-aarch64 = []
+# Mixed-Criticality Systems — replaces the classic round-robin
+# scheduler with sporadic-server scheduling contexts. Phase 10a.
+mcs = []
+# Multi-CPU support — per-CPU state, IPI dispatch. Phase 10b.
+smp = []
+# Hot-path IPC bypassing the slowpath. Phase 10c.
+fastpath = []
+# Lazy FPU state-switch. Phase 10d.
+fpu = []
+# Hardware-virtualisation extensions (VT-x). Phase 10e.
+vmx = []
