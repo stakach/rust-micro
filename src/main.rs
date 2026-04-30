@@ -85,6 +85,10 @@ mod fastpath;
 #[cfg(feature = "fpu")]
 mod fpu;
 
+// Phase 10e — VT-x VCPU lifecycle.
+#[cfg(feature = "vmx")]
+mod vcpu;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;

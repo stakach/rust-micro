@@ -33,6 +33,8 @@ pub fn test_main() {
     crate::fastpath::spec::test_fastpath();
     #[cfg(feature = "fpu")]
     crate::fpu::spec::test_fpu();
+    #[cfg(feature = "vmx")]
+    crate::vcpu::spec::test_vcpu();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);
