@@ -33,6 +33,15 @@ mod cte;
 // CSpace lookup — resolveAddressBits, lookupCap, lookupSlot.
 mod cspace;
 
+// Memory-region types and alignment helpers.
+mod region;
+
+// seL4 object types and per-type sizes.
+mod object_type;
+
+// Untyped retype — kernel object allocator.
+mod untyped;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;
