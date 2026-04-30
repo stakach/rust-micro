@@ -54,11 +54,16 @@ unsafe fn alloc_table_va() -> *mut u64 {
     assert!(KPT_USED < POOL_SIZE, "kernel page-table pool exhausted");
     let p = (&raw const KPT_POOL[KPT_USED]) as *mut u64;
     KPT_USED += 1;
-    // Zero the table — pool is BSS-zeroed already, but be explicit.
     for i in 0..512 {
         ptr::write_volatile(p.add(i), 0);
     }
     p
+}
+
+/// Public-from-arch helper: same as `alloc_table_va` but callable
+/// from sibling modules (e.g. usermode page-table install).
+pub unsafe fn alloc_user_table_va() -> *mut u64 {
+    alloc_table_va()
 }
 
 // ---------------------------------------------------------------------------

@@ -63,8 +63,11 @@ mod notification;
 // IRQ → notification dispatch.
 mod interrupt;
 
-// x86_64 virtual-address-space helpers (paging algorithm).
-mod vspace;
+// x86_64 virtual-address-space helpers — re-exported from
+// arch::x86_64::vspace so callers can stay arch-neutral. ARM and
+// RISC-V will land sibling modules with their own paging layouts.
+#[cfg(target_arch = "x86_64")]
+pub use crate::arch::x86_64::vspace;
 
 // Phase 11c — kernel boot: memory-map discovery + rootserver placement.
 mod boot;
@@ -152,9 +155,15 @@ fn _start() -> ! {
             }
         }
 
-        #[cfg(feature = "spec")]
-        arch::qemu_exit(0);
+        // Phase 13c — drop to ring 3 with a tiny user-mode payload
+        // that issues a single SysDebugPutChar and lets us observe
+        // the round-trip. This call never returns: on success the
+        // syscall dispatcher exits QEMU directly; on failure we'd
+        // hit the panic handler below.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::usermode::launch_user_mode_test();
 
+        #[cfg(any(not(target_arch = "x86_64"), not(feature = "spec")))]
         loop {}
     } else {
         // Non-bootstrap processors should halt until needed

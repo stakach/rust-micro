@@ -229,6 +229,20 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
         Ok(()) => 0,
         Err(_) => u64::MAX,
     };
+
+    // Phase 13c integration: if the user-mode launch test armed the
+    // flag, the very first SysDebugPutChar is the proof we crossed
+    // the ring 3 → ring 0 boundary. The user code spin-loops after
+    // its syscall, so we have to terminate the boot here ourselves.
+    use core::sync::atomic::Ordering;
+    if super::usermode::USERMODE_TEST_TRIGGERED.load(Ordering::Relaxed)
+        && matches!(syscall, Syscall::SysDebugPutChar)
+    {
+        arch::log(
+            "\n[user-mode round-trip succeeded — exiting QEMU]\n",
+        );
+        crate::arch::qemu_exit(0);
+    }
 }
 
 // ---------------------------------------------------------------------------

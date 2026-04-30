@@ -10,9 +10,12 @@ pub mod gdt;
 pub mod interrupts;
 pub mod lapic;
 pub mod msr;
+pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod syscall_entry;
+pub mod usermode;
+pub mod vspace;
 
 pub use cpu::{get_cpu_id, halt_cpu};
 pub use exceptions::init_exceptions;
