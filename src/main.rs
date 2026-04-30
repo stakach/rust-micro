@@ -81,6 +81,10 @@ mod smp;
 #[cfg(feature = "fastpath")]
 mod fastpath;
 
+// Phase 10d — lazy FPU switch state machine.
+#[cfg(feature = "fpu")]
+mod fpu;
+
 // Loads tests if we're running specs
 #[cfg(feature = "spec")]
 mod spec;

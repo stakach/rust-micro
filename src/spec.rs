@@ -31,6 +31,8 @@ pub fn test_main() {
     crate::smp::spec::test_smp();
     #[cfg(feature = "fastpath")]
     crate::fastpath::spec::test_fastpath();
+    #[cfg(feature = "fpu")]
+    crate::fpu::spec::test_fpu();
 
     arch::log("All specs passed!\n");
     arch::qemu_exit(0);
