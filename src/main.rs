@@ -66,6 +66,9 @@ mod interrupt;
 // x86_64 virtual-address-space helpers (paging algorithm).
 mod vspace;
 
+// Phase 11c — kernel boot: memory-map discovery + rootserver placement.
+mod boot;
+
 // Phase 10a — MCS scheduling-context object (gated behind cargo
 // `mcs` feature). Adds sporadic-server refill bookkeeping on top of
 // the classic scheduler.

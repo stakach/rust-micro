@@ -27,6 +27,7 @@ pub fn test_main() {
     crate::notification::spec::test_notification();
     crate::interrupt::spec::test_interrupt();
     crate::vspace::spec::test_vspace();
+    crate::boot::spec::test_boot();
     integration_tests::test_integration();
 
     #[cfg(feature = "mcs")]
