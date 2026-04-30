@@ -284,22 +284,54 @@ module with strong unit-test coverage. Trying to make these "safe" with
 Each phase ends with the kernel still booting and all specs green. No
 phase leaves the tree red.
 
-### Status — Phases 0–9 complete
+### Status — Phases 0–10f complete
 
-All nine forward phases below are landed on the `sel4-rust` branch.
-76 ✓s pass on real boot across architecture, generated bitfield types,
-ABI layout, capability round-trip, CSpace lookup, region/object types,
-untyped retype, TCB+scheduler, syscall dispatch, endpoint IPC,
-notification, IRQ dispatch, vspace/paging, and 5 cross-subsystem
-integration scenarios. Zero `unsafe` was added in any of these phases
-beyond the pre-existing toy-kernel arch layer.
+Every phase planned below has landed on the `sel4-rust` branch.
+The default build runs **76 ✓ specs**; with every Phase 10 cargo
+feature enabled (`mcs,smp,fastpath,fpu,vmx`) the count rises to
+**99 ✓ specs**. Zero `unsafe` was added in any phase beyond the
+pre-existing toy-kernel arch layer.
 
-What's *not* landed (deferred to Phase 10+, see §1 scope):
-- Real userspace execution (SYSCALL/SYSRET, GDT user segments, page-
-  table CR3 switch, an embedded user blob).
-- Full rootserver placement / boot.c port.
-- MCS scheduler, SMP, fastpath, FPU, VT-x.
-- aarch64 / riscv arch ports.
+| Phase | Feature flag | Module | Specs |
+|---|---|---|---|
+| 0 | — | codegen/, build.rs | — |
+| 1 | — | structures, syscalls, types | 9 |
+| 2 | — | cap, cte, cspace | 13 |
+| 3 | — | region, object_type, untyped | 13 |
+| 4 | — | tcb, scheduler | 8 |
+| 5 | — | error, syscall_handler | 5 |
+| 6 | — | endpoint | 6 |
+| 7 | — | notification, interrupt | 9 |
+| 8 | — | structures::arch, vspace | 7 |
+| 9 | — | spec/integration_tests | 5 |
+| 10a | `mcs` | sched_context | +6 |
+| 10b | `smp` | smp | +4 |
+| 10c | `fastpath` | fastpath | +5 |
+| 10d | `fpu` | fpu | +4 |
+| 10e | `vmx` | vcpu | +5 |
+| 10f | — | arch/aarch64 stubs | — |
+
+What's *still not* landed (genuine future work, not in the scope
+the user signed off on):
+- Real userspace execution: SYSCALL/SYSRET MSR programming, GDT
+  user segments, the SYSCALL trap-entry naked-asm stub, CR3 switch
+  on context-switch, an embedded user-mode blob.
+- Full `boot.c` port: rootserver placement, BootInfo population
+  from BOOTBOOT's memory map, the initial-thread launch.
+- Hardware bring-up for the deferred features: MCS scheduler
+  hookup into the real scheduler tick, LAPIC ICR for IPI delivery,
+  CR0.TS programming for FPU traps, vmlaunch/vmresume, GIC
+  driver for aarch64.
+- Production refills count for MCS (currently capped at
+  `MAX_REFILLS = 8`), real CPU count for SMP (capped at 4),
+  XSAVE region for FPU (currently a generation counter).
+- aarch64 GIC driver and a `triplets/mykernel-aarch64.json`
+  target spec.
+
+Each of the items above is purely additive to the modules in
+place. The kernel core (cap, cte, cspace, untyped, scheduler,
+endpoint, notification, vspace) has zero dependence on any of
+them.
 
 ### Phase 0 — preparation (no kernel changes)
 
