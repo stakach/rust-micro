@@ -1,54 +1,223 @@
-# Active phase plan — Phase 25: real page-fault hook
+# Active phase plan — Phase 28: SMP / AP CPU bring-up
 
 ## Goal
-Hook the x86_64 page-fault handler into the `fault::deliver_fault`
-machinery from Phase 22. When a user thread page-faults, the
-kernel:
-1. Reads CR2 + error code + saved CS from the iret frame.
-2. If the fault came from CPL=3 (user), calls `deliver_fault`
-   with a `VMFault` carrying CR2 + the error code.
-3. Picks a new thread to run (since the faulter is now blocked
-   on Reply), swaps CR3, and iretqs into it.
-4. If the fault came from CPL=0 (kernel), panics — we have no
-   recovery for kernel faults.
+BOOTBOOT already starts every CPU in long mode at `_start` —
+no trampoline / INIT-SIPI-SIPI needed. `main.rs` already has
+the BSP/AP split (BSP runs init, APs `halt_cpu`). This phase
+turns AP halts into a real per-CPU init path, so every CPU
+ends up sitting in a scheduler loop ready to run threads.
 
-The existing page-fault stub from `interrupt_with_error!`
-swallows the saved CS and passes garbage to the handler via
-broken System V ABI plumbing. We write a proper one.
+What's already in the repo:
+* `main.rs:117-181` — `_start` runs on all cores. BSP (matched
+  via APIC ID == BOOTBOOT BSP ID) does init + spec runner; APs
+  call `arch::halt_cpu()` and loop.
+* `src/smp.rs` — `PerCpu<T>`, `NodeState`, `IpiKind`, signal +
+  handle IPI bookkeeping (gated behind `smp` feature, BSP-only
+  specs today).
+* `arch/x86_64/acpi.rs` — MADT walker producing `LocalApic`
+  entries; can enumerate APs.
+* `arch/x86_64/lapic.rs` — LAPIC reads work today; ICR write
+  for IPIs is missing.
+* QEMU launch is `-smp 1` (default). Bring-up testing needs
+  `-smp 4` in `scripts/run_specs.sh`.
 
-## Plan
-- [x] 25a — `page_fault_entry` naked stub puts cr2 → rdi,
-  error → rsi, saved_cs → rdx, saved_rip → rcx before the call.
-- [x] 25b — `handle_page_fault_typed(cr2, err, cs, rip)` routes
-  user faults to `deliver_fault(current, VMFault {...})` and
-  qemu_exit's after delivery (we can't iret back to a blocked
-  thread cleanly until Phase 26's IRQ-style state save lands;
-  exiting at least proves the path was taken). Kernel faults
-  log the regs and halt.
-- [x] 25c — IDT[14] now installs `page_fault_entry`.
-- [x] 25d — AY demo unchanged.
+## Plan (incremental — one session per slice)
+- [x] 28a — Per-CPU init + AP barrier. **DONE**
+  * Always-on `smp` module (feature gate removed).
+  * GDT extended to hold MAX_CPUS TSS descriptors. Selector for
+    CPU N is `TSS_SEL_BASE + N * 0x10`. Per-CPU TSS array in BSS.
+  * `init_gdt_for_cpu(cpu_id)` populates GDT on BSP, just loads
+    on APs; each CPU `ltr`s its own slot and writes its own
+    rsp0. `set_kernel_rsp_for_cpu(cpu_id, rsp)` for per-CPU
+    rsp0 updates.
+  * `ap_main`: spins on `BSP_READY` → `init_gdt_for_cpu(cpu_id)`
+    → `load_idt` → `init_syscall_msrs` → `mark_ap_alive` → HLT
+    loop.
+  * BSP barriers on `wait_for_aps(numcores - 1)` before specs /
+    demo. Serial shows "Waiting for APs..." → "All APs up".
+  * `scripts/run_specs.sh` runs QEMU with `-smp 4`.
+  * Spec: `all_aps_came_up` asserts `APS_ALIVE == numcores - 1`.
 
-## Out of scope
-* Deliberate user-fault test — needs a payload that faults and
-  a fault-handler thread. Defer to a future phase that builds
-  out the init-thread story.
+- [x] 28b — Big kernel lock (BKL). **DONE**
+  * `smp::BKL: AtomicU32` — 0 = free, else holder cpu_id + 1.
+  * `bkl_acquire()` spins on cmpxchg; `bkl_release()` stores 0.
+  * `BklGuard` RAII helpers in `syscall_entry.rs`,
+    `exceptions.rs`, `pit.rs` — `bkl_acquire()` then
+    `let _bkl = BklGuard;` releases on any return path.
+  * Wrapped: `rust_syscall_dispatch`, `handle_page_fault_typed`,
+    `pit_isr`. (Other exception handlers are panic-fatal —
+    they don't release.)
+  * Spec: `bkl_acquire_release_round_trip` confirms holder
+    encoding + repeat-acquire.
+  * Known follow-up for 28c: `SYSCALL_SAVE` and
+    `SYSCALL_KERNEL_RSP` are still global statics; once APs
+    run threads they need to be per-CPU (likely via GS_BASE
+    + a per-CPU struct).
+
+- [x] 28c — Per-CPU NodeState + runqueues. **DONE**
+  * New `SchedulerNode { queues, current, idle }` per CPU.
+  * `Scheduler { slab, nodes: [SchedulerNode; MAX_CPUS] }`.
+  * `Tcb.affinity: u32` field — `admit()` enqueues onto
+    `nodes[affinity]`. Defaults to BSP (0).
+  * Helpers: `current()`/`set_current()` route through
+    `crate::arch::get_cpu_id()`; `current_for_cpu(cpu)`/
+    `set_current_for_cpu` for cross-CPU access.
+  * `choose_thread()` / `should_preempt()` / `tick()` operate
+    on the calling CPU's node.
+  * All ~28 call sites in fault.rs, kernel.rs, syscall_handler.rs,
+    syscall_entry.rs, usermode.rs, scheduler.rs/spec migrated
+    from `s.scheduler.current = X` to
+    `s.scheduler.set_current(X)`.
+  * Spec: `per_cpu_queues_are_isolated` admits with affinity 0
+    and 1, asserts both queues hold the right counts.
+  * Behavioral parity: under -smp 4, all threads still run on
+    BSP (every TCB gets affinity=0 from `Tcb::default`); APs
+    remain in HLT until 28d/e wire them into the scheduler.
+
+- [x] 28d — Cross-CPU IPI driver. **DONE**
+  * `IPI_VECTOR = 0x40` in `smp.rs`. `ipi_irq_entry` naked
+    stub in `lapic.rs` calls `ipi_isr` which acquires BKL,
+    drains via `handle_ipis`, EOIs, releases.
+  * `smp::send_ipi(target_cpu, kind)` registers the cause in
+    `IPI_NODES[target_cpu]` then writes the LAPIC ICR. Caller
+    holds BKL while signaling.
+  * `IPI_NODES: PerCpu<NodeState>` is the always-in-BSS,
+    BKL-protected per-CPU bookkeeping (separate from the
+    `SchedulerNode` array — they'll merge in a later phase).
+  * BSP path now calls `install_kernel_page_tables` +
+    `init_lapic` directly (was only via the paging spec).
+  * AP path adds `init_lapic` to the per-CPU init sequence.
+  * Per-CPU EFER bits: `init_syscall_msrs` now also sets
+    `EFER.NXE` so APs walking the LAPIC PTE (bit 63 = NX)
+    don't trip a reserved-bit fault.
+  * Spec: `cross_cpu_ipi_delivers_and_runs_isr` — BSP fires
+    Reschedule IPI to AP1, polls `IPI_HANDLED_COUNT` and
+    confirms AP1's pending bitmap drained.
+
+## Out of scope (later phases)
+* Fine-grained locking (replace BKL with per-subsystem locks).
+* Cross-CPU thread migration via cap invocations.
+* TLB-shootdown IPI integration with vspace ops.
+* aarch64 SMP — different bring-up sequence.
+* CPU hotplug.
 
 ## Verification
-* AY demo unchanged.
-* Spec count unchanged.
-* If a fault DID happen, the boot output would log it before
-  exiting; absent that we know the path is dormant.
+* AY demo unchanged on each phase.
+* Per-phase specs pass under `-smp 4`.
+* Phase 28a: serial shows "all APs up: 3"; APs idle in HLT.
+* Phase 28b: stress under `-smp 4` stays correct.
+
+## Review (filled on completion)
+
+
+# Phase 27: PML4Cap + userspace vspace swap — DONE
+
+## Goal
+Type the apex paging cap (PML4 — tag 9). Today PML4 falls
+through `Cap::Arch`; the kernel allocates and CR3-swaps PML4s
+internally via `make_user_pml4`. With a typed cap, userspace can
+own its vspace root, hand a PML4 cap to a TCB via SetSpace, and
+have the syscall return path swap CR3 to it on resume.
+
+## Plan
+- [x] 27a — `Cap::PML4` typed variant + tag 9 round-trip
+  through the generated `Pml4Cap` bitfield.
+- [x] 27b — `Untyped::Retype` produces PML4 caps via new
+  `object_type::X86_PML4 = 13` (4 KiB per PML4).
+- [x] 27c — `TCB::SetSpace` accepts a Cap::PML4 vspace-root and
+  writes its physical address into `tcb.cpu_context.cr3`. The
+  syscall return path already loads CR3 from there before
+  sysretq. Non-PML4 vspace caps surface InvalidCapability.
+- [x] 27d — Specs cover round-trip + Retype-to-PML4 + SetSpace
+  pointing a TCB at a fresh PML4 (and rejecting a non-PML4 cap).
+
+## Out of scope
+* Hardware CR3 swap test from spec mode (no real PML4 page
+  to load — the spec just verifies the cap value lands in the
+  TCB context).
+* ASID pool / ASID control caps (tags 11/13) — separate phase.
+* Replacing `make_user_pml4`'s PML4-clone helper. The new typed
+  cap lives alongside it; the AY demo continues to use the
+  helper.
+
+## Verification
+* AY demo unchanged. ✓
+* New SetSpace-pins-CR3 spec passes; PT/PD/PDPT/PML4 round-trip
+  + Retype specs extended to cover PML4. ✓
+* Spec count: 133 → 134 (the round-trip and retype bullets each
+  gained a PML4 sub-case in place).
 
 ## Review
 
-* All 4 sub-tasks done.
-* The new stub finally passes registers correctly — the
-  `interrupt_with_error!` macro elsewhere in exceptions.rs is
-  still using the broken pattern (passes garbage to its
-  extern-C handlers). That's a wider bug that should be fixed
-  in a sweep, but PF was the most user-visible.
-* Real test of "user thread faults → handler runs" needs a
-  payload that intentionally faults plus a fault-handler thread
-  in the demo. Out of scope for this commit; the algorithmic
-  bridge is verified by the spec in `fault.rs`.
-* AY demo unchanged → 130 ✓ specs.
+Phase 27 was clean — `Cap::PML4` slotted into the same shape as
+PT/PD/PDPT (typed variant, tag 9, X86_PML4=13). The interesting
+piece was extending `TCB::SetSpace` to consume a Cap::PML4 and
+write `ptr.addr()` straight into `tcb.cpu_context.cr3`, since
+the syscall return path already CR3-swaps from there before
+sysretq. With a typed PML4, that path becomes user-driven instead
+of relying on `make_user_pml4` (which the AY demo still uses
+internally — no need to retire it yet).
+
+No codegen surprises this round — the field_high fix from Phase
+26 already made `capPML4BasePtr` (a plain `field 64`) round-trip
+the full pointer cleanly.
+
+# Phase 26: PageTable cap chain — DONE
+
+## Goal
+Type the rest of the x86_64 paging caps. Currently
+PageTable / PageDirectory / PDPT caps fall through to the
+opaque `Cap::Arch` variant. Promote them to typed variants and
+wire up Map/Unmap invocations so userspace can manage page
+tables explicitly (instead of relying on auto-allocation in
+ensure_user_table).
+
+## Plan
+- [x] 26a — `Cap::PageTable` / `PageDirectory` / `Pdpt` typed
+  variants. Round-trip via the generated `PageTableCap` /
+  `PageDirectoryCap` / `PdptCap` bitfields.
+- [x] 26b — `Untyped::Retype` produces them via new
+  `object_type::X86_PAGE_TABLE / X86_PAGE_DIRECTORY / X86_PDPT`
+  values (10, 11, 12 — extending the X86_4K/2M/1G range from
+  Phase 19).
+- [x] 26c — `decode_invocation` for each: `X86PageTableMap`,
+  `X86PageDirectoryMap`, `X86PDPTMap` install the cap into the
+  target paging structure. (Unmap variants get plumbing but no
+  hardware action yet — they just clear the mapped flag in the
+  cap.)
+- [x] 26d — Specs cover round-trip + Retype + Map of one PT.
+
+## Out of scope
+* Actual page-table-walk integration. Today's
+  `usermode::ensure_user_table` auto-allocates intermediate
+  tables on demand; with explicit caps the user could chain
+  them, but we don't need that for the AY demo.
+* PML4Cap (the user's vspace root) — currently kernel-managed.
+
+## Verification
+* AY demo unchanged. ✓
+* New round-trip + invocation specs pass. ✓
+* Spec count rose by 3 (paging round-trip, retype-to-PT-chain,
+  PT::Map/Unmap).
+
+## Review
+
+Phase 26 completed. While wiring up the typed caps we hit a real
+codegen bug: `field_high` was being treated as a regular plain field
+(no shift), so PT/PD/PDPT mapped-address fields would silently
+truncate the high bits and round-trip to `mapped=0`. Fixed in
+`build_support/bf.rs`: now parses `base 64(N,M)` properly and bakes
+the active canonical_size into each `field_high` shift expression.
+Existing call-sites in `arch/x86_64/vspace.rs` that pre-shifted
+`paddr >> PAGE_BITS_4K` had to drop the manual shift; the codegen
+handles alignment now. Captured as a lesson in tasks/lessons.md.
+
+## Next candidates
+* AP CPU bring-up (multi-core SMP).
+* MCS scheduler integration (refill_charge tied to live PIT tick).
+* Real BootInfo + ELF init thread (replacing the AY demo with a
+  proper rootserver).
+* PML4Cap (typed vspace-root cap so SetSpace can swap CR3 from
+  userspace).
+* MDB linked-list to replace structural Revoke.
+* aarch64 hardware bring-up.

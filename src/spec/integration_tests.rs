@@ -247,7 +247,7 @@ fn untyped_to_frame_map() {
     // the right physical-address payload.
     let idx = decompose_vaddr(user_vaddr).pt as usize;
     assert_eq!(pt[idx].present(), 1);
-    assert_eq!(pt[idx].page_base_address(), frame_paddr >> 12);
+    assert_eq!(pt[idx].page_base_address(), frame_paddr);
     arch::log("  ✓ Untyped → PT-shaped allocation + frame_map_4k\n");
 }
 

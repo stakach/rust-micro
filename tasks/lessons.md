@@ -85,6 +85,49 @@ Rule — a test fixture that touches the global Scheduler must
 own clean-up of *both* the slab AND the per-priority queues.
 Just freeing the slot leaves the queue inconsistent.
 
+## Pattern: `field_high` in the .bf codegen
+
+Real seL4's `bitfield_gen.py` treats `field_high N` as "store the
+high N bits of a canonical-size value" — the codegen generates a
+shift = `canonical_size - N` so the low bits drop out on write and
+get re-zeroed (and sign-extended) on read. Our local `build_support/bf.rs`
+originally ignored that and just stored the raw low N bits, which
+made anything sized below the canonical width un-roundtrippable.
+
+Symptom — Cap::PageTable round-trip threw away mapped-address bits
+above the 28-bit storage. PT caps round-tripped to mapped=0 even
+though `is_mapped` was set.
+
+Fix — bf.rs now (a) parses the `base 64(N,M)` directive instead of
+filtering it in the preprocessor, and (b) bakes the active
+canonical_size into each `field_high` field's shift expression.
+Existing call-sites that pre-shifted (`paddr >> PAGE_BITS_4K` into
+`with_page_base_address`) had to drop the manual shift, since the
+codegen does it now.
+
+Rule — when adding bitfield types (esp. PTE-shaped or pointer-shaped
+fields under a different `base` directive), trust `field_high` to
+encode alignment for you. Don't shift externally; do shift the test
+expectation back to the *full* address, not paddr >> bits.
+
+## Pattern: per-CPU MSRs need explicit setup on every CPU
+
+Symptom — under SMP, AP triple-faulted with err=0xa (reserved-bit
+set) when writing to the LAPIC MMIO. cr2 pointed at a valid
+mapping that BSP could reach. Cause: BOOTBOOT sets EFER.NXE=1
+on the BSP, but APs come up with NXE=0. When BSP installed a
+PTE with bit 63 (NX) set into the shared kernel PML4, AP saw
+bit 63 as reserved during the page-table walk and #PF'd.
+
+Fix — `init_syscall_msrs` now ORs in `EFER_NXE` alongside
+`EFER_SCE`. APs run that as part of their per-CPU init.
+
+Rule — when BOOTBOOT (or any bootloader) configures EFER, MTRRs,
+PAT, or other per-CPU MSRs on the BSP, **assume APs come up with
+the architectural defaults**. Replicate every per-CPU MSR write
+in the AP init path. The BSP-only-ran-it bugs surface only under
+SMP and as cryptic page faults.
+
 ## Pattern: x86_64 calling-convention plumbing
 
 - The `extern "C"` (System V) ABI puts the first arg in `rdi`,

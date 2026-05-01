@@ -125,7 +125,11 @@ pub fn make_pte(paddr: Word, rights: VmRights, cache: CacheAttr, executable: boo
         .with_pat(pat)
         .with_cache_disabled(pcd)
         .with_write_through(pwt)
-        .with_page_base_address(paddr >> PAGE_BITS_4K)
+        // The codegen's `field_high` setter drops the low
+        // (canonical_size - field_size) bits, so we pass the full
+        // physical address through and let the bitfield handle the
+        // alignment shift.
+        .with_page_base_address(paddr)
 }
 
 /// Build a PD entry pointing to a page table at `pt_paddr`.
@@ -135,7 +139,7 @@ pub fn make_pde_pt(pt_paddr: Word, rights: VmRights, executable: bool) -> PdePt 
         .with_read_write(rights.writable() as u64)
         .with_super_user(rights.user() as u64)
         .with_xd((!executable) as u64)
-        .with_pt_base_address(pt_paddr >> PAGE_BITS_4K)
+        .with_pt_base_address(pt_paddr)
 }
 
 /// Build a PD entry mapping a 2 MiB large page directly.
@@ -150,9 +154,7 @@ pub fn make_pde_large(paddr: Word, rights: VmRights, cache: CacheAttr, executabl
         .with_pat(pat)
         .with_cache_disabled(pcd)
         .with_write_through(pwt)
-        // The 2 MiB page address is encoded with its low 9 zero bits
-        // implicit (i.e. bits 21..51).
-        .with_page_base_address(paddr >> PAGE_BITS_2M)
+        .with_page_base_address(paddr)
 }
 
 /// Build a PDPT entry pointing to a page directory.
@@ -163,7 +165,7 @@ pub fn make_pdpte_pd(pd_paddr: Word, rights: VmRights, executable: bool) -> Pdpt
         .with_read_write(rights.writable() as u64)
         .with_super_user(rights.user() as u64)
         .with_xd((!executable) as u64)
-        .with_pd_base_address(pd_paddr >> PAGE_BITS_4K)
+        .with_pd_base_address(pd_paddr)
 }
 
 /// Build a PDPT entry mapping a 1 GiB page.
@@ -178,7 +180,7 @@ pub fn make_pdpte_1g(paddr: Word, rights: VmRights, cache: CacheAttr, executable
         .with_pat(pat)
         .with_cache_disabled(pcd)
         .with_write_through(pwt)
-        .with_page_base_address(paddr >> PAGE_BITS_1G)
+        .with_page_base_address(paddr)
 }
 
 /// Build a PML4 entry pointing to a PDPT.
@@ -188,7 +190,7 @@ pub fn make_pml4e(pdpt_paddr: Word, rights: VmRights, executable: bool) -> Pml4e
         .with_read_write(rights.writable() as u64)
         .with_super_user(rights.user() as u64)
         .with_xd((!executable) as u64)
-        .with_pdpt_base_address(pdpt_paddr >> PAGE_BITS_4K)
+        .with_pdpt_base_address(pdpt_paddr)
 }
 
 // ---------------------------------------------------------------------------
@@ -318,8 +320,9 @@ pub mod spec {
         assert_eq!(pte.read_write(), 1);
         assert_eq!(pte.super_user(), 1);
         assert_eq!(pte.xd(), 1);
-        // Page base stored as paddr >> 12.
-        assert_eq!(pte.page_base_address(), 0x1000_0000 >> 12);
+        // The codegen's getter re-applies the alignment shift, so
+        // we get the original physical address back.
+        assert_eq!(pte.page_base_address(), 0x1000_0000);
         // Cache attr is Writeback → all three bits 0.
         assert_eq!(pte.pat(), 0);
         assert_eq!(pte.cache_disabled(), 0);
@@ -336,7 +339,7 @@ pub mod spec {
             .unwrap();
         let idx = decompose_vaddr(vaddr).pt as usize;
         assert_eq!(pt[idx].present(), 1);
-        assert_eq!(pt[idx].page_base_address(), paddr >> 12);
+        assert_eq!(pt[idx].page_base_address(), paddr);
         // Other entries untouched.
         let other = (idx + 1) % ENTRIES_PER_TABLE;
         assert_eq!(pt[other].present(), 0);

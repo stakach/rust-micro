@@ -99,15 +99,9 @@ pub fn preprocess(src: &str, cfg: &HashMap<String, bool>) -> String {
             continue;
         }
         // `base 64(48,1)` / `base 64(51,0)` set the word and
-        // canonical sizes for blocks that follow. We only consume
-        // x86_64 (canonical_size = 48) blocks today and the few PTE
-        // blocks under `base 64(51,0)` use only `field` / `field_high`,
-        // neither of which depend on canonical_size — so the
-        // directive can be safely ignored. Re-visit when we add a
-        // `field_ptr` consumer at canonical_size != 48.
-        if trimmed.starts_with("base ") {
-            continue;
-        }
+        // canonical sizes for blocks that follow. The parser
+        // consumes them so it can scope `field_high` shift
+        // computations correctly per block.
 
         if *emit_stack.last().unwrap() {
             out.push_str(line_no_comment);
@@ -247,10 +241,17 @@ pub struct Module {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Currently-active canonical pointer width in bits, set by the
+    /// most recent `base 64(N,M)` directive. Defaults to
+    /// CANONICAL_SIZE so blocks before any `base` directive still
+    /// lower correctly.
+    canonical_size: u64,
 }
 
 impl Parser {
-    fn new(toks: Vec<Tok>) -> Self { Self { toks, pos: 0 } }
+    fn new(toks: Vec<Tok>) -> Self {
+        Self { toks, pos: 0, canonical_size: CANONICAL_SIZE }
+    }
     fn peek(&self) -> Option<&Tok> { self.toks.get(self.pos) }
     fn bump(&mut self) -> Option<Tok> {
         let t = self.toks.get(self.pos).cloned();
@@ -323,7 +324,9 @@ impl Parser {
     fn parse_module(&mut self) -> Result<Module, String> {
         let mut module = Module::default();
         while self.peek().is_some() {
-            if self.eat_keyword("block") {
+            if self.eat_keyword("base") {
+                self.parse_base_directive()?;
+            } else if self.eat_keyword("block") {
                 module.blocks.push(self.parse_block()?);
             } else if self.eat_keyword("tagged_union") {
                 module.tagged_unions.push(self.parse_tagged_union()?);
@@ -332,6 +335,40 @@ impl Parser {
             }
         }
         Ok(module)
+    }
+
+    /// Parses `base 64(N,M)` — N is the canonical pointer width
+    /// (significant bits), M is the sign-extend flag (we ignore M
+    /// since our setters never need to assert; round-trip via
+    /// sign-extend on read suffices). Updates `self.canonical_size`
+    /// for blocks that follow.
+    fn parse_base_directive(&mut self) -> Result<(), String> {
+        // Consume the word size — must be 64 since the codegen only
+        // supports 64-bit base.
+        let word_bits = match self.parse_expr()? {
+            Expr::Lit(n) => n,
+            other => return Err(format!("base directive expects literal word size, got {:?}", other)),
+        };
+        if word_bits != WORD_SIZE {
+            return Err(format!("base directive: word size {} not supported", word_bits));
+        }
+        if !matches!(self.peek(), Some(Tok::LParen)) {
+            // Plain `base 64` with no parens — keep the default.
+            return Ok(());
+        }
+        self.bump(); // (
+        let canonical = match self.parse_expr()? {
+            Expr::Lit(n) => n,
+            other => return Err(format!("base directive: canonical size must be literal, got {:?}", other)),
+        };
+        // Eat optional `,M` sign-extend flag.
+        if matches!(self.peek(), Some(Tok::Comma)) {
+            self.bump();
+            let _ = self.parse_expr()?;
+        }
+        self.expect(&Tok::RParen)?;
+        self.canonical_size = canonical;
+        Ok(())
     }
 
     fn parse_block(&mut self) -> Result<BlockDecl, String> {
@@ -391,11 +428,22 @@ impl Parser {
             "field_high" => {
                 let name = self.expect_ident()?;
                 let size = self.parse_expr()?;
+                // field_high stores the *high* `size` bits of a
+                // canonical-size value: low `canonical_size - size`
+                // bits are dropped on write and re-zeroed (then
+                // sign-extended) on read. Bake the *currently active*
+                // canonical_size from the most recent `base` directive
+                // into the shift Expr so blocks under different `base`
+                // declarations get the right alignment.
+                let shift = Expr::Sub(
+                    Box::new(Expr::Lit(self.canonical_size)),
+                    Box::new(size.clone()),
+                );
                 Ok(vec![FieldDecl {
                     name: Some(name),
                     size,
                     kind: FieldKind::High,
-                    shift: Expr::Lit(0),
+                    shift,
                 }])
             }
             "field_ptr" => {

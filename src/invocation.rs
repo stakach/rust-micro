@@ -47,6 +47,9 @@ pub fn decode_invocation(
         Cap::IrqControl => decode_irq_control(label, args, invoker),
         Cap::IrqHandler { irq } => decode_irq_handler(irq, label, args, invoker),
         Cap::Frame { .. } => decode_frame(target, label, args, invoker),
+        Cap::PageTable { .. } => decode_page_table(target, label, args, invoker),
+        Cap::PageDirectory { .. } => decode_page_directory(target, label, args, invoker),
+        Cap::Pdpt { .. } => decode_pdpt(target, label, args, invoker),
         Cap::Null => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidCapability,
         ))),
@@ -202,6 +205,172 @@ fn decode_frame_get_address(
         tcb.ipc_length = 1;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 26 — PT / PD / PDPT invocations.
+//
+// Each Map(vaddr) installs the cap into the parent paging structure
+// at the matching index in the *invoker's vspace* (today: live CR3).
+// Unmap clears the mapped flag in the cap; we don't yet tear down
+// the hardware entry — the slot will get overwritten when the cap is
+// re-mapped or freed.
+//
+// Layering reminder:
+//   Cap::Pdpt        Map → installs at PML4[idx]   level=3
+//   Cap::PageDirectory Map → installs at PDPT[idx] level=2
+//   Cap::PageTable   Map → installs at PD[idx]     level=1
+// ---------------------------------------------------------------------------
+
+fn decode_page_table(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    match label {
+        InvocationLabel::X86PageTableMap => decode_pt_map(target, args, invoker),
+        InvocationLabel::X86PageTableUnmap => decode_pt_unmap(target, invoker),
+        _ => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        ))),
+    }
+}
+
+fn decode_page_directory(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    match label {
+        InvocationLabel::X86PageDirectoryMap => decode_pd_map(target, args, invoker),
+        InvocationLabel::X86PageDirectoryUnmap => decode_pd_unmap(target, invoker),
+        _ => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        ))),
+    }
+}
+
+fn decode_pdpt(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    match label {
+        InvocationLabel::X86PDPTMap => decode_pdpt_map(target, args, invoker),
+        InvocationLabel::X86PDPTUnmap => decode_pdpt_unmap(target, invoker),
+        _ => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        ))),
+    }
+}
+
+/// Common shape: write a paging-structure cap into the parent table
+/// at the appropriate level, then update the source slot's cap to
+/// record the mapped vaddr.
+fn map_paging_struct(
+    target: Cap,
+    args: &SyscallArgs,
+    invoker: TcbId,
+    level: u32,
+) -> KResult<()> {
+    use crate::arch::x86_64::usermode;
+    let (paddr, current_mapped) = paging_struct_state(&target);
+    if current_mapped.is_some() {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_DeleteFirst,
+        )));
+    }
+    let vaddr = args.a2;
+    if vaddr & 0xFFF != 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_AlignmentError,
+        )));
+    }
+
+    // Outside spec mode, install the entry into the live PML4.
+    // Spec mode runs without a real page-table tree, so we skip
+    // the hardware install and only update the cap shadow.
+    #[cfg(not(feature = "spec"))]
+    {
+        let installed = unsafe { usermode::install_user_table(level, vaddr, paddr) };
+        if !installed {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup,
+            )));
+        }
+    }
+    #[cfg(feature = "spec")]
+    let _ = (level, usermode::install_user_table); // silence unused-function warning under spec
+
+    rewrite_paging_cap_in_cspace(invoker, &target, Some(vaddr));
+    Ok(())
+}
+
+fn unmap_paging_struct(target: Cap, invoker: TcbId) -> KResult<()> {
+    rewrite_paging_cap_in_cspace(invoker, &target, None);
+    Ok(())
+}
+
+fn paging_struct_state(cap: &Cap) -> (u64, Option<u64>) {
+    match *cap {
+        Cap::PageTable { ptr, mapped, .. } => (ptr.addr(), mapped),
+        Cap::PageDirectory { ptr, mapped, .. } => (ptr.addr(), mapped),
+        Cap::Pdpt { ptr, mapped, .. } => (ptr.addr(), mapped),
+        _ => unreachable!(),
+    }
+}
+
+fn rewrite_paging_cap_in_cspace(invoker: TcbId, cap: &Cap, new_mapped: Option<u64>) {
+    let target_paddr = paging_struct_state(cap).0;
+    unsafe {
+        let s = KERNEL.get();
+        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+        let cnode_ptr = match cspace_root {
+            Cap::CNode { ptr, .. } => ptr,
+            _ => return,
+        };
+        let cnode_idx = KernelState::cnode_index(cnode_ptr);
+        for slot in s.cnodes[cnode_idx].0.iter_mut() {
+            let updated = match slot.cap() {
+                Cap::PageTable { ptr, asid, .. } if ptr.addr() == target_paddr => {
+                    Some(Cap::PageTable { ptr, mapped: new_mapped, asid })
+                }
+                Cap::PageDirectory { ptr, asid, .. } if ptr.addr() == target_paddr => {
+                    Some(Cap::PageDirectory { ptr, mapped: new_mapped, asid })
+                }
+                Cap::Pdpt { ptr, asid, .. } if ptr.addr() == target_paddr => {
+                    Some(Cap::Pdpt { ptr, mapped: new_mapped, asid })
+                }
+                _ => None,
+            };
+            if let Some(cap) = updated {
+                slot.set_cap(&cap);
+                break;
+            }
+        }
+    }
+}
+
+fn decode_pt_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    map_paging_struct(target, args, invoker, 1)
+}
+fn decode_pd_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    map_paging_struct(target, args, invoker, 2)
+}
+fn decode_pdpt_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    map_paging_struct(target, args, invoker, 3)
+}
+fn decode_pt_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
+    unmap_paging_struct(target, invoker)
+}
+fn decode_pd_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
+    unmap_paging_struct(target, invoker)
+}
+fn decode_pdpt_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
+    unmap_paging_struct(target, invoker)
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +852,19 @@ fn decode_tcb(
                     t.cspace_root = c;
                 }
                 if let Some(c) = vspace_cap {
+                    // Phase 27: a typed PML4 cap pins the target's
+                    // CR3 — the syscall return path consumes
+                    // `cpu_context.cr3` before sysretq. Refuse any
+                    // non-PML4 cap so userspace can't smuggle a
+                    // bogus root into a TCB.
+                    match c {
+                        Cap::PML4 { ptr, .. } => {
+                            t.cpu_context.cr3 = ptr.addr();
+                        }
+                        Cap::Null => {}
+                        _ => return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability))),
+                    }
                     t.vspace_root = c;
                 }
                 Ok(())
@@ -737,10 +919,68 @@ pub mod spec {
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
         frame_map_unmap_get_address();
+        page_table_map_unmap();
         tcb_write_read_registers();
         tcb_set_space_and_bind_notification();
+        tcb_set_space_pml4_pins_cr3();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
+    }
+
+    /// Phase 26d — `Cap::PageTable` `Map` / `Unmap` round-trip.
+    /// Installs a PT cap, records the mapped vaddr, then unmaps.
+    /// We don't verify the hardware install here — the spec build
+    /// stubs that out (no live PD to walk in this fixture).
+    #[inline(never)]
+    fn page_table_map_unmap() {
+        use crate::cap::{PageTableStorage};
+        let invoker = setup_invoker(0);
+        let pt_paddr = 0x0000_0000_00B0_0000u64;
+        let pt_cap = Cap::PageTable {
+            ptr: PPtr::<PageTableStorage>::new(pt_paddr).unwrap(),
+            mapped: None,
+            asid: 0,
+        };
+        unsafe { KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&pt_cap); }
+
+        // Map at a 2 MiB-aligned vaddr (PD-entry granularity).
+        let vaddr = 0x0000_0100_0080_0000u64;
+        let args = SyscallArgs {
+            a1: (InvocationLabel::X86PageTableMap as u64) << 12,
+            a2: vaddr,
+            ..Default::default()
+        };
+        decode_invocation(pt_cap, &args, invoker).expect("PT map ok");
+
+        unsafe {
+            match KERNEL.get().cnodes[0].0[2].cap() {
+                Cap::PageTable { mapped: Some(v), .. } if v == vaddr => {}
+                other => panic!("expected mapped PT, got {:?}", other),
+            }
+        }
+
+        // Re-map → DeleteFirst.
+        let stored = unsafe { KERNEL.get().cnodes[0].0[2].cap() };
+        let r = decode_invocation(stored, &args, invoker);
+        assert!(matches!(r,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_DeleteFirst }))));
+
+        // Unmap clears the mapping.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::X86PageTableUnmap as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(stored, &args, invoker).expect("PT unmap ok");
+        unsafe {
+            match KERNEL.get().cnodes[0].0[2].cap() {
+                Cap::PageTable { mapped: None, .. } => {}
+                other => panic!("expected unmapped PT, got {:?}", other),
+            }
+        }
+
+        teardown_invoker(invoker);
+        arch::log("  ✓ Cap::PageTable Map / Unmap updates cap shadow\n");
     }
 
     /// Build a fresh state for one test: invoker TCB id, and a
@@ -1263,6 +1503,71 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ TCB::SetSpace + Bind/UnbindNotification\n");
+    }
+
+    /// Phase 27 — `TCB::SetSpace` with a typed `Cap::PML4` writes the
+    /// PML4's physical address into the target TCB's `cpu_context.cr3`.
+    /// The syscall return path uses that as CR3 on resume.
+    #[inline(never)]
+    fn tcb_set_space_pml4_pins_cr3() {
+        use crate::cap::{Pml4Storage};
+
+        let invoker = setup_invoker(0);
+        let target = unsafe {
+            let mut t = crate::tcb::Tcb::default();
+            t.priority = 80;
+            KERNEL.get().scheduler.admit(t)
+        };
+        let target_cap = Cap::Thread {
+            tcb: PPtr::<crate::cap::Tcb>::new(target.0 as u64).unwrap(),
+        };
+
+        // Plant a PML4 cap at slot 3 of the invoker's CNode.
+        let pml4_paddr = 0x0000_0000_00C0_0000u64;
+        let pml4_cap = Cap::PML4 {
+            ptr: PPtr::<Pml4Storage>::new(pml4_paddr).unwrap(),
+            mapped: true,
+            asid: 0,
+        };
+        unsafe { KERNEL.get().cnodes[0].0[3] = Cte::with_cap(&pml4_cap); }
+
+        // SetSpace(fault_ep=0, cnode_cptr=0, vspace_cptr=3)
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBSetSpace as u64) << 12,
+            a2: 0, a3: 0, a4: 3,
+            ..Default::default()
+        };
+        decode_invocation(target_cap, &args, invoker).expect("set vspace");
+        unsafe {
+            let t = KERNEL.get().scheduler.slab.get(target);
+            assert_eq!(t.cpu_context.cr3, pml4_paddr);
+            assert!(matches!(t.vspace_root, Cap::PML4 { .. }));
+        }
+
+        // SetSpace with a non-PML4 vspace cap (a CNode) is rejected.
+        unsafe {
+            KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&Cap::CNode {
+                ptr: KernelState::cnode_ptr(1),
+                radix: 5, guard_size: 59, guard: 0,
+            });
+        }
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBSetSpace as u64) << 12,
+            a2: 0, a3: 0, a4: 4,
+            ..Default::default()
+        };
+        let r = decode_invocation(target_cap, &args, invoker);
+        assert!(matches!(r,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_InvalidCapability }))));
+        // CR3 unchanged.
+        unsafe {
+            let t = KERNEL.get().scheduler.slab.get(target);
+            assert_eq!(t.cpu_context.cr3, pml4_paddr);
+            KERNEL.get().scheduler.slab.free(target);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ TCB::SetSpace pins CR3 from a Cap::PML4\n");
     }
 
     #[inline(never)]

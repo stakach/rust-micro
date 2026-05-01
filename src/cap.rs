@@ -18,7 +18,7 @@
 //! later phases inside small, well-encapsulated `unsafe` helpers.
 
 use crate::structures::*;
-use crate::structures::arch::FrameCap;
+use crate::structures::arch::{FrameCap, PageDirectoryCap, PageTableCap, PdptCap, Pml4Cap};
 use crate::types::seL4_Word as Word;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
@@ -50,6 +50,10 @@ pub mod tag {
 
     // Arch (odd) tags — x86_64 specific subset we decode today.
     pub const FRAME: u64 = 1;
+    pub const PAGE_TABLE: u64 = 3;
+    pub const PAGE_DIRECTORY: u64 = 5;
+    pub const PDPT: u64 = 7;
+    pub const PML4: u64 = 9;
 
     /// Returns true for all arch-specific cap tags. Mirrors
     /// `isArchCap` in seL4: arch caps occupy odd tag values.
@@ -143,6 +147,13 @@ pub struct CNodeStorage;
 pub struct UntypedStorage;
 /// Physical-frame storage backing a `Cap::Frame`.
 pub struct FrameStorage;
+/// Storage backing a `Cap::PageTable` / `PageDirectory` / `Pdpt`.
+pub struct PageTableStorage;
+pub struct PageDirectoryStorage;
+pub struct PdptStorage;
+/// Storage backing a `Cap::PML4` — the apex of the x86_64 paging
+/// chain. One PML4 is one 4 KiB page of 512 PML4Es.
+pub struct Pml4Storage;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum FrameSize {
@@ -267,6 +278,34 @@ pub enum Cap {
         mapped: Option<u64>,
         asid: u16,
         is_device: bool,
+    },
+    /// x86 leaf page table (cap tag = 3) — points at a 4 KiB
+    /// table that holds 512 PTEs.
+    PageTable {
+        ptr: PPtr<PageTableStorage>,
+        mapped: Option<u64>, // vaddr where the PT covers
+        asid: u16,
+    },
+    /// x86 page directory (cap tag = 5) — 512 PDEs.
+    PageDirectory {
+        ptr: PPtr<PageDirectoryStorage>,
+        mapped: Option<u64>,
+        asid: u16,
+    },
+    /// x86 page-directory-pointer table (cap tag = 7) — 512 PDPTEs.
+    Pdpt {
+        ptr: PPtr<PdptStorage>,
+        mapped: Option<u64>,
+        asid: u16,
+    },
+    /// x86 page map level 4 (cap tag = 9) — apex of the paging
+    /// chain. Holding a PML4 cap is "owning a vspace": the kernel
+    /// treats `ptr.addr()` as a CR3 value when this cap is
+    /// installed via TCB::SetSpace.
+    PML4 {
+        ptr: PPtr<Pml4Storage>,
+        mapped: bool,
+        asid: u16,
     },
     /// Any other arch-tagged cap (page tables, ASID pool, etc.).
     /// Stored as the raw two-word encoding; full decoding for the
@@ -408,6 +447,62 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 is_device: c.capFIsDevice() != 0,
             }
         }
+        tag::PAGE_TABLE => {
+            let c = PageTableCap { words };
+            let Some(ptr) = PPtr::<PageTableStorage>::new(c.capPTBasePtr()) else {
+                return Cap::Null;
+            };
+            Cap::PageTable {
+                ptr,
+                mapped: if c.capPTIsMapped() != 0 {
+                    Some(c.capPTMappedAddress())
+                } else {
+                    None
+                },
+                asid: c.capPTMappedASID() as u16,
+            }
+        }
+        tag::PAGE_DIRECTORY => {
+            let c = PageDirectoryCap { words };
+            let Some(ptr) = PPtr::<PageDirectoryStorage>::new(c.capPDBasePtr()) else {
+                return Cap::Null;
+            };
+            Cap::PageDirectory {
+                ptr,
+                mapped: if c.capPDIsMapped() != 0 {
+                    Some(c.capPDMappedAddress())
+                } else {
+                    None
+                },
+                asid: c.capPDMappedASID() as u16,
+            }
+        }
+        tag::PDPT => {
+            let c = PdptCap { words };
+            let Some(ptr) = PPtr::<PdptStorage>::new(c.capPDPTBasePtr()) else {
+                return Cap::Null;
+            };
+            Cap::Pdpt {
+                ptr,
+                mapped: if c.capPDPTIsMapped() != 0 {
+                    Some(c.capPDPTMappedAddress())
+                } else {
+                    None
+                },
+                asid: c.capPDPTMappedASID() as u16,
+            }
+        }
+        tag::PML4 => {
+            let c = Pml4Cap { words };
+            let Some(ptr) = PPtr::<Pml4Storage>::new(c.capPML4BasePtr()) else {
+                return Cap::Null;
+            };
+            Cap::PML4 {
+                ptr,
+                mapped: c.capPML4IsMapped() != 0,
+                asid: c.capPML4MappedASID() as u16,
+            }
+        }
         t if tag::is_arch(t) => Cap::Arch { cap_type: t, words },
         _ => Cap::Null,
     }
@@ -487,6 +582,51 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             c = c.with_capType(tag::DOMAIN);
             c.words
         }
+        Cap::PageTable { ptr, mapped, asid } => {
+            // page_table_cap visible-field order:
+            //   capPTMappedASID, capPTBasePtr, capType,
+            //   capPTIsMapped, capPTMappedAddress
+            PageTableCap::new(
+                *asid as u64,
+                ptr.addr(),
+                tag::PAGE_TABLE,
+                mapped.is_some() as u64,
+                mapped.unwrap_or(0),
+            )
+            .words
+        }
+        Cap::PageDirectory { ptr, mapped, asid } => {
+            PageDirectoryCap::new(
+                *asid as u64,
+                ptr.addr(),
+                tag::PAGE_DIRECTORY,
+                mapped.is_some() as u64,
+                mapped.unwrap_or(0),
+            )
+            .words
+        }
+        Cap::Pdpt { ptr, mapped, asid } => {
+            PdptCap::new(
+                *asid as u64,
+                ptr.addr(),
+                tag::PDPT,
+                mapped.is_some() as u64,
+                mapped.unwrap_or(0),
+            )
+            .words
+        }
+        Cap::PML4 { ptr, mapped, asid } => {
+            // pml4_cap has explicit_params (capPML4MappedASID,
+            // capPML4BasePtr, capType, capPML4IsMapped) — pass them
+            // in that order.
+            Pml4Cap::new(
+                *asid as u64,
+                ptr.addr(),
+                tag::PML4,
+                *mapped as u64,
+            )
+            .words
+        }
         Cap::Frame { ptr, size, rights, mapped, asid, is_device } => {
             // Visible field order (no explicit_params on frame_cap):
             //   capFMappedASID, capFBasePtr, capType, capFSize,
@@ -552,9 +692,65 @@ pub mod spec {
         roundtrip_irq_handler();
         roundtrip_arch_passthrough();
         roundtrip_frame();
+        roundtrip_paging_structs();
         type_tag_dispatch();
 
         arch::log("Cap round-trip tests completed\n");
+    }
+
+    fn roundtrip_paging_structs() {
+        // The .bf encodes mapped-address fields as `field_high N` so
+        // the codegen drops the low `canonical_size - N` bits on
+        // write and rezeroes them on read. Picking values that match
+        // the natural paging granularity (PT = 2 MiB, PD = 1 GiB,
+        // PDPT = 256 GiB after shift) keeps the round-trip lossless.
+
+        // PageTable: cap_type tag = 3. shift = 48-28 = 20 (1 MiB
+        // resolution). 0x10_0000_0000 (= 64 GiB) is well-aligned.
+        let pt = Cap::PageTable {
+            ptr: PPtr::<PageTableStorage>::new(0x0000_0000_0030_0000).unwrap(),
+            mapped: Some(0x0000_0010_0000_0000),
+            asid: 5,
+        };
+        let words = to_words(&pt);
+        assert_eq!(cap_type_of(words), tag::PAGE_TABLE);
+        assert_eq!(from_words(words), pt);
+
+        // PageDirectory: cap_type tag = 5. shift = 48-19 = 29
+        // (~512 MiB resolution). Test with the unmapped variant so
+        // the address field's narrowness doesn't show through.
+        let pd = Cap::PageDirectory {
+            ptr: PPtr::<PageDirectoryStorage>::new(0x0000_0000_0030_1000).unwrap(),
+            mapped: None,
+            asid: 0,
+        };
+        let words = to_words(&pd);
+        assert_eq!(cap_type_of(words), tag::PAGE_DIRECTORY);
+        assert_eq!(from_words(words), pd);
+
+        // Pdpt: cap_type tag = 7. shift = 48-10 = 38 (256 GiB
+        // resolution). Pick 0x80_0000_0000 (= 1<<39 = 512 GiB).
+        let pdpt = Cap::Pdpt {
+            ptr: PPtr::<PdptStorage>::new(0x0000_0000_0030_2000).unwrap(),
+            mapped: Some(0x0000_0080_0000_0000),
+            asid: 9,
+        };
+        let words = to_words(&pdpt);
+        assert_eq!(cap_type_of(words), tag::PDPT);
+        assert_eq!(from_words(words), pdpt);
+
+        // PML4: cap_type tag = 9. capPML4BasePtr is `field 64` so
+        // there's no shift — full 64-bit address round-trips.
+        let pml4 = Cap::PML4 {
+            ptr: PPtr::<Pml4Storage>::new(0x0000_0000_0030_3000).unwrap(),
+            mapped: true,
+            asid: 11,
+        };
+        let words = to_words(&pml4);
+        assert_eq!(cap_type_of(words), tag::PML4);
+        assert_eq!(from_words(words), pml4);
+
+        arch::log("  ✓ page-table / directory / PDPT / PML4 caps round-trip\n");
     }
 
     fn roundtrip_null() {
@@ -648,15 +844,15 @@ pub mod spec {
     }
 
     fn roundtrip_arch_passthrough() {
-        // A still-undecoded arch cap (page_table = tag 3) must
-        // pass through opaquely. Tag 1 (frame) gets decoded into
-        // Cap::Frame, so we pick a tag that isn't typed yet.
+        // Use tag 11 (asid_control) — still un-typed at this
+        // point. Earlier phases used 1 (frame) and 3
+        // (page_table); both now decode to typed variants.
         let mut words = [0u64; 2];
-        words[0] = 3u64 << 59;
+        words[0] = 11u64 << 59;
         let back = from_words(words);
         match back {
-            Cap::Arch { cap_type: 3, words: w } => assert_eq!(w, words),
-            other => panic!("expected Cap::Arch{{3,..}}, got {:?}", other),
+            Cap::Arch { cap_type: 11, words: w } => assert_eq!(w, words),
+            other => panic!("expected Cap::Arch{{11,..}}, got {:?}", other),
         }
         arch::log("  ✓ arch cap passes through opaquely (un-typed tags)\n");
     }
