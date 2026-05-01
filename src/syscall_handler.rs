@@ -174,10 +174,11 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                 }
                 (ptr, badge.0)
             }
-            _ => {
-                return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_InvalidCapability,
-                )));
+            // Phase 16: non-Endpoint cap on a Send/Call → invocation
+            // dispatch (Untyped::Retype, CNode::Copy/Move/...,
+            // TCB::Suspend/Resume/SetPriority, etc.).
+            other => {
+                return crate::invocation::decode_invocation(other, args, current);
             }
         };
         // Stage the message on the sender TCB so endpoint::send_ipc

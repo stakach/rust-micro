@@ -36,6 +36,7 @@ pub fn test_main() {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::context::spec::test_context_switch();
     crate::syscall_handler::spec::test_syscall_handler();
+    crate::invocation::spec::test_invocation();
     crate::endpoint::spec::test_endpoint();
     crate::notification::spec::test_notification();
     crate::interrupt::spec::test_interrupt();

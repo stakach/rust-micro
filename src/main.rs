@@ -60,6 +60,10 @@ mod syscall_handler;
 // Endpoint state machine (slowpath IPC).
 mod endpoint;
 
+// Phase 16 — invocation dispatcher (Untyped::Retype, CNode::Copy,
+// TCB::Suspend, etc. as syscalls).
+mod invocation;
+
 // Notification state machine (signal/wait).
 mod notification;
 
