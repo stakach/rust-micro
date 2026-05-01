@@ -161,16 +161,26 @@ pub unsafe extern "C" fn pit_irq_entry() {
 }
 
 extern "C" fn pit_isr() {
+    // Phase 28b — BKL. The PIT interrupt fires on whichever CPU
+    // wins arbitration; under SMP it can land on an AP while the
+    // BSP holds the BKL. Spinning here is fine since IF=0 keeps
+    // the CPU re-entrant only via NMI (which we don't take).
+    crate::smp::bkl_acquire();
+    let _bkl = BklGuard;
+
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     // Phase 23: charge a timeslice tick to the current thread.
-    // The static-borrow path matches every other kernel state
-    // access — we're in IRQ context running with IF=0 (CPU
-    // disabled IF on entry), so no other kernel-entry context
-    // can be live.
     unsafe {
         crate::kernel::KERNEL.get().scheduler.tick();
     }
     super::pic::eoi(0);
+}
+
+struct BklGuard;
+impl Drop for BklGuard {
+    fn drop(&mut self) {
+        crate::smp::bkl_release();
+    }
 }
 
 /// Wire the PIT IRQ end-to-end:

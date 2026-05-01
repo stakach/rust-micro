@@ -175,18 +175,28 @@ impl ReadyQueues {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler facade. Bundles the slab, the ready queues, the current
-// thread, and an idle thread fallback.
+// Per-CPU scheduling state. Mirrors seL4's `nodeState` per-CPU struct.
+// Each CPU owns its own ready queues + current/idle pointers; the slab
+// is shared since TCBs aren't pinned to a CPU at allocation time
+// (affinity decides which queue they land in via `admit`).
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SchedulerNode {
+    pub queues: ReadyQueues,
+    pub current: Option<TcbId>,
+    pub idle: Option<TcbId>,
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler facade. Bundles the (shared) TCB slab and the per-CPU
+// scheduling nodes.
 // ---------------------------------------------------------------------------
 
 #[derive(Copy, Clone, Debug)]
 pub struct Scheduler {
     pub slab: TcbSlab,
-    pub queues: ReadyQueues,
-    /// Currently-running thread, or `None` if we're idling.
-    pub current: Option<TcbId>,
-    /// The idle TCB. Used when no thread is runnable.
-    pub idle: Option<TcbId>,
+    pub nodes: [SchedulerNode; crate::smp::MAX_CPUS],
 }
 
 impl Default for Scheduler {
@@ -195,69 +205,143 @@ impl Default for Scheduler {
 
 impl Scheduler {
     pub const fn new() -> Self {
-        Self {
-            slab: TcbSlab::new(),
+        const NODE: SchedulerNode = SchedulerNode {
             queues: ReadyQueues::new(),
             current: None,
             idle: None,
+        };
+        Self {
+            slab: TcbSlab::new(),
+            nodes: [NODE; crate::smp::MAX_CPUS],
         }
     }
 
-    /// Allocate a TCB and (if it's runnable) enqueue it.
+    // -- per-CPU accessors ---------------------------------------------------
+
+    /// Read this CPU's `current` thread. Convenience for the common
+    /// case where callers run on the BKL holder.
+    #[inline]
+    pub fn current(&self) -> Option<TcbId> {
+        self.nodes[crate::arch::get_cpu_id() as usize].current
+    }
+
+    /// Set this CPU's `current` thread.
+    #[inline]
+    pub fn set_current(&mut self, val: Option<TcbId>) {
+        self.nodes[crate::arch::get_cpu_id() as usize].current = val;
+    }
+
+    /// Read another CPU's `current` thread (used by IPI handlers
+    /// once Phase 28d lands).
+    #[inline]
+    pub fn current_for_cpu(&self, cpu: u32) -> Option<TcbId> {
+        self.nodes[cpu as usize].current
+    }
+
+    #[inline]
+    pub fn set_current_for_cpu(&mut self, cpu: u32, val: Option<TcbId>) {
+        self.nodes[cpu as usize].current = val;
+    }
+
+    /// Borrow this CPU's ready queues (read-only).
+    #[inline]
+    pub fn queues(&self) -> &ReadyQueues {
+        &self.nodes[crate::arch::get_cpu_id() as usize].queues
+    }
+
+    /// Borrow this CPU's ready queues mutably.
+    #[inline]
+    pub fn queues_mut(&mut self) -> &mut ReadyQueues {
+        &mut self.nodes[crate::arch::get_cpu_id() as usize].queues
+    }
+
+    /// Reset every CPU's queues — used by spec teardowns to scrub
+    /// state between tests since we don't yet have a TCB destructor
+    /// that dequeues on free.
+    pub fn reset_queues(&mut self) {
+        for node in self.nodes.iter_mut() {
+            node.queues = ReadyQueues::new();
+        }
+    }
+
+    /// Read this CPU's idle thread.
+    #[inline]
+    pub fn idle(&self) -> Option<TcbId> {
+        self.nodes[crate::arch::get_cpu_id() as usize].idle
+    }
+
+    /// Set this CPU's idle thread.
+    #[inline]
+    pub fn set_idle(&mut self, val: Option<TcbId>) {
+        self.nodes[crate::arch::get_cpu_id() as usize].idle = val;
+    }
+
+    // -- thread admission / lifecycle ----------------------------------------
+
+    /// Allocate a TCB and (if it's runnable) enqueue it on its
+    /// affinity CPU's queue.
     pub fn admit(&mut self, tcb: Tcb) -> TcbId {
         let runnable = tcb.is_runnable();
+        let cpu = tcb.affinity as usize;
         let id = self.slab.alloc(tcb).expect("TcbSlab full");
         if runnable {
-            self.queues.enqueue(&mut self.slab, id);
+            self.nodes[cpu].queues.enqueue(&mut self.slab, id);
         }
         id
     }
 
-    /// Mark a thread as runnable and (re-)add it to the queue.
+    /// Mark a thread as runnable and (re-)add it to its affinity
+    /// CPU's queue.
     pub fn make_runnable(&mut self, id: TcbId) {
         let was_runnable = self.slab.get(id).is_runnable();
+        let cpu = self.slab.get(id).affinity as usize;
         self.slab.get_mut(id).state = ThreadStateType::Running;
         if !was_runnable {
-            self.queues.enqueue(&mut self.slab, id);
+            self.nodes[cpu].queues.enqueue(&mut self.slab, id);
         }
     }
 
-    /// Block a thread on whatever it's blocking on. Removes from
-    /// queue and updates state.
+    /// Block a thread. Removes from its affinity CPU's queue (if
+    /// runnable), updates state, and surrenders the CPU if it was
+    /// current on any node.
     pub fn block(&mut self, id: TcbId, new_state: ThreadStateType) {
         debug_assert!(!new_state.is_runnable());
         let was_runnable = self.slab.get(id).is_runnable();
+        let cpu = self.slab.get(id).affinity as usize;
         if was_runnable {
-            self.queues.dequeue(&mut self.slab, id);
+            self.nodes[cpu].queues.dequeue(&mut self.slab, id);
         }
         self.slab.get_mut(id).state = new_state;
-        // If the blocked thread was current, surrender the CPU.
-        if self.current == Some(id) {
-            self.current = None;
+        // If the blocked thread was current on any CPU, clear it
+        // there. Today only the affinity CPU could have it as
+        // current, but loop over all to be safe against migrations.
+        for node in self.nodes.iter_mut() {
+            if node.current == Some(id) {
+                node.current = None;
+            }
         }
     }
 
-    /// Pick the thread that should run next. Mirrors seL4's
-    /// `scheduleChooseNewThread` for the single-domain non-MCS case:
-    ///
-    ///   - if any queue is non-empty, pop its highest-priority head
-    ///   - otherwise, fall through to the idle thread.
+    /// Pick the thread that should run next on the calling CPU.
+    /// Mirrors seL4's `scheduleChooseNewThread` for the single-domain
+    /// non-MCS case but per-CPU.
     pub fn choose_thread(&mut self) -> Option<TcbId> {
-        if let Some(id) = self.queues.pop_highest(&mut self.slab) {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        if let Some(id) = self.nodes[cpu].queues.pop_highest(&mut self.slab) {
             // Re-enqueue at the tail so equal-priority threads
-            // round-robin. seL4 does this lazily inside
-            // `appendToReadyQueue`; we do it here for symmetry.
-            self.queues.enqueue(&mut self.slab, id);
+            // round-robin.
+            self.nodes[cpu].queues.enqueue(&mut self.slab, id);
             Some(id)
         } else {
-            self.idle
+            self.nodes[cpu].idle
         }
     }
 
-    /// Decide whether the current thread should yield. Returns
-    /// `Some(new_id)` if a higher-priority thread is ready.
+    /// Decide whether the current thread on this CPU should yield.
     pub fn should_preempt(&self) -> Option<u8> {
-        match (self.current, self.queues.peek_highest()) {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        let node = &self.nodes[cpu];
+        match (node.current, node.queues.peek_highest()) {
             (Some(cur), Some(top)) => {
                 let cur_prio = self.slab.get(cur).priority;
                 if top > cur_prio { Some(top) } else { None }
@@ -267,22 +351,15 @@ impl Scheduler {
         }
     }
 
-    /// One scheduler tick. Decrement the current thread's
-    /// timeslice; return `true` if it ran out (caller's
-    /// responsibility to refill / preempt).
-    ///
-    /// Mirrors `seL4/src/kernel/thread.c::timerTick` for the
-    /// non-MCS path: each timer interrupt charges one tick to
-    /// the running thread.
+    /// One scheduler tick on the calling CPU. Decrement the current
+    /// thread's timeslice; return `true` if it ran out.
     pub fn tick(&mut self) -> bool {
-        let cur = match self.current {
+        let cur = match self.current() {
             Some(c) => c,
             None => return false,
         };
         let t = self.slab.get_mut(cur);
         if t.time_slice == 0 {
-            // Already exhausted; subsequent ticks are no-ops
-            // until the caller refills.
             return true;
         }
         t.time_slice -= 1;
@@ -309,7 +386,36 @@ pub mod spec {
         preempt_only_strictly_higher();
         tick_decrements_timeslice();
         tick_with_no_current_is_noop();
+        per_cpu_queues_are_isolated();
         arch::log("Scheduler tests completed\n");
+    }
+
+    /// Phase 28c — admitting threads with different `affinity` values
+    /// places them on the matching CPU's queue; each CPU's queue is
+    /// independent. Verifies the per-CPU `nodes` array isn't a
+    /// thinly-disguised single shared queue.
+    #[inline(never)]
+    fn per_cpu_queues_are_isolated() {
+        let mut s = Scheduler::new();
+        let mut a = runnable(60);
+        a.affinity = 0;
+        let mut b = runnable(60);
+        b.affinity = 1;
+        let mut c = runnable(60);
+        c.affinity = 1;
+        let _ = s.admit(a);
+        let _ = s.admit(b);
+        let _ = s.admit(c);
+        // CPU 0's queue holds 1 thread at prio 60.
+        assert_eq!(s.nodes[0].queues.len_at(&s.slab, 60), 1);
+        // CPU 1's queue holds 2 threads at prio 60.
+        assert_eq!(s.nodes[1].queues.len_at(&s.slab, 60), 2);
+        // Setting current per-CPU is independent.
+        s.set_current_for_cpu(0, Some(crate::tcb::TcbId(0)));
+        s.set_current_for_cpu(1, Some(crate::tcb::TcbId(1)));
+        assert_eq!(s.current_for_cpu(0), Some(crate::tcb::TcbId(0)));
+        assert_eq!(s.current_for_cpu(1), Some(crate::tcb::TcbId(1)));
+        arch::log("  ✓ per-CPU queues + current are independent\n");
     }
 
     fn runnable(prio: u8) -> Tcb {
@@ -356,7 +462,7 @@ pub mod spec {
         let a = s.admit(runnable(50));
         let b = s.admit(runnable(50));
         let c = s.admit(runnable(50));
-        assert_eq!(s.queues.len_at(&s.slab, 50), 3);
+        assert_eq!(s.queues().len_at(&s.slab, 50), 3);
         assert_eq!(s.choose_thread(), Some(a));
         assert_eq!(s.choose_thread(), Some(b));
         assert_eq!(s.choose_thread(), Some(c));
@@ -369,19 +475,19 @@ pub mod spec {
         let mut s = Scheduler::new();
         let a = s.admit(runnable(50));
         let b = s.admit(runnable(50));
-        s.current = Some(a);
+        s.set_current(Some(a));
 
         // Block `a` waiting on a notification.
         s.block(a, ThreadStateType::BlockedOnNotification);
         // Queue at priority 50 now has just `b`.
-        assert_eq!(s.queues.len_at(&s.slab, 50), 1);
-        assert_eq!(s.current, None);
+        assert_eq!(s.queues().len_at(&s.slab, 50), 1);
+        assert_eq!(s.current(), None);
         // choose_thread picks `b`.
         assert_eq!(s.choose_thread(), Some(b));
 
         // Unblock `a` — it goes back into the queue at the tail.
         s.make_runnable(a);
-        assert_eq!(s.queues.len_at(&s.slab, 50), 2);
+        assert_eq!(s.queues().len_at(&s.slab, 50), 2);
         arch::log("  ✓ block / make_runnable updates queue and current\n");
     }
 
@@ -394,7 +500,7 @@ pub mod spec {
             ..Default::default()
         };
         let idle = s.slab.alloc(idle_tcb).unwrap();
-        s.idle = Some(idle);
+        s.set_idle(Some(idle));
         assert_eq!(s.choose_thread(), Some(idle));
         arch::log("  ✓ empty queues fall through to the idle thread\n");
     }
@@ -405,7 +511,7 @@ pub mod spec {
         let mut t = runnable(50);
         t.time_slice = 3;
         let id = s.admit(t);
-        s.current = Some(id);
+        s.set_current(Some(id));
         // Three ticks bring it to zero; the third returns true.
         assert_eq!(s.tick(), false);
         assert_eq!(s.slab.get(id).time_slice, 2);
@@ -431,7 +537,7 @@ pub mod spec {
         let mut s = Scheduler::new();
         let a = s.admit(runnable(100));
         let _b = s.admit(runnable(50));
-        s.current = Some(a);
+        s.set_current(Some(a));
 
         // Same-priority sibling does NOT preempt.
         assert_eq!(s.should_preempt(), None);

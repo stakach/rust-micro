@@ -143,7 +143,7 @@ pub mod spec {
                 .position(|e| e.is_some())
                 .map(|i| TcbId(i as u16))
                 .expect("boot thread must still be live");
-            s.scheduler.current = Some(boot);
+            s.scheduler.set_current(Some(boot));
         }
         arch::log("Fault delivery tests completed\n");
     }
@@ -156,8 +156,8 @@ pub mod spec {
             // Wipe the priority bitmap + per-priority head/tail
             // pointers. The TCBs themselves stay in the slab —
             // each fresh `admit` re-enqueues them cleanly.
-            s.scheduler.queues = crate::scheduler::ReadyQueues::new();
-            s.scheduler.current = None;
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
         }
     }
 
@@ -206,7 +206,7 @@ pub mod spec {
             // it can SysRecv on it.
             s.scheduler.slab.get_mut(handler).cspace_root = cnode_cap;
             // Handler waits on the endpoint first.
-            s.scheduler.current = Some(handler);
+            s.scheduler.set_current(Some(handler));
         }
         let r = crate::syscall_handler::handle_syscall(
             crate::syscalls::Syscall::SysRecv,
@@ -216,7 +216,7 @@ pub mod spec {
         assert!(r.is_ok());
 
         // Now fault the faulter.
-        unsafe { KERNEL.get().scheduler.current = Some(faulter); }
+        unsafe { KERNEL.get().scheduler.set_current(Some(faulter)); }
         deliver_fault(faulter, FaultMessage::VMFault {
             addr: 0xDEAD_BEEF,
             fsr: 0x4,
@@ -236,7 +236,7 @@ pub mod spec {
         }
 
         // Handler does SysReply to resume the faulter.
-        unsafe { KERNEL.get().scheduler.current = Some(handler); }
+        unsafe { KERNEL.get().scheduler.set_current(Some(handler)); }
         let r = crate::syscall_handler::handle_syscall(
             crate::syscalls::Syscall::SysReply,
             &crate::syscall_handler::SyscallArgs::default(),
@@ -251,7 +251,7 @@ pub mod spec {
             // Cleanup.
             s.scheduler.slab.free(handler);
             s.scheduler.slab.free(faulter);
-            s.scheduler.current = Some(crate::tcb::TcbId(0));
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ fault → handler → SysReply → faulter resumes\n");
     }

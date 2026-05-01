@@ -58,22 +58,18 @@ static mut LAPIC_VBASE: u64 = 0;
 
 /// Enable the LAPIC. Idempotent — calling twice is harmless.
 ///
-/// On a BOOTBOOT-loaded kernel the LAPIC's physical page is **not**
-/// pre-mapped into kernel virtual address space — neither at the
-/// `mmio` symbol's address nor at the physical address itself.
-/// Installing a fresh mapping requires walking and modifying the
-/// page tables, but BOOTBOOT also doesn't pre-map page-table memory
-/// at any kernel-half address we can reach safely.
-///
-/// Phase 12a delivers the **driver** logic: register layout, send-
-/// IPI / EOI / timer-init helpers, the SVR-enable sequence. The
-/// MMIO mapping itself lands with the page-table installer in the
-/// follow-up phase that owns the kernel's vspace setup. Until then
-/// the LAPIC functions are unsafe to call from a running kernel
-/// (`init_lapic` will page-fault); the test that follows verifies
-/// the *driver* via the MSR-side reads only.
+/// **Precondition** (Phase 13b): the kernel page-table installer in
+/// `paging::install_kernel_page_tables` must have run; it maps the
+/// LAPIC physical page at `KERNEL_LAPIC_VBASE`. Calling this before
+/// the installer page-faults.
 pub fn init_lapic() {
-    // Intentionally a no-op for now. See doc comment.
+    unsafe {
+        LAPIC_VBASE = super::paging::KERNEL_LAPIC_VBASE;
+        // Software-enable the LAPIC and park the spurious-vector.
+        write_reg(SPURIOUS_VECTOR, SVR_ENABLE | SPURIOUS_VECTOR_NUMBER);
+        // Set task priority to 0 (accept all interrupts).
+        write_reg(TASK_PRIORITY, 0);
+    }
 }
 
 /// Acknowledge the current interrupt, allowing the next pending
@@ -90,6 +86,44 @@ pub fn apic_id() -> u32 {
 /// Read the LAPIC version register.
 pub fn version() -> u32 {
     unsafe { read_reg(VERSION_REGISTER) }
+}
+
+/// Naked-asm IPI entry stub. Vectored from the IDT at `IPI_VECTOR`.
+/// Pushes a dummy error code + vector marker (matching the
+/// `interrupt!` macro shape) and tail-calls the typed handler.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn ipi_irq_entry() {
+    core::arch::naked_asm!(
+        "push 0",
+        "push 0",
+        "call {handler}",
+        "add rsp, 16",
+        "iretq",
+        handler = sym ipi_isr,
+    );
+}
+
+extern "C" fn ipi_isr() {
+    use core::sync::atomic::Ordering;
+
+    crate::smp::bkl_acquire();
+
+    // Drain pending IPIs targeted at the current CPU.
+    let me = crate::arch::get_cpu_id();
+    let nodes = crate::smp::nodes_mut();
+    crate::smp::handle_ipis(nodes, me, |_from, _kind| {
+        // For Phase 28d the action is just "we got it". Phase 28e
+        // wires Reschedule → choose_thread, TlbInvalidate → invlpg,
+        // Stop → halt.
+    });
+
+    // Bump the spec-observable counter outside the lock so a
+    // BSP poll can read it without taking BKL.
+    crate::smp::IPI_HANDLED_COUNT.fetch_add(1, Ordering::SeqCst);
+
+    eoi();
+    crate::smp::bkl_release();
 }
 
 /// Send a fixed-mode IPI to a specific physical APIC ID. Mirrors
@@ -180,6 +214,8 @@ pub mod spec {
         msr_base_at_legacy_address();
         register_layout_constants();
         timer_divide_table_covers_common_values();
+        live_lapic_id_and_version_after_paging();
+        live_apic_timer_decrements();
         arch::log("LAPIC tests completed\n");
     }
 
@@ -213,6 +249,32 @@ pub mod spec {
         // SVR enable bit is bit 8.
         assert_eq!(super::SVR_ENABLE, 1 << 8);
         arch::log("  ✓ LAPIC register offsets match Intel SDM\n");
+    }
+
+    #[inline(never)]
+    fn live_lapic_id_and_version_after_paging() {
+        // The paging spec already called install_kernel_page_tables
+        // and init_lapic. The LAPIC is now mapped and enabled.
+        let id = apic_id();
+        let v = version();
+        assert!(id < 256, "APIC ID fits in 8 bits, got {id}");
+        assert!(v != 0, "LAPIC version register populated");
+        arch::log("  ✓ LAPIC ID + version readable through MMIO\n");
+    }
+
+    #[inline(never)]
+    fn live_apic_timer_decrements() {
+        // Park the LAPIC timer with a generous one-shot count;
+        // verify the current-count register decreases.
+        const VEC: u8 = 0xEF;
+        timer_one_shot(VEC, 7 /* divide ÷1 */, 1_000_000);
+        let a = timer_current_count();
+        for _ in 0..200_000 {
+            core::hint::spin_loop();
+        }
+        let b = timer_current_count();
+        assert!(b < a, "APIC timer should decrement (a={a} b={b})");
+        arch::log("  ✓ APIC timer current count decrements\n");
     }
 
     #[inline(never)]

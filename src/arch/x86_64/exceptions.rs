@@ -1,5 +1,16 @@
 use super::interrupts::{IDT, IdtEntry, interrupt, interrupt_with_error};
 
+/// RAII guard for the BKL — releases on drop. Same shape as the
+/// one in `syscall_entry.rs`; duplicated rather than moved into
+/// `smp::` to keep the lock surface area visible at each entry
+/// point.
+struct BklGuard;
+impl Drop for BklGuard {
+    fn drop(&mut self) {
+        crate::smp::bkl_release();
+    }
+}
+
 // Define all exception handlers using macros
 interrupt!(divide_error_handler, handle_divide_error);
 interrupt!(debug_handler, handle_debug);
@@ -171,6 +182,12 @@ extern "C" fn handle_page_fault_typed(
     saved_cs: u64,
     saved_rip: u64,
 ) {
+    // Phase 28b — BKL across the fault handler. Fault delivery
+    // touches the kernel scheduler + fault EP cap chain, all of
+    // which are shared kernel state.
+    crate::smp::bkl_acquire();
+    let _bkl = BklGuard;
+
     let user_mode = (saved_cs & 3) == 3;
     if !user_mode {
         crate::arch::log("KERNEL PAGE FAULT @ rip=0x");

@@ -85,7 +85,7 @@ fn handle_reply(args: &SyscallArgs) -> KResult<()> {
 
     unsafe {
         let s = KERNEL.get();
-        let current = s.scheduler.current.ok_or_else(|| {
+        let current = s.scheduler.current().ok_or_else(|| {
             KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_InvalidCapability,
             ))
@@ -158,7 +158,7 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
 
     unsafe {
         let s = KERNEL.get();
-        let current = s.scheduler.current.ok_or_else(|| {
+        let current = s.scheduler.current().ok_or_else(|| {
             KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_InvalidCapability,
             ))
@@ -231,7 +231,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
 
     unsafe {
         let s = KERNEL.get();
-        let current = s.scheduler.current.ok_or_else(|| {
+        let current = s.scheduler.current().ok_or_else(|| {
             KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_InvalidCapability,
             ))
@@ -428,7 +428,7 @@ pub mod spec {
 
         unsafe {
             let s = KERNEL.get();
-            let current = s.scheduler.current.expect("boot thread");
+            let current = s.scheduler.current().expect("boot thread");
 
             // Plant an Endpoint cap in CNode 0, slot 1.
             let ep_ptr = KernelState::endpoint_ptr(0);
@@ -458,7 +458,7 @@ pub mod spec {
 
         // Capture the boot thread id before SysSend (which blocks
         // the caller and clears scheduler.current).
-        let boot_tcb = unsafe { KERNEL.get().scheduler.current.unwrap() };
+        let boot_tcb = unsafe { KERNEL.get().scheduler.current().unwrap() };
 
         // Issue SysSend on cap_ptr=1.
         let mut sink = BufferSink::new();
@@ -485,7 +485,7 @@ pub mod spec {
             );
             s.scheduler.slab.get_mut(boot_tcb).state =
                 ThreadStateType::Running;
-            s.scheduler.current = Some(boot_tcb);
+            s.scheduler.set_current(Some(boot_tcb));
             s.scheduler.slab.get_mut(boot_tcb).cspace_root = Cap::Null;
         }
         arch::log("  ✓ SysSend looks up endpoint via CSpace + blocks sender\n");
@@ -544,7 +544,7 @@ pub mod spec {
         let mut sink = BufferSink::new();
 
         // Server arrives first → blocks on Recv.
-        unsafe { KERNEL.get().scheduler.current = Some(server); }
+        unsafe { KERNEL.get().scheduler.set_current(Some(server)); }
         let r = handle_syscall(Syscall::SysRecv,
             &SyscallArgs { a0: 1, ..Default::default() }, &mut sink);
         assert!(r.is_ok());
@@ -557,7 +557,7 @@ pub mod spec {
 
         // Caller does SysCall (a Send + auto-block-on-Reply).
         // Sender stages 'X' as msg_regs[0], length=1.
-        unsafe { KERNEL.get().scheduler.current = Some(caller); }
+        unsafe { KERNEL.get().scheduler.set_current(Some(caller)); }
         let r = handle_syscall(Syscall::SysCall,
             &SyscallArgs { a0: 1, a1: 1, a2: b'X' as Word, ..Default::default() },
             &mut sink);
@@ -573,7 +573,7 @@ pub mod spec {
         }
 
         // Server replies with 'Y'.
-        unsafe { KERNEL.get().scheduler.current = Some(server); }
+        unsafe { KERNEL.get().scheduler.set_current(Some(server)); }
         let r = handle_syscall(Syscall::SysReply,
             &SyscallArgs { a1: 1, a2: b'Y' as Word, ..Default::default() },
             &mut sink);
@@ -592,7 +592,7 @@ pub mod spec {
             s.scheduler.slab.free(server);
             // Restore boot thread (id 0 — first admitted) as
             // current.
-            s.scheduler.current = Some(crate::tcb::TcbId(0));
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ SysCall → Recv → Reply round-trip\n");
     }

@@ -47,7 +47,6 @@ pub fn test_main() {
 
     #[cfg(feature = "mcs")]
     crate::sched_context::spec::test_sched_context();
-    #[cfg(feature = "smp")]
     crate::smp::spec::test_smp();
     #[cfg(feature = "fastpath")]
     crate::fastpath::spec::test_fastpath();

@@ -52,12 +52,25 @@ pub fn init_interrupts() {
                 0x8E,
             );
         }
-        
+        // Phase 28d — install the cross-CPU IPI handler.
+        IDT[crate::smp::IPI_VECTOR as usize] = IdtEntry::new(
+            super::lapic::ipi_irq_entry as u64,
+            0x08,
+            0,
+            0x8E,
+        );
+    }
+    load_idt();
+}
+
+/// Per-CPU IDT load. Run on each CPU after the BSP has populated
+/// the shared IDT. Loads `IDT` into `IDTR` and unmasks IF via STI.
+pub fn load_idt() {
+    unsafe {
         let idt_desc = IdtDescriptor {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: core::ptr::addr_of!(IDT) as u64,
         };
-        
         asm!("lidt [{}]", in(reg) &idt_desc);
         asm!("sti");
     }

@@ -17,6 +17,19 @@
 use crate::arch::x86_64::gdt::{KERNEL_CS, USER32_CS};
 use crate::arch::x86_64::msr::*;
 
+/// RAII guard that releases the BKL when dropped. Keeps every
+/// kernel-entry function tidy: `let _bkl = BklGuard;` after the
+/// `bkl_acquire()` call and the lock comes back automatically on
+/// any return path (including panics that we'd want to abort
+/// anyway).
+struct BklGuard;
+
+impl Drop for BklGuard {
+    fn drop(&mut self) {
+        crate::smp::bkl_release();
+    }
+}
+
 /// Bits to clear in RFLAGS on SYSCALL entry. The kernel always
 /// wants IF=0 (interrupts off), DF=0 (string-op direction), and
 /// the trap/AC flags zero. We OR all of them into one mask:
@@ -27,9 +40,13 @@ const FMASK_VALUE: u64 = (1 << 9) | (1 << 10) | (1 << 8) | (1 << 18);
 /// CS / SS selectors in IA32_STAR refer to a real GDT entry).
 pub fn init_syscall_msrs() {
     unsafe {
-        // Enable SYSCALL/SYSRET via IA32_EFER.SCE.
+        // Enable SYSCALL/SYSRET via IA32_EFER.SCE, and No-eXecute
+        // page-table support via EFER.NXE so PTEs with bit 63 set
+        // don't trip a reserved-bit fault on this CPU. BOOTBOOT
+        // sets these on the BSP but not on APs; per-CPU setup
+        // makes APs match.
         let efer = rdmsr(IA32_EFER);
-        wrmsr(IA32_EFER, efer | EFER_SCE);
+        wrmsr(IA32_EFER, efer | EFER_SCE | crate::arch::x86_64::msr::EFER_NXE);
 
         // IA32_STAR layout:
         //   bits 31..0  = legacy SYSCALL target EIP (32-bit; unused
@@ -249,6 +266,15 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
     use crate::syscall_handler::{handle_syscall, DebugSink, SyscallArgs};
     use crate::syscalls::Syscall;
 
+    // Phase 28b — Big Kernel Lock. Hold across all kernel-state
+    // mutations + the next-thread pick. Released after we've
+    // committed the next thread's user_context back to the save
+    // area; the asm stub's sysretq tail only reads (from
+    // SYSCALL_SAVE) after that, and that read is single-CPU since
+    // SYSCALL_SAVE is only touched by this CPU's syscall path.
+    crate::smp::bkl_acquire();
+    let _bkl = BklGuard;
+
     struct SerialSink;
     impl DebugSink for SerialSink {
         fn put_byte(&mut self, b: u8) {
@@ -267,7 +293,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
     use crate::kernel::KERNEL;
     use core::sync::atomic::Ordering as AtomOrd;
     unsafe {
-        if let Some(prev) = KERNEL.get().scheduler.current {
+        if let Some(prev) = KERNEL.get().scheduler.current() {
             KERNEL.get().scheduler.slab.get_mut(prev).user_context = *ctx;
             IN_FLIGHT_INVOKER.store(prev.0 as u32, AtomOrd::Relaxed);
         } else {
@@ -326,12 +352,12 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
     // that don't end up parking the caller.
     unsafe {
         let s = KERNEL.get();
-        let next = match s.scheduler.current {
+        let next = match s.scheduler.current() {
             Some(t) => Some(t),
             None => s.scheduler.choose_thread(),
         };
         if let Some(next) = next {
-            s.scheduler.current = Some(next);
+            s.scheduler.set_current(Some(next));
             // Phase 24: if next thread runs in a different vspace,
             // swap CR3. Kernel half is identical across user
             // PML4s so the swap is safe — the next instruction
@@ -363,7 +389,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
             let was_recv_path = matches!(
                 syscall,
                 Syscall::SysRecv | Syscall::SysNBRecv | Syscall::SysReplyRecv,
-            ) && Some(next) == s.scheduler.current;
+            ) && Some(next) == s.scheduler.current();
             // The "matches" above guards against the sender side:
             // when a blocked sender wakes up, we don't want to
             // overwrite its rdi/rdx with the receiver's view.

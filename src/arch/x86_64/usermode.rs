@@ -279,7 +279,7 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         // Demote the boot thread out of the way: keep it as a TCB
         // for fallback but mark it Inactive so choose_thread skips
         // it. Both demo TCBs sit at higher priority anyway.
-        if let Some(boot) = s.scheduler.current {
+        if let Some(boot) = s.scheduler.current() {
             s.scheduler.block(boot, ThreadStateType::Inactive);
         }
         // Pick the receiver to run first — that way it'll park on
@@ -288,7 +288,7 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         // it blocks on the endpoint queue, scheduler picks the
         // receiver next, receiver receives, both unblock, both
         // continue (and each issues the putchar).
-        s.scheduler.current = Some(sender);
+        s.scheduler.set_current(Some(sender));
 
         // Arm the demo flag. The syscall dispatcher checks this on
         // every SysDebugPutChar and bumps IPC_PRINTED; once it sees
@@ -454,6 +454,68 @@ unsafe fn ensure_user_table(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
     let table_p = kernel_virt_to_phys(table_v as u64);
     core::ptr::write_volatile(entry_ptr, (table_p & !0xFFF) | flags);
     table_p as *mut u64
+}
+
+/// Phase 26 — install an intermediate paging structure into the
+/// invoker's vspace (i.e. the live CR3 PML4). `level` selects the
+/// parent table the entry is written into:
+///   * `level=3` → PML4 entry at index `vaddr >> 39`. Used to map a
+///     `Cap::Pdpt` into a vspace.
+///   * `level=2` → PDPT entry at index `vaddr >> 30`. Used to map a
+///     `Cap::PageDirectory`. Walks PML4 to find the PDPT.
+///   * `level=1` → PD entry at index `vaddr >> 21`. Used to map a
+///     `Cap::PageTable`. Walks PML4 → PDPT to find the PD.
+///
+/// Returns false if a parent entry is missing (caller should map
+/// the higher-level structure first) or if the target entry is
+/// already present (caller should Unmap first).
+pub unsafe fn install_user_table(level: u32, vaddr: u64, table_paddr: u64) -> bool {
+    let pml4 = (read_cr3() & 0xFFFF_F000) as *mut u64;
+    install_user_table_in(pml4, level, vaddr, table_paddr)
+}
+
+unsafe fn install_user_table_in(
+    pml4: *mut u64,
+    level: u32,
+    vaddr: u64,
+    table_paddr: u64,
+) -> bool {
+    use super::paging::PTE_PS;
+    let flags = PTE_PRESENT | PTE_RW | PTE_USER;
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+
+    let entry_ptr: *mut u64 = match level {
+        3 => pml4.add(pml4_idx),
+        2 => {
+            let e = core::ptr::read_volatile(pml4.add(pml4_idx));
+            if e & PTE_PRESENT == 0 || e & PTE_PS != 0 {
+                return false;
+            }
+            ((e & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pdpt_idx)
+        }
+        1 => {
+            let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+            if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+                return false;
+            }
+            let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+            let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+            if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
+                return false;
+            }
+            ((pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pd_idx)
+        }
+        _ => return false,
+    };
+
+    let cur = core::ptr::read_volatile(entry_ptr);
+    if cur & PTE_PRESENT != 0 {
+        return false;
+    }
+    core::ptr::write_volatile(entry_ptr, (table_paddr & !0xFFF) | flags);
+    true
 }
 
 // Make Syscall referenced so unused-import lint doesn't fire when

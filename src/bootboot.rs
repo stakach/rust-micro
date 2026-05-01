@@ -96,3 +96,9 @@ pub fn get_bootstrap_processor_id() -> u16 {
     let bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
     bootboot_r.bspid
 }
+
+/// Total number of CPU cores BOOTBOOT brought up (BSP + APs).
+pub fn get_num_cores() -> u16 {
+    let bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
+    bootboot_r.numcores
+}

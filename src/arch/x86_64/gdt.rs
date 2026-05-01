@@ -32,16 +32,32 @@ pub const KERNEL_DS: u16 = 0x10;
 pub const USER32_CS: u16 = 0x18; // legacy, kept for SYSRET
 pub const USER_DS: u16 = 0x20 | 3;
 pub const USER_CS: u16 = 0x28 | 3;
-pub const TSS_SEL: u16 = 0x30;
+/// Selector for CPU 0's TSS. Subsequent CPUs use selectors at
+/// `TSS_SEL_BASE + 0x10 * cpu_id` (a TSS descriptor takes two GDT
+/// slots = 0x10 bytes).
+pub const TSS_SEL_BASE: u16 = 0x30;
+
+/// Backwards-compatible alias for code paths that haven't been
+/// SMP-aware'd yet (single-CPU scheduler updates etc.).
+pub const TSS_SEL: u16 = TSS_SEL_BASE;
+
+/// Selector for the TSS associated with `cpu_id`.
+pub const fn tss_selector(cpu_id: u32) -> u16 {
+    TSS_SEL_BASE + (cpu_id as u16) * 0x10
+}
 
 // ---------------------------------------------------------------------------
 // GDT and TSS storage. Both live in BSS.
 //
-// GDT: 8 entries × 8 bytes = 64 bytes. Slot 6/7 hold the upper half
-// of the TSS system descriptor.
+// Layout (one shared GDT across all CPUs):
+//   slots 0..6  — null + kernel/user CS/DS (see selector constants).
+//   slots 6+2k..7+2k (k = 0..MAX_CPUS) — TSS for CPU k.
+// Each TSS sits in its own per-CPU slot of the `TSS_PER_CPU` array.
 // ---------------------------------------------------------------------------
 
-const GDT_ENTRIES: usize = 8;
+use crate::smp::MAX_CPUS;
+
+const GDT_ENTRIES: usize = 6 + 2 * MAX_CPUS;
 
 #[repr(C, align(16))]
 struct GdtTable {
@@ -72,7 +88,7 @@ struct Tss {
     pub iomap_base: u16,
 }
 
-static mut TSS: Tss = Tss {
+const TSS_INIT: Tss = Tss {
     _reserved0: 0,
     rsp0: 0,
     rsp1: 0,
@@ -89,6 +105,8 @@ static mut TSS: Tss = Tss {
     _reserved3: 0,
     iomap_base: 0,
 };
+
+static mut TSS_PER_CPU: [Tss; MAX_CPUS] = [TSS_INIT; MAX_CPUS];
 
 // Descriptor used by `lgdt`. 10 bytes packed: 2-byte limit + 8-byte
 // base.
@@ -187,43 +205,61 @@ const fn tss_descriptor_low(base: u64, limit: u32) -> u64 {
 // ---------------------------------------------------------------------------
 
 pub fn init_gdt() {
-    // Capture the current stack as the kernel rsp0. When a user
-    // thread enters via SYSCALL or an interrupt, this is the rsp
-    // the CPU loads. For now we use the boot stack; per-thread
-    // kernel stacks land with thread switching.
+    init_gdt_for_cpu(0)
+}
+
+/// Per-CPU GDT/TSS init. Populates the shared GDT with all CPU
+/// TSS descriptors (the BSP path), or just loads it (AP path).
+/// `cpu_id == 0` is BSP; non-zero is an AP that joins after BOOTBOOT
+/// has dropped it at `_start`.
+pub fn init_gdt_for_cpu(cpu_id: u32) {
     let rsp0 = current_rsp();
 
     unsafe {
-        // SAFETY: We're the only writer pre-init. After this point
-        // the GDT becomes a read-mostly structure; subsequent
-        // changes (e.g. updating TSS rsp0 on context switch) only
-        // touch fields that don't affect the descriptor layout.
-        TSS.rsp0 = rsp0;
-        TSS.iomap_base = core::mem::size_of::<Tss>() as u16;
+        let tss_size = core::mem::size_of::<Tss>();
+        let tss_limit = (tss_size - 1) as u32;
 
-        let tss_base = &raw const TSS as u64;
-        let tss_limit = (core::mem::size_of::<Tss>() - 1) as u32;
+        // Each CPU sets its own TSS rsp0 + iomap_base before loading
+        // it. Other CPUs' TSS slots are untouched.
+        let tss_p = &raw mut TSS_PER_CPU[cpu_id as usize];
+        (*tss_p).rsp0 = rsp0;
+        (*tss_p).iomap_base = tss_size as u16;
 
-        GDT.entries[0] = 0;
-        GDT.entries[1] = KERNEL_CS_DESC;
-        GDT.entries[2] = KERNEL_DS_DESC;
-        GDT.entries[3] = USER32_CS_DESC;
-        GDT.entries[4] = USER_DS_DESC;
-        GDT.entries[5] = USER_CS_DESC;
-        GDT.entries[6] = tss_descriptor_low(tss_base, tss_limit);
-        GDT.entries[7] = tss_base >> 32;
+        // BSP (cpu 0) builds the shared GDT entries before lgdt-ing.
+        // APs assume the GDT is already populated and just load it.
+        if cpu_id == 0 {
+            GDT.entries[0] = 0;
+            GDT.entries[1] = KERNEL_CS_DESC;
+            GDT.entries[2] = KERNEL_DS_DESC;
+            GDT.entries[3] = USER32_CS_DESC;
+            GDT.entries[4] = USER_DS_DESC;
+            GDT.entries[5] = USER_CS_DESC;
+            for cpu in 0..MAX_CPUS {
+                let tss_base = &raw const TSS_PER_CPU[cpu] as u64;
+                GDT.entries[6 + 2 * cpu] = tss_descriptor_low(tss_base, tss_limit);
+                GDT.entries[7 + 2 * cpu] = tss_base >> 32;
+            }
+        }
 
-        load_gdt(&raw const GDT as u64, (core::mem::size_of::<GdtTable>() - 1) as u16);
-        load_tss(TSS_SEL);
+        load_gdt(
+            &raw const GDT as u64,
+            (core::mem::size_of::<GdtTable>() - 1) as u16,
+        );
+        load_tss(tss_selector(cpu_id));
     }
 }
 
 /// Update the kernel-mode rsp the CPU loads on user→kernel
 /// transition. Called by the scheduler whenever the current thread
-/// changes — each thread has its own kernel stack.
+/// changes — each thread has its own kernel stack. Targets the
+/// caller's CPU.
 pub fn set_kernel_rsp(rsp: u64) {
+    set_kernel_rsp_for_cpu(crate::arch::get_cpu_id() as u32, rsp);
+}
+
+pub fn set_kernel_rsp_for_cpu(cpu_id: u32, rsp: u64) {
     unsafe {
-        TSS.rsp0 = rsp;
+        TSS_PER_CPU[cpu_id as usize].rsp0 = rsp;
     }
 }
 
@@ -235,7 +271,7 @@ pub fn gdt_entry(index: usize) -> u64 {
 
 #[cfg(feature = "spec")]
 pub fn tss_rsp0() -> u64 {
-    unsafe { TSS.rsp0 }
+    unsafe { TSS_PER_CPU[crate::arch::get_cpu_id() as usize].rsp0 }
 }
 
 // ---------------------------------------------------------------------------

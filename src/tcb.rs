@@ -185,6 +185,10 @@ pub struct Tcb {
     /// kernel notification pool). `None` if not bound.
     /// (`fault_handler` cptr already exists above.)
     pub bound_notification: Option<u16>,
+    /// Phase 28c — CPU affinity (0..MAX_CPUS). The thread is enqueued
+    /// onto this CPU's per-CPU runqueue; only that CPU runs it. seL4
+    /// calls this `tcbAffinity`. Migration is a later phase.
+    pub affinity: u32,
 }
 
 impl Default for Tcb {
@@ -213,6 +217,7 @@ impl Default for Tcb {
             reply_to: None,
             vspace_root: crate::cap::Cap::Null,
             bound_notification: None,
+            affinity: 0,
         }
     }
 }

@@ -167,7 +167,7 @@ pub fn bootstrap_boot_thread() -> TcbId {
         t.priority = 254; // top priority — kernel boot
         t.state = ThreadStateType::Running;
         let id = s.scheduler.admit(t);
-        s.scheduler.current = Some(id);
+        s.scheduler.set_current(Some(id));
         id
     }
 }
@@ -176,7 +176,7 @@ pub fn bootstrap_boot_thread() -> TcbId {
 /// hasn't run yet. Useful for syscall handlers that need to know
 /// *which* TCB to consult for the CSpace lookup.
 pub fn current_thread() -> Option<TcbId> {
-    unsafe { KERNEL.get().scheduler.current }
+    unsafe { KERNEL.get().scheduler.current() }
 }
 
 // ---------------------------------------------------------------------------

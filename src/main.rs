@@ -88,8 +88,10 @@ mod boot;
 #[cfg(feature = "mcs")]
 mod sched_context;
 
-// Phase 10b — multi-CPU support: per-CPU NodeState + IPI dispatch.
-#[cfg(feature = "smp")]
+// Phase 10b / 28 — multi-CPU support: per-CPU NodeState + IPI
+// dispatch. Always-on now that BOOTBOOT drops every CPU at
+// `_start`; the `smp` cargo feature still gates the spec runner
+// for the smp module to keep its tests scoped.
 mod smp;
 
 // Phase 10c — IPC fastpath bypassing the slowpath book-keeping for
@@ -126,58 +128,115 @@ fn _start() -> ! {
     let bootboot_bsp_id = bootboot::get_bootstrap_processor_id() as arch::CpuId;
     
     if current_apic_id == bootboot_bsp_id {
-        arch::init_serial();
-        arch::log("Serial initialized!\n");
-
-        arch::log("Initializing GDT/TSS...\n");
-        arch::init_gdt();
-
-        arch::log("Initializing interrupts...\n");
-        arch::init_interrupts();
-
-        arch::log("Initializing exception handlers...\n");
-        arch::init_exceptions();
-
-        arch::log("Initializing SYSCALL MSRs...\n");
-        arch::init_syscall_msrs();
-
-        arch::log("Kernel initialization complete on BSP\n");
-
-        #[cfg(feature = "spec")]
-        spec::test_main();
-
-        // Real boot orchestration: read the loader's memory map,
-        // place the rootserver. Phase 12d runs this on the live
-        // BOOTBOOT-supplied state — useful as an end-to-end smoke
-        // test that the boot code that's been spec'd in synthetic
-        // form actually copes with real-hardware data.
-        #[cfg(target_arch = "x86_64")]
-        match boot::kernel_init() {
-            Ok(_) => arch::log("boot: kernel_init succeeded\n"),
-            Err(e) => {
-                arch::log("boot: kernel_init failed: ");
-                match e {
-                    boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
-                    boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
-                    boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
-                }
-                arch::log("\n");
-            }
-        }
-
-        // Phase 14d — two-thread IPC ping-pong. Spawns a sender +
-        // receiver, both ring-3, sharing an Endpoint cap. The
-        // dispatcher exits QEMU once it sees both threads complete
-        // their SysDebugPutChar invocations.
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::x86_64::usermode::launch_two_thread_ipc_demo();
-
-        #[cfg(any(not(target_arch = "x86_64"), not(feature = "spec")))]
-        loop {}
+        bsp_main();
     } else {
-        // Non-bootstrap processors should halt until needed
+        ap_main(current_apic_id);
+    }
+}
+
+/// BSP entry — runs all global init (serial, GDT contents, IDT
+/// contents, exception vectors), signals APs to come up, waits for
+/// the AP barrier, then runs spec runner / demo.
+fn bsp_main() -> ! {
+    arch::init_serial();
+    arch::log("Serial initialized!\n");
+
+    arch::log("Initializing GDT/TSS...\n");
+    arch::init_gdt();
+
+    arch::log("Initializing interrupts...\n");
+    arch::init_interrupts();
+
+    arch::log("Initializing exception handlers...\n");
+    arch::init_exceptions();
+
+    arch::log("Initializing SYSCALL MSRs...\n");
+    arch::init_syscall_msrs();
+
+    // Phase 28d — install kernel page tables (so the LAPIC is
+    // mapped at KERNEL_LAPIC_VBASE) then software-enable the BSP's
+    // LAPIC. Once enabled, IPI delivery works in either direction.
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::paging::install_kernel_page_tables();
+        crate::arch::x86_64::lapic::init_lapic();
+    }
+
+    arch::log("Kernel initialization complete on BSP\n");
+
+    // Release APs — the shared GDT and IDT are now populated, so
+    // they can safely lgdt/lidt and load their per-CPU TSS.
+    let n_cores = bootboot::get_num_cores() as u32;
+    let n_aps = n_cores.saturating_sub(1);
+    smp::signal_bsp_ready();
+    if n_aps > 0 {
+        arch::log("Waiting for APs to come up...\n");
+        smp::wait_for_aps(n_aps);
+        arch::log("All APs up\n");
+    }
+
+    #[cfg(feature = "spec")]
+    spec::test_main();
+
+    // Real boot orchestration: read the loader's memory map,
+    // place the rootserver. Phase 12d runs this on the live
+    // BOOTBOOT-supplied state — useful as an end-to-end smoke
+    // test that the boot code that's been spec'd in synthetic
+    // form actually copes with real-hardware data.
+    #[cfg(target_arch = "x86_64")]
+    match boot::kernel_init() {
+        Ok(_) => arch::log("boot: kernel_init succeeded\n"),
+        Err(e) => {
+            arch::log("boot: kernel_init failed: ");
+            match e {
+                boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
+                boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
+                boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
+            }
+            arch::log("\n");
+        }
+    }
+
+    // Phase 14d — two-thread IPC ping-pong. Spawns a sender +
+    // receiver, both ring-3, sharing an Endpoint cap. The
+    // dispatcher exits QEMU once it sees both threads complete
+    // their SysDebugPutChar invocations.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::usermode::launch_two_thread_ipc_demo();
+
+    #[cfg(any(not(target_arch = "x86_64"), not(feature = "spec")))]
+    loop {}
+}
+
+/// AP entry — wait for BSP to finish populating shared structures,
+/// then load them, set up per-CPU MSRs, signal alive, halt forever.
+/// Phase 28d will replace the halt loop with the per-CPU scheduler.
+fn ap_main(apic_id: arch::CpuId) -> ! {
+    smp::wait_for_bsp_ready();
+
+    // For QEMU and most hardware, APIC IDs are dense starting at 0,
+    // so we use APIC ID as the per-CPU index. Production may need a
+    // MADT-driven apic_id → cpu_index table.
+    let cpu_id = apic_id;
+    if (cpu_id as usize) >= smp::MAX_CPUS {
         arch::halt_cpu();
         loop {}
+    }
+
+    arch::init_gdt_for_cpu(cpu_id);
+    arch::load_idt();
+    arch::init_syscall_msrs();
+    // Phase 28d — each AP needs its own LAPIC software-enabled
+    // before it can deliver/receive IPIs. The MMIO mapping is
+    // shared (BOOTBOOT identity-maps the LAPIC page); only the
+    // SVR + TPR writes are per-CPU.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::lapic::init_lapic();
+
+    smp::mark_ap_alive();
+
+    loop {
+        arch::halt_cpu();
     }
 }
 

@@ -20,6 +20,6 @@ pub mod vspace;
 
 pub use cpu::{get_cpu_id, halt_cpu};
 pub use exceptions::init_exceptions;
-pub use gdt::init_gdt;
-pub use interrupts::init_interrupts;
+pub use gdt::{init_gdt, init_gdt_for_cpu};
+pub use interrupts::{init_interrupts, load_idt};
 pub use syscall_entry::init_syscall_msrs;
