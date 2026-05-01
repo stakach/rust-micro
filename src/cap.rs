@@ -346,11 +346,11 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
         )
         .words,
         Cap::Notification { ptr, badge, rights } => NotificationCap::new(
-            badge.0,
-            rights.can_receive as u64,
-            rights.can_send as u64,
-            ptr.addr(),
-            tag::NOTIFICATION,
+            badge.0,                        // capNtfnBadge
+            tag::NOTIFICATION,              // capType
+            rights.can_receive as u64,      // capNtfnCanReceive
+            rights.can_send as u64,         // capNtfnCanSend
+            ptr.addr(),                     // capNtfnPtr
         )
         .words,
         Cap::Reply { tcb, can_grant, master } => ReplyCap::new(

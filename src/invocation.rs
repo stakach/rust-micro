@@ -44,6 +44,8 @@ pub fn decode_invocation(
         Cap::Untyped { .. } => decode_untyped(target, label, args, invoker),
         Cap::CNode { .. } => decode_cnode(target, label, args, invoker),
         Cap::Thread { .. } => decode_tcb(target, label, args, invoker),
+        Cap::IrqControl => decode_irq_control(label, args, invoker),
+        Cap::IrqHandler { irq } => decode_irq_handler(irq, label, args, invoker),
         Cap::Null => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidCapability,
         ))),
@@ -52,6 +54,93 @@ pub fn decode_invocation(
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IRQ invocations.
+// ---------------------------------------------------------------------------
+
+fn decode_irq_control(
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    match label {
+        InvocationLabel::IRQIssueIRQHandler => {
+            // a2 = IRQ number, a3 = dest slot index
+            let irq = args.a2 as u16;
+            let dest_index = args.a3 as usize;
+            unsafe {
+                let s = KERNEL.get();
+                let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+                let cnode_ptr = match cspace_root {
+                    Cap::CNode { ptr, .. } => ptr,
+                    _ => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    ))),
+                };
+                let cnode_idx = KernelState::cnode_index(cnode_ptr);
+                let slots = &mut s.cnodes[cnode_idx].0;
+                if dest_index >= slots.len() {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_RangeError,
+                    )));
+                }
+                if !slots[dest_index].cap().is_null() {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_DeleteFirst,
+                    )));
+                }
+                slots[dest_index].set_cap(&Cap::IrqHandler { irq });
+            }
+            Ok(())
+        }
+        _ => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        ))),
+    }
+}
+
+fn decode_irq_handler(
+    irq: u16,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    unsafe {
+        let s = KERNEL.get();
+        match label {
+            InvocationLabel::IRQAckIRQ => {
+                crate::interrupt::ack_irq(&mut s.irqs, irq).map_err(|_|
+                    KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability)))
+            }
+            InvocationLabel::IRQSetIRQHandler => {
+                // a2 = CPtr to a Notification cap to bind.
+                let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+                let ntfn_cap = crate::cspace::lookup_cap(s, &cspace_root, args.a2)?;
+                let ntfn_ptr = match ntfn_cap {
+                    Cap::Notification { ptr, .. } => ptr,
+                    _ => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability))),
+                };
+                let ntfn_idx = KernelState::ntfn_index(ntfn_ptr) as u16;
+                // Replace any existing handler binding and install
+                // the new one.
+                let _ = crate::interrupt::clear_handler(&mut s.irqs, irq);
+                crate::interrupt::set_notification(&mut s.irqs, irq, ntfn_idx)
+                    .map_err(|_| KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability)))
+            }
+            InvocationLabel::IRQClearIRQHandler => {
+                crate::interrupt::clear_handler(&mut s.irqs, irq)
+                    .map_err(|_| KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability)))
+            }
+            _ => Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_IllegalOperation))),
+        }
     }
 }
 
@@ -418,6 +507,8 @@ pub mod spec {
         cnode_copy_via_invocation();
         cnode_move_clears_source();
         cnode_revoke_zaps_descendants();
+        irq_control_issues_handler_cap();
+        irq_handler_set_clear_ack();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
     }
@@ -627,6 +718,101 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ CNode::Revoke clears Untyped descendants\n");
+    }
+
+    #[inline(never)]
+    fn irq_control_issues_handler_cap() {
+        let invoker = setup_invoker(0);
+        // Invoke IRQControl::IssueIRQHandler with IRQ=7,
+        // dest_slot=2.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::IRQIssueIRQHandler as u64) << 12,
+            a2: 7,
+            a3: 2,
+            ..Default::default()
+        };
+        decode_invocation(Cap::IrqControl, &args, invoker)
+            .expect("issue handler ok");
+        unsafe {
+            let s = KERNEL.get();
+            match s.cnodes[0].0[2].cap() {
+                Cap::IrqHandler { irq: 7 } => {}
+                other => panic!("expected IrqHandler{{7}}, got {:?}", other),
+            }
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ IRQControl::IssueIRQHandler issues a handler cap\n");
+    }
+
+    #[inline(never)]
+    fn irq_handler_set_clear_ack() {
+        let invoker = setup_invoker(0);
+        // Stage a notification cap at slot 5 in CNode 0.
+        unsafe {
+            let s = KERNEL.get();
+            s.cnodes[0].0[5] = Cte::with_cap(&Cap::Notification {
+                ptr: KernelState::ntfn_ptr(3),
+                badge: crate::cap::Badge(0),
+                rights: crate::cap::NotificationRights {
+                    can_send: true, can_receive: true,
+                },
+            });
+        }
+
+        // SetNotification: bind IRQ 9 to the ntfn cap at slot 5.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::IRQSetIRQHandler as u64) << 12,
+            a2: 5, // CPtr to ntfn cap
+            ..Default::default()
+        };
+        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker)
+            .expect("set notification ok");
+        unsafe {
+            let s = KERNEL.get();
+            let entry = s.irqs.get(9).unwrap();
+            assert_eq!(entry.state, crate::interrupt::IrqState::Signal);
+            assert_eq!(entry.notification, Some(3));
+        }
+
+        // Simulate the IRQ firing — pending should go true.
+        unsafe {
+            let s = KERNEL.get();
+            crate::interrupt::handle_interrupt(
+                &mut s.irqs,
+                &mut s.notifications,
+                &mut s.scheduler,
+                9,
+            );
+            assert!(s.irqs.get(9).unwrap().pending);
+        }
+
+        // Ack via invocation.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::IRQAckIRQ as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker)
+            .expect("ack ok");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(!s.irqs.get(9).unwrap().pending);
+        }
+
+        // Clear via invocation.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::IRQClearIRQHandler as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker)
+            .expect("clear ok");
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.irqs.get(9).unwrap().state,
+                crate::interrupt::IrqState::Inactive);
+        }
+
+        teardown_invoker(invoker);
+        arch::log("  ✓ IRQHandler::Set/Ack/Clear cycle\n");
     }
 
     #[inline(never)]

@@ -15,10 +15,12 @@
 
 use core::cell::UnsafeCell;
 
-use crate::cap::{Cap, CNodeStorage, EndpointObj, PPtr};
+use crate::cap::{Cap, CNodeStorage, EndpointObj, NotificationObj, PPtr};
 use crate::cspace::CSpace;
 use crate::cte::Cte;
 use crate::endpoint::Endpoint;
+use crate::interrupt::IrqTable;
+use crate::notification::Notification;
 use crate::scheduler::Scheduler;
 use crate::tcb::{Tcb, TcbId, ThreadStateType};
 
@@ -26,6 +28,9 @@ use crate::tcb::{Tcb, TcbId, ThreadStateType};
 /// allocates them via Untyped retype with no fixed cap; the slab
 /// is just a convenience until we wire that path.
 pub const MAX_ENDPOINTS: usize = 16;
+
+/// Maximum notifications in the in-kernel pool.
+pub const MAX_NTFNS: usize = 16;
 
 /// CTEs per pre-allocated CNode in the in-kernel pool.
 pub const CNODE_RADIX: u8 = 5;
@@ -49,19 +54,26 @@ pub struct KernelState {
     /// (We use 1-based indexing so PPtr's NonZeroU64 invariant
     /// holds.)
     pub endpoints: [Endpoint; MAX_ENDPOINTS],
+    /// Same convention for notifications.
+    pub notifications: [Notification; MAX_NTFNS],
     /// Pre-allocated CNode pool. Same 1-based indexing convention
     /// for `Cap::CNode { ptr, .. }`.
     pub cnodes: [CNodePage; MAX_CNODES],
+    /// Per-IRQ binding table.
+    pub irqs: IrqTable,
 }
 
 impl KernelState {
     pub const fn new() -> Self {
         const EMPTY_EP: Endpoint = Endpoint::new();
+        const EMPTY_NT: Notification = Notification::new();
         const EMPTY_CN: CNodePage = CNodePage([Cte::null(); CNODE_SLOTS]);
         Self {
             scheduler: Scheduler::new(),
             endpoints: [EMPTY_EP; MAX_ENDPOINTS],
+            notifications: [EMPTY_NT; MAX_NTFNS],
             cnodes: [EMPTY_CN; MAX_CNODES],
+            irqs: IrqTable::new(),
         }
     }
 
@@ -79,6 +91,13 @@ impl KernelState {
         PPtr::<CNodeStorage>::new(i as u64 + 1).expect("non-zero")
     }
     pub fn cnode_index(p: PPtr<CNodeStorage>) -> usize {
+        (p.addr() - 1) as usize
+    }
+
+    pub fn ntfn_ptr(i: usize) -> PPtr<NotificationObj> {
+        PPtr::<NotificationObj>::new(i as u64 + 1).expect("non-zero")
+    }
+    pub fn ntfn_index(p: PPtr<NotificationObj>) -> usize {
         (p.addr() - 1) as usize
     }
 

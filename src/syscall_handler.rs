@@ -174,9 +174,22 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                 }
                 (ptr, badge.0)
             }
-            // Phase 16: non-Endpoint cap on a Send/Call → invocation
-            // dispatch (Untyped::Retype, CNode::Copy/Move/...,
-            // TCB::Suspend/Resume/SetPriority, etc.).
+            // Phase 18a: Send on a Notification cap is signal().
+            Cap::Notification { ptr, badge, rights } => {
+                if !rights.can_send {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )));
+                }
+                let idx = crate::kernel::KernelState::ntfn_index(ptr);
+                let s_ptr: *mut crate::kernel::KernelState = s;
+                let ntfn = &mut (*s_ptr).notifications[idx];
+                let sched = &mut (*s_ptr).scheduler;
+                let _woken = crate::notification::signal(ntfn, sched, badge.0);
+                return Ok(());
+            }
+            // Phase 16: non-IPC cap on a Send/Call → invocation
+            // dispatch.
             other => {
                 return crate::invocation::decode_invocation(other, args, current);
             }
@@ -233,6 +246,20 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                     )));
                 }
                 ptr
+            }
+            // Phase 18a: Recv on a Notification cap is wait().
+            Cap::Notification { ptr, rights, .. } => {
+                if !rights.can_receive {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )));
+                }
+                let idx = crate::kernel::KernelState::ntfn_index(ptr);
+                let s_ptr: *mut crate::kernel::KernelState = s;
+                let ntfn = &mut (*s_ptr).notifications[idx];
+                let sched = &mut (*s_ptr).scheduler;
+                let _outcome = crate::notification::wait(ntfn, sched, current);
+                return Ok(());
             }
             _ => {
                 return Err(KException::SyscallError(SyscallError::new(
