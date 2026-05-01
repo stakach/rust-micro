@@ -74,9 +74,13 @@ pub fn handle_syscall(
             // teardowns (which leave stale priority-bitmap state
             // across admit/free cycles) don't trip.
             //
-            // Long-term: a proper TCB destructor that dequeues on
-            // free would let us rotate unconditionally. Until then,
-            // we gate on the rootserver-demo flag.
+            // The current thread is already enqueued (admit /
+            // make_runnable / choose_thread all leave it on its
+            // priority queue). Yield = "let an equal-priority peer
+            // go first": dequeue cur and re-add it at the tail,
+            // then clear `current` so the syscall return path picks
+            // the new head. Re-enqueueing without dequeuing first
+            // double-adds `cur` and corrupts the intrusive list.
             #[cfg(target_arch = "x86_64")]
             if crate::rootserver::ROOTSERVER_DEMO_ACTIVE
                 .load(core::sync::atomic::Ordering::Relaxed)
@@ -85,11 +89,11 @@ pub fn handle_syscall(
                     let s = crate::kernel::KERNEL.get();
                     if let Some(cur) = s.scheduler.current() {
                         let cpu = crate::arch::get_cpu_id() as usize;
-                        if s.scheduler.nodes[cpu].queues.peek_highest().is_some() {
-                            let slab = &mut s.scheduler.slab;
-                            s.scheduler.nodes[cpu].queues.enqueue(slab, cur);
-                            s.scheduler.set_current(None);
-                        }
+                        let q = &mut s.scheduler.nodes[cpu].queues;
+                        let slab = &mut s.scheduler.slab;
+                        q.dequeue(slab, cur);
+                        q.enqueue(slab, cur);
+                        s.scheduler.set_current(None);
                     }
                 }
             }

@@ -144,17 +144,44 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[no_mangle]
 pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Naked entry — pushes a dummy error code so the iretq frame is
-/// consistent with `interrupt!`-shaped exception handlers, calls
-/// the Rust ISR, EOIs the PIC, returns.
+/// Naked entry. The CPU has already pushed the iretq frame (SS,
+/// RSP, RFLAGS, CS, RIP); we save every caller-saved register
+/// before calling the Rust ISR, then restore them. Without this
+/// the ISR's call frame trashes the user thread's `rdi`/`rsi`/
+/// `rax`/etc. mid-syscall-arg-marshalling, producing garbled
+/// `SysDebugPutChar` output and worse.
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn pit_irq_entry() {
     core::arch::naked_asm!(
-        "push 0",
-        "push 0",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        // Keep the stack 16-byte aligned for the call. We've
+        // pushed 9 regs (= 72 bytes) on top of the IRQ-frame's
+        // 5-word (= 40 bytes) push; total 112 bytes. The CPU's
+        // stack was 16-byte aligned at entry to user-mode code,
+        // and the iretq frame has 5 words, leaving the post-frame
+        // RSP at +8 mod 16. We need RSP at 0 mod 16 before `call`,
+        // so reserve another 8 bytes.
+        "sub rsp, 8",
         "call {handler}",
-        "add rsp, 16",
+        "add rsp, 8",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
         "iretq",
         handler = sym pit_isr,
     );

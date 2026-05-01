@@ -34,10 +34,19 @@ const LBL_UNTYPED_RETYPE: u64 = 1;
 const LBL_TCB_WRITE_REGISTERS: u64 = 3;
 const LBL_TCB_SET_SPACE: u64 = 11;
 const LBL_TCB_RESUME: u64 = 13;
+/// Phase 32g — MCS labels, generated under CONFIG_KERNEL_MCS.
+const LBL_SCHED_CONTROL_CONFIGURE: u64 = 33;
+const LBL_SCHED_CONTEXT_BIND: u64 = 34;
+const LBL_TCB_SET_PRIORITY: u64 = 6;
 
 /// `seL4_ObjectType` values we use here.
 const OBJ_TCB: u64 = 1;
 const OBJ_ENDPOINT: u64 = 2;
+/// `ObjectType::SchedContext` — order in `object_type.rs`. We use the
+/// minimum 8 bits = 256 bytes per SC, well above the SchedContext
+/// struct's footprint.
+const OBJ_SCHED_CONTEXT: u64 = 5;
+const SCHED_CONTEXT_BITS: u32 = 8;
 
 /// Initial CNode slots (mirrors the kernel's `seL4_RootCNodeCapSlots`).
 const CAP_INIT_THREAD_CNODE: u64 = 2;
@@ -49,6 +58,14 @@ const FIRST_EMPTY_SLOT: u64 = 12;
 const SLOT_ENDPOINT: u64 = 12;
 /// Slot we'll write the new child TCB into.
 const SLOT_CHILD_TCB: u64 = 13;
+/// Phase 32g — slot the kernel installs a `Cap::SchedControl` into
+/// (see `rootserver.rs::launch_rootserver`).
+const SLOT_SCHED_CONTROL: u64 = 14;
+/// Slots for the two MCS children's SchedContext + TCB caps.
+const SLOT_SC_HIGH: u64 = 15;
+const SLOT_SC_LOW: u64 = 16;
+const SLOT_TCB_HIGH: u64 = 17;
+const SLOT_TCB_LOW: u64 = 18;
 
 // ---------------------------------------------------------------------------
 // Syscall stubs. The x86_64 SYSCALL ABI puts the syscall number in
@@ -160,6 +177,39 @@ fn tcb_resume(target: u64) -> u64 {
     unsafe { syscall5(SYS_SEND, target, msg_info, 0, 0, 0) }
 }
 
+/// `TCB::SetPriority(target, prio)`. Required by the MCS demo so
+/// the children share the rootserver's priority and get scheduled
+/// when it yields (a fresh TCB is priority 0 by default).
+#[inline(always)]
+fn tcb_set_priority(target: u64, prio: u64) -> u64 {
+    let msg_info = LBL_TCB_SET_PRIORITY << 12;
+    unsafe { syscall5(SYS_SEND, target, msg_info, prio, 0, 0) }
+}
+
+/// `SchedControl::ConfigureFlags(target_sc=cptr, budget, period)`.
+/// ABI: a0 = SchedControl cptr (consumed by handle_send),
+/// a2 = target SC cptr, a3 = budget, a4 = period.
+#[inline(always)]
+fn sched_control_configure(
+    sched_control: u64,
+    target_sc_cptr: u64,
+    budget: u64,
+    period: u64,
+) -> u64 {
+    let msg_info = LBL_SCHED_CONTROL_CONFIGURE << 12;
+    unsafe {
+        syscall5(SYS_SEND, sched_control, msg_info, target_sc_cptr, budget, period)
+    }
+}
+
+/// `SchedContext::Bind(target_sc, tcb_cap)`. Ties the SC's refill
+/// schedule to the TCB so PIT-driven mcs_tick charges/parks/wakes it.
+#[inline(always)]
+fn sched_context_bind(sc_cptr: u64, tcb_cptr: u64) -> u64 {
+    let msg_info = LBL_SCHED_CONTEXT_BIND << 12;
+    unsafe { syscall5(SYS_SEND, sc_cptr, msg_info, tcb_cptr, 0, 0) }
+}
+
 /// IPC `Send` on an Endpoint cap. `length` words are taken from
 /// `msg_regs[]` (here just one — `data` goes through rdx → msg_regs[0]).
 #[inline(always)]
@@ -212,6 +262,37 @@ pub unsafe extern "C" fn child_entry() -> ! {
     // side; we picked it for visibility in serial output.
     ep_send_one(SLOT_ENDPOINT, 0xCAFE);
     loop {
+        yield_now();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 32g — mixed-criticality demo. We spawn two children; each
+// runs a tight `print + yield` loop printing a single-byte tag. The
+// SchedContext bound to each child rate-limits its CPU time:
+//   high — period=10 budget=8 → ~80% of ticks → emits 'H'
+//   low  — period=10 budget=2 → ~20% of ticks → emits 'B'
+// The kernel's syscall_entry exit hook samples the bytes and exits
+// QEMU once we've seen enough of each to verify the ratio.
+// ---------------------------------------------------------------------------
+
+static mut HIGH_STACK: ChildStack = ChildStack([0; 4096]);
+static mut LOW_STACK: ChildStack = ChildStack([0; 4096]);
+
+#[no_mangle]
+#[link_section = ".text.high"]
+pub unsafe extern "C" fn high_child_entry() -> ! {
+    loop {
+        debug_put_char(b'H');
+        yield_now();
+    }
+}
+
+#[no_mangle]
+#[link_section = ".text.low"]
+pub unsafe extern "C" fn low_child_entry() -> ! {
+    loop {
+        debug_put_char(b'B');
         yield_now();
     }
 }
@@ -395,9 +476,104 @@ pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_hex(payload);
     print_str(b" from child]\n");
 
+    // -----------------------------------------------------------------
+    // Phase 32g — mixed-criticality demo. The 3rd '\n' just printed
+    // flips the kernel into MCS-demo mode. From here we set up two
+    // SC-bound children and let MCS arbitrate between them.
+    // -----------------------------------------------------------------
+    spawn_mcs_children();
+
     loop {
         yield_now();
     }
+}
+
+unsafe fn spawn_mcs_children() {
+    // 1. Retype two SchedContexts out of the rootserver's Untyped.
+    //    Each is the minimum size (256 bytes — small but enough,
+    //    since the kernel-side `SchedContext` lives in the static
+    //    pool, not in this memory).
+    let r = untyped_retype(
+        CAP_INIT_UNTYPED,
+        OBJ_SCHED_CONTEXT,
+        SCHED_CONTEXT_BITS,
+        /* num_objects */ 2,
+        SLOT_SC_HIGH,
+    );
+    if r != 0 { print_str(b"[mcs retype SC FAILED]\n"); return; }
+
+    // 2. Configure budgets. period=10, high gets 8 ticks, low gets 2.
+    let r = sched_control_configure(
+        SLOT_SCHED_CONTROL, SLOT_SC_HIGH, /* budget */ 8, /* period */ 10);
+    if r != 0 { print_str(b"[mcs configure high FAILED]\n"); return; }
+    let r = sched_control_configure(
+        SLOT_SCHED_CONTROL, SLOT_SC_LOW,  /* budget */ 2, /* period */ 10);
+    if r != 0 { print_str(b"[mcs configure low FAILED]\n"); return; }
+
+    // 3. Retype two TCBs.
+    let r = untyped_retype(
+        CAP_INIT_UNTYPED, OBJ_TCB, /* user_size_bits */ 0, /* num_objects */ 2,
+        SLOT_TCB_HIGH);
+    if r != 0 { print_str(b"[mcs retype TCB FAILED]\n"); return; }
+
+    // 4. Wire each child: SetSpace (share our CSpace + VSpace),
+    //    WriteRegisters (entry + stack), SetPriority (so the
+    //    scheduler picks them when we yield), Bind to its SC,
+    //    Resume.
+    if !configure_child(SLOT_TCB_HIGH, high_child_entry as u64,
+                        (&raw mut HIGH_STACK as u64) + 4096 - 8,
+                        SLOT_SC_HIGH, b"H") { return; }
+    if !configure_child(SLOT_TCB_LOW, low_child_entry as u64,
+                        (&raw mut LOW_STACK as u64) + 4096 - 8,
+                        SLOT_SC_LOW, b"B") { return; }
+
+    print_str(b"[mcs demo: H/B children launched]\n");
+}
+
+unsafe fn configure_child(
+    tcb_slot: u64, rip: u64, rsp: u64, sc_slot: u64, tag: &[u8],
+) -> bool {
+    let r = tcb_set_space(tcb_slot, /* fault_ep */ 0,
+                          CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
+    if r != 0 {
+        print_str(b"[mcs setspace ");
+        print_str(tag);
+        print_str(b" FAILED]\n");
+        return false;
+    }
+    let r = tcb_write_registers(tcb_slot, rip, rsp, /* arg0 */ 0);
+    if r != 0 {
+        print_str(b"[mcs writeregs ");
+        print_str(tag);
+        print_str(b" FAILED]\n");
+        return false;
+    }
+    // Match the rootserver's priority so the scheduler picks this
+    // child when the rootserver yields. Default priority of a fresh
+    // TCB is 0, which is below the rootserver's 100 — without this
+    // the child would never be dispatched.
+    let r = tcb_set_priority(tcb_slot, /* prio */ 100);
+    if r != 0 {
+        print_str(b"[mcs setprio ");
+        print_str(tag);
+        print_str(b" FAILED]\n");
+        return false;
+    }
+    let r = sched_context_bind(sc_slot, tcb_slot);
+    if r != 0 {
+        print_str(b"[mcs bind ");
+        print_str(tag);
+        print_str(b" FAILED]\n");
+        return false;
+    }
+    let r = tcb_resume(tcb_slot);
+    if r != 0 {
+        print_str(b"[mcs resume ");
+        print_str(tag);
+        print_str(b" FAILED]\n");
+        return false;
+    }
+    true
 }
 
 #[panic_handler]

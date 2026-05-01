@@ -440,20 +440,69 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
             crate::arch::qemu_exit(0);
         }
     }
-    // Phase 29e/g: the rootserver prints (a) the alive banner +
-    // BootInfo summary, and (b) its retype-result line. Both end
-    // in '\n'; we exit on the second newline so both messages
-    // make it to serial.
+    // Phase 29e/g/h + 32g — exit logic for the rootserver demo.
+    //   * The 29h IPC sequence prints three newlines (alive banner,
+    //     retype-Endpoint, IPC-result). On the third newline we
+    //     activate `MCS_DEMO_ACTIVE` and the rootserver continues
+    //     into Phase 32g (spawn two SC-bound children that print
+    //     'H' / 'B').
+    //   * In MCS phase, count 'H' and 'B' bytes; once we've seen
+    //     enough of each to verify the budget split, log a summary
+    //     and qemu_exit.
     if crate::rootserver::ROOTSERVER_DEMO_ACTIVE.load(Ordering::Relaxed)
         && matches!(syscall, Syscall::SysDebugPutChar)
     {
-        if args.a0 as u8 == b'\n' {
+        let b = args.a0 as u8;
+        if b == b'\n' {
             let prev = crate::rootserver::ROOTSERVER_PRINTED
                 .fetch_add(1, Ordering::Relaxed);
-            // Phase 29h prints three lines: alive banner, retype
-            // result, child-message-received.
-            if prev + 1 >= 3 {
-                arch::log("[rootserver bootstrap complete — exiting QEMU]\n");
+            if prev + 1 >= 3 && !crate::rootserver::MCS_DEMO_ACTIVE
+                .load(Ordering::Relaxed)
+            {
+                crate::rootserver::MCS_DEMO_ACTIVE
+                    .store(true, Ordering::Relaxed);
+            }
+        } else if crate::rootserver::MCS_DEMO_ACTIVE.load(Ordering::Relaxed) {
+            if b == b'H' {
+                crate::rootserver::MCS_H_COUNT.fetch_add(1, Ordering::Relaxed);
+            } else if b == b'B' {
+                crate::rootserver::MCS_B_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            // Exit when we've seen enough chars from both children
+            // to verify the budget split. Threshold is generous so
+            // we land deep into the MCS scheduler rather than just
+            // catching the first dispatch.
+            let h = crate::rootserver::MCS_H_COUNT.load(Ordering::Relaxed);
+            let bc = crate::rootserver::MCS_B_COUNT.load(Ordering::Relaxed);
+            // Threshold sized so MCS spans several refill periods
+            // and the H:B ratio settles toward the budget split.
+            // Each char ≈ 1 µs in qemu; 20 000 chars ≈ 20 ms which
+            // is two full 10-ms refill periods at 1000 Hz PIT.
+            if h + bc >= 20000 && h > 0 && bc > 0 {
+                arch::log("\n[MCS demo: ");
+                let mut tmp = [0u8; 20];
+                fn print_decimal(n: usize) {
+                    let mut buf = [0u8; 20];
+                    let mut i = buf.len();
+                    let mut n = n;
+                    if n == 0 {
+                        crate::arch::log("0");
+                        return;
+                    }
+                    while n > 0 {
+                        i -= 1;
+                        buf[i] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                    }
+                    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+                        crate::arch::log(s);
+                    }
+                }
+                let _ = tmp;
+                print_decimal(h);
+                arch::log("H ");
+                print_decimal(bc);
+                arch::log("B] [rootserver bootstrap complete — exiting QEMU]\n");
                 crate::arch::qemu_exit(0);
             }
         }

@@ -635,14 +635,17 @@ fn decode_sched_context(
 // Phase 32d — SchedControl invocations.
 //
 // `SchedControlConfigureFlags(target_sc, budget, period, extra_refills, badge, flags)`
-// programs the named SchedContext's refill schedule. seL4's
-// signature ABI:
-//   a2 = budget    (ticks)
-//   a3 = period    (ticks)
-//   a4 = extra_refills (count, currently unused — we keep
-//        MAX_REFILLS fixed)
-//   a5 = badge / flags (we ignore for now)
-//   a0 = target SC cap_ptr (the rest go via SyscallArgs above).
+// programs the named SchedContext's refill schedule. The SysSend
+// ABI puts the SchedControl cap itself in `a0` (the cap whose
+// invocation we're decoding), so the target SC cptr has to ride
+// along in a different slot:
+//   a0 = invoking SchedControl cap_ptr (consumed by handle_send)
+//   a2 = target SC cap_ptr
+//   a3 = budget    (ticks)
+//   a4 = period    (ticks)
+// Real seL4 hands the SC over via the message's extra-caps area,
+// but we don't model extra caps yet — this in-line layout is the
+// minimum needed for the rootserver demo.
 //
 // The kernel resets the SC's refill schedule to a single
 // pending-refill record (release_time=0, amount=budget); seL4's
@@ -658,10 +661,10 @@ fn decode_sched_control(
 ) -> KResult<()> {
     match label {
         InvocationLabel::SchedControlConfigureFlags => {
-            let target_cptr = args.a0;
-            let budget = args.a2;
-            let period = args.a3;
-            // a4 (extra refills) and a5 (flags) ignored for now.
+            let target_cptr = args.a2;
+            let budget = args.a3;
+            let period = args.a4;
+            // a5 (flags) ignored for now.
 
             unsafe {
                 let s = KERNEL.get();
@@ -2353,11 +2356,13 @@ pub mod spec {
         let sched_control = Cap::SchedControl { core: 0 };
 
         // Invoke Configure(target=slot 7, budget=20, period=100).
+        // ABI: a0 = invoking SchedControl cptr (looked up by
+        // handle_send), a2 = target SC cptr, a3 = budget, a4 = period.
         let args = SyscallArgs {
-            a0: 7, // target SC cap_ptr
             a1: (InvocationLabel::SchedControlConfigureFlags as u64) << 12,
-            a2: 20,  // budget
-            a3: 100, // period
+            a2: 7,   // target SC cap_ptr
+            a3: 20,  // budget
+            a4: 100, // period
             ..Default::default()
         };
         decode_invocation(sched_control, &args, invoker).expect("configure ok");
@@ -2380,10 +2385,10 @@ pub mod spec {
 
         // budget > period is rejected as RangeError.
         let args = SyscallArgs {
-            a0: 7,
             a1: (InvocationLabel::SchedControlConfigureFlags as u64) << 12,
-            a2: 200, // budget
-            a3: 100, // period
+            a2: 7,
+            a3: 200, // budget
+            a4: 100, // period
             ..Default::default()
         };
         let r = decode_invocation(sched_control, &args, invoker);

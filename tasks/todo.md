@@ -128,21 +128,43 @@ What's already in place:
     9 ticks, thread runs; charge 1 more, thread blocks; advance
     to release_time, thread wakes.
 
-- [ ] 32d — SchedControl invocation.
-  * `SchedControl::Configure(target_sc, period, budget,
-    extra_refills)` — sets the SC's refill schedule.
-  * Required to make the SC actually configurable from
-    userspace; otherwise the rootserver can't program a child's
-    deadline.
+- [x] 32g — Rootserver demo: mixed-criticality. **DONE**
+  * Rootserver retypes 2 SchedContexts at MIN_SCHED_CONTEXT_BITS,
+    configures via SchedControl (slot 14, installed by the
+    kernel in `launch_rootserver`):
+      SC_HIGH = period 10, budget 8 — high-criticality task.
+      SC_LOW  = period 10, budget 2 — best-effort task.
+  * Retypes 2 child TCBs, SetSpace + WriteRegisters +
+    SetPriority(100) + SchedContextBind + Resume on each.
+    Children loop `debug_put_char('H' or 'B') + yield`.
+  * `launch_rootserver` enables PIT at 1000 Hz before dispatch
+    so `mcs_tick` fires periodically.
+  * Kernel exit hook samples 'H' / 'B' bytes after the IPC
+    banner, exits at h+b ≥ 20 000 with summary
+    `[MCS demo: NH MB]`. Observed split ≈ 2:1 (vs the 4:1
+    budget split) because cooperative yield equalises CPU time
+    *between* PIT IRQs — once SC_LOW exhausts and parks,
+    SC_HIGH dominates until the next refill.
 
-- [ ] 32e — Rootserver demo: mixed-criticality.
-  * Rootserver retypes 2 SchedContexts:
-      (a) period=100, budget=80   — high-criticality task.
-      (b) period=100, budget=20   — best-effort task.
-  * Spawns child TCBs bound to each. Both run a SysYield loop;
-    the high-criticality one always gets ≥ 80 ticks per period
-    even when the best-effort child is hot. Verify via the
-    per-CPU SYSCALL counter we already added in Phase 28h.
+  Bugs surfaced + fixed along the way:
+    * `pit_irq_entry` didn't save user-mode caller-saved
+      registers (rax/rcx/rdx/rsi/rdi/r8-r11) before calling
+      its Rust ISR — the ISR's call frame trashed user
+      context, producing garbled `SysDebugPutChar` output and
+      eventual fault loops. Added a save/restore around the
+      ISR call.
+    * `SysYield` re-enqueued the current TCB without
+      dequeuing first — and `current` is *already* in the
+      ready queue (admit/make_runnable/choose_thread all leave
+      it there). The double-add corrupted the intrusive
+      linked list. Fixed to dequeue → enqueue → clear current.
+    * `decode_sched_control` read the target SC cap_ptr from
+      `args.a0`, but `args.a0` in the SysSend path is always
+      the *invoking* cap (the SchedControl). Moved target SC
+      to `a2`, budget to `a3`, period to `a4`; updated the
+      existing spec to match.
+    * Rootserver page pool bumped 16 → 32 to fit the bigger
+      .bss (HIGH_STACK + LOW_STACK + CHILD_STACK = 12 KiB).
 
 ## Out of scope (future)
 * Replenishment scheduling on a wall clock vs scheduler ticks

@@ -54,7 +54,7 @@ use crate::types::{
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
 
-const PAGE_POOL_SIZE: usize = 16;
+const PAGE_POOL_SIZE: usize = 32;
 static mut ROOTSERVER_PAGE_POOL: [Page; PAGE_POOL_SIZE] =
     [const { Page([0; 4096]) }; PAGE_POOL_SIZE];
 static mut ROOTSERVER_PAGE_USED: usize = 0;
@@ -214,6 +214,15 @@ pub static ROOTSERVER_DEMO_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// so a future spec can poll it.
 pub static ROOTSERVER_PRINTED: AtomicUsize = AtomicUsize::new(0);
 
+/// Phase 32g — after the 29h IPC banner finishes (3rd newline),
+/// the rootserver moves to the MCS phase: it spawns two child
+/// TCBs bound to high- and low-budget SCs that print 'H' and 'B'
+/// respectively. The kernel exit hook counts those bytes and
+/// exits once we've seen enough to verify both children ran.
+pub static MCS_DEMO_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static MCS_H_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static MCS_B_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Phase 29e — replace the AY demo. Loads the rootserver, builds
 /// its TCB + CSpace, writes the BootInfo page, demotes the boot
 /// thread, swaps CR3, and `sysretq`s into user mode. Never returns;
@@ -301,6 +310,11 @@ pub unsafe fn launch_rootserver() -> ! {
         free_index: 0,
         is_device: false,
     });
+    // Phase 32g — give the rootserver a SchedControl cap so it can
+    // `SchedControl::Configure` SCs it retypes from its Untyped.
+    // Pinned at slot 14 by convention (kernel + rootserver agree).
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[14] =
+        Cte::with_cap(&Cap::SchedControl { core: 0 });
 
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)
@@ -327,6 +341,14 @@ pub unsafe fn launch_rootserver() -> ! {
 
     // Arm the dispatcher's exit hook.
     ROOTSERVER_DEMO_ACTIVE.store(true, Ordering::Relaxed);
+
+    // Phase 32g — enable the PIT before dispatch so mcs_tick fires
+    // periodically. Without this, the children would run cooperatively
+    // (1:1 split via yield) and the MCS budget split would never be
+    // visible. 1000 Hz lines up with the children's budgets in ticks
+    // (period=10, high=8, low=2 → ~10 ms refill window per child).
+    crate::arch::x86_64::pic::init_pic();
+    crate::arch::x86_64::pit::enable_periodic_irq(1000);
 
     // Swap CR3 to the rootserver's PML4 (kernel half preserved).
     core::arch::asm!(
