@@ -44,6 +44,25 @@ Rule — when calling a generated `Cap::new(...)`, always reread the
 .bf source to confirm whether explicit params exist. If not, count
 the visible fields top-to-bottom in declaration order.
 
+## Pattern: scheduler-queue staleness across spec teardowns
+
+Symptom — Phase 22 spec panicked at `TcbSlab::get_mut on empty
+slot`. Cause: a previous spec's teardown freed TCBs that were
+still linked into `scheduler.queues.heads/tails` (made_runnable
+had enqueued them). The next test's `admit` re-used the freed
+slot but `enqueue` followed the stale `tails[prio]` pointer to
+walk an empty slot. Panic.
+
+Fix — when a spec admits TCBs and frees them, the next spec must
+reset `scheduler.queues = ReadyQueues::new()` before any new
+`admit`. Better long-term: implement a proper TCB destructor that
+dequeues before freeing — but skipping that is fine for spec
+isolation as long as we wipe queues per test fixture.
+
+Rule — a test fixture that touches the global Scheduler must
+own clean-up of *both* the slab AND the per-priority queues.
+Just freeing the slot leaves the queue inconsistent.
+
 ## Pattern: x86_64 calling-convention plumbing
 
 - The `extern "C"` (System V) ABI puts the first arg in `rdi`,

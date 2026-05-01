@@ -64,6 +64,9 @@ mod endpoint;
 // TCB::Suspend, etc. as syscalls).
 mod invocation;
 
+// Phase 22 — fault delivery via fault EP cap.
+mod fault;
+
 // Notification state machine (signal/wait).
 mod notification;
 

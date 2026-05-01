@@ -1,78 +1,74 @@
-# Active phase plan — Phase 21: user-mode dynamic allocation
+# Active phase plan — Phase 22: fault delivery
 
 ## Goal
-Demonstrate the full seL4-shape flow from user mode: a ring-3
-thread retypes an Untyped into a Frame, maps the Frame at a
-chosen vaddr, writes to the mapped memory, reads it back, and
-prints the result. Proves Phase 16 (Untyped::Retype) and Phase 19
-(Frame::Map) work end-to-end from user space, not just spec.
+When a user thread takes a fault (page fault, unknown syscall,
+user exception), the kernel must:
 
-## Demo flow
-- Sender: `SysSend('Y' on endpoint cap=1)` (existing).
-- Receiver:
-  1. `SysDebugPutChar('A')` — proof we started.
-  2. `SysCall(cap=2 = Untyped, label=UntypedRetype, type=X86_4K,
-     num=1, dest_offset=3)` — retype a frame into slot 3.
-  3. `SysCall(cap=3 = Frame, label=X86PageMap, vaddr=V, rights=RW)`
-     — install the frame at user-virtual V.
-  4. `SysRecv(cap=1)` — receive the sender's 'Y'.
-  5. `mov [V], received_byte` — store through the new mapping.
-  6. `mov rdi, [V]` — load it back.
-  7. `SysDebugPutChar(rdi)` — print it.
+1. Build a fault message describing the fault.
+2. Send it via IPC to the thread's fault-handler endpoint
+   (the cap pointed to by `tcb.fault_handler` cptr).
+3. Block the faulting thread `BlockedOnReply` so a `SysReply` from
+   the handler can resume / restart it.
+4. Fault handler receives, decides to either Reply (resume) or
+   Restart via `TCB::Resume` after fixing the underlying issue.
 
-If we observe `AY` on serial we know:
-* Slot lookup works.
-* Untyped::Retype as a syscall works.
-* Frame::Map as a syscall works.
-* The new PTE actually points at the new frame (the byte loaded
-  matches the byte stored).
-* IPC still works.
+Without this, user faults panic the kernel — a real seL4 system
+wouldn't survive any buggy userland.
+
+## Scope (minimum useful)
+* New `src/fault.rs` module with `deliver_fault(faulting_tcb,
+  fault)` that:
+  - looks up the fault EP cap in the faulting thread's CSpace
+  - encodes the fault into msg_regs[0..N]
+  - calls `endpoint::send_ipc` with `do_call=true` so the
+    faulter ends up `BlockedOnReply` and the handler's
+    `reply_to` is set
+  - returns `Err(KException::Fault(...))` if anything in the
+    delivery itself fails (no handler, EP cap not an Endpoint,
+    etc.) so the kernel can fall back to "kill the thread"
+* `FaultMessage` enum with the 4 seL4 fault kinds
+  (CapFault / VMFault / UnknownSyscall / UserException). Maps
+  to `seL4_FaultType` constants.
+* Hook page-fault and unknown-syscall paths into deliver_fault.
+* Specs covering:
+  - fault delivery sets msg_regs / blocks faulter
+  - handler can SysReply to wake the faulter back up
+  - missing fault handler returns the fault (caller decides)
 
 ## Plan
-- [x] 21a — Pre-populate receiver's CNode with an Untyped cap at
-  slot 2 (carved from `DEMO_POOL`, a 16 KiB BSS-aligned pool).
-- [x] 21b — Hand-assembled the new receiver payload (~140 bytes).
-- [x] 21c — Existing IPC_PRINTED threshold (≥ 2) already matches.
-- [x] 21d — Boot output reads `AY`.
+- [x] 22a — `fault.rs` with FaultMessage + deliver_fault
+- [-] 22b — x86_64 page-fault hook deferred (requires user-mode
+       page-table isolation first; without it any fault from the
+       kernel side would corrupt the boot path)
+- [-] 22c — handle_unknown_syscall hook deferred for the same
+       reason
+- [x] 22d — Specs prove the fault → handler → reply round-trip
 
-## ABI plumbing notes
-* MessageInfo for Retype: label = UntypedRetype = 1. Encoded
-  bits: `(label << 12) | (length & 0x7F)`. We only need length
-  for IPC payload, not for invocations — kernel reads label from
-  rsi.
-* SyscallArgs for Retype: a0 = cap_ptr to untyped, a2 =
-  object_type word (X86_4K = 7), a3 = (size_bits<<32) |
-  num_objects = 1, a4 = dest_offset = 3.
-* SyscallArgs for X86PageMap: a0 = cap_ptr to frame, a1 =
-  (X86PageMap << 12), a2 = vaddr, a3 = FrameRights::ReadWrite
-  (= 3).
+## Lessons recorded
+- Freeing TCBs that are still linked into the scheduler's ready
+  queues causes the next `admit` to deref a stale slot (panic in
+  `TcbSlab::get_mut`). Fix: `scheduler.queues = ReadyQueues::new()`
+  before any test that admits TCBs into the same slab.
 
 ## Verification
-* All previous specs still pass.
-* IPC demo's payload bytes line up with the assembled
-  instructions (manual trace).
-* Boot output ends with `AY` then exit.
+* All 128 ✓ specs still pass.
+* New fault delivery specs verify the round-trip.
+* User-mode demo unchanged (shouldn't fault).
 
 ## Review
 
-* All 4 sub-tasks complete on the first build. The hand-assembled
-  payload happened to be correct on the first run — every byte
-  was checked against the manual encoding in the comment block.
-* Boot output: `AY`. The `Y` is the byte that came:
-  sender's user code → Cap::Endpoint → endpoint::transfer →
-  receiver's TCB.msg_regs[0] → Phase 15a fan-out into rdx →
-  user's `mov rcx, rdx` → user's store `mov [V], cl` → loaded
-  back via `movzx rdi, byte [V]` → SysDebugPutChar → serial.
-* This proves end-to-end:
-  - SysSend on Endpoint cap from ring 3
-  - SysSend on Untyped cap from ring 3 → Untyped::Retype
-    invocation places a Frame cap in the receiver's CSpace
-  - SysSend on Frame cap from ring 3 → Frame::Map invocation
-    installs the PTE
-  - The PTE actually backs real memory (DEMO_POOL) and the
-    page-table walk lands the user's load on the byte the user
-    just stored
-  - SysRecv on Endpoint from ring 3 returns the sender's byte in
-    rdx (Phase 15a fan-out)
-* Specs unchanged at 128 ✓; user-mode demo is now strictly
-  more impressive.
+* `fault.rs` lands the algorithmic core of fault delivery. Its
+  contract: given a TCB and a `FaultMessage`, send the message
+  via the thread's fault EP, block the thread `BlockedOnReply`,
+  and stamp the handler's `reply_to`.
+* Spec proves the full round-trip including the handler's
+  SysReply waking the faulter.
+* Hooking into the actual x86_64 page-fault and unknown-syscall
+  handlers is deferred. We can't pass user faults to user mode
+  cleanly until per-thread page tables exist (Phase 28) — until
+  then a real fault would destabilize the kernel rather than be
+  delivered. The algorithmic bridge is in place; the hook is a
+  ~10-line change once the prerequisite lands.
+* Hit + recorded a real bug: scheduler-queue staleness across
+  tests that free TCBs. Fix is one helper.
+* Spec count 128 → 130. User-mode demo (`AY`) unchanged.

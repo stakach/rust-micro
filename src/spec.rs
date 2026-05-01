@@ -37,6 +37,7 @@ pub fn test_main() {
     crate::arch::x86_64::context::spec::test_context_switch();
     crate::syscall_handler::spec::test_syscall_handler();
     crate::invocation::spec::test_invocation();
+    crate::fault::spec::test_fault();
     crate::endpoint::spec::test_endpoint();
     crate::notification::spec::test_notification();
     crate::interrupt::spec::test_interrupt();
