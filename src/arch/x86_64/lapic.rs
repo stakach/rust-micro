@@ -106,20 +106,51 @@ pub unsafe extern "C" fn ipi_irq_entry() {
 
 extern "C" fn ipi_isr() {
     use core::sync::atomic::Ordering;
+    use crate::smp::IpiKind;
 
     crate::smp::bkl_acquire();
 
-    // Drain pending IPIs targeted at the current CPU.
+    // Drain pending IPIs and dispatch by kind. We snapshot the
+    // requested actions out of the per-CPU NodeState while holding
+    // BKL, then act on them with the same lock still held — the
+    // KERNEL state mutations all live under BKL.
     let me = crate::arch::get_cpu_id();
     let nodes = crate::smp::nodes_mut();
-    crate::smp::handle_ipis(nodes, me, |_from, _kind| {
-        // For Phase 28d the action is just "we got it". Phase 28e
-        // wires Reschedule → choose_thread, TlbInvalidate → invlpg,
-        // Stop → halt.
+    let mut want_reschedule = false;
+    crate::smp::handle_ipis(nodes, me, |_from, kind| match kind {
+        IpiKind::Reschedule => want_reschedule = true,
+        IpiKind::InvalidateTlb { vaddr } => {
+            // Best-effort TLB invalidate on this CPU. Full
+            // shootdown integration with vspace ops lands later.
+            unsafe {
+                core::arch::asm!(
+                    "invlpg [{a}]",
+                    a = in(reg) vaddr,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        IpiKind::Stop => {
+            // Halt-loop forever. Used at shutdown — no graceful
+            // unwinding needed since we never resume an AP after
+            // this.
+            loop {
+                unsafe { core::arch::asm!("hlt"); }
+            }
+        }
     });
 
-    // Bump the spec-observable counter outside the lock so a
-    // BSP poll can read it without taking BKL.
+    // Phase 28e — Reschedule IPI runs choose_thread on the target.
+    // Updates per-CPU `current` so the next ap_scheduler_loop
+    // iteration sees the new pick.
+    if want_reschedule {
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            let next = s.scheduler.choose_thread();
+            s.scheduler.set_current(next);
+        }
+    }
+
     crate::smp::IPI_HANDLED_COUNT.fetch_add(1, Ordering::SeqCst);
 
     eoi();

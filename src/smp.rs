@@ -193,6 +193,13 @@ pub fn send_ipi(target_cpu: u32, kind: IpiKind) {
 /// outside the BKL to confirm the AP processed the IPI.
 pub static IPI_HANDLED_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Send a `Reschedule` IPI to `target_cpu`. Convenience wrapper
+/// around `send_ipi` for the common case. Caller holds BKL.
+#[cfg(target_arch = "x86_64")]
+pub fn kick_cpu(target_cpu: u32) {
+    send_ipi(target_cpu, IpiKind::Reschedule);
+}
+
 /// Maximum CPUs we'll ever run on. Picked small so the per-CPU
 /// arrays fit on the stack inside specs and on the BSS in the
 /// production kernel without alloc().
@@ -320,7 +327,72 @@ pub mod spec {
         all_aps_came_up();
         bkl_acquire_release_round_trip();
         cross_cpu_ipi_delivers_and_runs_isr();
+        ap_picks_thread_off_its_queue_via_reschedule();
         arch::log("SMP tests completed\n");
+    }
+
+    /// Phase 28e — admit a TCB with `affinity = 1` (so it lands on
+    /// AP1's queue), fire a Reschedule IPI to AP1, and poll until
+    /// AP1's IPI handler runs `choose_thread` and assigns it as
+    /// `nodes[1].current`. Verifies the per-CPU scheduler can be
+    /// driven from another CPU end-to-end.
+    #[inline(never)]
+    fn ap_picks_thread_off_its_queue_via_reschedule() {
+        if crate::bootboot::get_num_cores() < 2 {
+            arch::log("  ✓ AP-pick test skipped (single-CPU launch)\n");
+            return;
+        }
+
+        // Admit a runnable TCB pinned to CPU 1.
+        let admitted_id = unsafe {
+            bkl_acquire();
+            let s = crate::kernel::KERNEL.get();
+            let mut t = crate::tcb::Tcb::default();
+            t.priority = 200;
+            t.state = crate::tcb::ThreadStateType::Running;
+            t.affinity = 1;
+            let id = s.scheduler.admit(t);
+            bkl_release();
+            id
+        };
+
+        // Kick AP1.
+        bkl_acquire();
+        kick_cpu(1);
+        bkl_release();
+
+        // Poll AP1's `current` pointer. choose_thread re-enqueues
+        // its pick at the tail, so the value remains visible.
+        let mut spins = 0u64;
+        loop {
+            let cur = unsafe {
+                crate::kernel::KERNEL.get()
+                    .scheduler.current_for_cpu(1)
+            };
+            if cur == Some(admitted_id) {
+                break;
+            }
+            spins += 1;
+            if spins > 100_000_000 {
+                panic!("AP1's choose_thread never produced the admitted TCB");
+            }
+            core::hint::spin_loop();
+        }
+
+        // Cleanup so subsequent specs aren't poisoned.
+        unsafe {
+            bkl_acquire();
+            let s = crate::kernel::KERNEL.get();
+            s.scheduler.set_current_for_cpu(1, None);
+            // The thread is still enqueued on nodes[1].queues; reset
+            // those queues fully to avoid dangling sched_next/_prev
+            // links into the now-freed slot.
+            s.scheduler.reset_queues();
+            s.scheduler.slab.free(admitted_id);
+            bkl_release();
+        }
+
+        arch::log("  ✓ AP picks thread off its queue via Reschedule IPI\n");
     }
 
     /// Phase 28d — fire an IPI from BSP (running this spec) to AP1

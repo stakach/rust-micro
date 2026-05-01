@@ -74,6 +74,24 @@ What's already in the repo:
     BSP (every TCB gets affinity=0 from `Tcb::default`); APs
     remain in HLT until 28d/e wire them into the scheduler.
 
+- [x] 28e — AP scheduler loop. **DONE**
+  * `ap_main` now calls `ap_scheduler_loop` instead of
+    `loop { halt_cpu }`. Each iteration takes the BKL, lets the
+    scheduler observe `current`, releases BKL, then `sti; hlt`
+    until the next IPI / IRQ.
+  * IPI ISR: `Reschedule` runs `choose_thread()` on the target's
+    per-CPU node and stores the result in `set_current()`.
+    `InvalidateTlb { vaddr }` runs `invlpg`. `Stop` halts the
+    AP forever.
+  * `smp::kick_cpu(target_cpu)` convenience wrapper around
+    `send_ipi(target_cpu, Reschedule)`.
+  * Spec: `ap_picks_thread_off_its_queue_via_reschedule` — BSP
+    admits a TCB with `affinity=1`, `kick_cpu(1)`, polls
+    `current_for_cpu(1)` until it equals the admitted TCB.
+  * Still TODO (Phase 28f): per-CPU `SYSCALL_SAVE` /
+    `SYSCALL_KERNEL_RSP` so APs can actually dispatch user
+    threads. Today the AP picks a thread but doesn't run it.
+
 - [x] 28d — Cross-CPU IPI driver. **DONE**
   * `IPI_VECTOR = 0x40` in `smp.rs`. `ipi_irq_entry` naked
     stub in `lapic.rs` calls `ipi_isr` which acquires BKL,

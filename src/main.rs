@@ -235,8 +235,39 @@ fn ap_main(apic_id: arch::CpuId) -> ! {
 
     smp::mark_ap_alive();
 
+    ap_scheduler_loop();
+}
+
+/// AP idle loop. Each iteration:
+///   1. takes the BKL,
+///   2. lets the IPI ISR / scheduler decide what should run on this
+///      CPU (today, just looks at this CPU's current pointer; once
+///      Phase 28f lands per-CPU SYSCALL_SAVE the AP will dispatch
+///      user threads here),
+///   3. releases the BKL,
+///   4. HLTs until an interrupt (typically a Reschedule IPI from
+///      another CPU or an IRQ).
+///
+/// Interrupts are kept on while HLTed and off while inside the
+/// kernel. STI immediately followed by HLT is the canonical way
+/// to atomically "enable interrupts and wait for one" on x86.
+fn ap_scheduler_loop() -> ! {
     loop {
-        arch::halt_cpu();
+        // Tighten the kernel-vs-user-mode invariant: every wake-up
+        // immediately re-enters the kernel under BKL, then exits.
+        smp::bkl_acquire();
+        // (Future: if `current` is Some(tcb), context-switch into
+        // it here. For Phase 28e we just observe the pick.)
+        smp::bkl_release();
+
+        // Wait for next IPI / IRQ.
+        unsafe {
+            core::arch::asm!(
+                "sti",
+                "hlt",
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 
