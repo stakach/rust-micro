@@ -55,7 +55,27 @@ What's already in place:
     (in invoker's CSpace) and binds it to the target TCB.
   * Spec: SetSchedContext stores the binding.
 
-- [ ] 32c — refill_charge ↔ PIT tick.
+- [x] 32c — Bind SchedContext to TCB. **DONE**
+  * `MAX_SCHED_CONTEXTS = 16` SchedContext pool in
+    `KernelState::sched_contexts`, with bump allocator
+    `alloc_sched_context()` and `sched_context_ptr() /
+    sched_context_index()` helpers (same convention as
+    Endpoints — PPtr.addr = pool_index + 1).
+  * `Tcb::sc: Option<u16>` records the bound SC's pool index;
+    `SchedContext::bound_tcb` records the reverse link.
+  * `Untyped::Retype(SchedContext)` post-processes through the
+    pool: emit closure swaps the carved cap for one keyed off
+    the pool slot.
+  * `decode_sched_context` handles `SchedContextBind` (a2 =
+    TCB cap_ptr) and `SchedContextUnbind`. Refuses double-bind
+    in either direction with `DeleteFirst`.
+  * Spec: retype Untyped → SC, bind to a fresh TCB, verify both
+    sides linked, unbind clears them, re-bind after unbind ok.
+  * `CONFIG_KERNEL_MCS` flip in the XML codegen also bumped
+    TCBSetSpace 10 → 11 and TCBResume 12 → 13. Rootserver's
+    hardcoded label constants updated to match.
+
+- [ ] 32d — refill_charge ↔ PIT tick.
   * Wire `pit_isr` (under `cfg(feature = "mcs")`) to call
     `refill_charge(tcb.sc, ticks_elapsed)` instead of the
     classic `time_slice -= 1`.

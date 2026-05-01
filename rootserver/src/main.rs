@@ -27,11 +27,13 @@ const SYS_YIELD: i64 = -7;
 const SYS_SEND: i64 = -3;
 const SYS_RECV: i64 = -5;
 
-/// `InvocationLabel`s we issue.
+/// `InvocationLabel`s we issue. Phase 32a flipped CONFIG_KERNEL_MCS
+/// on so the TCB labels shifted: SetSpace went 10 → 11, Resume
+/// went 12 → 13. (WriteRegisters at 3 is identical across both.)
 const LBL_UNTYPED_RETYPE: u64 = 1;
 const LBL_TCB_WRITE_REGISTERS: u64 = 3;
-const LBL_TCB_SET_SPACE: u64 = 10;
-const LBL_TCB_RESUME: u64 = 12;
+const LBL_TCB_SET_SPACE: u64 = 11;
+const LBL_TCB_RESUME: u64 = 13;
 
 /// `seL4_ObjectType` values we use here.
 const OBJ_TCB: u64 = 1;

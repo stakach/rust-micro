@@ -52,6 +52,7 @@ pub fn decode_invocation(
         Cap::Pdpt { .. } => decode_pdpt(target, label, args, invoker),
         Cap::AsidControl => decode_asid_control(label, args, invoker),
         Cap::AsidPool { .. } => decode_asid_pool(target, label, args, invoker),
+        Cap::SchedContext { .. } => decode_sched_context(target, label, args, invoker),
         Cap::Null => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidCapability,
         ))),
@@ -561,6 +562,75 @@ static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(1);
 
 // ---------------------------------------------------------------------------
+// Phase 32c — SchedContext invocations.
+//
+// `SchedContextBind(target_tcb_or_ntfn)` ties the SC to a thread
+// (TCB cap arg) so its refill schedule controls that thread's CPU
+// allocation. `SchedContextUnbind` reverses the link.
+//
+// `SchedControl::Configure` (for setting period + budget) lives on
+// the seL4_SchedControl cap, not the SC cap, and is Phase 32d. The
+// kernel-side SchedControl singleton isn't typed yet.
+// ---------------------------------------------------------------------------
+
+fn decode_sched_context(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    let sc_id = match target {
+        Cap::SchedContext { ptr, .. } => {
+            KernelState::sched_context_index(ptr) as u16
+        }
+        _ => unreachable!(),
+    };
+    match label {
+        InvocationLabel::SchedContextBind => {
+            // a2 = TCB cap_ptr in invoker's CSpace. (seL4 also
+            // accepts Notification caps; we only handle the TCB
+            // case for now.)
+            let tcb_cptr = args.a2;
+            unsafe {
+                let s = KERNEL.get();
+                let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                let tcb_cap = crate::cspace::lookup_cap(s, &invoker_cspace, tcb_cptr)?;
+                let tcb_id = match tcb_cap {
+                    Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
+                    _ => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability))),
+                };
+                // Refuse double-bind in either direction.
+                if s.scheduler.slab.get(tcb_id).sc.is_some() {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_DeleteFirst)));
+                }
+                if s.sched_contexts[sc_id as usize].bound_tcb.is_some() {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_DeleteFirst)));
+                }
+                s.scheduler.slab.get_mut(tcb_id).sc = Some(sc_id);
+                s.sched_contexts[sc_id as usize].bound_tcb = Some(tcb_id);
+            }
+            Ok(())
+        }
+        InvocationLabel::SchedContextUnbind => {
+            unsafe {
+                let s = KERNEL.get();
+                if let Some(tcb_id) = s.sched_contexts[sc_id as usize].bound_tcb {
+                    s.scheduler.slab.get_mut(tcb_id).sc = None;
+                    s.sched_contexts[sc_id as usize].bound_tcb = None;
+                }
+            }
+            Ok(())
+        }
+        _ => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IRQ invocations.
 // ---------------------------------------------------------------------------
 
@@ -798,6 +868,14 @@ fn decode_untyped_retype(
                             radix,
                             guard_size,
                             guard,
+                        }
+                    }
+                    Cap::SchedContext { size_bits, .. } => {
+                        let i = (*s_ptr).alloc_sched_context()
+                            .expect("sched_context pool exhausted");
+                        Cap::SchedContext {
+                            ptr: KernelState::sched_context_ptr(i),
+                            size_bits,
                         }
                     }
                     other => other,
@@ -1232,6 +1310,7 @@ pub mod spec {
         tcb_set_space_and_bind_notification();
         tcb_set_space_pml4_pins_cr3();
         asid_control_make_pool_then_assign();
+        sched_context_bind_unbind();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
     }
@@ -2074,6 +2153,98 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ TCB::SetSpace pins CR3 from a Cap::PML4\n");
+    }
+
+    /// Phase 32c — bind a SchedContext to a TCB.
+    ///   1. Retype an Untyped → SchedContext (slot 7).
+    ///   2. Plant a TCB cap (slot 8) referring to a freshly admitted
+    ///      Tcb in the slab.
+    ///   3. Invoke `SchedContextBind(target=SC slot 7, tcb=slot 8)`.
+    ///   4. Verify the TCB's `.sc` is Some(idx) and the SC's
+    ///      `bound_tcb` is the TCB id.
+    ///   5. `Unbind` clears both sides.
+    #[inline(never)]
+    fn sched_context_bind_unbind() {
+        use crate::cap::{SchedContextStorage, UntypedStorage};
+
+        let invoker = setup_invoker(0);
+
+        // Plant an Untyped at slot 0 (radix-5 CNode covers ample
+        // space for one SchedContext).
+        unsafe {
+            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&Cap::Untyped {
+                ptr: PPtr::<UntypedStorage>::new(0x0060_0000).unwrap(),
+                block_bits: 14,
+                free_index: 0,
+                is_device: false,
+            });
+        }
+
+        // Retype Untyped → SchedContext at slot 7.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::UntypedRetype as u64) << 12,
+            a2: crate::object_type::ObjectType::SchedContext.to_word(),
+            a3: ((crate::object_type::MIN_SCHED_CONTEXT_BITS as u64) << 32) | 1,
+            a4: 7,
+            ..Default::default()
+        };
+        let ut_cap = unsafe { KERNEL.get().cnodes[0].0[0].cap() };
+        decode_invocation(ut_cap, &args, invoker).expect("retype SC");
+        let sc_cap = unsafe { KERNEL.get().cnodes[0].0[7].cap() };
+        let sc_idx = match sc_cap {
+            Cap::SchedContext { ptr, .. } => {
+                let _: PPtr<SchedContextStorage> = ptr;
+                KernelState::sched_context_index(ptr)
+            }
+            other => panic!("expected Cap::SchedContext, got {:?}", other),
+        };
+
+        // Admit a target TCB and stash its cap at slot 8.
+        let target_tcb = unsafe {
+            let mut t = crate::tcb::Tcb::default();
+            t.priority = 50;
+            KERNEL.get().scheduler.admit(t)
+        };
+        unsafe {
+            KERNEL.get().cnodes[0].0[8] = Cte::with_cap(&Cap::Thread {
+                tcb: PPtr::<crate::cap::Tcb>::new(target_tcb.0 as u64).unwrap(),
+            });
+        }
+
+        // SchedContextBind(target_sc=slot 7, tcb=slot 8).
+        let args = SyscallArgs {
+            a1: (InvocationLabel::SchedContextBind as u64) << 12,
+            a2: 8, // tcb cap_ptr
+            ..Default::default()
+        };
+        decode_invocation(sc_cap, &args, invoker).expect("bind ok");
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(target_tcb).sc, Some(sc_idx as u16));
+            assert_eq!(s.sched_contexts[sc_idx].bound_tcb, Some(target_tcb));
+        }
+
+        // Re-binding the SC (or another SC to this TCB) → DeleteFirst.
+        let r = decode_invocation(sc_cap, &args, invoker);
+        assert!(matches!(r,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_DeleteFirst }))));
+
+        // Unbind clears both sides.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::SchedContextUnbind as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(sc_cap, &args, invoker).expect("unbind ok");
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(target_tcb).sc, None);
+            assert_eq!(s.sched_contexts[sc_idx].bound_tcb, None);
+            // Clean up.
+            s.scheduler.slab.free(target_tcb);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ SchedContextBind / Unbind\n");
     }
 
     #[inline(never)]

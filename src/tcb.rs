@@ -189,6 +189,12 @@ pub struct Tcb {
     /// onto this CPU's per-CPU runqueue; only that CPU runs it. seL4
     /// calls this `tcbAffinity`. Migration is a later phase.
     pub affinity: u32,
+    /// Phase 32c — bound SchedContext (kernel-pool index, +1
+    /// matching the `Cap::SchedContext` PPtr encoding so 0 = "no
+    /// SC bound"). seL4 calls this `tcbSchedContext`. Once the PIT
+    /// MCS integration lands (Phase 32d/e), the per-tick refill
+    /// charge debits this SC instead of `time_slice`.
+    pub sc: Option<u16>,
 }
 
 impl Default for Tcb {
@@ -218,6 +224,7 @@ impl Default for Tcb {
             vspace_root: crate::cap::Cap::Null,
             bound_notification: None,
             affinity: 0,
+            sc: None,
         }
     }
 }

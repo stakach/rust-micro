@@ -28,7 +28,10 @@ use std::fmt::Write as _;
 
 pub fn default_config() -> HashMap<&'static str, bool> {
     [
-        ("CONFIG_KERNEL_MCS", false),
+        // Phase 32a — MCS is the only scheduler model. Flip on so
+        // the generated InvocationLabel enum includes
+        // SchedContextBind / SchedControlConfigure / etc.
+        ("CONFIG_KERNEL_MCS", true),
         ("CONFIG_ENABLE_SMP_SUPPORT", false),
         ("CONFIG_HARDWARE_DEBUG_API", false),
         ("CONFIG_VTX", false),

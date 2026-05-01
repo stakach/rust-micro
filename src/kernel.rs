@@ -32,6 +32,9 @@ pub const MAX_ENDPOINTS: usize = 32;
 /// Maximum notifications in the in-kernel pool.
 pub const MAX_NTFNS: usize = 16;
 
+/// Maximum SchedContexts in the in-kernel pool (Phase 32c).
+pub const MAX_SCHED_CONTEXTS: usize = 16;
+
 /// CTEs per pre-allocated CNode in the in-kernel pool.
 pub const CNODE_RADIX: u8 = 5;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
@@ -56,6 +59,10 @@ pub struct KernelState {
     pub endpoints: [Endpoint; MAX_ENDPOINTS],
     /// Same convention for notifications.
     pub notifications: [Notification; MAX_NTFNS],
+    /// Phase 32c — in-kernel SchedContext pool. `Cap::SchedContext`
+    /// PPtrs encode `pool_index + 1`, same convention as endpoints.
+    pub sched_contexts: [crate::sched_context::SchedContext;
+                         MAX_SCHED_CONTEXTS],
     /// Pre-allocated CNode pool. Same 1-based indexing convention
     /// for `Cap::CNode { ptr, .. }`.
     pub cnodes: [CNodePage; MAX_CNODES],
@@ -72,6 +79,7 @@ pub struct KernelState {
     pub next_endpoint: usize,
     pub next_notification: usize,
     pub next_cnode: usize,
+    pub next_sched_context: usize,
 }
 
 impl KernelState {
@@ -79,11 +87,14 @@ impl KernelState {
         const EMPTY_EP: Endpoint = Endpoint::new();
         const EMPTY_NT: Notification = Notification::new();
         const EMPTY_CN: CNodePage = CNodePage([Cte::null(); CNODE_SLOTS]);
+        const EMPTY_SC: crate::sched_context::SchedContext =
+            crate::sched_context::SchedContext::new(0, 0);
         Self {
             scheduler: Scheduler::new(),
             endpoints: [EMPTY_EP; MAX_ENDPOINTS],
             notifications: [EMPTY_NT; MAX_NTFNS],
             cnodes: [EMPTY_CN; MAX_CNODES],
+            sched_contexts: [EMPTY_SC; MAX_SCHED_CONTEXTS],
             irqs: IrqTable::new(),
             // Reserve indices < these for kernel-internal use
             // (boot CNode = 0, AY-demo CNodes = 1, 2, rootserver
@@ -92,6 +103,7 @@ impl KernelState {
             next_endpoint: 4,
             next_notification: 0,
             next_cnode: 4,
+            next_sched_context: 0,
         }
     }
 
@@ -133,6 +145,35 @@ impl KernelState {
             slot.set_cap(&Cap::Null);
         }
         Some(i)
+    }
+
+    /// Phase 32c — allocate the next free SchedContext slot.
+    /// Returns the pool index; the caller's `Cap::SchedContext`
+    /// PPtr should encode `index + 1`.
+    pub fn alloc_sched_context(&mut self) -> Option<usize> {
+        if self.next_sched_context >= MAX_SCHED_CONTEXTS {
+            return None;
+        }
+        let i = self.next_sched_context;
+        self.next_sched_context += 1;
+        // Reset to a fresh zero-budget SC; userspace later
+        // `SchedControl::Configure`s the period/budget.
+        self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
+        Some(i)
+    }
+
+    /// `PPtr<SchedContextStorage>` for SC pool slot `i` — encodes
+    /// `i + 1` into the address so it stays NonZero.
+    pub fn sched_context_ptr(
+        i: usize,
+    ) -> PPtr<crate::cap::SchedContextStorage> {
+        PPtr::<crate::cap::SchedContextStorage>::new(i as u64 + 1)
+            .expect("non-zero")
+    }
+    pub fn sched_context_index(
+        p: PPtr<crate::cap::SchedContextStorage>,
+    ) -> usize {
+        (p.addr() - 1) as usize
     }
 
     /// Build the `PPtr<EndpointObj>` for endpoint slot `i`. The
