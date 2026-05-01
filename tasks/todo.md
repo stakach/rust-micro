@@ -1,57 +1,54 @@
-# Active phase plan — Phase 24: per-thread CR3
+# Active phase plan — Phase 25: real page-fault hook
 
 ## Goal
-Each user thread gets its own PML4 with the kernel half mirrored
-from the live BOOTBOOT tables and the user half thread-specific.
-The SYSCALL dispatcher swaps CR3 when scheduling decides on a
-different thread. This is the canonical microkernel address-space
-isolation property — without it the AY demo's two threads
-are sharing memory by accident.
+Hook the x86_64 page-fault handler into the `fault::deliver_fault`
+machinery from Phase 22. When a user thread page-faults, the
+kernel:
+1. Reads CR2 + error code + saved CS from the iret frame.
+2. If the fault came from CPL=3 (user), calls `deliver_fault`
+   with a `VMFault` carrying CR2 + the error code.
+3. Picks a new thread to run (since the faulter is now blocked
+   on Reply), swaps CR3, and iretqs into it.
+4. If the fault came from CPL=0 (kernel), panics — we have no
+   recovery for kernel faults.
+
+The existing page-fault stub from `interrupt_with_error!`
+swallows the saved CS and passes garbage to the handler via
+broken System V ABI plumbing. We write a proper one.
 
 ## Plan
-- [x] 24a — `paging::make_user_pml4()` clones the live PML4
-  verbatim (incl. PML4[0] for BOOTBOOT's identity map, which
-  the kernel needs to walk page tables under any CR3). Returns
-  the new PML4 paddr.
-- [x] 24b — `usermode::map_user_4k_into_pml4(pml4_pa, ...)`
-  variant. Existing `map_user_4k_public` reads live CR3 then
-  delegates.
-- [x] 24c — Dispatcher swaps CR3 to next thread's
-  `cpu_context.cr3` before sysretq.
-- [x] 24d — `spawn_thread` takes a `pml4_paddr` arg;
-  `launch_two_thread_ipc_demo` allocates one PML4 per thread
-  and maps each thread's pages only into its own PML4.
-- [x] 24e — AY still works post-switch.
+- [x] 25a — `page_fault_entry` naked stub puts cr2 → rdi,
+  error → rsi, saved_cs → rdx, saved_rip → rcx before the call.
+- [x] 25b — `handle_page_fault_typed(cr2, err, cs, rip)` routes
+  user faults to `deliver_fault(current, VMFault {...})` and
+  qemu_exit's after delivery (we can't iret back to a blocked
+  thread cleanly until Phase 26's IRQ-style state save lands;
+  exiting at least proves the path was taken). Kernel faults
+  log the regs and halt.
+- [x] 25c — IDT[14] now installs `page_fault_entry`.
+- [x] 25d — AY demo unchanged.
 
-## Risks
-* Subtle: when handle_send::SysSend on Frame::Map runs, the
-  invocation handler currently uses `map_user_4k_public` which
-  walks the live CR3. With per-thread CR3, "live CR3" is the
-  invoker's PML4 — which is correct! The `map_user_4k_in` API
-  is more flexible but the live-CR3 wrapper is fine for
-  Frame::Map's "install in current vspace" semantics.
-* If make_user_pml4 fails (pool exhausted), threads can't
-  start. Bump POOL_SIZE if needed.
+## Out of scope
+* Deliberate user-fault test — needs a payload that faults and
+  a fault-handler thread. Defer to a future phase that builds
+  out the init-thread story.
 
 ## Verification
-* AY demo still works.
-* Spec count unchanged or +1.
+* AY demo unchanged.
+* Spec count unchanged.
+* If a fault DID happen, the boot output would log it before
+  exiting; absent that we know the path is dormant.
 
 ## Review
 
-* All 5 sub-tasks land. AY demo continues to work, but each
-  thread now runs in its OWN PML4 — try memory access at the
-  other thread's vaddrs and you'd page-fault.
-* Real bug caught + recorded: zeroing the user half of the
-  cloned PML4 broke kernel page-table walks. The kernel
-  depends on BOOTBOOT's PML4[0] identity map for low-physical
-  memory access (page tables, ACPI). Fixed by copying ALL
-  PML4 entries verbatim. Future Phase: relocate the identity
-  map to PML4[256] (kernel half) so the user half can be
-  truly empty.
-* KPT_POOL bumped 8 → 32 to accommodate per-thread PML4s.
-* CR3 swap in dispatcher checks CR3 only changes when needed
-  (avoids a full TLB flush per syscall when the current
-  thread keeps running).
-* User-mode demo unchanged in output but architecturally now
-  isolated.
+* All 4 sub-tasks done.
+* The new stub finally passes registers correctly — the
+  `interrupt_with_error!` macro elsewhere in exceptions.rs is
+  still using the broken pattern (passes garbage to its
+  extern-C handlers). That's a wider bug that should be fixed
+  in a sweep, but PF was the most user-visible.
+* Real test of "user thread faults → handler runs" needs a
+  payload that intentionally faults plus a fault-handler thread
+  in the demo. Out of scope for this commit; the algorithmic
+  bridge is verified by the spec in `fault.rs`.
+* AY demo unchanged → 130 ✓ specs.
