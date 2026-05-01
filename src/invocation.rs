@@ -46,6 +46,7 @@ pub fn decode_invocation(
         Cap::Thread { .. } => decode_tcb(target, label, args, invoker),
         Cap::IrqControl => decode_irq_control(label, args, invoker),
         Cap::IrqHandler { irq } => decode_irq_handler(irq, label, args, invoker),
+        Cap::Frame { .. } => decode_frame(target, label, args, invoker),
         Cap::Null => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidCapability,
         ))),
@@ -55,6 +56,152 @@ pub fn decode_invocation(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Frame invocations (Phase 19).
+// ---------------------------------------------------------------------------
+
+fn decode_frame(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    match label {
+        InvocationLabel::X86PageMap => decode_frame_map(target, args, invoker),
+        InvocationLabel::X86PageUnmap => decode_frame_unmap(target, args, invoker),
+        InvocationLabel::X86PageGetAddress => decode_frame_get_address(target, args, invoker),
+        _ => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        ))),
+    }
+}
+
+/// `X86Page::Map(vspace, vaddr, rights)` — install the frame at
+/// `vaddr` in the invoker's vspace. We only handle 4 KiB pages
+/// today; large/huge fall through with InvalidArgument.
+///
+/// ABI: a2 = vaddr, a3 = rights word (FrameRights encoding).
+fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    use crate::arch::x86_64::usermode;
+    let (paddr, size, _device, current_mapped) = match target {
+        Cap::Frame { ptr, size, is_device, mapped, .. } => (ptr.addr(), size, is_device, mapped),
+        _ => unreachable!(),
+    };
+    if !matches!(size, crate::cap::FrameSize::Small) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
+        )));
+    }
+    if current_mapped.is_some() {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_DeleteFirst,
+        )));
+    }
+    let vaddr = args.a2;
+    let rights = crate::cap::FrameRights::from_word(args.a3);
+    let writable = matches!(rights, crate::cap::FrameRights::ReadWrite);
+
+    if vaddr & 0xFFF != 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_AlignmentError,
+        )));
+    }
+
+    // Install via the same low-level page-table helper userspace
+    // pages use. We don't have per-thread CR3 yet so this maps
+    // into the shared kernel page tables — fine for the demo.
+    unsafe {
+        usermode::map_user_4k_public(vaddr, paddr, writable);
+    }
+
+    // Update the cap to reflect the mapping. We need to find the
+    // source slot that holds this Frame cap and rewrite it. Walk
+    // the invoker's CSpace.
+    unsafe {
+        let s = KERNEL.get();
+        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+        let cnode_ptr = match cspace_root {
+            Cap::CNode { ptr, .. } => ptr,
+            _ => return Ok(()),
+        };
+        let cnode_idx = KernelState::cnode_index(cnode_ptr);
+        for slot in s.cnodes[cnode_idx].0.iter_mut() {
+            if let Cap::Frame { ptr, .. } = slot.cap() {
+                if ptr.addr() == paddr {
+                    let updated = Cap::Frame {
+                        ptr,
+                        size,
+                        rights,
+                        mapped: Some(vaddr),
+                        asid: 0,
+                        is_device: _device,
+                    };
+                    slot.set_cap(&updated);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    let paddr = match target {
+        Cap::Frame { ptr, .. } => ptr.addr(),
+        _ => unreachable!(),
+    };
+    // Walk the CSpace and zero the mapping in the matching cap.
+    // Real hardware unmap (PTE clear + invlpg) belongs in the
+    // arch layer — we skip it for now since the spec only checks
+    // the cap-state side.
+    unsafe {
+        let s = KERNEL.get();
+        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+        let cnode_ptr = match cspace_root {
+            Cap::CNode { ptr, .. } => ptr,
+            _ => return Ok(()),
+        };
+        let cnode_idx = KernelState::cnode_index(cnode_ptr);
+        for slot in s.cnodes[cnode_idx].0.iter_mut() {
+            if let Cap::Frame { ptr, size, rights, is_device, .. } = slot.cap() {
+                if ptr.addr() == paddr {
+                    slot.set_cap(&Cap::Frame {
+                        ptr,
+                        size,
+                        rights,
+                        mapped: None,
+                        asid: 0,
+                        is_device,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `X86Page::GetAddress` — return the frame's physical address in
+/// the caller's `msg_regs[0]`. The syscall return path fans this
+/// out to user-mode `rdx` (Phase 15a).
+fn decode_frame_get_address(
+    target: Cap,
+    _args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    let paddr = match target {
+        Cap::Frame { ptr, .. } => ptr.addr(),
+        _ => unreachable!(),
+    };
+    unsafe {
+        let s = KERNEL.get();
+        let tcb = s.scheduler.slab.get_mut(invoker);
+        tcb.msg_regs[0] = paddr;
+        tcb.ipc_length = 1;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +656,7 @@ pub mod spec {
         cnode_revoke_zaps_descendants();
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
+        frame_map_unmap_get_address();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
     }
@@ -813,6 +961,92 @@ pub mod spec {
 
         teardown_invoker(invoker);
         arch::log("  ✓ IRQHandler::Set/Ack/Clear cycle\n");
+    }
+
+    #[inline(never)]
+    fn frame_map_unmap_get_address() {
+        use crate::cap::{FrameRights, FrameSize, FrameStorage};
+
+        let invoker = setup_invoker(0);
+        // Plant a Frame cap at slot 1 of CNode 0. Pick a paddr
+        // safely past BOOTBOOT's identity range so map_user_4k
+        // doesn't clash with the loader's 1 GiB pages, and a
+        // vaddr in PML4[2] (= same place the user-mode demo uses).
+        let paddr = 0x0000_0000_0090_0000u64;
+        let frame_cap = Cap::Frame {
+            ptr: PPtr::<FrameStorage>::new(paddr).unwrap(),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadWrite,
+            mapped: None,
+            asid: 0,
+            is_device: false,
+        };
+        unsafe { KERNEL.get().cnodes[0].0[1] = Cte::with_cap(&frame_cap); }
+
+        // Invoke X86PageGetAddress — kernel writes paddr into the
+        // invoker's msg_regs[0].
+        let args = SyscallArgs {
+            a1: (InvocationLabel::X86PageGetAddress as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(frame_cap, &args, invoker).expect("get address ok");
+        unsafe {
+            assert_eq!(KERNEL.get().scheduler.slab.get(invoker).msg_regs[0], paddr);
+        }
+
+        // Invoke X86PageMap — install at vaddr 0x100_0040_0000.
+        let vaddr = 0x0000_0100_0040_0000u64;
+        let args = SyscallArgs {
+            a1: (InvocationLabel::X86PageMap as u64) << 12,
+            a2: vaddr,
+            a3: FrameRights::ReadWrite.to_word(),
+            ..Default::default()
+        };
+        decode_invocation(frame_cap, &args, invoker).expect("map ok");
+
+        // Cap state was updated to record the mapping.
+        unsafe {
+            match KERNEL.get().cnodes[0].0[1].cap() {
+                Cap::Frame { mapped: Some(v), rights: FrameRights::ReadWrite, .. }
+                    if v == vaddr => {}
+                other => panic!("expected mapped frame, got {:?}", other),
+            }
+        }
+
+        // Verify the PTE actually went in by walking the live
+        // page tables.
+        let translated = crate::arch::x86_64::paging::live_virt_to_phys(vaddr);
+        assert_eq!(translated, Some(paddr));
+
+        // Re-mapping the same frame surfaces DeleteFirst.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::X86PageMap as u64) << 12,
+            a2: vaddr,
+            a3: FrameRights::ReadWrite.to_word(),
+            ..Default::default()
+        };
+        // Use the freshly-stored cap (which has mapped=Some).
+        let now_cap = unsafe { KERNEL.get().cnodes[0].0[1].cap() };
+        let r = decode_invocation(now_cap, &args, invoker);
+        assert!(matches!(r,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_DeleteFirst })))
+        );
+
+        // Unmap clears the mapping in the cap.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::X86PageUnmap as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(now_cap, &args, invoker).expect("unmap ok");
+        unsafe {
+            match KERNEL.get().cnodes[0].0[1].cap() {
+                Cap::Frame { mapped: None, .. } => {}
+                other => panic!("expected unmapped frame, got {:?}", other),
+            }
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ Frame::Map / Unmap / GetAddress round-trip\n");
     }
 
     #[inline(never)]

@@ -18,6 +18,7 @@
 //! later phases inside small, well-encapsulated `unsafe` helpers.
 
 use crate::structures::*;
+use crate::structures::arch::FrameCap;
 use crate::types::seL4_Word as Word;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
@@ -46,6 +47,9 @@ pub mod tag {
     pub const IRQ_HANDLER: u64 = 16;
     pub const ZOMBIE: u64 = 18;
     pub const DOMAIN: u64 = 20;
+
+    // Arch (odd) tags — x86_64 specific subset we decode today.
+    pub const FRAME: u64 = 1;
 
     /// Returns true for all arch-specific cap tags. Mirrors
     /// `isArchCap` in seL4: arch caps occupy odd tag values.
@@ -137,6 +141,64 @@ pub struct Tcb;
 pub struct CNodeStorage;
 /// Untyped object — opaque memory the kernel will retype.
 pub struct UntypedStorage;
+/// Physical-frame storage backing a `Cap::Frame`.
+pub struct FrameStorage;
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum FrameSize {
+    /// 4 KiB — `capFSize = 0`.
+    #[default]
+    Small,
+    /// 2 MiB — `capFSize = 1`.
+    Large,
+    /// 1 GiB — `capFSize = 2`.
+    Huge,
+}
+
+impl FrameSize {
+    pub const fn bits(self) -> u32 {
+        match self { Self::Small => 12, Self::Large => 21, Self::Huge => 30 }
+    }
+    pub const fn from_word(w: u64) -> Option<Self> {
+        match w {
+            0 => Some(Self::Small),
+            1 => Some(Self::Large),
+            2 => Some(Self::Huge),
+            _ => None,
+        }
+    }
+    pub const fn to_word(self) -> u64 {
+        match self { Self::Small => 0, Self::Large => 1, Self::Huge => 2 }
+    }
+}
+
+/// Frame access rights. Matches seL4's `seL4_X86_VMRights` encoding
+/// — 0 = kernel-only, 1 = read-only, 3 = read-write — so the
+/// 2-bit `capFVMRights` field stores it directly.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum FrameRights {
+    #[default]
+    KernelOnly,
+    ReadOnly,
+    ReadWrite,
+}
+
+impl FrameRights {
+    pub const fn to_word(self) -> u64 {
+        match self {
+            Self::KernelOnly => 0,
+            Self::ReadOnly => 1,
+            Self::ReadWrite => 3,
+        }
+    }
+    pub const fn from_word(w: u64) -> Self {
+        match w {
+            1 => Self::ReadOnly,
+            3 => Self::ReadWrite,
+            _ => Self::KernelOnly,
+        }
+    }
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum ZombieKind {
@@ -195,9 +257,20 @@ pub enum Cap {
         kind: ZombieKind,
     },
     Domain,
-    /// Any odd-tagged cap (frame, page table, etc.). Stored as the
-    /// raw two-word encoding; full decoding lives in `arch/<arch>`
-    /// and lands in Phase 8.
+    /// x86 4 KiB / 2 MiB / 1 GiB physical frame (cap tag = 1).
+    /// `mapped` records the user-virtual address the frame is
+    /// installed at, or `None` if not currently mapped.
+    Frame {
+        ptr: PPtr<FrameStorage>,
+        size: FrameSize,
+        rights: FrameRights,
+        mapped: Option<u64>,
+        asid: u16,
+        is_device: bool,
+    },
+    /// Any other arch-tagged cap (page tables, ASID pool, etc.).
+    /// Stored as the raw two-word encoding; full decoding for the
+    /// remaining cap types lands in later phases.
     Arch {
         cap_type: u64,
         words: [Word; 2],
@@ -318,6 +391,23 @@ pub fn from_words(words: [Word; 2]) -> Cap {
             Cap::Zombie { id: c.capZombieID(), kind }
         }
         tag::DOMAIN => Cap::Domain,
+        tag::FRAME => {
+            let c = FrameCap { words };
+            let Some(ptr) = PPtr::<FrameStorage>::new(c.capFBasePtr()) else {
+                return Cap::Null;
+            };
+            Cap::Frame {
+                ptr,
+                size: FrameSize::from_word(c.capFSize()).unwrap_or_default(),
+                rights: FrameRights::from_word(c.capFVMRights()),
+                mapped: {
+                    let v = c.capFMappedAddress();
+                    if v == 0 { None } else { Some(v) }
+                },
+                asid: c.capFMappedASID() as u16,
+                is_device: c.capFIsDevice() != 0,
+            }
+        }
         t if tag::is_arch(t) => Cap::Arch { cap_type: t, words },
         _ => Cap::Null,
     }
@@ -397,6 +487,23 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             c = c.with_capType(tag::DOMAIN);
             c.words
         }
+        Cap::Frame { ptr, size, rights, mapped, asid, is_device } => {
+            // Visible field order (no explicit_params on frame_cap):
+            //   capFMappedASID, capFBasePtr, capType, capFSize,
+            //   capFMapType, capFMappedAddress, capFVMRights,
+            //   capFIsDevice
+            FrameCap::new(
+                *asid as u64,
+                ptr.addr(),
+                tag::FRAME,
+                size.to_word(),
+                0,                              // capFMapType: 0 = normal (non-EPT)
+                mapped.unwrap_or(0),
+                rights.to_word(),
+                *is_device as u64,
+            )
+            .words
+        }
         Cap::Arch { cap_type: _, words } => *words,
     }
 }
@@ -444,6 +551,7 @@ pub mod spec {
         roundtrip_thread();
         roundtrip_irq_handler();
         roundtrip_arch_passthrough();
+        roundtrip_frame();
         type_tag_dispatch();
 
         arch::log("Cap round-trip tests completed\n");
@@ -509,19 +617,48 @@ pub mod spec {
         arch::log("  ✓ irq_handler cap round-trips\n");
     }
 
+    fn roundtrip_frame() {
+        let cap = Cap::Frame {
+            ptr: PPtr::<FrameStorage>::new(0x0000_0000_0040_0000).unwrap(),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadWrite,
+            mapped: Some(0x0000_0080_0000_1000),
+            asid: 7,
+            is_device: false,
+        };
+        let words = to_words(&cap);
+        // Cap type tag = 1 (FRAME).
+        assert_eq!(cap_type_of(words), tag::FRAME);
+        let back = from_words(words);
+        assert_eq!(back, cap);
+
+        // Unmapped variant — capFMappedAddress = 0 → mapped: None.
+        let cap2 = Cap::Frame {
+            ptr: PPtr::<FrameStorage>::new(0x80_0000).unwrap(),
+            size: FrameSize::Large,
+            rights: FrameRights::ReadOnly,
+            mapped: None,
+            asid: 0,
+            is_device: true,
+        };
+        let words = to_words(&cap2);
+        let back = from_words(words);
+        assert_eq!(back, cap2);
+        arch::log("  ✓ frame cap round-trips with mapped + unmapped variants\n");
+    }
+
     fn roundtrip_arch_passthrough() {
-        // An arch cap (odd tag) must pass through untouched.
+        // A still-undecoded arch cap (page_table = tag 3) must
+        // pass through opaquely. Tag 1 (frame) gets decoded into
+        // Cap::Frame, so we pick a tag that isn't typed yet.
         let mut words = [0u64; 2];
-        // Set capType=1 (frame_cap). The capType bits live at word 0
-        // bits 59..63; we don't go through the bitfield API here
-        // because we want to construct a *raw* odd-tagged value.
-        words[0] = 1u64 << 59;
+        words[0] = 3u64 << 59;
         let back = from_words(words);
         match back {
-            Cap::Arch { cap_type: 1, words: w } => assert_eq!(w, words),
-            other => panic!("expected Cap::Arch{{1,..}}, got {:?}", other),
+            Cap::Arch { cap_type: 3, words: w } => assert_eq!(w, words),
+            other => panic!("expected Cap::Arch{{3,..}}, got {:?}", other),
         }
-        arch::log("  ✓ arch cap passes through opaquely\n");
+        arch::log("  ✓ arch cap passes through opaquely (un-typed tags)\n");
     }
 
     fn type_tag_dispatch() {

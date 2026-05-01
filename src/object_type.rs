@@ -48,6 +48,13 @@ pub const MIN_UNTYPED_SIZE_BITS: u32 = 4;
 /// Largest legal Untyped — the full virtual word size.
 pub const MAX_UNTYPED_SIZE_BITS: u32 = 47;
 
+// x86_64 arch object types — these sit above
+// `seL4_NonArchObjectTypeCount` in libsel4. Numbered to match
+// seL4's `seL4_X86_*Object` ordering.
+pub const X86_4K: u64 = 7;
+pub const X86_2M: u64 = 8;
+pub const X86_1G: u64 = 9;
+
 // ---------------------------------------------------------------------------
 // ObjectType enum.
 // ---------------------------------------------------------------------------
@@ -134,7 +141,12 @@ pub fn size_in_bits(ty: ObjectType, user_size_bits: u32) -> Result<u32, SizeErro
         ObjectType::Endpoint => Ok(ENDPOINT_SIZE_BITS),
         ObjectType::Notification => Ok(NOTIFICATION_SIZE_BITS),
         ObjectType::SchedContext | ObjectType::Reply => Err(SizeError::Unsupported),
-        ObjectType::Arch(_) => Err(SizeError::Unsupported),
+        ObjectType::Arch(t) => match t {
+            X86_4K => Ok(12),
+            X86_2M => Ok(21),
+            X86_1G => Ok(30),
+            _ => Err(SizeError::Unsupported),
+        },
     }
 }
 

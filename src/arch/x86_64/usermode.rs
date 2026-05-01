@@ -280,6 +280,13 @@ pub fn launch_user_mode_test() -> ! {
 // Page-table helpers (shared with Phase 13c).
 // ---------------------------------------------------------------------------
 
+/// Public-from-arch helper: install a 4 KiB user-accessible
+/// mapping. Re-export of the internal `map_user_4k` so the
+/// invocation layer can call it for `Cap::Frame::Map`.
+pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool) {
+    map_user_4k(vaddr, paddr, writable);
+}
+
 unsafe fn map_user_4k(vaddr: u64, paddr: u64, writable: bool) {
     let pml4 = (read_cr3() & 0xFFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;

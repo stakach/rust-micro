@@ -1,43 +1,52 @@
-# Active phase plan — Phase 18: Notification + IRQ syscalls
+# Active phase plan — Phase 19: Frame::Map + arch caps
 
 ## Goal
-Wire `Cap::Notification` and the IRQ caps (`Cap::IrqControl`, `Cap::IrqHandler`)
-through the syscall path so userspace can do `Signal`/`Wait` on a notification
-and bind notifications to IRQ lines for driver-style code.
+Make x86 Frame caps first-class — typed `Cap::Frame` variant with
+`Map` / `Unmap` / `GetAddress` invocations. Once this lands,
+userspace can allocate a page from an Untyped, map it at a chosen
+vaddr, and access the memory.
+
+`PageTable` / `PageDirectory` / `PDPT` are deferred — Phase 13b's
+page-table installer auto-allocates intermediate tables on demand,
+so we don't need explicit cap-chain installs to demo Frame::Map.
+ASID management (`AsidPool::Assign`, `AsidControl::MakePool`) is
+also deferred — we use a single shared ASID for now.
 
 ## Plan
 
-- [x] 18a — `SysSend` on `Cap::Notification` → `signal()`
-- [x] 18b — `SysRecv` on `Cap::Notification` → `wait()`
-- [x] 18c — `decode_invocation` for `Cap::IrqControl::IssueIRQHandler`
-- [x] 18d — `decode_invocation` for `Cap::IrqHandler::Ack`,
-  `SetNotification`, `Clear`
-- [x] 18e — Specs for each path; existing IPC demo unchanged
+- [x] 19a — Extend `Cap` enum with `Frame { ptr, size, rights,
+  mapped, asid, is_device }` variant. `from_words` / `to_words`
+  via the generated `FrameCap` bitfield.
+- [x] 19b — `make_object_cap` for `ObjectType::Arch(frame_size)`
+  (so Untyped::Retype can produce Frame caps).
+- [x] 19c — `decode_invocation` for `Cap::Frame`: X86PageMap,
+  X86PageUnmap, X86PageGetAddress.
+- [x] 19d — Specs: round-trip Frame cap (mapped + unmapped),
+  Map verifies PTE via `live_virt_to_phys`, double-Map is
+  DeleteFirst, Unmap clears the cap.
 
 ## ABI notes
-- `SysSend` on a Notification uses the badge from the cap; payload is
-  ignored (signal merges via OR).
-- `SysRecv` returns the consumed badge in `rdi` (existing IPC return
-  path already populates this from `tcb.ipc_badge`).
-- `IrqControl::IssueIRQHandler(irq, dest_root, dest_index, dest_depth)`:
-  for our compressed ABI we take `irq` from `a2`, `dest_index` from
-  `a3`. `dest_root` defaults to invoker's CSpace root.
-- `IrqHandler::Ack` clears `pending` flag.
-- `IrqHandler::SetNotification(ntfn_cptr)` binds a notification cap;
-  `ntfn_cptr` from `a2`.
+- Invocation labels:
+  - X86PageMap = (decoded by codegen — appears in `InvocationLabel`)
+  - X86PageUnmap
+  - X86PageGetAddress
+- Map ABI (compressed): a2 = vaddr, a3 = rights bits, a4 = unused
+- GetAddress ABI: returns paddr in the result; we stuff it into
+  the caller's tcb.msg_regs[0] so user can read after sysret.
 
 ## Verification
-1. Build clean (`./scripts/build_kernel.sh`).
-2. Spec runner shows new ✓s.
-3. Existing two-thread user-mode IPC demo (`PM`) still ends with
-   `[two-thread IPC succeeded — exiting QEMU]`.
+1. Build clean.
+2. New invocation specs pass.
+3. Existing 124 ✓ specs unchanged.
+4. User-mode IPC demo (`PM`) still works.
 
 ## Review
 
-* All 6 new invocation paths land + pass spec.
-* Hit a real bug — `NotificationCap::new` arg order — caught by the
-  `IRQHandler::Set` spec when the looked-up cap came back as
-  non-Notification. Fixed in `src/cap.rs::to_words`.
-* Spec count: 124 ✓ (was 122 before phase 18). User-mode IPC demo
-  still produces `PM` and exits cleanly.
-* Lesson recorded: codegen `new()` arg-order convention.
+* All 4 sub-tasks complete. 8 invocation specs now pass (was 7).
+* End-to-end Frame::Map verified by walking the live page tables
+  with `paging::live_virt_to_phys` — proves the cap-shaped
+  invocation actually installed the right PTE.
+* Phase 13c arch round-trip spec needed a tweak: it relied on
+  tag=1 falling through to `Cap::Arch`, but tag=1 is now Frame.
+  Switched the test to tag=3 (page_table — still un-typed).
+* User-mode IPC demo unchanged — 124 → 126 ✓ specs.

@@ -221,8 +221,31 @@ fn make_object_cap(
                 },
             })
         }
-        ObjectType::SchedContext | ObjectType::Reply | ObjectType::Arch(_) => {
+        ObjectType::SchedContext | ObjectType::Reply => {
             Err(RetypeError::InvalidArgument)
+        }
+        ObjectType::Arch(t) => {
+            // x86_64 frame types — see object_type::X86_* constants.
+            use crate::cap::{FrameRights, FrameSize, FrameStorage};
+            use crate::object_type::{X86_1G, X86_2M, X86_4K};
+            let size = match t {
+                X86_4K => FrameSize::Small,
+                X86_2M => FrameSize::Large,
+                X86_1G => FrameSize::Huge,
+                _ => return Err(RetypeError::InvalidArgument),
+            };
+            let ptr = PPtr::<FrameStorage>::new(obj_addr)
+                .ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::Frame {
+                ptr,
+                size,
+                // Newly retyped frames have full rights; mapping
+                // narrows them.
+                rights: FrameRights::ReadWrite,
+                mapped: None,
+                asid: 0,
+                is_device: parent_is_device,
+            })
         }
     }
 }
