@@ -61,6 +61,17 @@ pub struct KernelState {
     pub cnodes: [CNodePage; MAX_CNODES],
     /// Per-IRQ binding table.
     pub irqs: IrqTable,
+
+    /// Phase 29h — bump-allocator state for the in-kernel
+    /// endpoint / notification / cnode pools. `Untyped::Retype` for
+    /// these object types takes the next free slot and bumps the
+    /// counter; the Untyped's own physical bytes stay reserved but
+    /// the actual kernel object lives here. (Real seL4 stores the
+    /// object in the Untyped's memory; we keep separate pools for
+    /// allocation simplicity.)
+    pub next_endpoint: usize,
+    pub next_notification: usize,
+    pub next_cnode: usize,
 }
 
 impl KernelState {
@@ -74,7 +85,54 @@ impl KernelState {
             notifications: [EMPTY_NT; MAX_NTFNS],
             cnodes: [EMPTY_CN; MAX_CNODES],
             irqs: IrqTable::new(),
+            // Reserve indices < these for kernel-internal use
+            // (boot CNode = 0, AY-demo CNodes = 1, 2, rootserver
+            // CNode = 3). Bump allocators start past the reserved
+            // range.
+            next_endpoint: 4,
+            next_notification: 0,
+            next_cnode: 4,
         }
+    }
+
+    /// Allocate the next free in-kernel endpoint. Returns the slot
+    /// index; the caller owns the Endpoint there. Returns `None` if
+    /// the pool is exhausted. Caller holds BKL.
+    pub fn alloc_endpoint(&mut self) -> Option<usize> {
+        if self.next_endpoint >= MAX_ENDPOINTS {
+            return None;
+        }
+        let i = self.next_endpoint;
+        self.next_endpoint += 1;
+        // Reset to an Idle endpoint regardless of prior content.
+        self.endpoints[i] = Endpoint::new();
+        Some(i)
+    }
+
+    /// Same shape as `alloc_endpoint` for notifications.
+    pub fn alloc_notification(&mut self) -> Option<usize> {
+        if self.next_notification >= MAX_NTFNS {
+            return None;
+        }
+        let i = self.next_notification;
+        self.next_notification += 1;
+        self.notifications[i] = Notification::new();
+        Some(i)
+    }
+
+    /// Same shape for CNodes — userspace's `Untyped::Retype` of a
+    /// CNode lands in one of these pre-allocated pages.
+    pub fn alloc_cnode(&mut self) -> Option<usize> {
+        if self.next_cnode >= MAX_CNODES {
+            return None;
+        }
+        let i = self.next_cnode;
+        self.next_cnode += 1;
+        // Wipe any leftover slots.
+        for slot in self.cnodes[i].0.iter_mut() {
+            slot.set_cap(&Cap::Null);
+        }
+        Some(i)
     }
 
     /// Build the `PPtr<EndpointObj>` for endpoint slot `i`. The

@@ -161,13 +161,39 @@ End state:
     → decode_untyped_retype → write into rootserver CNode →
     sysretq with rax=0.
 
-- [ ] 29h — Spawn a child TCB, IPC over the new endpoint.
-  * Retype the rest of the untyped into a TCB.
-  * Configure the child via TCB::SetSpace / WriteRegisters
-    (shares VSpace + CSpace with rootserver for now).
-  * `TCB::Resume`.
-  * Child does `SysSend(endpoint, message)`; rootserver
-    `SysRecv` and prints.
+- [x] 29h — Spawn a child TCB, IPC over the new endpoint. **DONE**
+  * Rootserver retypes its Untyped → TCB at slot 13, then issues
+    `TCB::SetSpace(child=13, cnode=2, vspace=3)` (child shares
+    rootserver's CSpace + VSpace), `TCB::WriteRegisters` to point
+    rip at `child_entry`, `TCB::Resume` to make it runnable.
+  * Rootserver `SysRecv`s on slot 12. Child runs `child_entry`,
+    sends 0xCAFE over the endpoint, yields. Rootserver wakes
+    and prints "[rootserver got 0xcafe from child]".
+  * Required several kernel-side fixes:
+      - `decode_untyped_retype` post-processes emitted caps for
+        kernel-pool-backed types (TCB / Endpoint / Notification /
+        CNode) — admit a real object into the kernel pool, encode
+        the pool index into the cap's PPtr.
+      - New bump allocators: `KernelState::alloc_endpoint /
+        alloc_notification / alloc_cnode`.
+      - `endpoint::transfer` now fans the IPC payload into the
+        receiver's `user_context` immediately, so the receiver
+        gets the message in registers regardless of which side
+        was waiting first.
+      - `SysYield` now actually rotates (under the rootserver
+        demo flag, to avoid tripping spec teardowns that leave
+        stale priority-bitmap state).
+      - `is_derived_from` extended to recognise Frame / PT / PD /
+        PDPT / PML4 children of an Untyped parent.
+      - Existing CNode::Revoke spec switched from Endpoint
+        children (now pool-allocated, outside the Untyped's
+        physical range) to Frame children whose PPtr is still
+        the carved paddr.
+  * Boot output:
+        [rootserver alive] node 0/4, 1 untyped(s) of 16384 bytes
+        [rootserver retyped Untyped -> Endpoint at slot 12]
+        [rootserver got 0xcafe from child]
+        [rootserver bootstrap complete — exiting QEMU]
 
 ## Out of scope (future phases)
 * Multi-segment ELF dynamic linking (we only handle static-PIE).

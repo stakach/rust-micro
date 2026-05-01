@@ -66,7 +66,35 @@ pub fn handle_syscall(
             handle_reply(args)?;
             handle_recv(args, /* blocking */ true)
         }
-        Syscall::SysYield => Ok(()),
+        Syscall::SysYield => {
+            // Phase 29h — when the rootserver demo is live, yield
+            // actually rotates so a child that's done its IPC can
+            // hand the CPU back to the rootserver. Outside that
+            // path, leave `SysYield` as the original no-op so spec
+            // teardowns (which leave stale priority-bitmap state
+            // across admit/free cycles) don't trip.
+            //
+            // Long-term: a proper TCB destructor that dequeues on
+            // free would let us rotate unconditionally. Until then,
+            // we gate on the rootserver-demo flag.
+            #[cfg(target_arch = "x86_64")]
+            if crate::rootserver::ROOTSERVER_DEMO_ACTIVE
+                .load(core::sync::atomic::Ordering::Relaxed)
+            {
+                unsafe {
+                    let s = crate::kernel::KERNEL.get();
+                    if let Some(cur) = s.scheduler.current() {
+                        let cpu = crate::arch::get_cpu_id() as usize;
+                        if s.scheduler.nodes[cpu].queues.peek_highest().is_some() {
+                            let slab = &mut s.scheduler.slab;
+                            s.scheduler.nodes[cpu].queues.enqueue(slab, cur);
+                            s.scheduler.set_current(None);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         Syscall::SysDebugPutChar | Syscall::SysDebugDumpScheduler => {
             let n = syscall as i32 as i64;
             handle_unknown_syscall(n, args, sink)

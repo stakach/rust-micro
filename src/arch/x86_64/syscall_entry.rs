@@ -364,6 +364,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
     crate::smp::SYSCALL_COUNT_PER_CPU[arch::get_cpu_id() as usize]
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
+
     // Phase 28f — recover the calling CPU's UserContext from the
     // per-CPU array. The asm stub wrote it via `gs:[16 + ...]`;
     // we look it up by APIC ID here.
@@ -449,7 +450,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
         if args.a0 as u8 == b'\n' {
             let prev = crate::rootserver::ROOTSERVER_PRINTED
                 .fetch_add(1, Ordering::Relaxed);
-            if prev + 1 >= 2 {
+            // Phase 29h prints three lines: alive banner, retype
+            // result, child-message-received.
+            if prev + 1 >= 3 {
                 arch::log("[rootserver bootstrap complete — exiting QEMU]\n");
                 crate::arch::qemu_exit(0);
             }

@@ -25,18 +25,28 @@ use core::panic::PanicInfo;
 const SYS_DEBUG_PUT_CHAR: i64 = -9;
 const SYS_YIELD: i64 = -7;
 const SYS_SEND: i64 = -3;
+const SYS_RECV: i64 = -5;
 
-/// `InvocationLabel::UntypedRetype` (see `codegen/object-api*.xml`).
+/// `InvocationLabel`s we issue.
 const LBL_UNTYPED_RETYPE: u64 = 1;
+const LBL_TCB_WRITE_REGISTERS: u64 = 3;
+const LBL_TCB_SET_SPACE: u64 = 10;
+const LBL_TCB_RESUME: u64 = 12;
 
 /// `seL4_ObjectType` values we use here.
+const OBJ_TCB: u64 = 1;
 const OBJ_ENDPOINT: u64 = 2;
 
-/// CNode slot the kernel populated with our 16 KiB Untyped cap.
+/// Initial CNode slots (mirrors the kernel's `seL4_RootCNodeCapSlots`).
+const CAP_INIT_THREAD_CNODE: u64 = 2;
+const CAP_INIT_THREAD_VSPACE: u64 = 3;
 const CAP_INIT_UNTYPED: u64 = 11;
-
-/// First empty slot in our root CNode (BootInfo's `empty.start`).
+/// First empty slot — see BootInfo `empty.start`.
 const FIRST_EMPTY_SLOT: u64 = 12;
+/// Slot we'll write the new Endpoint into.
+const SLOT_ENDPOINT: u64 = 12;
+/// Slot we'll write the new child TCB into.
+const SLOT_CHILD_TCB: u64 = 13;
 
 // ---------------------------------------------------------------------------
 // Syscall stubs. The x86_64 SYSCALL ABI puts the syscall number in
@@ -127,6 +137,83 @@ fn untyped_retype(
     }
 }
 
+/// `TCB::SetSpace(target, fault_ep, cnode_cptr, vspace_cptr)`.
+#[inline(always)]
+fn tcb_set_space(target: u64, fault_ep: u64, cnode: u64, vspace: u64) -> u64 {
+    let msg_info = LBL_TCB_SET_SPACE << 12;
+    unsafe { syscall5(SYS_SEND, target, msg_info, fault_ep, cnode, vspace) }
+}
+
+/// `TCB::WriteRegisters(target, rip, rsp, arg0)`.
+#[inline(always)]
+fn tcb_write_registers(target: u64, rip: u64, rsp: u64, arg0: u64) -> u64 {
+    let msg_info = LBL_TCB_WRITE_REGISTERS << 12;
+    unsafe { syscall5(SYS_SEND, target, msg_info, rip, rsp, arg0) }
+}
+
+/// `TCB::Resume(target)`.
+#[inline(always)]
+fn tcb_resume(target: u64) -> u64 {
+    let msg_info = LBL_TCB_RESUME << 12;
+    unsafe { syscall5(SYS_SEND, target, msg_info, 0, 0, 0) }
+}
+
+/// IPC `Send` on an Endpoint cap. `length` words are taken from
+/// `msg_regs[]` (here just one — `data` goes through rdx → msg_regs[0]).
+#[inline(always)]
+fn ep_send_one(endpoint: u64, data: u64) -> u64 {
+    // MessageInfo: bits 0..6 = length (1 word). label = 0.
+    let msg_info: u64 = 1;
+    unsafe { syscall5(SYS_SEND, endpoint, msg_info, data, 0, 0) }
+}
+
+/// IPC `Recv` on an Endpoint cap. The kernel fans IPC return into
+/// rdi=badge, rsi=MessageInfo, rdx/r10/r8/r9=msg_regs[0..3]. Returns
+/// `(rax, rdi, rsi, rdx)` so the caller can read the message.
+#[inline(always)]
+unsafe fn ep_recv(endpoint: u64) -> (u64, u64, u64, u64) {
+    let rax: u64;
+    let rdi: u64;
+    let rsi: u64;
+    let rdx: u64;
+    asm!(
+        "syscall",
+        in("rax") SYS_RECV as u64,
+        inout("rdi") endpoint => rdi,
+        lateout("rax") rax,
+        lateout("rsi") rsi,
+        lateout("rdx") rdx,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack, preserves_flags),
+    );
+    (rax, rdi, rsi, rdx)
+}
+
+// ---------------------------------------------------------------------------
+// Child thread state. Phase 29h spawns a single worker pinned to the
+// rootserver's VSpace; we own its stack here in BSS and pass the
+// linker-known address of `child_entry` as its entry point.
+// ---------------------------------------------------------------------------
+
+#[repr(C, align(16))]
+struct ChildStack([u8; 4096]);
+static mut CHILD_STACK: ChildStack = ChildStack([0; 4096]);
+
+/// Child-thread entry. Sends one IPC over the shared endpoint, then
+/// yields forever. `extern "C"` so the calling convention matches
+/// what the kernel sets up via `TCB::WriteRegisters`.
+#[no_mangle]
+#[link_section = ".text.child"]
+pub unsafe extern "C" fn child_entry() -> ! {
+    // 0xCAFE is the sentinel the rootserver receives on the other
+    // side; we picked it for visibility in serial output.
+    ep_send_one(SLOT_ENDPOINT, 0xCAFE);
+    loop {
+        yield_now();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // seL4_BootInfo subset. The kernel writes the full struct into our
 // BootInfo page; we only decode the fields we use here.
@@ -181,6 +268,23 @@ fn print_str(s: &[u8]) {
     }
 }
 
+fn print_hex(n: u64) {
+    if n == 0 {
+        debug_put_char(b'0');
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    let mut x = n;
+    while x > 0 {
+        i -= 1;
+        let nyb = (x & 0xF) as u8;
+        buf[i] = if nyb < 10 { b'0' + nyb } else { b'a' + nyb - 10 };
+        x >>= 4;
+    }
+    print_str(&buf[i..]);
+}
+
 fn print_u64(mut n: u64) {
     if n == 0 {
         debug_put_char(b'0');
@@ -218,29 +322,77 @@ pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b" bytes\n");
 
     // Phase 29g — retype the Untyped into one Endpoint, written
-    // into our CNode at slot FIRST_EMPTY_SLOT. End-to-end exercise
-    // of the userspace cap-allocation path: the rootserver issues
-    // a `SysSend(Untyped, UntypedRetype)` invocation, the kernel
-    // carves the free range, builds a Cap::Endpoint, and stores
-    // it in the destination slot.
+    // into our CNode at slot FIRST_EMPTY_SLOT.
     let r = untyped_retype(
         CAP_INIT_UNTYPED,
         OBJ_ENDPOINT,
-        /* user_size_bits */ 0, // Endpoint has fixed size — ignored.
+        /* user_size_bits */ 0,
         /* num_objects */    1,
-        /* dest_offset */    FIRST_EMPTY_SLOT,
+        /* dest_offset */    SLOT_ENDPOINT,
     );
 
-    if r == 0 {
-        print_str(b"[rootserver retyped Untyped -> Endpoint at slot ");
-        print_u64(FIRST_EMPTY_SLOT);
-        print_str(b" - bootstrap complete]\n");
-    } else {
-        print_str(b"[rootserver retype FAILED]\n");
+    if r != 0 {
+        print_str(b"[rootserver retype Endpoint FAILED]\n");
+        loop { yield_now(); }
+    }
+    print_str(b"[rootserver retyped Untyped -> Endpoint at slot ");
+    print_u64(SLOT_ENDPOINT);
+    print_str(b"]\n");
+
+    // Phase 29h — retype another TCB out of the same Untyped,
+    // configure it (share rootserver's VSpace + CSpace), Resume,
+    // then SysRecv on the endpoint we just made. The child sends
+    // an IPC carrying 0xCAFE; we print it.
+    let r = untyped_retype(
+        CAP_INIT_UNTYPED,
+        OBJ_TCB,
+        /* user_size_bits */ 0,
+        /* num_objects */    1,
+        /* dest_offset */    SLOT_CHILD_TCB,
+    );
+    if r != 0 {
+        print_str(b"[rootserver retype TCB FAILED]\n");
+        loop { yield_now(); }
     }
 
-    // Phase 29h+ will retype a TCB out of what's left of the
-    // untyped, configure it, and IPC over the new endpoint.
+    // SetSpace: child shares our CNode (slot 2) and VSpace (slot 3).
+    // No fault EP for now (a2 = 0 → child faults are fatal).
+    let r = tcb_set_space(
+        SLOT_CHILD_TCB,
+        /* fault_ep */ 0,
+        CAP_INIT_THREAD_CNODE,
+        CAP_INIT_THREAD_VSPACE,
+    );
+    if r != 0 { print_str(b"[setspace FAILED]\n"); loop { yield_now(); } }
+
+    // WriteRegisters: child starts at child_entry with rsp at the
+    // top of its dedicated stack page.
+    let child_rip = child_entry as u64;
+    let child_rsp = (&raw mut CHILD_STACK as u64) + 4096 - 8;
+    let r = tcb_write_registers(
+        SLOT_CHILD_TCB,
+        child_rip,
+        child_rsp,
+        /* arg0 */ 0,
+    );
+    if r != 0 { print_str(b"[writeregs FAILED]\n"); loop { yield_now(); } }
+
+    // Resume the child. It enters the scheduler queue at default
+    // priority; the next dispatch picks one of us — when we block
+    // on Recv below, the child runs.
+    let r = tcb_resume(SLOT_CHILD_TCB);
+    if r != 0 { print_str(b"[resume FAILED]\n"); loop { yield_now(); } }
+
+    // Receive the child's message. Blocks until it arrives.
+    let (rax, _badge, _info, payload) = ep_recv(SLOT_ENDPOINT);
+    if rax != 0 {
+        print_str(b"[recv FAILED]\n");
+        loop { yield_now(); }
+    }
+    print_str(b"[rootserver got 0x");
+    print_hex(payload);
+    print_str(b" from child]\n");
+
     loop {
         yield_now();
     }

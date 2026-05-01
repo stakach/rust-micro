@@ -264,10 +264,10 @@ pub unsafe fn launch_rootserver() -> ! {
     // rootserver's own startup code can now invoke any of these by
     // CPtr.
     s.cnodes[ROOTSERVER_CNODE_IDX].0[1] = Cte::with_cap(&Cap::Thread {
-        // Cap::Thread uses a PPtr<Tcb> that the kernel uses purely
-        // as a sentinel — we never deref it; cspace lookups go
-        // through the slab. Encode the TcbId as the low 16 bits.
-        tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64 + 0x1000).unwrap(),
+        // `decode_tcb` recovers the TcbId via `tcb_ptr.addr() as u16`,
+        // so we encode the TcbId directly (slab IDs start from 1
+        // after the boot thread, so `PPtr::new` always succeeds).
+        tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64).expect("nonzero tcb id"),
     });
     s.cnodes[ROOTSERVER_CNODE_IDX].0[2] = Cte::with_cap(&cnode_cap);
     s.cnodes[ROOTSERVER_CNODE_IDX].0[3] = Cte::with_cap(&Cap::PML4 {

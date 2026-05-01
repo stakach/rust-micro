@@ -251,6 +251,24 @@ fn transfer(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) 
     r.ipc_badge = badge;
     let n = (length as usize).min(r.msg_regs.len());
     r.msg_regs[..n].copy_from_slice(&regs[..n]);
+
+    // Phase 29h — fan the IPC payload into the receiver's
+    // user-visible registers immediately. The dispatcher's existing
+    // tail only fans-in when the in-flight syscall is the receiver's
+    // SysRecv, which doesn't cover the "receiver-blocked-first,
+    // sender-arrives-later" path. We do it here so the receiver's
+    // saved user_context has the right values whenever it next runs.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mi = (label << 12) | (length as Word & 0x7F);
+        r.user_context.rax = 0; // SysRecv returns Ok(()) → rax = 0
+        r.user_context.rsi = mi;
+        r.user_context.rdi = badge;
+        r.user_context.rdx = r.msg_regs[0];
+        r.user_context.r10 = r.msg_regs[1];
+        r.user_context.r8  = r.msg_regs[2];
+        r.user_context.r9  = r.msg_regs[3];
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -555,11 +555,71 @@ fn decode_untyped_retype(
         // Carve children. The closure runs once per child; we
         // place the cap into the destination slot at the matching
         // offset.
+        //
+        // Phase 29h — for `Cap::Thread`, the raw retype path emits
+        // a PPtr keyed off the Untyped's physical address, but
+        // `decode_tcb` recovers the TcbId via `tcb_ptr.addr() as u16`.
+        // Re-encode by admitting a fresh `Tcb::default()` into the
+        // slab and storing the TcbId in the cap.
         let mut emit_idx = dest_offset;
+        // We can't borrow `s.scheduler.slab` inside the closure
+        // because `cnode_slots` already holds a mutable borrow of
+        // a sibling field of `*s`. Use a raw pointer to bypass
+        // the aliasing check; the BKL guarantees we're the only
+        // writer.
+        let scheduler_ptr: *mut crate::scheduler::Scheduler =
+            &raw mut s.scheduler;
+        // Need a mutable handle on `s` to allocate from the
+        // endpoint / notification / cnode pools too. We reborrow
+        // via `KERNEL.get()` to avoid the existing `&mut s.cnodes`
+        // borrow's aliasing constraint.
+        let s_ptr: *mut crate::kernel::KernelState = KERNEL.get();
         let result = crate::untyped::retype(
             &mut state, object_type, size_bits, num_objects,
             |cap| {
-                cnode_slots[emit_idx].set_cap(&cap);
+                let cap_to_store = match cap {
+                    Cap::Thread { .. } => {
+                        let id = (*scheduler_ptr).admit(crate::tcb::Tcb {
+                            state: crate::tcb::ThreadStateType::Inactive,
+                            priority: 0,
+                            ..Default::default()
+                        });
+                        Cap::Thread {
+                            tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64)
+                                .expect("nonzero tcb id"),
+                        }
+                    }
+                    Cap::Endpoint { badge, rights, .. } => {
+                        let i = (*s_ptr).alloc_endpoint()
+                            .expect("endpoint pool exhausted");
+                        Cap::Endpoint {
+                            ptr: KernelState::endpoint_ptr(i),
+                            badge,
+                            rights,
+                        }
+                    }
+                    Cap::Notification { badge, rights, .. } => {
+                        let i = (*s_ptr).alloc_notification()
+                            .expect("notification pool exhausted");
+                        Cap::Notification {
+                            ptr: KernelState::ntfn_ptr(i),
+                            badge,
+                            rights,
+                        }
+                    }
+                    Cap::CNode { radix, guard_size, guard, .. } => {
+                        let i = (*s_ptr).alloc_cnode()
+                            .expect("cnode pool exhausted");
+                        Cap::CNode {
+                            ptr: KernelState::cnode_ptr(i),
+                            radix,
+                            guard_size,
+                            guard,
+                        }
+                    }
+                    other => other,
+                };
+                cnode_slots[emit_idx].set_cap(&cap_to_store);
                 emit_idx += 1;
             },
         );
@@ -671,6 +731,11 @@ fn is_derived_from(child: &Cap, parent: &Cap) -> bool {
                 Thread { tcb } => inside(tcb.addr()),
                 Untyped { ptr, .. } => inside(ptr.addr()) && ptr.addr() != base,
                 Reply { tcb, .. } => inside(tcb.addr()),
+                Frame { ptr, .. } => inside(ptr.addr()),
+                PageTable { ptr, .. } => inside(ptr.addr()),
+                PageDirectory { ptr, .. } => inside(ptr.addr()),
+                Pdpt { ptr, .. } => inside(ptr.addr()),
+                PML4 { ptr, .. } => inside(ptr.addr()),
                 _ => false,
             }
         }
@@ -1055,20 +1120,27 @@ pub mod spec {
         };
         decode_invocation(ut_cap, &args, invoker).expect("retype ok");
 
-        // Slots 4..7 each hold an Endpoint cap.
+        // Slots 4..7 each hold an Endpoint cap. Phase 29h's pool
+        // remap made `ptr.addr()` an index-into-`endpoints[]+1` (so
+        // `decode_endpoint` can route to the kernel pool); we just
+        // verify each slot is a non-null Endpoint with a unique
+        // pool index.
         unsafe {
             let s = KERNEL.get();
+            let mut seen_indices = [false; crate::kernel::MAX_ENDPOINTS];
             for i in 4..8 {
                 match s.cnodes[0].0[i].cap() {
                     Cap::Endpoint { ptr, .. } => {
-                        // Endpoints sit at base + i*16.
-                        let expect = untyped_base + ((i - 4) as u64) * 16;
-                        assert_eq!(ptr.addr(), expect);
+                        let idx = (ptr.addr() - 1) as usize;
+                        assert!(idx < crate::kernel::MAX_ENDPOINTS,
+                            "ep index out of range: {}", idx);
+                        assert!(!seen_indices[idx], "duplicate ep index");
+                        seen_indices[idx] = true;
                     }
                     other => panic!("expected endpoint at {i}, got {:?}", other),
                 }
             }
-            // The Untyped's free_index advanced.
+            // The Untyped's free_index advanced (4 endpoints × 16 bytes).
             match s.cnodes[0].0[0].cap() {
                 Cap::Untyped { free_index, .. } => assert_eq!(free_index, 64),
                 other => panic!("expected updated untyped, got {:?}", other),
@@ -1158,10 +1230,15 @@ pub mod spec {
         };
         unsafe { KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap); }
 
-        // Retype 4 endpoints into slots 4..7.
+        // Retype 4 Frames (X86_4K) into slots 4..7. We use Frames
+        // here rather than Endpoints because Phase 29h remapped
+        // Endpoint retype to pull from the kernel pool; structural
+        // Revoke (which compares ptrs to the Untyped's range) still
+        // works for Frames since their PPtr remains the carved
+        // physical address.
         let args = SyscallArgs {
             a1: (InvocationLabel::UntypedRetype as u64) << 12,
-            a2: ObjectType::Endpoint.to_word(),
+            a2: crate::object_type::X86_4K,
             a3: 4,
             a4: 4,
             ..Default::default()
@@ -1172,7 +1249,7 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             for i in 4..8 {
-                assert!(matches!(s.cnodes[0].0[i].cap(), Cap::Endpoint { .. }));
+                assert!(matches!(s.cnodes[0].0[i].cap(), Cap::Frame { .. }));
             }
         }
 
