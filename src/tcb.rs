@@ -162,6 +162,13 @@ pub struct Tcb {
     /// invocation that does cap lookup; defaults to `Cap::Null` for
     /// boot threads that haven't been wired up yet.
     pub cspace_root: crate::cap::Cap,
+    /// Saved user-mode register state for SYSCALL/SYSRET. The
+    /// arch-specific syscall dispatcher copies the in-flight
+    /// SYSCALL_SAVE area into here on entry and back out before
+    /// sysretq, so each thread's user state survives across
+    /// schedule() calls.
+    #[cfg(target_arch = "x86_64")]
+    pub user_context: crate::arch::x86_64::syscall_entry::UserContext,
 }
 
 impl Default for Tcb {
@@ -184,6 +191,9 @@ impl Default for Tcb {
             ipc_badge: 0,
             cpu_context: CpuContext { ksp: 0, cr3: 0 },
             cspace_root: crate::cap::Cap::Null,
+            #[cfg(target_arch = "x86_64")]
+            user_context:
+                crate::arch::x86_64::syscall_entry::UserContext::new_zero(),
         }
     }
 }

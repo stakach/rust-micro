@@ -158,13 +158,12 @@ fn _start() -> ! {
             }
         }
 
-        // Phase 13c — drop to ring 3 with a tiny user-mode payload
-        // that issues a single SysDebugPutChar and lets us observe
-        // the round-trip. This call never returns: on success the
-        // syscall dispatcher exits QEMU directly; on failure we'd
-        // hit the panic handler below.
+        // Phase 14d — two-thread IPC ping-pong. Spawns a sender +
+        // receiver, both ring-3, sharing an Endpoint cap. The
+        // dispatcher exits QEMU once it sees both threads complete
+        // their SysDebugPutChar invocations.
         #[cfg(target_arch = "x86_64")]
-        crate::arch::x86_64::usermode::launch_user_mode_test();
+        crate::arch::x86_64::usermode::launch_two_thread_ipc_demo();
 
         #[cfg(any(not(target_arch = "x86_64"), not(feature = "spec")))]
         loop {}
