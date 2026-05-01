@@ -74,6 +74,24 @@ What's already in the repo:
     BSP (every TCB gets affinity=0 from `Tcb::default`); APs
     remain in HLT until 28d/e wire them into the scheduler.
 
+- [x] 28f — Per-CPU SYSCALL_SAVE / KERNEL_RSP via swapgs. **DONE**
+  * `PerCpuSyscallArea { kernel_rsp, _pad, user_ctx }` —
+    `static mut PER_CPU_SYSCALL: [PerCpuSyscallArea; MAX_CPUS]`.
+  * `init_per_cpu_gs()` (called from `init_syscall_msrs`) sets
+    `IA32_KERNEL_GS_BASE` to the calling CPU's slot.
+  * The naked SYSCALL stub does `swapgs` first thing, addresses
+    saves/restores via `gs:[16 + reg_offset]` and the kernel
+    stack via `gs:[0]`, then `swapgs` before `sysretq`.
+  * `rust_syscall_dispatch` no longer takes a ctx pointer arg —
+    recovers its `&mut UserContext` via `current_cpu_user_ctx_mut()`
+    (= `&mut PER_CPU_SYSCALL[arch::get_cpu_id()].user_ctx`).
+  * `set_syscall_kernel_rsp(rsp)` updates the calling CPU's slot.
+  * Spec: `per_cpu_kernel_gs_base_set` — BSP's MSR points at its
+    own slot in the array.
+  * APs can now safely SYSCALL without corrupting BSP's save area;
+    Phase 28+ work can put threads on AP queues + actually
+    dispatch them.
+
 - [x] 28e — AP scheduler loop. **DONE**
   * `ap_main` now calls `ap_scheduler_loop` instead of
     `loop { halt_cpu }`. Each iteration takes the BKL, lets the

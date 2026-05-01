@@ -65,6 +65,12 @@ pub fn init_syscall_msrs() {
         // RFLAGS mask.
         wrmsr(IA32_FMASK, FMASK_VALUE);
     }
+
+    // Phase 28f — per-CPU `IA32_KERNEL_GS_BASE` so the SYSCALL
+    // stub's `swapgs` lands GS at the calling CPU's slot of
+    // `PER_CPU_SYSCALL`. Done here so every CPU's init path
+    // (BSP and AP) wires it up automatically.
+    init_per_cpu_gs();
 }
 
 /// Read-back accessors used by the spec.
@@ -138,25 +144,88 @@ impl UserContext {
     }
 }
 
-/// Single save area for the current syscall in flight. Phase 11c
-/// replaces this with a per-TCB context once threads exist.
-#[no_mangle]
-pub static mut SYSCALL_SAVE: UserContext = UserContext {
-    rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
-    r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-    rsp: 0,
+/// Per-CPU SYSCALL bookkeeping. Each CPU owns one of these slots
+/// and reaches it through `IA32_KERNEL_GS_BASE` after a `swapgs`.
+///
+/// Field layout matters — the naked syscall stub addresses fields
+/// by hard-coded offsets relative to `gs:[0]`, not by name:
+///   * offset  0 — `kernel_rsp`     (SYSCALL kernel stack pointer)
+///   * offset  8 — padding to keep `user_ctx` 16-byte aligned
+///   * offset 16 — `user_ctx`       (UserContext save area)
+///
+/// `self_ptr` is **not** stored here; the Rust dispatcher recovers
+/// the slot via `arch::get_cpu_id()`, and the asm stub addresses
+/// fields with constant offsets only.
+#[repr(C, align(16))]
+pub struct PerCpuSyscallArea {
+    pub kernel_rsp: u64,
+    _pad: u64,
+    pub user_ctx: UserContext,
+}
+
+const PER_CPU_INIT: PerCpuSyscallArea = PerCpuSyscallArea {
+    kernel_rsp: 0,
+    _pad: 0,
+    user_ctx: UserContext {
+        rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
+        r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+        rsp: 0,
+    },
 };
 
-/// Kernel-stack pointer the entry stub loads on SYSCALL. The Phase
-/// 11a TSS holds the same value for IRQ entries; this static is the
-/// SYSCALL-specific rsp because SYSCALL does not consult the TSS.
+/// Per-CPU syscall save areas. One slot per CPU; each CPU's
+/// `IA32_KERNEL_GS_BASE` MSR points at its own slot. The asm stub
+/// then uses GS-relative addressing to read/write its own slot,
+/// avoiding the cross-CPU race a single shared `SYSCALL_SAVE`
+/// would have under SMP.
 #[no_mangle]
-pub static mut SYSCALL_KERNEL_RSP: u64 = 0;
+pub static mut PER_CPU_SYSCALL: [PerCpuSyscallArea; crate::smp::MAX_CPUS] =
+    [PER_CPU_INIT; crate::smp::MAX_CPUS];
 
-/// Set the kernel rsp the SYSCALL entry will switch to.
+/// Set the kernel rsp the SYSCALL entry will switch to. Targets
+/// the calling CPU's per-CPU slot.
 pub fn set_syscall_kernel_rsp(rsp: u64) {
     unsafe {
-        SYSCALL_KERNEL_RSP = rsp;
+        let cpu = crate::arch::get_cpu_id() as usize;
+        PER_CPU_SYSCALL[cpu].kernel_rsp = rsp;
+    }
+}
+
+/// Get a pointer to the calling CPU's UserContext save area —
+/// used by the Rust dispatcher (the asm stub addresses it via
+/// gs-relative writes, not via this helper).
+pub fn current_cpu_user_ctx_mut() -> &'static mut UserContext {
+    unsafe {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        &mut PER_CPU_SYSCALL[cpu].user_ctx
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Field offsets the naked stub references. Keep these in sync with
+// `PerCpuSyscallArea` — `static_assertions` would catch drift but
+// we keep deps minimal.
+// ---------------------------------------------------------------------------
+
+/// Offset of `kernel_rsp` within `PerCpuSyscallArea` (gs-relative).
+const OFF_KSP: usize = 0;
+/// Offset of `user_ctx` within `PerCpuSyscallArea` (gs-relative).
+const OFF_CTX: usize = 16;
+
+/// Set the calling CPU's `IA32_KERNEL_GS_BASE` to its per-CPU slot.
+/// `swapgs` after SYSCALL entry then makes `gs:[0]` resolve to the
+/// kernel slot; on `swapgs` before sysretq the kernel value moves
+/// back into KERNEL_GS_BASE and `gs:` reverts to whatever the user
+/// had (we leave that 0).
+pub fn init_per_cpu_gs() {
+    unsafe {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        let base = (&raw mut PER_CPU_SYSCALL[cpu]) as u64;
+        wrmsr(IA32_KERNEL_GS_BASE, base);
+        // We never set the *active* GS_BASE — it stays 0 (or
+        // whatever user sets). swapgs swaps the two; SYSCALL entry
+        // does the swap so the kernel side runs with `gs` pointing
+        // at the per-CPU slot.
     }
 }
 
@@ -196,59 +265,74 @@ pub unsafe extern "C" fn enter_user_via_sysret(ctx: *const UserContext) -> ! {
 /// SYSCALL trap entry. Naked so we control every instruction —
 /// the compiler can't be allowed to add a prologue that would
 /// clobber rcx / r11 before we save them.
+///
+/// Phase 28f makes this SMP-safe: instead of a single global
+/// `SYSCALL_SAVE` static, every CPU has its own slot reachable
+/// via `gs:` after `swapgs` (which swaps the active `IA32_GS_BASE`
+/// with `IA32_KERNEL_GS_BASE`, the latter set per-CPU at init).
+/// All saves/restores below use `gs:[OFF_CTX + reg_offset]`.
+///
+/// Bytes: PerCpuSyscallArea layout is
+///   `kernel_rsp:8 | _pad:8 | user_ctx{rax..rsp}:16*8`,
+/// so OFF_KSP=0 and OFF_CTX=16. Field offsets within UserContext
+/// are the same as in the previous flat-static layout.
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
-        // Save the user GPRs into SYSCALL_SAVE. RIP-relative
-        // addressing because the kernel image is PIC-shaped.
-        "mov [rip + {save} + 0],   rax",
-        "mov [rip + {save} + 8],   rbx",
-        "mov [rip + {save} + 16],  rcx",
-        "mov [rip + {save} + 24],  rdx",
-        "mov [rip + {save} + 32],  rsi",
-        "mov [rip + {save} + 40],  rdi",
-        "mov [rip + {save} + 48],  rbp",
-        "mov [rip + {save} + 56],  r8",
-        "mov [rip + {save} + 64],  r9",
-        "mov [rip + {save} + 72],  r10",
-        "mov [rip + {save} + 80],  r11",
-        "mov [rip + {save} + 88],  r12",
-        "mov [rip + {save} + 96],  r13",
-        "mov [rip + {save} + 104], r14",
-        "mov [rip + {save} + 112], r15",
-        "mov [rip + {save} + 120], rsp",
+        // Switch to the kernel's per-CPU GS_BASE.
+        "swapgs",
 
-        // Switch to the kernel stack.
-        "mov rsp, [rip + {kstack}]",
+        // Save the user GPRs into the calling CPU's user_ctx
+        // (gs:[16 + reg_offset]).
+        "mov gs:[16 + 0],   rax",
+        "mov gs:[16 + 8],   rbx",
+        "mov gs:[16 + 16],  rcx",
+        "mov gs:[16 + 24],  rdx",
+        "mov gs:[16 + 32],  rsi",
+        "mov gs:[16 + 40],  rdi",
+        "mov gs:[16 + 48],  rbp",
+        "mov gs:[16 + 56],  r8",
+        "mov gs:[16 + 64],  r9",
+        "mov gs:[16 + 72],  r10",
+        "mov gs:[16 + 80],  r11",
+        "mov gs:[16 + 88],  r12",
+        "mov gs:[16 + 96],  r13",
+        "mov gs:[16 + 104], r14",
+        "mov gs:[16 + 112], r15",
+        "mov gs:[16 + 120], rsp",
+
+        // Switch to the kernel stack (gs:[0] = kernel_rsp).
+        "mov rsp, gs:[0]",
 
         // Call the Rust dispatcher. ABI:
         //   rdi = syscall number (we put rax there)
-        //   rsi = pointer to UserContext
-        "mov rdi, [rip + {save} + 0]",
-        "lea rsi, [rip + {save}]",
+        // The dispatcher recovers its UserContext via
+        // `arch::get_cpu_id()` indexing into `PER_CPU_SYSCALL`.
+        "mov rdi, gs:[16 + 0]",
         "call {handler}",
 
         // Restore user GPRs (rcx and r11 carry the SYSRET targets).
-        "mov rax, [rip + {save} + 0]",
-        "mov rbx, [rip + {save} + 8]",
-        "mov rcx, [rip + {save} + 16]",
-        "mov rdx, [rip + {save} + 24]",
-        "mov rsi, [rip + {save} + 32]",
-        "mov rdi, [rip + {save} + 40]",
-        "mov rbp, [rip + {save} + 48]",
-        "mov r8,  [rip + {save} + 56]",
-        "mov r9,  [rip + {save} + 64]",
-        "mov r10, [rip + {save} + 72]",
-        "mov r11, [rip + {save} + 80]",
-        "mov r12, [rip + {save} + 88]",
-        "mov r13, [rip + {save} + 96]",
-        "mov r14, [rip + {save} + 104]",
-        "mov r15, [rip + {save} + 112]",
-        "mov rsp, [rip + {save} + 120]",
+        "mov rax, gs:[16 + 0]",
+        "mov rbx, gs:[16 + 8]",
+        "mov rcx, gs:[16 + 16]",
+        "mov rdx, gs:[16 + 24]",
+        "mov rsi, gs:[16 + 32]",
+        "mov rdi, gs:[16 + 40]",
+        "mov rbp, gs:[16 + 48]",
+        "mov r8,  gs:[16 + 56]",
+        "mov r9,  gs:[16 + 64]",
+        "mov r10, gs:[16 + 72]",
+        "mov r11, gs:[16 + 80]",
+        "mov r12, gs:[16 + 88]",
+        "mov r13, gs:[16 + 96]",
+        "mov r14, gs:[16 + 104]",
+        "mov r15, gs:[16 + 112]",
+        "mov rsp, gs:[16 + 120]",
+
+        // Swap GS_BASE back to the user value before sysretq.
+        "swapgs",
         "sysretq",
-        save = sym SYSCALL_SAVE,
-        kstack = sym SYSCALL_KERNEL_RSP,
         handler = sym rust_syscall_dispatch,
     );
 }
@@ -261,19 +345,24 @@ pub unsafe extern "C" fn syscall_entry() {
 /// Public so specs (and a future user-mode integration test) can
 /// invoke the same path the trap entry calls.
 #[no_mangle]
-pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
+pub extern "C" fn rust_syscall_dispatch(number: u64) {
     use crate::arch;
     use crate::syscall_handler::{handle_syscall, DebugSink, SyscallArgs};
     use crate::syscalls::Syscall;
 
     // Phase 28b — Big Kernel Lock. Hold across all kernel-state
     // mutations + the next-thread pick. Released after we've
-    // committed the next thread's user_context back to the save
-    // area; the asm stub's sysretq tail only reads (from
-    // SYSCALL_SAVE) after that, and that read is single-CPU since
-    // SYSCALL_SAVE is only touched by this CPU's syscall path.
+    // committed the next thread's user_context back to the per-CPU
+    // save area; the asm stub's sysretq tail only reads from that
+    // save area after that, and the read is single-CPU since each
+    // CPU has its own slot indexed via gs:.
     crate::smp::bkl_acquire();
     let _bkl = BklGuard;
+
+    // Phase 28f — recover the calling CPU's UserContext from the
+    // per-CPU array. The asm stub wrote it via `gs:[16 + ...]`;
+    // we look it up by APIC ID here.
+    let ctx: &mut UserContext = current_cpu_user_ctx_mut();
 
     struct SerialSink;
     impl DebugSink for SerialSink {
@@ -455,9 +544,26 @@ pub mod spec {
         star_kernel_user_pair();
         lstar_points_at_entry();
         fmask_clears_interrupt_flag();
+        per_cpu_kernel_gs_base_set();
         dispatcher_emits_byte_for_sys_debug_put_char();
         dispatcher_signals_unknown_via_max_rax();
         arch::log("SYSCALL MSR tests completed\n");
+    }
+
+    /// Phase 28f — `IA32_KERNEL_GS_BASE` on this CPU should point
+    /// at this CPU's slot in `PER_CPU_SYSCALL`. After SYSCALL+swapgs
+    /// the kernel addresses its slot via `gs:[...]`.
+    #[inline(never)]
+    fn per_cpu_kernel_gs_base_set() {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        let expected =
+            unsafe { (&raw const super::PER_CPU_SYSCALL[cpu]) as u64 };
+        let actual = unsafe {
+            super::rdmsr(super::IA32_KERNEL_GS_BASE)
+        };
+        assert_eq!(actual, expected,
+            "BSP's IA32_KERNEL_GS_BASE should point at its PER_CPU_SYSCALL slot");
+        arch::log("  ✓ IA32_KERNEL_GS_BASE points at this CPU's slot\n");
     }
 
     #[inline(never)]
@@ -503,24 +609,28 @@ pub mod spec {
     #[inline(never)]
     pub fn dispatcher_emits_byte_for_sys_debug_put_char() {
         // SysDebugPutChar = -9. ABI: rdi = arg0 (the byte).
-        let mut ctx = UserContext::default();
+        // Phase 28f — the dispatcher reads its UserContext from the
+        // calling CPU's `PER_CPU_SYSCALL` slot, so we plant the
+        // synthetic context there before invoking it.
+        let ctx = super::current_cpu_user_ctx_mut();
+        *ctx = UserContext::default();
         ctx.rdi = b'!' as u64;
-        // Pre-flight rax sentinel; the dispatcher writes the
-        // syscall result back here.
         ctx.rax = 0xDEAD_BEEF;
 
-        super::rust_syscall_dispatch(-9i64 as u64, &mut ctx);
+        super::rust_syscall_dispatch(-9i64 as u64);
 
-        // Successful syscall stamps rax = 0.
+        let ctx = super::current_cpu_user_ctx_mut();
         assert_eq!(ctx.rax, 0, "dispatcher should set rax=0 on success");
         arch::log("  ✓ rust_syscall_dispatch handles SysDebugPutChar\n");
     }
 
     #[inline(never)]
     pub fn dispatcher_signals_unknown_via_max_rax() {
-        let mut ctx = UserContext::default();
+        let ctx = super::current_cpu_user_ctx_mut();
+        *ctx = UserContext::default();
         ctx.rax = 0;
-        super::rust_syscall_dispatch(99u64, &mut ctx);
+        super::rust_syscall_dispatch(99u64);
+        let ctx = super::current_cpu_user_ctx_mut();
         assert_eq!(ctx.rax, u64::MAX, "unknown syscall returns -1");
         arch::log("  ✓ rust_syscall_dispatch flags unknown syscalls\n");
     }
