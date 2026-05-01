@@ -158,6 +158,10 @@ pub struct Tcb {
     pub ipc_badge: Word,
     /// Architecture context for context-switching.
     pub cpu_context: CpuContext,
+    /// Root of this thread's CSpace. Must be `Cap::CNode` for any
+    /// invocation that does cap lookup; defaults to `Cap::Null` for
+    /// boot threads that haven't been wired up yet.
+    pub cspace_root: crate::cap::Cap,
 }
 
 impl Default for Tcb {
@@ -179,6 +183,7 @@ impl Default for Tcb {
             msg_regs: [0; SCRATCH_MSG_LEN],
             ipc_badge: 0,
             cpu_context: CpuContext { ksp: 0, cr3: 0 },
+            cspace_root: crate::cap::Cap::Null,
         }
     }
 }

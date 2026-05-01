@@ -15,16 +15,93 @@
 
 use core::cell::UnsafeCell;
 
+use crate::cap::{Cap, CNodeStorage, EndpointObj, PPtr};
+use crate::cspace::CSpace;
+use crate::cte::Cte;
+use crate::endpoint::Endpoint;
 use crate::scheduler::Scheduler;
 use crate::tcb::{Tcb, TcbId, ThreadStateType};
 
+/// Maximum endpoints in the in-kernel pool. Production seL4
+/// allocates them via Untyped retype with no fixed cap; the slab
+/// is just a convenience until we wire that path.
+pub const MAX_ENDPOINTS: usize = 16;
+
+/// CTEs per pre-allocated CNode in the in-kernel pool.
+pub const CNODE_RADIX: u8 = 5;
+pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
+
+/// Maximum pre-allocated CNodes.
+pub const MAX_CNODES: usize = 4;
+
+/// One pre-allocated CNode: 32 slots × 32 bytes = 1 KiB.
+#[repr(C, align(32))]
+pub struct CNodePage(pub [Cte; CNODE_SLOTS]);
+
+impl Default for CNodePage {
+    fn default() -> Self { Self([Cte::null(); CNODE_SLOTS]) }
+}
+
 pub struct KernelState {
     pub scheduler: Scheduler,
+    /// In-kernel endpoint pool. Entry `i` is reachable through a
+    /// `Cap::Endpoint { ptr, .. }` whose `ptr.addr() == i + 1`.
+    /// (We use 1-based indexing so PPtr's NonZeroU64 invariant
+    /// holds.)
+    pub endpoints: [Endpoint; MAX_ENDPOINTS],
+    /// Pre-allocated CNode pool. Same 1-based indexing convention
+    /// for `Cap::CNode { ptr, .. }`.
+    pub cnodes: [CNodePage; MAX_CNODES],
 }
 
 impl KernelState {
     pub const fn new() -> Self {
-        Self { scheduler: Scheduler::new() }
+        const EMPTY_EP: Endpoint = Endpoint::new();
+        const EMPTY_CN: CNodePage = CNodePage([Cte::null(); CNODE_SLOTS]);
+        Self {
+            scheduler: Scheduler::new(),
+            endpoints: [EMPTY_EP; MAX_ENDPOINTS],
+            cnodes: [EMPTY_CN; MAX_CNODES],
+        }
+    }
+
+    /// Build the `PPtr<EndpointObj>` for endpoint slot `i`. The
+    /// 1-based indexing keeps the address NonZero so it fits in a
+    /// PPtr.
+    pub fn endpoint_ptr(i: usize) -> PPtr<EndpointObj> {
+        PPtr::<EndpointObj>::new(i as u64 + 1).expect("non-zero")
+    }
+    pub fn endpoint_index(p: PPtr<EndpointObj>) -> usize {
+        (p.addr() - 1) as usize
+    }
+
+    pub fn cnode_ptr(i: usize) -> PPtr<CNodeStorage> {
+        PPtr::<CNodeStorage>::new(i as u64 + 1).expect("non-zero")
+    }
+    pub fn cnode_index(p: PPtr<CNodeStorage>) -> usize {
+        (p.addr() - 1) as usize
+    }
+
+    /// Resolve an endpoint cap to the live `Endpoint` object.
+    pub fn endpoint_for_cap(&mut self, cap: &Cap) -> Option<(PPtr<EndpointObj>, &mut Endpoint)> {
+        match cap {
+            Cap::Endpoint { ptr, .. } => {
+                let idx = Self::endpoint_index(*ptr);
+                self.endpoints.get_mut(idx).map(|e| (*ptr, e))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl CSpace for KernelState {
+    fn cnode_at(&self, ptr: PPtr<CNodeStorage>, count: usize) -> Option<&[Cte]> {
+        let idx = Self::cnode_index(ptr);
+        let page = self.cnodes.get(idx)?;
+        let slots = &page.0;
+        // Caller may ask for fewer than CNODE_SLOTS — lookup_cap
+        // bounds the slice on `slot_count = 1 << radix`.
+        Some(&slots[..count.min(slots.len())])
     }
 }
 
