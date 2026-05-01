@@ -75,7 +75,21 @@ What's already in place:
     TCBSetSpace 10 → 11 and TCBResume 12 → 13. Rootserver's
     hardcoded label constants updated to match.
 
-- [ ] 32d — refill_charge ↔ PIT tick.
+- [x] 32d — Cap::SchedControl + ConfigureFlags. **DONE**
+  * Tag 24 promoted to `Cap::SchedControl { core: u32 }` typed
+    variant. Round-trip via the generated `SchedControlCap`.
+  * `decode_sched_control` handles
+    `SchedControlConfigureFlags(target_sc, budget, period)` —
+    looks up the SC cap in invoker's CSpace, rejects budget=0
+    or budget>period with `RangeError`, then resets the SC to a
+    fresh `(period, budget)` schedule with one ready refill at
+    release_time=0.
+  * Spec: `sched_control_configure_sets_period_budget` retypes
+    an SC, plants a SchedControl cap, invokes Configure, asserts
+    the SC's fields + ready refill, and confirms budget>period
+    is rejected.
+
+- [ ] 32e — refill_charge ↔ PIT tick.
   * Wire `pit_isr` (under `cfg(feature = "mcs")`) to call
     `refill_charge(tcb.sc, ticks_elapsed)` instead of the
     classic `time_slice -= 1`.

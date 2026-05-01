@@ -22,7 +22,7 @@ use crate::structures::arch::{
     AsidControlCap, AsidPoolCap, FrameCap, PageDirectoryCap, PageTableCap, PdptCap,
     Pml4Cap,
 };
-use crate::structures::SchedContextCap;
+use crate::structures::{SchedContextCap, SchedControlCap};
 use crate::types::seL4_Word as Word;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
@@ -52,6 +52,7 @@ pub mod tag {
     pub const ZOMBIE: u64 = 18;
     pub const DOMAIN: u64 = 20;
     pub const SCHED_CONTEXT: u64 = 22;
+    pub const SCHED_CONTROL: u64 = 24;
 
     // Arch (odd) tags — x86_64 specific subset we decode today.
     pub const FRAME: u64 = 1;
@@ -350,6 +351,13 @@ pub enum Cap {
         ptr: PPtr<SchedContextStorage>,
         size_bits: u8,
     },
+    /// Phase 32d — per-CPU `SchedControl` cap (tag 24). Holding it
+    /// permits `SchedControlConfigureFlags` invocations that set
+    /// the period / budget on a target SchedContext. `core` names
+    /// which CPU's SchedControl this is.
+    SchedControl {
+        core: u32,
+    },
     /// Any other arch-tagged cap (page tables, ASID pool, etc.).
     /// Stored as the raw two-word encoding; full decoding for the
     /// remaining cap types lands in later phases.
@@ -566,6 +574,10 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 size_bits: c.capSCSizeBits() as u8,
             }
         }
+        tag::SCHED_CONTROL => {
+            let c = SchedControlCap { words };
+            Cap::SchedControl { core: c.core() as u32 }
+        }
         t if tag::is_arch(t) => Cap::Arch { cap_type: t, words },
         _ => Cap::Null,
     }
@@ -714,6 +726,9 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             )
             .words
         }
+        Cap::SchedControl { core } => {
+            SchedControlCap::new(*core as u64, tag::SCHED_CONTROL).words
+        }
         Cap::Frame { ptr, size, rights, mapped, asid, is_device } => {
             // Visible field order (no explicit_params on frame_cap):
             //   capFMappedASID, capFBasePtr, capType, capFSize,
@@ -782,6 +797,7 @@ pub mod spec {
         roundtrip_paging_structs();
         roundtrip_asid_caps();
         roundtrip_sched_context_cap();
+        roundtrip_sched_control_cap();
         type_tag_dispatch();
 
         arch::log("Cap round-trip tests completed\n");
@@ -853,6 +869,17 @@ pub mod spec {
         assert_eq!(cap_type_of(words), tag::SCHED_CONTEXT);
         assert_eq!(from_words(words), sc);
         arch::log("  ✓ SchedContext cap round-trips\n");
+    }
+
+    fn roundtrip_sched_control_cap() {
+        let sc = Cap::SchedControl { core: 0 };
+        let words = to_words(&sc);
+        assert_eq!(cap_type_of(words), tag::SCHED_CONTROL);
+        assert_eq!(from_words(words), sc);
+        let sc2 = Cap::SchedControl { core: 3 };
+        let words = to_words(&sc2);
+        assert_eq!(from_words(words), sc2);
+        arch::log("  ✓ SchedControl cap round-trips\n");
     }
 
     fn roundtrip_asid_caps() {

@@ -53,6 +53,7 @@ pub fn decode_invocation(
         Cap::AsidControl => decode_asid_control(label, args, invoker),
         Cap::AsidPool { .. } => decode_asid_pool(target, label, args, invoker),
         Cap::SchedContext { .. } => decode_sched_context(target, label, args, invoker),
+        Cap::SchedControl { .. } => decode_sched_control(label, args, invoker),
         Cap::Null => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidCapability,
         ))),
@@ -621,6 +622,72 @@ fn decode_sched_context(
                     s.scheduler.slab.get_mut(tcb_id).sc = None;
                     s.sched_contexts[sc_id as usize].bound_tcb = None;
                 }
+            }
+            Ok(())
+        }
+        _ => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 32d — SchedControl invocations.
+//
+// `SchedControlConfigureFlags(target_sc, budget, period, extra_refills, badge, flags)`
+// programs the named SchedContext's refill schedule. seL4's
+// signature ABI:
+//   a2 = budget    (ticks)
+//   a3 = period    (ticks)
+//   a4 = extra_refills (count, currently unused — we keep
+//        MAX_REFILLS fixed)
+//   a5 = badge / flags (we ignore for now)
+//   a0 = target SC cap_ptr (the rest go via SyscallArgs above).
+//
+// The kernel resets the SC's refill schedule to a single
+// pending-refill record (release_time=0, amount=budget); seL4's
+// real implementation builds a queue of replenishments. Our
+// simple version is sufficient for Phase 32e's mixed-criticality
+// demo.
+// ---------------------------------------------------------------------------
+
+fn decode_sched_control(
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    match label {
+        InvocationLabel::SchedControlConfigureFlags => {
+            let target_cptr = args.a0;
+            let budget = args.a2;
+            let period = args.a3;
+            // a4 (extra refills) and a5 (flags) ignored for now.
+
+            unsafe {
+                let s = KERNEL.get();
+                let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                let target = crate::cspace::lookup_cap(s, &invoker_cspace, target_cptr)?;
+                let sc_idx = match target {
+                    Cap::SchedContext { ptr, .. } => {
+                        KernelState::sched_context_index(ptr)
+                    }
+                    _ => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability))),
+                };
+                if budget == 0 || period == 0 || budget > period {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_RangeError)));
+                }
+                let sc = &mut s.sched_contexts[sc_idx];
+                *sc = crate::sched_context::SchedContext::new(period, budget);
+                // Seed one ready refill so a freshly-configured SC
+                // can be charged immediately.
+                sc.refills[0] = crate::sched_context::Refill {
+                    release_time: 0,
+                    amount: budget,
+                };
+                sc.head = 0;
+                sc.count = 1;
             }
             Ok(())
         }
@@ -1311,6 +1378,7 @@ pub mod spec {
         tcb_set_space_pml4_pins_cr3();
         asid_control_make_pool_then_assign();
         sched_context_bind_unbind();
+        sched_control_configure_sets_period_budget();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
     }
@@ -2245,6 +2313,86 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ SchedContextBind / Unbind\n");
+    }
+
+    /// Phase 32d — SchedControl::Configure programs an SC's
+    /// period+budget. We retype an SC, plant a SchedControl cap
+    /// in slot 9, then invoke Configure to set period=100 ms,
+    /// budget=20 ms; the SC's fields should reflect the values
+    /// and a single ready refill should be queued.
+    #[inline(never)]
+    fn sched_control_configure_sets_period_budget() {
+        use crate::cap::UntypedStorage;
+
+        let invoker = setup_invoker(0);
+
+        // Plant Untyped at slot 0 + retype to SchedContext at slot 7.
+        unsafe {
+            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&Cap::Untyped {
+                ptr: PPtr::<UntypedStorage>::new(0x0070_0000).unwrap(),
+                block_bits: 14,
+                free_index: 0,
+                is_device: false,
+            });
+        }
+        let ut_cap = unsafe { KERNEL.get().cnodes[0].0[0].cap() };
+        let args = SyscallArgs {
+            a1: (InvocationLabel::UntypedRetype as u64) << 12,
+            a2: crate::object_type::ObjectType::SchedContext.to_word(),
+            a3: ((crate::object_type::MIN_SCHED_CONTEXT_BITS as u64) << 32) | 1,
+            a4: 7,
+            ..Default::default()
+        };
+        decode_invocation(ut_cap, &args, invoker).expect("retype SC");
+
+        // Plant a SchedControl singleton cap at slot 9.
+        unsafe {
+            KERNEL.get().cnodes[0].0[9] =
+                Cte::with_cap(&Cap::SchedControl { core: 0 });
+        }
+        let sched_control = Cap::SchedControl { core: 0 };
+
+        // Invoke Configure(target=slot 7, budget=20, period=100).
+        let args = SyscallArgs {
+            a0: 7, // target SC cap_ptr
+            a1: (InvocationLabel::SchedControlConfigureFlags as u64) << 12,
+            a2: 20,  // budget
+            a3: 100, // period
+            ..Default::default()
+        };
+        decode_invocation(sched_control, &args, invoker).expect("configure ok");
+
+        // Verify the SC got reprogrammed.
+        let sc_idx = match unsafe { KERNEL.get().cnodes[0].0[7].cap() } {
+            Cap::SchedContext { ptr, .. } => {
+                KernelState::sched_context_index(ptr)
+            }
+            _ => panic!("expected SchedContext at slot 7"),
+        };
+        unsafe {
+            let sc = &KERNEL.get().sched_contexts[sc_idx];
+            assert_eq!(sc.budget, 20);
+            assert_eq!(sc.period, 100);
+            assert_eq!(sc.count, 1, "should have one ready refill");
+            assert_eq!(sc.refills[0].amount, 20);
+            assert_eq!(sc.refills[0].release_time, 0);
+        }
+
+        // budget > period is rejected as RangeError.
+        let args = SyscallArgs {
+            a0: 7,
+            a1: (InvocationLabel::SchedControlConfigureFlags as u64) << 12,
+            a2: 200, // budget
+            a3: 100, // period
+            ..Default::default()
+        };
+        let r = decode_invocation(sched_control, &args, invoker);
+        assert!(matches!(r,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_RangeError }))));
+
+        teardown_invoker(invoker);
+        arch::log("  ✓ SchedControl::ConfigureFlags sets period/budget\n");
     }
 
     #[inline(never)]
