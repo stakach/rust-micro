@@ -1,52 +1,52 @@
-# Active phase plan — Phase 19: Frame::Map + arch caps
+# Active phase plan — Phase 20: TCB invocations
 
 ## Goal
-Make x86 Frame caps first-class — typed `Cap::Frame` variant with
-`Map` / `Unmap` / `GetAddress` invocations. Once this lands,
-userspace can allocate a page from an Untyped, map it at a chosen
-vaddr, and access the memory.
-
-`PageTable` / `PageDirectory` / `PDPT` are deferred — Phase 13b's
-page-table installer auto-allocates intermediate tables on demand,
-so we don't need explicit cap-chain installs to demo Frame::Map.
-ASID management (`AsidPool::Assign`, `AsidControl::MakePool`) is
-also deferred — we use a single shared ASID for now.
-
-## Plan
-
-- [x] 19a — Extend `Cap` enum with `Frame { ptr, size, rights,
-  mapped, asid, is_device }` variant. `from_words` / `to_words`
-  via the generated `FrameCap` bitfield.
-- [x] 19b — `make_object_cap` for `ObjectType::Arch(frame_size)`
-  (so Untyped::Retype can produce Frame caps).
-- [x] 19c — `decode_invocation` for `Cap::Frame`: X86PageMap,
-  X86PageUnmap, X86PageGetAddress.
-- [x] 19d — Specs: round-trip Frame cap (mapped + unmapped),
-  Map verifies PTE via `live_virt_to_phys`, double-Map is
-  DeleteFirst, Unmap clears the cap.
+Round out the TCB cap so userspace can fully configure new threads
+without the kernel hand-crafting them. Adds:
+* `TCB::WriteRegisters` — set the thread's saved RIP/RSP and a few
+  arg regs.
+* `TCB::ReadRegisters` — fan the thread's saved registers back to
+  the caller via `msg_regs`.
+* `TCB::SetSpace` — set the thread's CSpace root + VSpace root +
+  fault-EP cap.
+* `TCB::BindNotification` — bind a Notification cap to the TCB
+  (signal-on-fault later).
 
 ## ABI notes
-- Invocation labels:
-  - X86PageMap = (decoded by codegen — appears in `InvocationLabel`)
-  - X86PageUnmap
-  - X86PageGetAddress
-- Map ABI (compressed): a2 = vaddr, a3 = rights bits, a4 = unused
-- GetAddress ABI: returns paddr in the result; we stuff it into
-  the caller's tcb.msg_regs[0] so user can read after sysret.
+`SyscallArgs` is 6 words, so we have to pack carefully. seL4's full
+ABI uses the IPC buffer for overflow; we don't have user IPC
+buffers wired yet, so the invocation handlers below take the most
+useful subset.
+
+* `WriteRegisters(rip, rsp, arg0)`: a2 = rip, a3 = rsp, a4 = arg0.
+* `ReadRegisters(suspend_source)`: a2 ignored. Writes msg_regs[0]
+  = rip, msg_regs[1] = rsp, msg_regs[2] = rax. ipc_length = 3.
+* `SetSpace(fault_ep_cptr, cnode_cptr, vspace_cptr)`: a2..a4.
+  fault_ep_cptr can be 0 to mean "no fault handler". vspace
+  isn't fully wired (single shared address space), so we just
+  store the cap as opaque for now.
+* `BindNotification(ntfn_cptr)`: a2 = cptr to a Notification cap;
+  installs it as the TCB's bound notification.
+
+## Plan
+- [x] 20a — TCB::WriteRegisters / ReadRegisters
+- [x] 20b — TCB::SetSpace (cspace_root + vspace_root + fault_ep)
+- [x] 20c — TCB::BindNotification (+ Unbind)
+- [x] 20d — specs for each
 
 ## Verification
-1. Build clean.
-2. New invocation specs pass.
-3. Existing 124 ✓ specs unchanged.
-4. User-mode IPC demo (`PM`) still works.
+* All previous specs pass.
+* New TCB invocation specs verify:
+  - WriteRegisters updates target.user_context.rcx/rsp/rdi
+  - ReadRegisters fans target's saved state into invoker's
+    msg_regs
+  - SetSpace updates target's cspace_root + records fault_ep
+  - BindNotification stamps target.bound_notification
 
 ## Review
 
-* All 4 sub-tasks complete. 8 invocation specs now pass (was 7).
-* End-to-end Frame::Map verified by walking the live page tables
-  with `paging::live_virt_to_phys` — proves the cap-shaped
-  invocation actually installed the right PTE.
-* Phase 13c arch round-trip spec needed a tweak: it relied on
-  tag=1 falling through to `Cap::Arch`, but tag=1 is now Frame.
-  Switched the test to tag=3 (page_table — still un-typed).
-* User-mode IPC demo unchanged — 124 → 126 ✓ specs.
+* All 4 sub-tasks complete; 2 new specs (10 invocation total).
+* Tcb gained `vspace_root: Cap` (opaque storage; per-thread CR3
+  lands when ASID does) and `bound_notification: Option<u16>`.
+* Existing `fault_handler: Word` reused for SetSpace's fault EP.
+* User-mode IPC demo unchanged; spec count 126 → 128.

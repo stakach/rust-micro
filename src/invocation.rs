@@ -605,7 +605,7 @@ fn decode_tcb(
     target: Cap,
     label: InvocationLabel,
     args: &SyscallArgs,
-    _invoker: TcbId,
+    invoker: TcbId,
 ) -> KResult<()> {
     let tcb_ptr = match target {
         Cap::Thread { tcb } => tcb,
@@ -629,6 +629,86 @@ fn decode_tcb(
             InvocationLabel::TCBSetPriority => {
                 let prio = args.a2 as u8;
                 s.scheduler.slab.get_mut(id).priority = prio;
+                Ok(())
+            }
+            InvocationLabel::TCBWriteRegisters => {
+                // a2 = rip, a3 = rsp, a4 = arg0 (rdi).
+                let t = s.scheduler.slab.get_mut(id);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    t.user_context.rcx = args.a2;
+                    t.user_context.rsp = args.a3;
+                    t.user_context.rdi = args.a4;
+                    // Default user RFLAGS — IF=1, bit 1 reserved=1.
+                    t.user_context.r11 = 0x202;
+                }
+                Ok(())
+            }
+            InvocationLabel::TCBReadRegisters => {
+                // Fan target's saved regs into invoker's msg_regs
+                // so the syscall return path delivers them.
+                let target_state = {
+                    let t = s.scheduler.slab.get(id);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        (t.user_context.rcx, t.user_context.rsp, t.user_context.rax)
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    { (0u64, 0u64, 0u64) }
+                };
+                let inv = s.scheduler.slab.get_mut(invoker);
+                inv.msg_regs[0] = target_state.0;
+                inv.msg_regs[1] = target_state.1;
+                inv.msg_regs[2] = target_state.2;
+                inv.ipc_length = 3;
+                Ok(())
+            }
+            InvocationLabel::TCBSetSpace => {
+                // a2 = fault_ep_cptr, a3 = cnode_cptr, a4 = vspace_cptr.
+                // Look up cnode and vspace caps in invoker's CSpace.
+                let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                let cnode_cap = if args.a3 != 0 {
+                    Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
+                } else { None };
+                let vspace_cap = if args.a4 != 0 {
+                    Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
+                } else { None };
+                let t = s.scheduler.slab.get_mut(id);
+                t.fault_handler = args.a2;
+                if let Some(c) = cnode_cap {
+                    if !matches!(c, Cap::CNode { .. }) {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    t.cspace_root = c;
+                }
+                if let Some(c) = vspace_cap {
+                    t.vspace_root = c;
+                }
+                Ok(())
+            }
+            InvocationLabel::TCBBindNotification => {
+                // a2 = ntfn_cptr.
+                let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                let ntfn_cap = crate::cspace::lookup_cap(s, &inv_cspace, args.a2)?;
+                let ntfn_idx = match ntfn_cap {
+                    Cap::Notification { ptr, .. } => {
+                        KernelState::ntfn_index(ptr) as u16
+                    }
+                    _ => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability))),
+                };
+                // Refuse double-bind (matches seL4's behaviour).
+                let t = s.scheduler.slab.get_mut(id);
+                if t.bound_notification.is_some() {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_DeleteFirst)));
+                }
+                t.bound_notification = Some(ntfn_idx);
+                Ok(())
+            }
+            InvocationLabel::TCBUnbindNotification => {
+                s.scheduler.slab.get_mut(id).bound_notification = None;
                 Ok(())
             }
             _ => Err(KException::SyscallError(SyscallError::new(
@@ -657,6 +737,8 @@ pub mod spec {
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
         frame_map_unmap_get_address();
+        tcb_write_read_registers();
+        tcb_set_space_and_bind_notification();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
     }
@@ -1047,6 +1129,140 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Frame::Map / Unmap / GetAddress round-trip\n");
+    }
+
+    #[inline(never)]
+    fn tcb_write_read_registers() {
+        let invoker = setup_invoker(0);
+        // Allocate a target TCB to manipulate.
+        let target = unsafe {
+            let mut t = crate::tcb::Tcb::default();
+            t.priority = 100;
+            KERNEL.get().scheduler.admit(t)
+        };
+        let target_cap = Cap::Thread {
+            tcb: crate::cap::PPtr::<crate::cap::Tcb>::new(target.0 as u64).unwrap(),
+        };
+
+        // WriteRegisters: rip = 0xCAFE_F00D, rsp = 0x100_4000, arg0 = 7.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBWriteRegisters as u64) << 12,
+            a2: 0xCAFE_F00D,
+            a3: 0x0010_4000,
+            a4: 7,
+            ..Default::default()
+        };
+        decode_invocation(target_cap, &args, invoker).expect("write regs");
+        unsafe {
+            let s = KERNEL.get();
+            let t = s.scheduler.slab.get(target);
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert_eq!(t.user_context.rcx, 0xCAFE_F00D);
+                assert_eq!(t.user_context.rsp, 0x0010_4000);
+                assert_eq!(t.user_context.rdi, 7);
+            }
+        }
+
+        // ReadRegisters: target's saved regs go into invoker's
+        // msg_regs.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBReadRegisters as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(target_cap, &args, invoker).expect("read regs");
+        unsafe {
+            let s = KERNEL.get();
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(inv.msg_regs[0], 0xCAFE_F00D);
+            assert_eq!(inv.msg_regs[1], 0x0010_4000);
+            assert_eq!(inv.ipc_length, 3);
+            s.scheduler.slab.free(target);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ TCB::Write/ReadRegisters round-trip\n");
+    }
+
+    #[inline(never)]
+    fn tcb_set_space_and_bind_notification() {
+        let invoker = setup_invoker(0);
+        let target = unsafe {
+            let t = crate::tcb::Tcb::default();
+            KERNEL.get().scheduler.admit(t)
+        };
+        let target_cap = Cap::Thread {
+            tcb: crate::cap::PPtr::<crate::cap::Tcb>::new(target.0 as u64).unwrap(),
+        };
+
+        // Plant caps in invoker's CSpace:
+        //   slot 1: a CNode cap (target's new cspace_root)
+        //   slot 2: a Notification cap (for BindNotification)
+        unsafe {
+            let s = KERNEL.get();
+            // Use cnode index 1 as the *target's* cspace_root.
+            let new_cnode_cap = Cap::CNode {
+                ptr: KernelState::cnode_ptr(1),
+                radix: 5, guard_size: 59, guard: 0,
+            };
+            s.cnodes[0].0[1] = Cte::with_cap(&new_cnode_cap);
+            s.cnodes[0].0[2] = Cte::with_cap(&Cap::Notification {
+                ptr: KernelState::ntfn_ptr(5),
+                badge: crate::cap::Badge(0),
+                rights: crate::cap::NotificationRights {
+                    can_send: true, can_receive: true,
+                },
+            });
+        }
+
+        // SetSpace(fault_ep=0, cnode_cptr=1, vspace_cptr=0)
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBSetSpace as u64) << 12,
+            a2: 0,
+            a3: 1,
+            a4: 0,
+            ..Default::default()
+        };
+        decode_invocation(target_cap, &args, invoker).expect("set space");
+        unsafe {
+            let t = KERNEL.get().scheduler.slab.get(target);
+            match t.cspace_root {
+                Cap::CNode { ptr, .. } if ptr == KernelState::cnode_ptr(1) => {}
+                other => panic!("expected new cspace, got {:?}", other),
+            }
+        }
+
+        // BindNotification(ntfn_cptr=2)
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBBindNotification as u64) << 12,
+            a2: 2,
+            ..Default::default()
+        };
+        decode_invocation(target_cap, &args, invoker).expect("bind ntfn");
+        unsafe {
+            let t = KERNEL.get().scheduler.slab.get(target);
+            assert_eq!(t.bound_notification, Some(5));
+        }
+
+        // Double-bind rejected.
+        let r = decode_invocation(target_cap, &args, invoker);
+        assert!(matches!(r,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_DeleteFirst })))
+        );
+
+        // Unbind clears the slot.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBUnbindNotification as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(target_cap, &args, invoker).expect("unbind");
+        unsafe {
+            let t = KERNEL.get().scheduler.slab.get(target);
+            assert_eq!(t.bound_notification, None);
+            KERNEL.get().scheduler.slab.free(target);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ TCB::SetSpace + Bind/UnbindNotification\n");
     }
 
     #[inline(never)]

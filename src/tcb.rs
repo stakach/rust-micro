@@ -176,6 +176,15 @@ pub struct Tcb {
     /// we keep it as a direct TcbId to skip the cap-derivation
     /// dance (added later in Phase 17).
     pub reply_to: Option<TcbId>,
+    /// Phase 20 — VSpace root cap (set via TCB::SetSpace).
+    /// Currently opaque (stored but not consulted) since we run
+    /// every thread in the shared kernel page tables; per-thread
+    /// CR3 lands when ASID management does.
+    pub vspace_root: crate::cap::Cap,
+    /// Phase 20 — bound notification slot index (within the
+    /// kernel notification pool). `None` if not bound.
+    /// (`fault_handler` cptr already exists above.)
+    pub bound_notification: Option<u16>,
 }
 
 impl Default for Tcb {
@@ -202,6 +211,8 @@ impl Default for Tcb {
             user_context:
                 crate::arch::x86_64::syscall_entry::UserContext::new_zero(),
             reply_to: None,
+            vspace_root: crate::cap::Cap::Null,
+            bound_notification: None,
         }
     }
 }
