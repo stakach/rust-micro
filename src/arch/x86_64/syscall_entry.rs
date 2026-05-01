@@ -439,6 +439,18 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
             crate::arch::qemu_exit(0);
         }
     }
+    // Phase 29e: the rootserver banner demo prints
+    // "[rootserver alive]\n" then loops on SysYield. We exit on the
+    // closing newline.
+    if crate::rootserver::ROOTSERVER_DEMO_ACTIVE.load(Ordering::Relaxed)
+        && matches!(syscall, Syscall::SysDebugPutChar)
+    {
+        crate::rootserver::ROOTSERVER_PRINTED.fetch_add(1, Ordering::Relaxed);
+        if args.a0 as u8 == b'\n' {
+            arch::log("[rootserver bootstrap complete — exiting QEMU]\n");
+            crate::arch::qemu_exit(0);
+        }
+    }
 
     // If the current thread blocked on a Send/Recv, scheduler.current
     // is None; pick the next runnable. If none is runnable we fall

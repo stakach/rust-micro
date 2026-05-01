@@ -54,12 +54,35 @@ End state:
     parses cleanly; entry matches `link.ld`; segments are
     well-formed (R always set, no W+X).
 
-- [ ] 29c — Segment loading + VSpace.
-  * Allocate per-segment 4 KiB pages from a kernel pool.
-  * Copy file data; zero BSS region (mem_size > file_size).
-  * Build a fresh PML4 (clone kernel half), map each segment's
-    pages at its vaddr with appropriate W/X bits.
-  * Allocate + map an IPC buffer page + a BootInfo page.
+- [x] 29c — Segment loading + VSpace. **DONE**
+  * `src/rootserver.rs` — `load() -> RootserverImage` parses
+    the ELF, allocates pages from `ROOTSERVER_PAGE_POOL`
+    (16 × 4 KiB in BSS), copies file data + zero-fills BSS
+    tail, builds a fresh PML4 via `make_user_pml4`, and maps
+    each segment with the right W bit.
+  * Adds + maps a 4 KiB user stack page at
+    `ROOTSERVER_STACK_VTOP - 0x1000`.
+  * Spec `loads_and_maps_segments` runs the loader, asserts
+    the entry RIP matches the ELF, the PML4 is non-zero +
+    page-aligned, and at least `n_segments + 1` pages were
+    consumed.
+
+- [x] 29d+e — Rootserver TCB spawn + dispatch. **DONE**
+  * `launch_rootserver()` loads the image, builds a TCB with
+    the right user_context, demotes the boot thread, swaps
+    CR3 to the rootserver's PML4, and `sysretq`s in.
+  * `ROOTSERVER_DEMO_ACTIVE` flag + dispatcher hook in
+    `rust_syscall_dispatch`: when the rootserver prints '\n'
+    via `SysDebugPutChar`, log success + qemu_exit.
+  * `bsp_main` now calls `launch_rootserver` instead of
+    `launch_two_thread_ipc_demo` — the seL4-style bootstrap
+    is the canonical boot path.
+  * Boot serial output:
+        [rootserver alive]
+        [rootserver bootstrap complete — exiting QEMU]
+  * 29d (BootInfo + initial caps layout) and 29g (workers via
+    Untyped retype) deferred to follow-up phases.
+
 
 - [ ] 29d — BootInfo + initial caps.
   * Mirror seL4's `seL4_BootInfo` shape (existing in types.rs);

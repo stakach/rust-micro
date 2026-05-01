@@ -44,6 +44,8 @@ pub fn test_main() {
     crate::vspace::spec::test_vspace();
     crate::boot::spec::test_boot();
     crate::elf::spec::test_elf();
+    #[cfg(target_arch = "x86_64")]
+    crate::rootserver::spec::test_rootserver();
     integration_tests::test_integration();
 
     #[cfg(feature = "mcs")]

@@ -102,6 +102,11 @@ mod rootserver_image;
 // rootserver image and exposes its entry point + PT_LOAD segments.
 mod elf;
 
+// Phase 29c — rootserver loader: parses ROOTSERVER_ELF, allocates
+// user pages, builds a fresh PML4 + user stack.
+#[cfg(target_arch = "x86_64")]
+mod rootserver;
+
 // Phase 10c — IPC fastpath bypassing the slowpath book-keeping for
 // the common-case Call / ReplyRecv shape.
 #[cfg(feature = "fastpath")]
@@ -205,12 +210,14 @@ fn bsp_main() -> ! {
         }
     }
 
-    // Phase 14d — two-thread IPC ping-pong. Spawns a sender +
-    // receiver, both ring-3, sharing an Endpoint cap. The
-    // dispatcher exits QEMU once it sees both threads complete
-    // their SysDebugPutChar invocations.
+    // Phase 29e — boot the rootserver. Loads the bundled ELF (built
+    // separately from `rootserver/`), builds its VSpace + TCB, and
+    // sysretq's into user mode at its `_start`. Replaces the AY
+    // hand-asm demo as the canonical "kernel actually runs userspace"
+    // bootstrap. The dispatcher exits QEMU when the rootserver
+    // prints '\n' (closing its banner).
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::usermode::launch_two_thread_ipc_demo();
+    unsafe { crate::rootserver::launch_rootserver(); }
 
     #[cfg(any(not(target_arch = "x86_64"), not(feature = "spec")))]
     loop {}
