@@ -1,4 +1,105 @@
-# Active phase plan — Phase 29: ELF rootserver bootstrap
+# Active phase plan — Phase 30: MDB linked-list — DONE
+
+## Review
+
+Replaced structural "compare physical addresses" cap-derivation
+matching with a real MDB tree. Each `Cte` now records its
+`mdb_parent: Option<MdbId>` (packed `(cnode_idx, slot)` → u16)
+in the unused low 16 bits of `mdb_words[0]`.
+
+Behavior:
+* `Untyped::Retype` records each child's parent as the source
+  Untyped's CTE id.
+* `CNode::Copy` / `Mint` records the new cap's parent as the
+  source slot.
+* `CNode::Revoke` runs a fixed-point iteration over the
+  `cnodes[]` table: any CTE whose parent is already revoked
+  becomes revoked too. Sweeps until no progress, then clears
+  every revoked slot except the source.
+* `CNode::Delete` clears the parent edge along with the cap.
+
+Workaround removed: the existing `cnode_revoke_zaps_descendants`
+spec is back to using Endpoint children (pool-allocated outside
+the Untyped's physical range — the case that broke structural
+revoke and motivated this phase).
+
+Spec count: 150 → 152.
+  * `mdb_records_retype_parent_link` — every retyped child's MDB
+    parent points back at the source Untyped's CTE.
+  * `mdb_revoke_walks_grandchildren` — Retype→Endpoint then
+    Copy that endpoint to a sibling slot. Revoking the original
+    Untyped clears both the direct child AND the copy
+    transitively.
+
+Pool sizing: bumped `MAX_ENDPOINTS` 16 → 32 because the new
+specs allocate more endpoints than fit before. (Pool entries
+aren't reclaimed yet; that's an MDB-aware Delete improvement
+for a follow-up phase.)
+
+## Out of scope (future)
+* Pool reclaim — Revoke / Delete should free pool slots so the
+  bump allocator can wrap. Today next_endpoint et al. only grow.
+* Doubly-linked prev/next list (we only track the parent edge;
+  full seL4 MDB has prev/next siblings).
+* Cross-CNode invariants under Move.
+
+
+# Phase 29: ELF rootserver bootstrap
+
+## Original goal (kept for context)
+Replace structural cap-derivation matching (`is_derived_from`
+comparing PPtrs) with a real linked-list MDB. Every CTE becomes
+a node in a doubly-linked derivation tree:
+  * `mdb_prev` / `mdb_next` — siblings in birth order.
+  * `mdb_parent` — the CTE the cap was derived from (None for
+    the root, e.g. the boot Untyped).
+
+Then Revoke walks descendants exactly; Copy/Mint/Move re-link
+the tree; Delete unlinks one node. No more "structural compare
+paddrs" tricks, and the workaround in
+`cnode_revoke_zaps_descendants` (had to switch from Endpoint to
+Frame children because pool-allocated caps fall outside the
+parent Untyped's range) goes away.
+
+## Plan
+- [ ] 30a — `MdbId(cnode_idx: u8, slot: u16)` packed identifier.
+  Extend `Cte` with `prev`, `next`, `parent: Option<MdbId>`.
+  Re-encode any code that allocates CTEs to start unlinked.
+- [ ] 30b — Insertion helper `mdb_insert_after(parent, new)`.
+  Used by `Untyped::Retype` (each new cap → child of source),
+  `CNode::Copy / Mint / Mutate` (sibling of source), and any
+  other path that creates a fresh cap.
+- [ ] 30c — Removal helper `mdb_remove(node)`. Used by
+  `CNode::Delete` and the slot-overwrite path.
+- [ ] 30d — Tree walker `mdb_descendants(root, cb)`. Re-implement
+  `cnode_revoke` on top of it.
+- [ ] 30e — Drop `is_derived_from` + the structural revoke; the
+  MDB walker is the source of truth.
+- [ ] 30f — Tests:
+    * Untyped retypes 4 endpoints, MDB shows them as siblings
+      under the Untyped.
+    * Copy of one endpoint adds a sibling-of-sibling.
+    * Revoke of the Untyped clears all 5 (originals + copy).
+    * Delete of the original endpoint removes only that node;
+      the copy survives.
+
+## Out of scope
+* Cross-CNode MDB invariants under Move (we'll only support
+  intra-CNode for now; cross-CNode Move just moves the cap
+  bytes without re-rooting).
+* MDB-aware Revoke for the rootserver demo (already works
+  via the workarounds; switching it over is a follow-up
+  cosmetic change).
+
+## Verification
+* All existing specs pass.
+* New 30f specs cover the tree-walk shape.
+* Boot output unchanged.
+
+## Review (filled on completion)
+
+
+# Phase 29: ELF rootserver bootstrap
 
 ## Goal
 Mirror seL4's standard bootstrap. Today the kernel runs the

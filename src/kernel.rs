@@ -27,7 +27,7 @@ use crate::tcb::{Tcb, TcbId, ThreadStateType};
 /// Maximum endpoints in the in-kernel pool. Production seL4
 /// allocates them via Untyped retype with no fixed cap; the slab
 /// is just a convenience until we wire that path.
-pub const MAX_ENDPOINTS: usize = 16;
+pub const MAX_ENDPOINTS: usize = 32;
 
 /// Maximum notifications in the in-kernel pool.
 pub const MAX_NTFNS: usize = 16;

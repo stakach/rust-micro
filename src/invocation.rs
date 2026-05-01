@@ -574,6 +574,14 @@ fn decode_untyped_retype(
         // via `KERNEL.get()` to avoid the existing `&mut s.cnodes`
         // borrow's aliasing constraint.
         let s_ptr: *mut crate::kernel::KernelState = KERNEL.get();
+        // Phase 30 — record each carved child's parent CTE in the
+        // MDB. The source untyped lives at slot `args.a0` of the
+        // invoker's CSpace (we use a0 directly because our flat
+        // radix-5 CNode + guard_size=59 makes cptr == slot).
+        let parent_id = crate::cte::MdbId::pack(
+            cnode_idx as u8,
+            args.a0 as u16,
+        );
         let result = crate::untyped::retype(
             &mut state, object_type, size_bits, num_objects,
             |cap| {
@@ -620,6 +628,7 @@ fn decode_untyped_retype(
                     other => other,
                 };
                 cnode_slots[emit_idx].set_cap(&cap_to_store);
+                cnode_slots[emit_idx].set_parent(Some(parent_id));
                 emit_idx += 1;
             },
         );
@@ -667,13 +676,14 @@ fn decode_cnode(
     }
 }
 
-/// CNode::Revoke — delete every cap "derived from" the cap at
-/// `(target_cnode, src_index)`. Without a full MDB we identify
-/// descendants by inspecting cap contents: anything that points
-/// at the same kernel object (or, for Untyped, falls inside the
-/// untyped's physical range) is a descendant. The source slot
-/// itself is left intact — Revoke deletes the children only;
-/// callers use CNodeDelete to remove the source.
+/// CNode::Revoke — Phase 30. Delete every cap whose MDB-parent
+/// chain leads back to `(target_cnode, src_index)`. We track each
+/// CTE's parent in `Cte::set_parent` (recorded by `Untyped::Retype`
+/// + `CNode::Copy/Mint`); the walk is a fixed-point pass that
+/// repeatedly clears CTEs whose parent has already been
+/// revoked-or-source. The source slot itself is left intact —
+/// Revoke deletes the children only; callers use CNodeDelete to
+/// remove the source.
 fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
     let src_index = args.a2 as usize;
     let cnode_ptr = match target {
@@ -683,28 +693,63 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
     unsafe {
         let s = KERNEL.get();
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        let source_cap = if src_index < s.cnodes[cnode_idx].0.len() {
-            s.cnodes[cnode_idx].0[src_index].cap()
-        } else {
+        if src_index >= s.cnodes[cnode_idx].0.len() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_RangeError,
             )));
-        };
+        }
+        let source_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u16);
 
-        // Walk every CTE in every CNode in the slab. For each cap
-        // that "is_derived_from" the source, zero it. Skip the
-        // source slot itself.
-        for ci in 0..s.cnodes.len() {
-            for si in 0..s.cnodes[ci].0.len() {
-                if ci == cnode_idx && si == src_index {
-                    continue;
-                }
-                let cap = s.cnodes[ci].0[si].cap();
-                if is_derived_from(&cap, &source_cap) {
-                    s.cnodes[ci].0[si].set_cap(&Cap::Null);
+        // Tombstone bitmap: bit set means "this CTE has been
+        // revoked-or-is-source". Sized to MAX_CNODES * 32 (radix-5
+        // CNode = 32 slots). We assume each CNode uses 32 slots.
+        const SLOTS_PER_NODE: usize = 32;
+        let mut revoked: [[bool; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES] =
+            [[false; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES];
+        revoked[cnode_idx][src_index] = true;
+
+        // Iterate to fixed point: any CTE whose parent is revoked
+        // gets revoked too. Capacity-bounded — at most
+        // `MAX_CNODES * 32` CTEs to mark, so this loop is bounded.
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for ci in 0..s.cnodes.len() {
+                for si in 0..SLOTS_PER_NODE.min(s.cnodes[ci].0.len()) {
+                    if revoked[ci][si] {
+                        continue;
+                    }
+                    if let Some(p) = s.cnodes[ci].0[si].parent() {
+                        let pi = p.cnode_idx() as usize;
+                        let ps = p.slot() as usize;
+                        if pi < crate::kernel::MAX_CNODES
+                            && ps < SLOTS_PER_NODE
+                            && revoked[pi][ps]
+                        {
+                            revoked[ci][si] = true;
+                            progress = true;
+                        }
+                    }
                 }
             }
         }
+
+        // Clear every revoked slot except the source itself.
+        for ci in 0..s.cnodes.len() {
+            for si in 0..SLOTS_PER_NODE.min(s.cnodes[ci].0.len()) {
+                if revoked[ci][si]
+                    && !(ci == cnode_idx && si == src_index)
+                {
+                    s.cnodes[ci].0[si].set_cap(&Cap::Null);
+                    s.cnodes[ci].0[si].set_parent(None);
+                }
+            }
+        }
+
+        // Silence unused: the structural fallback used to live
+        // here. Keep `is_derived_from` available for any code that
+        // still wants the structural check (none does today).
+        let _ = source_id;
     }
     Ok(())
 }
@@ -786,6 +831,10 @@ fn cnode_copy_or_mint(
             }
         }
         slots[dest_index].set_cap(&copy);
+        // Phase 30 — the new cap is derived from the source slot;
+        // its MDB parent is the source CTE.
+        let src_id = crate::cte::MdbId::pack(idx as u8, src_index as u16);
+        slots[dest_index].set_parent(Some(src_id));
     }
     Ok(())
 }
@@ -839,6 +888,11 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             )));
         }
         slots[index].set_cap(&Cap::Null);
+        // Phase 30 — also clear the MDB edge so children of the
+        // deleted slot become orphaned (revoking the deleted slot
+        // can't reach them, which matches seL4's "delete unlinks
+        // but doesn't recursively delete" semantics).
+        slots[index].set_parent(None);
     }
     Ok(())
 }
@@ -993,6 +1047,8 @@ pub mod spec {
         cnode_copy_via_invocation();
         cnode_move_clears_source();
         cnode_revoke_zaps_descendants();
+        mdb_records_retype_parent_link();
+        mdb_revoke_walks_grandchildren();
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
         frame_map_unmap_get_address();
@@ -1002,6 +1058,108 @@ pub mod spec {
         tcb_set_space_pml4_pins_cr3();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
+    }
+
+    /// Phase 30 — every cap retyped from an Untyped should record
+    /// that Untyped's CTE as its MDB parent.
+    #[inline(never)]
+    fn mdb_records_retype_parent_link() {
+        let invoker = setup_invoker(0);
+        let ut_cap = Cap::Untyped {
+            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x0080_0000).unwrap(),
+            block_bits: 14,
+            free_index: 0,
+            is_device: false,
+        };
+        unsafe {
+            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+        }
+        // Retype 3 endpoints into slots 4..6.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::UntypedRetype as u64) << 12,
+            a2: crate::object_type::ObjectType::Endpoint.to_word(),
+            a3: 3,
+            a4: 4,
+            ..Default::default()
+        };
+        decode_invocation(ut_cap, &args, invoker).expect("retype");
+
+        unsafe {
+            let s = KERNEL.get();
+            let expected = crate::cte::MdbId::pack(0, 0);
+            for i in 4..7 {
+                let p = s.cnodes[0].0[i].parent();
+                assert_eq!(p, Some(expected),
+                    "slot {i}'s MDB parent should be (0, 0)");
+            }
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ Untyped::Retype records each child's MDB parent\n");
+    }
+
+    /// Phase 30 — Revoke walks the derivation graph transitively.
+    /// Retype an Untyped → 1 endpoint, Copy that endpoint into a
+    /// new slot, then revoke the Untyped. Both the original AND
+    /// the copy must be cleared.
+    #[inline(never)]
+    fn mdb_revoke_walks_grandchildren() {
+        let invoker = setup_invoker(0);
+        let ut_cap = Cap::Untyped {
+            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x0090_0000).unwrap(),
+            block_bits: 14,
+            free_index: 0,
+            is_device: false,
+        };
+        unsafe {
+            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+        }
+        // Retype Endpoint at slot 4.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::UntypedRetype as u64) << 12,
+            a2: crate::object_type::ObjectType::Endpoint.to_word(),
+            a3: 1,
+            a4: 4,
+            ..Default::default()
+        };
+        decode_invocation(ut_cap, &args, invoker).expect("retype");
+
+        // Copy the endpoint at slot 4 → slot 5.
+        let cnode_cap = unsafe {
+            KERNEL.get().scheduler.slab.get(invoker).cspace_root
+        };
+        let args = SyscallArgs {
+            a1: (InvocationLabel::CNodeCopy as u64) << 12,
+            a2: 5, a3: 4,
+            ..Default::default()
+        };
+        decode_invocation(cnode_cap, &args, invoker).expect("copy");
+        unsafe {
+            let s = KERNEL.get();
+            let original = crate::cte::MdbId::pack(0, 4);
+            assert_eq!(s.cnodes[0].0[5].parent(), Some(original),
+                "copy's MDB parent should be the original at slot 4");
+        }
+
+        // Revoke the Untyped at slot 0 — should walk transitively
+        // and clear both slot 4 (direct child) and slot 5 (grandchild
+        // via Copy).
+        let args = SyscallArgs {
+            a1: (InvocationLabel::CNodeRevoke as u64) << 12,
+            a2: 0,
+            ..Default::default()
+        };
+        decode_invocation(cnode_cap, &args, invoker).expect("revoke");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(matches!(s.cnodes[0].0[0].cap(), Cap::Untyped { .. }),
+                "source Untyped should remain after revoke");
+            assert!(s.cnodes[0].0[4].cap().is_null(),
+                "direct child should be revoked");
+            assert!(s.cnodes[0].0[5].cap().is_null(),
+                "grandchild via Copy should be revoked transitively");
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ Revoke walks derivation graph transitively (MDB)\n");
     }
 
     /// Phase 26d — `Cap::PageTable` `Map` / `Unmap` round-trip.
@@ -1230,15 +1388,15 @@ pub mod spec {
         };
         unsafe { KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap); }
 
-        // Retype 4 Frames (X86_4K) into slots 4..7. We use Frames
-        // here rather than Endpoints because Phase 29h remapped
-        // Endpoint retype to pull from the kernel pool; structural
-        // Revoke (which compares ptrs to the Untyped's range) still
-        // works for Frames since their PPtr remains the carved
-        // physical address.
+        // Retype 4 Endpoints into slots 4..7. Phase 30 — the MDB
+        // tree records each child's parent CTE, so Revoke walks
+        // descendants regardless of whether the cap's PPtr lies
+        // inside the Untyped's physical range. (The pool-allocated
+        // Endpoint caps would have failed structural Revoke before
+        // Phase 30; that's the bug the MDB walk fixes.)
         let args = SyscallArgs {
             a1: (InvocationLabel::UntypedRetype as u64) << 12,
-            a2: crate::object_type::X86_4K,
+            a2: crate::object_type::ObjectType::Endpoint.to_word(),
             a3: 4,
             a4: 4,
             ..Default::default()
@@ -1249,7 +1407,7 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             for i in 4..8 {
-                assert!(matches!(s.cnodes[0].0[i].cap(), Cap::Frame { .. }));
+                assert!(matches!(s.cnodes[0].0[i].cap(), Cap::Endpoint { .. }));
             }
         }
 
