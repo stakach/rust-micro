@@ -104,7 +104,20 @@ What's already in place:
     asserts the thread is parked Inactive on the second tick.
   * Wake-up on the next refill's release_time is Phase 32f.
 
-- [ ] 32f — Refill maturity wake-up.
+- [x] 32f — Refill maturity wake-up. **DONE**
+  * `mcs_tick` now does two passes per call:
+      1. Pre-charge wake-up scan: any parked TCB whose bound
+         SC has a matured head refill (`refill_ready(sc, now)`)
+         transitions Inactive → Running via `make_runnable`.
+      2. Charge the current TCB's SC. On exhaustion,
+         `refill_replenish` queues a new refill at `now+period`
+         and the thread parks.
+  * `current_time()` reads `pit::TICK_COUNT` in production;
+    spec mode pins it via `set_test_time(Some(t))` so tests
+    can control "now" deterministically.
+  * Spec `mcs_tick_wakes_on_matured_refill`: budget=1, period=10;
+    one tick exhausts the SC and parks the thread; advancing
+    test_time to 10 and ticking again wakes it.
   * Wire `pit_isr` (under `cfg(feature = "mcs")`) to call
     `refill_charge(tcb.sc, ticks_elapsed)` instead of the
     classic `time_slice -= 1`.

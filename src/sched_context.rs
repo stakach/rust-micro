@@ -191,6 +191,28 @@ pub fn refill_ready(sc: &SchedContext, now: Ticks) -> bool {
 pub fn mcs_tick(delta_ticks: Ticks) {
     unsafe {
         let s = crate::kernel::KERNEL.get();
+        let now = current_time();
+
+        // Phase 32f — first, wake any TCB whose SC's head refill
+        // has matured. The scan is O(MAX_SCHED_CONTEXTS) per
+        // tick; we keep the pool small (16 today).
+        for sc_idx in 0..s.sched_contexts.len() {
+            let sc = &s.sched_contexts[sc_idx];
+            let bound = match sc.bound_tcb {
+                Some(t) => t,
+                None => continue,
+            };
+            // Only consider TCBs that we previously parked.
+            let state = s.scheduler.slab.get(bound).state;
+            if state != crate::tcb::ThreadStateType::Inactive {
+                continue;
+            }
+            if refill_ready(sc, now) && sc.count > 0 {
+                s.scheduler.make_runnable(bound);
+            }
+        }
+
+        // Then charge the current thread's SC (if any).
         let cur = match s.scheduler.current() {
             Some(c) => c,
             None => return,
@@ -205,11 +227,42 @@ pub fn mcs_tick(delta_ticks: Ticks) {
         let sc = &mut s.sched_contexts[sc_idx];
         let exhausted = refill_charge(sc, delta_ticks);
         if exhausted {
-            // Budget gone — park the thread. Phase 32f wakes it
-            // when the next refill matures.
+            // Schedule the next refill one period from now so the
+            // thread can resume when it matures.
+            let _ = refill_replenish(sc, now);
             s.scheduler.block(cur, crate::tcb::ThreadStateType::Inactive);
         }
     }
+}
+
+/// "Now" in the same ticks the SC schedule uses. Driven by the
+/// PIT (`pit::TICK_COUNT`) on x86; specs override via
+/// `set_test_time` in spec mode.
+pub fn current_time() -> Ticks {
+    #[cfg(feature = "spec")]
+    {
+        let t = TEST_TIME.load(core::sync::atomic::Ordering::Relaxed);
+        if t != u64::MAX {
+            return t;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        return crate::arch::x86_64::pit::TICK_COUNT
+            .load(core::sync::atomic::Ordering::Relaxed) as Ticks;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { 0 }
+}
+
+#[cfg(feature = "spec")]
+static TEST_TIME: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Spec-only: pin `current_time()` to a known value.
+#[cfg(feature = "spec")]
+pub fn set_test_time(t: Option<Ticks>) {
+    TEST_TIME.store(t.unwrap_or(u64::MAX), core::sync::atomic::Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +283,69 @@ pub mod spec {
         refill_ready_threshold();
         ring_full_returns_error();
         mcs_tick_blocks_on_exhaustion();
+        mcs_tick_wakes_on_matured_refill();
         arch::log("MCS sched_context tests completed\n");
+    }
+
+    /// Phase 32f — exhausting the budget should both:
+    ///   * push a new refill one period in the future, and
+    ///   * eventually wake the thread when `current_time()`
+    ///     reaches that refill's release_time.
+    #[inline(never)]
+    fn mcs_tick_wakes_on_matured_refill() {
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
+
+            // Pin "now" so we don't race the live PIT.
+            super::set_test_time(Some(0));
+
+            let mut t = crate::tcb::Tcb::default();
+            t.priority = 50;
+            t.state = crate::tcb::ThreadStateType::Running;
+            let id = s.scheduler.admit(t);
+
+            let sc_idx = s.alloc_sched_context().expect("sc pool");
+            s.sched_contexts[sc_idx] = SchedContext::new(/* period */ 10, /* budget */ 1);
+            s.sched_contexts[sc_idx].push(Refill { release_time: 0, amount: 1 }).unwrap();
+            s.sched_contexts[sc_idx].bound_tcb = Some(id);
+            s.scheduler.slab.get_mut(id).sc = Some(sc_idx as u16);
+
+            s.scheduler.set_current(Some(id));
+
+            // Tick → budget exhausts → thread parks. The exhaustion
+            // path replenishes a new refill at now+period=10.
+            super::mcs_tick(1);
+            assert_eq!(s.scheduler.slab.get(id).state,
+                crate::tcb::ThreadStateType::Inactive,
+                "thread should be parked when SC exhausts");
+            // The new refill should sit in the ring with release_time=10.
+            assert!(s.sched_contexts[sc_idx].count >= 1,
+                "replenish should have queued a fresh refill");
+            let head = s.sched_contexts[sc_idx].head as usize;
+            assert_eq!(s.sched_contexts[sc_idx].refills[head].release_time, 10);
+
+            // Advance "now" past the refill's release_time. The next
+            // mcs_tick should see the matured refill and wake the
+            // parked thread.
+            super::set_test_time(Some(10));
+            // Make sure mcs_tick's "current" path doesn't confuse the
+            // wake-up scan: clear current first.
+            s.scheduler.set_current(None);
+            super::mcs_tick(0);
+            assert_eq!(s.scheduler.slab.get(id).state,
+                crate::tcb::ThreadStateType::Running,
+                "thread should be re-runnable after refill matures");
+
+            // Cleanup.
+            super::set_test_time(None);
+            s.scheduler.set_current(None);
+            s.scheduler.slab.free(id);
+            s.sched_contexts[sc_idx].bound_tcb = None;
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ mcs_tick wakes parked thread when next refill matures\n");
     }
 
     /// Phase 32e — driving `mcs_tick` against a live current TCB
