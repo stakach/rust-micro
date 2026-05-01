@@ -40,7 +40,7 @@ use super::msr::{rdmsr, IA32_APIC_BASE_MSR};
 #[repr(C, align(4096))]
 pub struct PtPage(pub [u64; 512]);
 
-const POOL_SIZE: usize = 8;
+const POOL_SIZE: usize = 32;
 
 #[no_mangle]
 pub static mut KPT_POOL: [PtPage; POOL_SIZE] = [const { PtPage([0; 512]) }; POOL_SIZE];
@@ -64,6 +64,31 @@ unsafe fn alloc_table_va() -> *mut u64 {
 /// from sibling modules (e.g. usermode page-table install).
 pub unsafe fn alloc_user_table_va() -> *mut u64 {
     alloc_table_va()
+}
+
+/// Phase 24 — clone the live PML4 into a fresh page-table page.
+/// Returns the new PML4's physical address (suitable for CR3).
+///
+/// We copy *every* live PML4 entry verbatim, not just the
+/// kernel-half ones. BOOTBOOT installs its low-memory identity
+/// map at PML4[0], and the kernel relies on it to walk page
+/// tables and reach ACPI / CR3-relative memory; if we zeroed
+/// the user half, the very next instruction the kernel ran
+/// after CR3 swap would page-fault on a missing identity-map
+/// entry. User-mode address-space isolation in our setup comes
+/// from PML4 *user-half* entries that the user code populates
+/// dynamically (above 256 GiB; PML4[2] in our demo) — those land
+/// in fresh sub-tables per PML4, so two threads sharing the
+/// PML4[0] identity map can still hold disjoint user-space
+/// mappings above 256 GiB.
+pub unsafe fn make_user_pml4() -> u64 {
+    let live = (read_cr3() & 0xFFFF_F000) as *const u64;
+    let new_va = alloc_table_va();
+    for i in 0..512 {
+        let entry = ptr::read_volatile(live.add(i));
+        ptr::write_volatile(new_va.add(i), entry);
+    }
+    kernel_virt_to_phys(new_va as u64)
 }
 
 // ---------------------------------------------------------------------------

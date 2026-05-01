@@ -209,15 +209,20 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         copy_payload(&raw const SENDER_CODE_PAGE, SENDER_PAYLOAD);
         copy_payload(&raw const RECEIVER_CODE_PAGE, RECEIVER_PAYLOAD);
 
-        // Map all four pages (code RX, stacks RW) into the live
-        // page tables.
-        map_user_4k(SENDER_CODE_VBASE,
+        // Phase 24: each thread gets its own PML4. Map only the
+        // pages each thread should be able to see — sender sees
+        // sender code/stack, receiver sees receiver code/stack
+        // (plus, after Retype/Map, its DEMO_POOL frame).
+        let sender_pml4 = super::paging::make_user_pml4();
+        let receiver_pml4 = super::paging::make_user_pml4();
+
+        map_user_4k_into_pml4(sender_pml4, SENDER_CODE_VBASE,
             kernel_virt_to_phys((&raw const SENDER_CODE_PAGE) as u64), false);
-        map_user_4k(SENDER_STACK_VBASE,
+        map_user_4k_into_pml4(sender_pml4, SENDER_STACK_VBASE,
             kernel_virt_to_phys((&raw const SENDER_STACK_PAGE) as u64), true);
-        map_user_4k(RECEIVER_CODE_VBASE,
+        map_user_4k_into_pml4(receiver_pml4, RECEIVER_CODE_VBASE,
             kernel_virt_to_phys((&raw const RECEIVER_CODE_PAGE) as u64), false);
-        map_user_4k(RECEIVER_STACK_VBASE,
+        map_user_4k_into_pml4(receiver_pml4, RECEIVER_STACK_VBASE,
             kernel_virt_to_phys((&raw const RECEIVER_STACK_PAGE) as u64), true);
 
         // Build the kernel-side state: an endpoint, two CNodes
@@ -252,16 +257,18 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         };
         s.cnodes[2].0[2] = Cte::with_cap(&untyped_cap);
 
-        // Spawn the two TCBs.
+        // Spawn the two TCBs, each with its own CR3.
         let sender = spawn_thread(
             sender_cnode,
             SENDER_CODE_VBASE,
             SENDER_STACK_VBASE + 0x1000 - 8,
+            sender_pml4,
         );
         let receiver = spawn_thread(
             receiver_cnode,
             RECEIVER_CODE_VBASE,
             RECEIVER_STACK_VBASE + 0x1000 - 8,
+            receiver_pml4,
         );
 
         // Set the kernel rsp the SYSCALL entry stub uses.
@@ -288,6 +295,12 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         // ≥ 2 it exits QEMU.
         IPC_DEMO_ACTIVE.store(true, Ordering::Relaxed);
 
+        // Swap CR3 to the sender's PML4 before sysretq — the
+        // user code page lives in `sender_pml4`, not the kernel
+        // tables we've been running in.
+        asm!("mov cr3, {}", in(reg) sender_pml4,
+            options(nostack, preserves_flags));
+
         // First-launch the sender.
         let ctx = s.scheduler.slab.get(sender).user_context;
         let _ = receiver; // suppress unused if receiver isn't reached on first hop
@@ -299,6 +312,7 @@ unsafe fn spawn_thread(
     cspace_root_ptr: PPtr<crate::cap::CNodeStorage>,
     user_rip: u64,
     user_rsp: u64,
+    pml4_paddr: u64,
 ) -> crate::tcb::TcbId {
     let s = KERNEL.get();
     let mut t = Tcb::default();
@@ -311,6 +325,7 @@ unsafe fn spawn_thread(
         guard: 0,
     };
     t.user_context = UserContext::for_entry(user_rip, user_rsp, /* arg0 */ 0);
+    t.cpu_context.cr3 = pml4_paddr;
     s.scheduler.admit(t)
 }
 
@@ -377,14 +392,33 @@ pub fn launch_user_mode_test() -> ! {
 // ---------------------------------------------------------------------------
 
 /// Public-from-arch helper: install a 4 KiB user-accessible
-/// mapping. Re-export of the internal `map_user_4k` so the
-/// invocation layer can call it for `Cap::Frame::Map`.
+/// mapping in the live (CR3) page tables. Re-export of the
+/// internal `map_user_4k` so the invocation layer can call it
+/// for `Cap::Frame::Map` — Frame::Map always installs in the
+/// invoker's vspace, which is whatever CR3 currently points at.
 pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool) {
-    map_user_4k(vaddr, paddr, writable);
+    let pml4 = (read_cr3() & 0xFFFF_F000) as *mut u64;
+    map_user_4k_in(pml4, vaddr, paddr, writable);
+}
+
+/// Phase 24 — install a 4 KiB mapping into an explicit PML4
+/// (used at thread-spawn time before we've switched CR3 to it).
+pub unsafe fn map_user_4k_into_pml4(
+    pml4_paddr: u64,
+    vaddr: u64,
+    paddr: u64,
+    writable: bool,
+) {
+    let pml4 = pml4_paddr as *mut u64;
+    map_user_4k_in(pml4, vaddr, paddr, writable);
 }
 
 unsafe fn map_user_4k(vaddr: u64, paddr: u64, writable: bool) {
     let pml4 = (read_cr3() & 0xFFFF_F000) as *mut u64;
+    map_user_4k_in(pml4, vaddr, paddr, writable);
+}
+
+unsafe fn map_user_4k_in(pml4: *mut u64, vaddr: u64, paddr: u64, writable: bool) {
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;

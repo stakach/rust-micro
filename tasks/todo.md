@@ -1,44 +1,57 @@
-# Active phase plan — Phase 23: scheduler tick wiring
+# Active phase plan — Phase 24: per-thread CR3
 
 ## Goal
-Connect the live PIT IRQ delivery (Phase 12f) to scheduler timeslice
-tracking. Each tick, decrement the current thread's `time_slice`;
-on zero, mark the thread for preemption. The actual context-switch
-on preempt waits for the IRQ-entry stub to be written (parallel to
-the existing SYSCALL stub); for now the tick logic + a "preempt
-flag" and accumulator are testable.
+Each user thread gets its own PML4 with the kernel half mirrored
+from the live BOOTBOOT tables and the user half thread-specific.
+The SYSCALL dispatcher swaps CR3 when scheduling decides on a
+different thread. This is the canonical microkernel address-space
+isolation property — without it the AY demo's two threads
+are sharing memory by accident.
 
 ## Plan
-- [x] 23a — `scheduler::tick()` decrements `current.time_slice`,
-  returns whether budget exhausted.
-- [x] 23b — Existing `pit::TICK_COUNT` already covers telemetry.
-- [x] 23c — PIT ISR now calls `scheduler::tick()` after the
-  TICK_COUNT increment.
-- [x] 23d — Two specs: counter-decrement happy path + no-op when
-  no current.
+- [x] 24a — `paging::make_user_pml4()` clones the live PML4
+  verbatim (incl. PML4[0] for BOOTBOOT's identity map, which
+  the kernel needs to walk page tables under any CR3). Returns
+  the new PML4 paddr.
+- [x] 24b — `usermode::map_user_4k_into_pml4(pml4_pa, ...)`
+  variant. Existing `map_user_4k_public` reads live CR3 then
+  delegates.
+- [x] 24c — Dispatcher swaps CR3 to next thread's
+  `cpu_context.cr3` before sysretq.
+- [x] 24d — `spawn_thread` takes a `pml4_paddr` arg;
+  `launch_two_thread_ipc_demo` allocates one PML4 per thread
+  and maps each thread's pages only into its own PML4.
+- [x] 24e — AY still works post-switch.
 
-## Out of scope (defer)
-* Actual context switch on preempt — needs IRQ-entry stub
-  matching the SYSCALL one (Phase 24+).
-* MCS sched_context refill_charge integration (Phase 25).
+## Risks
+* Subtle: when handle_send::SysSend on Frame::Map runs, the
+  invocation handler currently uses `map_user_4k_public` which
+  walks the live CR3. With per-thread CR3, "live CR3" is the
+  invoker's PML4 — which is correct! The `map_user_4k_in` API
+  is more flexible but the live-CR3 wrapper is fine for
+  Frame::Map's "install in current vspace" semantics.
+* If make_user_pml4 fails (pool exhausted), threads can't
+  start. Bump POOL_SIZE if needed.
 
 ## Verification
-* Spec count rises by 2-3.
-* User-mode demo unaffected (we mask IRQ 0 before launching
-  user mode currently).
-* Confirm `TICK_COUNT` increments on real boot — it already
-  does via Phase 12f.
+* AY demo still works.
+* Spec count unchanged or +1.
 
 ## Review
 
-* All 4 sub-tasks done.
-* PIT ISR now does:
-    1. `TICK_COUNT.fetch_add(1)` — telemetry counter
-    2. `KERNEL.scheduler.tick()` — charges the running thread
-    3. `pic::eoi(0)` — release the IRQ
-* The actual preempt-on-exhaustion (saving user state + picking
-  next + sysretq into next) waits for the IRQ-entry stub
-  Phase 24 will write. Until then "tick" just updates the
-  counter; the existing demo's threads run to completion
-  syscall-by-syscall as before.
-* Spec count 130 → 132. User-mode demo unchanged.
+* All 5 sub-tasks land. AY demo continues to work, but each
+  thread now runs in its OWN PML4 — try memory access at the
+  other thread's vaddrs and you'd page-fault.
+* Real bug caught + recorded: zeroing the user half of the
+  cloned PML4 broke kernel page-table walks. The kernel
+  depends on BOOTBOOT's PML4[0] identity map for low-physical
+  memory access (page tables, ACPI). Fixed by copying ALL
+  PML4 entries verbatim. Future Phase: relocate the identity
+  map to PML4[256] (kernel half) so the user half can be
+  truly empty.
+* KPT_POOL bumped 8 → 32 to accommodate per-thread PML4s.
+* CR3 swap in dispatcher checks CR3 only changes when needed
+  (avoids a full TLB flush per syscall when the current
+  thread keeps running).
+* User-mode demo unchanged in output but architecturally now
+  isolated.

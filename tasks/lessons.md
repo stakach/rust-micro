@@ -44,6 +44,28 @@ Rule — when calling a generated `Cap::new(...)`, always reread the
 .bf source to confirm whether explicit params exist. If not, count
 the visible fields top-to-bottom in declaration order.
 
+## Pattern: kernel needs the user half too on cloned PML4s
+
+Symptom — first cut of `make_user_pml4` zeroed PML4 entries
+0..256 and copied 256..512 from the live PML4. After CR3 swap to
+the cloned PML4, the very next page-table walk inside the kernel
+faulted. Cause: BOOTBOOT installs its low-memory identity map at
+PML4[0] (in the user half), and the kernel relies on it to
+dereference physical addresses (page tables it walks, ACPI tables
+it reads, the LAPIC mapping at `mmio` etc.). With PML4[0] zeroed
+in the new PML4, kernel code under that CR3 can't reach those.
+
+Fix — copy ALL 512 PML4 entries verbatim. User isolation in our
+setup comes from each thread's PML4[2] sub-tree being independent
+(allocated separately by ensure_user_table). Two threads can
+share PML4[0]'s identity map without sharing user-mode mappings,
+because their user PAGES live in different PML4 entries.
+
+Future cleanup — relocate the identity map to a PML4 entry in
+the kernel half (e.g. PML4[256]) so the user half can be entirely
+empty. Then every PML4[user-half] is a fresh allocation and we
+can trust "if it's in the user half it's user-private."
+
 ## Pattern: scheduler-queue staleness across spec teardowns
 
 Symptom — Phase 22 spec panicked at `TcbSlab::get_mut on empty

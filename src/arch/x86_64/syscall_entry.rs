@@ -332,6 +332,22 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
         };
         if let Some(next) = next {
             s.scheduler.current = Some(next);
+            // Phase 24: if next thread runs in a different vspace,
+            // swap CR3. Kernel half is identical across user
+            // PML4s so the swap is safe — the next instruction
+            // (and SYSCALL_SAVE / SYSCALL_KERNEL_RSP, which we
+            // touch below via the naked stub's restore tail) all
+            // live in the kernel half.
+            let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
+            if next_cr3 != 0 {
+                let cur_cr3: u64;
+                core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+                    options(nomem, nostack, preserves_flags));
+                if next_cr3 != cur_cr3 {
+                    core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
+                        options(nostack, preserves_flags));
+                }
+            }
             // Phase 15a: fan IPC delivery state from the receiving
             // TCB into its user-visible registers. The receiver
             // reads:
