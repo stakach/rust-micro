@@ -162,6 +162,14 @@ pub unsafe extern "C" fn pit_irq_entry() {
 
 extern "C" fn pit_isr() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Phase 23: charge a timeslice tick to the current thread.
+    // The static-borrow path matches every other kernel state
+    // access — we're in IRQ context running with IF=0 (CPU
+    // disabled IF on entry), so no other kernel-entry context
+    // can be live.
+    unsafe {
+        crate::kernel::KERNEL.get().scheduler.tick();
+    }
     super::pic::eoi(0);
 }
 

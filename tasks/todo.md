@@ -1,74 +1,44 @@
-# Active phase plan — Phase 22: fault delivery
+# Active phase plan — Phase 23: scheduler tick wiring
 
 ## Goal
-When a user thread takes a fault (page fault, unknown syscall,
-user exception), the kernel must:
-
-1. Build a fault message describing the fault.
-2. Send it via IPC to the thread's fault-handler endpoint
-   (the cap pointed to by `tcb.fault_handler` cptr).
-3. Block the faulting thread `BlockedOnReply` so a `SysReply` from
-   the handler can resume / restart it.
-4. Fault handler receives, decides to either Reply (resume) or
-   Restart via `TCB::Resume` after fixing the underlying issue.
-
-Without this, user faults panic the kernel — a real seL4 system
-wouldn't survive any buggy userland.
-
-## Scope (minimum useful)
-* New `src/fault.rs` module with `deliver_fault(faulting_tcb,
-  fault)` that:
-  - looks up the fault EP cap in the faulting thread's CSpace
-  - encodes the fault into msg_regs[0..N]
-  - calls `endpoint::send_ipc` with `do_call=true` so the
-    faulter ends up `BlockedOnReply` and the handler's
-    `reply_to` is set
-  - returns `Err(KException::Fault(...))` if anything in the
-    delivery itself fails (no handler, EP cap not an Endpoint,
-    etc.) so the kernel can fall back to "kill the thread"
-* `FaultMessage` enum with the 4 seL4 fault kinds
-  (CapFault / VMFault / UnknownSyscall / UserException). Maps
-  to `seL4_FaultType` constants.
-* Hook page-fault and unknown-syscall paths into deliver_fault.
-* Specs covering:
-  - fault delivery sets msg_regs / blocks faulter
-  - handler can SysReply to wake the faulter back up
-  - missing fault handler returns the fault (caller decides)
+Connect the live PIT IRQ delivery (Phase 12f) to scheduler timeslice
+tracking. Each tick, decrement the current thread's `time_slice`;
+on zero, mark the thread for preemption. The actual context-switch
+on preempt waits for the IRQ-entry stub to be written (parallel to
+the existing SYSCALL stub); for now the tick logic + a "preempt
+flag" and accumulator are testable.
 
 ## Plan
-- [x] 22a — `fault.rs` with FaultMessage + deliver_fault
-- [-] 22b — x86_64 page-fault hook deferred (requires user-mode
-       page-table isolation first; without it any fault from the
-       kernel side would corrupt the boot path)
-- [-] 22c — handle_unknown_syscall hook deferred for the same
-       reason
-- [x] 22d — Specs prove the fault → handler → reply round-trip
+- [x] 23a — `scheduler::tick()` decrements `current.time_slice`,
+  returns whether budget exhausted.
+- [x] 23b — Existing `pit::TICK_COUNT` already covers telemetry.
+- [x] 23c — PIT ISR now calls `scheduler::tick()` after the
+  TICK_COUNT increment.
+- [x] 23d — Two specs: counter-decrement happy path + no-op when
+  no current.
 
-## Lessons recorded
-- Freeing TCBs that are still linked into the scheduler's ready
-  queues causes the next `admit` to deref a stale slot (panic in
-  `TcbSlab::get_mut`). Fix: `scheduler.queues = ReadyQueues::new()`
-  before any test that admits TCBs into the same slab.
+## Out of scope (defer)
+* Actual context switch on preempt — needs IRQ-entry stub
+  matching the SYSCALL one (Phase 24+).
+* MCS sched_context refill_charge integration (Phase 25).
 
 ## Verification
-* All 128 ✓ specs still pass.
-* New fault delivery specs verify the round-trip.
-* User-mode demo unchanged (shouldn't fault).
+* Spec count rises by 2-3.
+* User-mode demo unaffected (we mask IRQ 0 before launching
+  user mode currently).
+* Confirm `TICK_COUNT` increments on real boot — it already
+  does via Phase 12f.
 
 ## Review
 
-* `fault.rs` lands the algorithmic core of fault delivery. Its
-  contract: given a TCB and a `FaultMessage`, send the message
-  via the thread's fault EP, block the thread `BlockedOnReply`,
-  and stamp the handler's `reply_to`.
-* Spec proves the full round-trip including the handler's
-  SysReply waking the faulter.
-* Hooking into the actual x86_64 page-fault and unknown-syscall
-  handlers is deferred. We can't pass user faults to user mode
-  cleanly until per-thread page tables exist (Phase 28) — until
-  then a real fault would destabilize the kernel rather than be
-  delivered. The algorithmic bridge is in place; the hook is a
-  ~10-line change once the prerequisite lands.
-* Hit + recorded a real bug: scheduler-queue staleness across
-  tests that free TCBs. Fix is one helper.
-* Spec count 128 → 130. User-mode demo (`AY`) unchanged.
+* All 4 sub-tasks done.
+* PIT ISR now does:
+    1. `TICK_COUNT.fetch_add(1)` — telemetry counter
+    2. `KERNEL.scheduler.tick()` — charges the running thread
+    3. `pic::eoi(0)` — release the IRQ
+* The actual preempt-on-exhaustion (saving user state + picking
+  next + sysretq into next) waits for the IRQ-entry stub
+  Phase 24 will write. Until then "tick" just updates the
+  counter; the existing demo's threads run to completion
+  syscall-by-syscall as before.
+* Spec count 130 → 132. User-mode demo unchanged.

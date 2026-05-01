@@ -266,6 +266,28 @@ impl Scheduler {
             _ => None,
         }
     }
+
+    /// One scheduler tick. Decrement the current thread's
+    /// timeslice; return `true` if it ran out (caller's
+    /// responsibility to refill / preempt).
+    ///
+    /// Mirrors `seL4/src/kernel/thread.c::timerTick` for the
+    /// non-MCS path: each timer interrupt charges one tick to
+    /// the running thread.
+    pub fn tick(&mut self) -> bool {
+        let cur = match self.current {
+            Some(c) => c,
+            None => return false,
+        };
+        let t = self.slab.get_mut(cur);
+        if t.time_slice == 0 {
+            // Already exhausted; subsequent ticks are no-ops
+            // until the caller refills.
+            return true;
+        }
+        t.time_slice -= 1;
+        t.time_slice == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +307,8 @@ pub mod spec {
         block_then_unblock();
         empty_falls_back_to_idle();
         preempt_only_strictly_higher();
+        tick_decrements_timeslice();
+        tick_with_no_current_is_noop();
         arch::log("Scheduler tests completed\n");
     }
 
@@ -373,6 +397,33 @@ pub mod spec {
         s.idle = Some(idle);
         assert_eq!(s.choose_thread(), Some(idle));
         arch::log("  ✓ empty queues fall through to the idle thread\n");
+    }
+
+    #[inline(never)]
+    fn tick_decrements_timeslice() {
+        let mut s = Scheduler::new();
+        let mut t = runnable(50);
+        t.time_slice = 3;
+        let id = s.admit(t);
+        s.current = Some(id);
+        // Three ticks bring it to zero; the third returns true.
+        assert_eq!(s.tick(), false);
+        assert_eq!(s.slab.get(id).time_slice, 2);
+        assert_eq!(s.tick(), false);
+        assert_eq!(s.slab.get(id).time_slice, 1);
+        assert_eq!(s.tick(), true);
+        assert_eq!(s.slab.get(id).time_slice, 0);
+        // Subsequent ticks stay true (already exhausted).
+        assert_eq!(s.tick(), true);
+        arch::log("  ✓ tick decrements timeslice; signals exhaustion\n");
+    }
+
+    #[inline(never)]
+    fn tick_with_no_current_is_noop() {
+        let mut s = Scheduler::new();
+        // No `current` set.
+        assert_eq!(s.tick(), false);
+        arch::log("  ✓ tick with no current is a no-op\n");
     }
 
     #[inline(never)]
