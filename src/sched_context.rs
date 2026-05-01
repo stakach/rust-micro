@@ -175,6 +175,44 @@ pub fn refill_ready(sc: &SchedContext, now: Ticks) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 32e — kernel-side per-tick MCS handler.
+//
+// Called from the PIT ISR (and from specs that exercise the
+// budgeting logic without a live PIT). Charges `delta_ticks` from
+// the current thread's bound SchedContext; if the SC's budget is
+// exhausted, blocks the thread (state = Inactive) so the
+// scheduler picks something else next dispatch. Wake-up on the
+// next refill's release_time lands in Phase 32f.
+//
+// Threads without a bound SC are unaffected — `current.sc` is
+// `None` and we early-out.
+// ---------------------------------------------------------------------------
+
+pub fn mcs_tick(delta_ticks: Ticks) {
+    unsafe {
+        let s = crate::kernel::KERNEL.get();
+        let cur = match s.scheduler.current() {
+            Some(c) => c,
+            None => return,
+        };
+        let sc_idx = match s.scheduler.slab.get(cur).sc {
+            Some(i) => i as usize,
+            None => return,
+        };
+        if sc_idx >= s.sched_contexts.len() {
+            return;
+        }
+        let sc = &mut s.sched_contexts[sc_idx];
+        let exhausted = refill_charge(sc, delta_ticks);
+        if exhausted {
+            // Budget gone — park the thread. Phase 32f wakes it
+            // when the next refill matures.
+            s.scheduler.block(cur, crate::tcb::ThreadStateType::Inactive);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Specs
 // ---------------------------------------------------------------------------
 
@@ -191,7 +229,60 @@ pub mod spec {
         replenish_schedules_for_next_period();
         refill_ready_threshold();
         ring_full_returns_error();
+        mcs_tick_blocks_on_exhaustion();
         arch::log("MCS sched_context tests completed\n");
+    }
+
+    /// Phase 32e — driving `mcs_tick` against a live current TCB
+    /// + bound SC. Two ticks against a 2-tick budget should leave
+    /// the thread `Inactive` (blocked on its empty SC).
+    #[inline(never)]
+    fn mcs_tick_blocks_on_exhaustion() {
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            // Reset scheduler queues / current so prior specs
+            // don't bleed in (lessons.md "scheduler-queue
+            // staleness across spec teardowns").
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
+
+            // Plant a thread + an SC and bind them.
+            let mut t = crate::tcb::Tcb::default();
+            t.priority = 50;
+            t.state = crate::tcb::ThreadStateType::Running;
+            let id = s.scheduler.admit(t);
+            // Allocate a SC slot, give it a 2-tick budget with one
+            // ready refill.
+            let sc_idx = s.alloc_sched_context().expect("sc pool");
+            s.sched_contexts[sc_idx] = SchedContext::new(/* period */ 100, /* budget */ 2);
+            s.sched_contexts[sc_idx].push(Refill { release_time: 0, amount: 2 }).unwrap();
+            s.sched_contexts[sc_idx].bound_tcb = Some(id);
+            s.scheduler.slab.get_mut(id).sc = Some(sc_idx as u16);
+
+            // Make this thread `current` so `mcs_tick` charges
+            // against it.
+            s.scheduler.set_current(Some(id));
+
+            // Tick once — budget 2 → 1, still running.
+            crate::sched_context::mcs_tick(1);
+            assert_eq!(s.scheduler.slab.get(id).state,
+                crate::tcb::ThreadStateType::Running);
+            assert_eq!(s.sched_contexts[sc_idx].refills[0].amount, 1);
+
+            // Tick again — budget 1 → 0, exhausted, thread parks.
+            crate::sched_context::mcs_tick(1);
+            assert_eq!(s.scheduler.slab.get(id).state,
+                crate::tcb::ThreadStateType::Inactive,
+                "thread should be parked when SC exhausts");
+
+            // Cleanup: free the slot so subsequent specs aren't
+            // poisoned. The SC pool entry stays consumed (no
+            // reclaim yet — see todo's "Pool reclaim" follow-up).
+            s.scheduler.set_current(None);
+            s.scheduler.slab.free(id);
+            s.sched_contexts[sc_idx].bound_tcb = None;
+        }
+        arch::log("  ✓ mcs_tick blocks the current TCB on SC exhaustion\n");
     }
 
     #[inline(never)]

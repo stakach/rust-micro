@@ -173,6 +173,9 @@ extern "C" fn pit_isr() {
     unsafe {
         crate::kernel::KERNEL.get().scheduler.tick();
     }
+    // Phase 32e — MCS: also debit the current thread's bound
+    // SchedContext. Threads with no SC bound are unaffected.
+    crate::sched_context::mcs_tick(/* delta_ticks */ 1);
     super::pic::eoi(0);
 }
 

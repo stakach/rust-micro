@@ -89,7 +89,22 @@ What's already in place:
     the SC's fields + ready refill, and confirms budget>period
     is rejected.
 
-- [ ] 32e — refill_charge ↔ PIT tick.
+- [x] 32e — refill_charge ↔ PIT tick. **DONE**
+  * `sched_context::mcs_tick(delta_ticks)` — kernel-side
+    handler called once per PIT IRQ. Looks up the current
+    TCB's bound SC; charges `refill_charge`; if exhausted,
+    blocks the thread (state = Inactive) so the dispatcher's
+    next pick finds the next runnable. Threads with `sc =
+    None` (rootserver, AY demo, default-spawned TCBs) are
+    unaffected.
+  * `pit_isr` calls `mcs_tick(1)` after the existing
+    `scheduler.tick()`.
+  * Spec `mcs_tick_blocks_on_exhaustion` admits a TCB, binds
+    it to a 2-tick budget SC, makes it `current`, ticks twice,
+    asserts the thread is parked Inactive on the second tick.
+  * Wake-up on the next refill's release_time is Phase 32f.
+
+- [ ] 32f — Refill maturity wake-up.
   * Wire `pit_isr` (under `cfg(feature = "mcs")`) to call
     `refill_charge(tcb.sc, ticks_elapsed)` instead of the
     classic `time_slice -= 1`.
