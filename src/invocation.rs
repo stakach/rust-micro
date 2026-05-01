@@ -183,9 +183,85 @@ fn decode_cnode(
         InvocationLabel::CNodeMove => cnode_move(target, args, invoker, /* mutate */ false),
         InvocationLabel::CNodeMutate => cnode_move(target, args, invoker, /* mutate */ true),
         InvocationLabel::CNodeDelete => cnode_delete(target, args, invoker),
+        InvocationLabel::CNodeRevoke => cnode_revoke(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
+    }
+}
+
+/// CNode::Revoke — delete every cap "derived from" the cap at
+/// `(target_cnode, src_index)`. Without a full MDB we identify
+/// descendants by inspecting cap contents: anything that points
+/// at the same kernel object (or, for Untyped, falls inside the
+/// untyped's physical range) is a descendant. The source slot
+/// itself is left intact — Revoke deletes the children only;
+/// callers use CNodeDelete to remove the source.
+fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
+    let src_index = args.a2 as usize;
+    let cnode_ptr = match target {
+        Cap::CNode { ptr, .. } => ptr,
+        _ => unreachable!(),
+    };
+    unsafe {
+        let s = KERNEL.get();
+        let cnode_idx = KernelState::cnode_index(cnode_ptr);
+        let source_cap = if src_index < s.cnodes[cnode_idx].0.len() {
+            s.cnodes[cnode_idx].0[src_index].cap()
+        } else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_RangeError,
+            )));
+        };
+
+        // Walk every CTE in every CNode in the slab. For each cap
+        // that "is_derived_from" the source, zero it. Skip the
+        // source slot itself.
+        for ci in 0..s.cnodes.len() {
+            for si in 0..s.cnodes[ci].0.len() {
+                if ci == cnode_idx && si == src_index {
+                    continue;
+                }
+                let cap = s.cnodes[ci].0[si].cap();
+                if is_derived_from(&cap, &source_cap) {
+                    s.cnodes[ci].0[si].set_cap(&Cap::Null);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// "child is derived from parent" — without an MDB, we approximate
+/// the relationship structurally. Simple but adequate for the
+/// common cases:
+///   * Untyped parent → any cap whose object lives inside the
+///     untyped's physical range
+///   * Endpoint/Notification/CNode/Thread parent → any cap with
+///     the same ptr (Mint and Copy produce children with the same
+///     ptr but possibly different badges/rights)
+fn is_derived_from(child: &Cap, parent: &Cap) -> bool {
+    use Cap::*;
+    match parent {
+        Untyped { ptr, block_bits, .. } => {
+            let base = ptr.addr();
+            let end = base.saturating_add(1u64 << block_bits);
+            let inside = |addr: u64| addr >= base && addr < end;
+            match child {
+                Endpoint { ptr, .. } => inside(ptr.addr()),
+                Notification { ptr, .. } => inside(ptr.addr()),
+                CNode { ptr, .. } => inside(ptr.addr()),
+                Thread { tcb } => inside(tcb.addr()),
+                Untyped { ptr, .. } => inside(ptr.addr()) && ptr.addr() != base,
+                Reply { tcb, .. } => inside(tcb.addr()),
+                _ => false,
+            }
+        }
+        Endpoint { ptr: pp, .. } => matches!(child, Endpoint { ptr: cp, .. } if cp.addr() == pp.addr()),
+        Notification { ptr: pp, .. } => matches!(child, Notification { ptr: cp, .. } if cp.addr() == pp.addr()),
+        CNode { ptr: pp, .. } => matches!(child, CNode { ptr: cp, .. } if cp.addr() == pp.addr()),
+        Thread { tcb: pp } => matches!(child, Thread { tcb: cp } if cp.addr() == pp.addr()),
+        _ => false,
     }
 }
 
@@ -341,6 +417,7 @@ pub mod spec {
         untyped_retype_via_invocation();
         cnode_copy_via_invocation();
         cnode_move_clears_source();
+        cnode_revoke_zaps_descendants();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
     }
@@ -492,6 +569,64 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ CNode::Move transfers cap and zeroes source\n");
+    }
+
+    /// Revoke walks the cap tree and zeroes every derived cap.
+    /// Source untyped is left intact; its children are deleted.
+    #[inline(never)]
+    fn cnode_revoke_zaps_descendants() {
+        let invoker = setup_invoker(0);
+        let untyped_base = 0x0080_0000u64;
+        let ut_cap = Cap::Untyped {
+            ptr: PPtr::<crate::cap::UntypedStorage>::new(untyped_base).unwrap(),
+            block_bits: 14,
+            free_index: 0,
+            is_device: false,
+        };
+        unsafe { KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap); }
+
+        // Retype 4 endpoints into slots 4..7.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::UntypedRetype as u64) << 12,
+            a2: ObjectType::Endpoint.to_word(),
+            a3: 4,
+            a4: 4,
+            ..Default::default()
+        };
+        decode_invocation(ut_cap, &args, invoker).expect("retype");
+
+        // Verify children present.
+        unsafe {
+            let s = KERNEL.get();
+            for i in 4..8 {
+                assert!(matches!(s.cnodes[0].0[i].cap(), Cap::Endpoint { .. }));
+            }
+        }
+
+        // Revoke the untyped at slot 0 — should zero all 4
+        // descendants but leave the untyped intact.
+        let cnode_cap = unsafe {
+            KERNEL.get().scheduler.slab.get(invoker).cspace_root
+        };
+        let args = SyscallArgs {
+            a1: (InvocationLabel::CNodeRevoke as u64) << 12,
+            a2: 0, // src slot = the untyped
+            ..Default::default()
+        };
+        decode_invocation(cnode_cap, &args, invoker).expect("revoke");
+
+        unsafe {
+            let s = KERNEL.get();
+            // Source untyped still present.
+            assert!(matches!(s.cnodes[0].0[0].cap(), Cap::Untyped { .. }));
+            // Children gone.
+            for i in 4..8 {
+                assert!(s.cnodes[0].0[i].cap().is_null(),
+                    "slot {i} should have been revoked");
+            }
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ CNode::Revoke clears Untyped descendants\n");
     }
 
     #[inline(never)]
