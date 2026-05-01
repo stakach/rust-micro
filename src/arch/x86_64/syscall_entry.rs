@@ -439,16 +439,20 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
             crate::arch::qemu_exit(0);
         }
     }
-    // Phase 29e: the rootserver banner demo prints
-    // "[rootserver alive]\n" then loops on SysYield. We exit on the
-    // closing newline.
+    // Phase 29e/g: the rootserver prints (a) the alive banner +
+    // BootInfo summary, and (b) its retype-result line. Both end
+    // in '\n'; we exit on the second newline so both messages
+    // make it to serial.
     if crate::rootserver::ROOTSERVER_DEMO_ACTIVE.load(Ordering::Relaxed)
         && matches!(syscall, Syscall::SysDebugPutChar)
     {
-        crate::rootserver::ROOTSERVER_PRINTED.fetch_add(1, Ordering::Relaxed);
         if args.a0 as u8 == b'\n' {
-            arch::log("[rootserver bootstrap complete — exiting QEMU]\n");
-            crate::arch::qemu_exit(0);
+            let prev = crate::rootserver::ROOTSERVER_PRINTED
+                .fetch_add(1, Ordering::Relaxed);
+            if prev + 1 >= 2 {
+                arch::log("[rootserver bootstrap complete — exiting QEMU]\n");
+                crate::arch::qemu_exit(0);
+            }
         }
     }
 

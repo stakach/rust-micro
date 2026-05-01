@@ -142,12 +142,32 @@ End state:
   * Doesn't actually dispatch — just stops at "ready to dispatch"
     so the spec runner stays in kernel mode.
 
-- [ ] 29g — Init/shell shape.
-  * Rootserver retypes one of its Untypeds into a 2nd TCB +
-    a CNode + an Endpoint.
-  * Spawns the child via TCB::SetSpace + Resume.
-  * Child sends an IPC; rootserver receives + prints. Demo of
-    seL4-style userspace bootstrapping.
+- [x] 29g — Rootserver retypes Untyped → Endpoint via SysSend. **DONE**
+  * Rootserver-side syscall stubs include a `syscall5` that
+    matches the kernel's invocation ABI (rdi=cap_ptr,
+    rsi=MessageInfo, rdx=arg0, r10=arg1, r8=arg2).
+  * High-level `untyped_retype()` helper wraps it.
+  * `_start` now invokes `Untyped::Retype` on its 16 KiB
+    Untyped (slot 11), writes one Endpoint into slot 12,
+    and prints the result.
+  * Kernel's exit hook updated to fire on the SECOND newline
+    so the alive banner + retype result both land on serial.
+  * Boot output:
+        [rootserver alive] node 0/4, 1 untyped(s) of 16384 bytes
+        [rootserver retyped Untyped -> Endpoint at slot 12 - bootstrap complete]
+        [rootserver bootstrap complete — exiting QEMU]
+  * End-to-end exercise of the userspace cap-allocation path:
+    SYSCALL → swapgs → BKL → cspace_lookup → decode_invocation
+    → decode_untyped_retype → write into rootserver CNode →
+    sysretq with rax=0.
+
+- [ ] 29h — Spawn a child TCB, IPC over the new endpoint.
+  * Retype the rest of the untyped into a TCB.
+  * Configure the child via TCB::SetSpace / WriteRegisters
+    (shares VSpace + CSpace with rootserver for now).
+  * `TCB::Resume`.
+  * Child does `SysSend(endpoint, message)`; rootserver
+    `SysRecv` and prints.
 
 ## Out of scope (future phases)
 * Multi-segment ELF dynamic linking (we only handle static-PIE).
