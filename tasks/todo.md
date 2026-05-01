@@ -1,4 +1,119 @@
-# Active phase plan — Phase 28: SMP / AP CPU bring-up
+# Active phase plan — Phase 29: ELF rootserver bootstrap
+
+## Goal
+Mirror seL4's standard bootstrap. Today the kernel runs the
+hand-asm AY demo at the end of `_start`. Phase 29 replaces that
+with a real rootserver: an ELF binary built as a separate Rust
+crate, loaded from memory by the kernel, granted an initial
+CSpace + VSpace + BootInfo, and dispatched as the first user
+thread.
+
+End state:
+* A separate `rootserver/` crate compiles to an ELF.
+* The kernel embeds (or loads from BOOTBOOT initrd) the ELF.
+* On boot, the kernel parses the ELF, builds the rootserver's
+  VSpace + CSpace + BootInfo, dispatches the TCB.
+* Rootserver runs in user mode, prints "hello from rootserver",
+  retypes untypeds to spawn child workers (the "shell/init"
+  shape), IPCs with them.
+* A spec runs the same bootstrap path against an in-memory ELF
+  fixture and verifies caps + mappings before reaching dispatch.
+
+## Plan (incremental — one or more sessions per slice)
+
+- [x] 29a — Separate `rootserver` crate. **DONE**
+  * `rootserver/` — independent Cargo crate (no workspace).
+  * Custom `triplet.json` (no `code-model: kernel`, separate
+    `link.ld`).
+  * `link.ld` puts text at 0x100_0040_0000 (PML4[2] +4 MiB) so
+    we don't collide with BOOTBOOT's 1 GiB identity map.
+  * `_start` prints "[rootserver alive]\n" via `SysDebugPutChar`
+    then loops on `SysYield`. Hand-rolled syscall stubs in pure
+    Rust (no_std).
+  * `scripts/build_kernel.sh` builds rootserver first; kernel
+    `include_bytes!`s the resulting ELF via `src/rootserver_image.rs`.
+
+  * `rootserver/Cargo.toml` — no_std binary, x86_64 user-mode.
+  * Tiny SYSCALL stub (rax=number, rdi..r9=args, syscall).
+  * `_start` entry that issues `SysDebugPutChar` to print a
+    sentinel byte, then loops on SysYield.
+  * Linker script targeting a fixed user vaddr range.
+  * Build artifact: `rootserver/target/.../rootserver` (ELF64).
+  * `build.rs` (kernel side) `include_bytes!`-embeds the ELF.
+
+- [x] 29b — ELF parser (subset). **DONE**
+  * `src/elf.rs` — pure-Rust no_std parser. ELF64 LE x86_64
+    only; rejects 32-bit / big-endian / non-x86_64 inputs.
+  * `parse(bytes) -> Result<Image, ElfError>` returns entry
+    RIP + iterator over `PT_LOAD` segments.
+  * `LoadSegment { vaddr, file_off, file_size, mem_size, flags }`
+    with `readable() / writable() / executable()` helpers.
+  * Reads packed-struct fields via `addr_of!` + `read_unaligned`
+    so we never deref a misaligned reference.
+  * Specs: rejects bogus magic + class; embedded rootserver
+    parses cleanly; entry matches `link.ld`; segments are
+    well-formed (R always set, no W+X).
+
+- [ ] 29c — Segment loading + VSpace.
+  * Allocate per-segment 4 KiB pages from a kernel pool.
+  * Copy file data; zero BSS region (mem_size > file_size).
+  * Build a fresh PML4 (clone kernel half), map each segment's
+    pages at its vaddr with appropriate W/X bits.
+  * Allocate + map an IPC buffer page + a BootInfo page.
+
+- [ ] 29d — BootInfo + initial caps.
+  * Mirror seL4's `seL4_BootInfo` shape (existing in types.rs);
+    populate with: nodeID, numNodes, ipcBuffer vaddr, untyped
+    list, slot ranges.
+  * Allocate the rootserver's CNode (1 << ROOT_CNODE_BITS).
+  * Populate slot 0 = NullCap, slot 1 = TCB cap (self), slot
+    2 = CNode cap (self), slot 3 = VSpace cap, slot 4 = IPC
+    buffer Frame cap, slot 5 = BootInfo Frame cap, then each
+    free memory region as an Untyped cap from slot N onwards.
+  * Map the BootInfo page so the rootserver can read it.
+
+- [ ] 29e — TCB spawn + dispatch.
+  * Build TCB: priority=255 (top), vspace_root = the new PML4
+    cap, cspace_root = the new CNode cap, user_context entry =
+    ELF entry RIP, rsp = top of allocated user stack page.
+  * `cpu_context.cr3` = PML4 paddr.
+  * Replace `launch_two_thread_ipc_demo` with a new
+    `launch_rootserver` that does the above + calls
+    `enter_user_via_sysret` on the rootserver's UserContext.
+  * Boot output: "[rootserver hello]" or similar, then qemu_exit.
+
+- [ ] 29f — Spec end-to-end.
+  * In-memory ELF fixture (reuse the rootserver bytes).
+  * Spec: parse ELF, allocate pages, build vspace+cspace, verify
+    cap slots populated correctly, verify BootInfo struct fields.
+  * Doesn't actually dispatch — just stops at "ready to dispatch"
+    so the spec runner stays in kernel mode.
+
+- [ ] 29g — Init/shell shape.
+  * Rootserver retypes one of its Untypeds into a 2nd TCB +
+    a CNode + an Endpoint.
+  * Spawns the child via TCB::SetSpace + Resume.
+  * Child sends an IPC; rootserver receives + prints. Demo of
+    seL4-style userspace bootstrapping.
+
+## Out of scope (future phases)
+* Multi-segment ELF dynamic linking (we only handle static-PIE).
+* Loading rootserver from BOOTBOOT initrd (we embed via
+  `include_bytes!` for now).
+* Multiple init processes / Linux-style fork.
+* The rootserver implementing a real filesystem / networking.
+* Shutting down / killing the rootserver.
+
+## Verification
+* AY demo retired; new rootserver path runs at boot.
+* Rootserver's user-mode `SysDebugPutChar` reaches serial.
+* 29f spec covers the bootstrap data layout.
+* Spec count rises by ~3-5.
+
+## Review (filled on completion)
+
+
+# Phase 28: SMP / AP CPU bring-up
 
 ## Goal
 BOOTBOOT already starts every CPU in long mode at `_start` —

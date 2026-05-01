@@ -1,5 +1,7 @@
 # Generated files
 /target/
+/rootserver/target/
+/rootserver/Cargo.lock
 /.tmp/
 bootboot.efi
 disk.img

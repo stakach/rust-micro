@@ -94,6 +94,14 @@ mod sched_context;
 // for the smp module to keep its tests scoped.
 mod smp;
 
+// Phase 29a — the seL4-style rootserver. Compiled as a separate
+// crate (rootserver/) and embedded here via `include_bytes!`.
+mod rootserver_image;
+
+// Phase 29b — minimal ELF64 parser. Reads the embedded
+// rootserver image and exposes its entry point + PT_LOAD segments.
+mod elf;
+
 // Phase 10c — IPC fastpath bypassing the slowpath book-keeping for
 // the common-case Call / ReplyRecv shape.
 #[cfg(feature = "fastpath")]

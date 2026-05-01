@@ -34,6 +34,20 @@ if ! rustup +nightly component list --installed 2>/dev/null | grep -q '^rust-src
   rustup +nightly component add rust-src
 fi
 
+# Phase 29a — the kernel embeds the rootserver ELF via
+# include_bytes!. Build the rootserver first so the ELF exists at
+# include_bytes! resolution time.
+(
+  cd rootserver
+  cargo +nightly build \
+    -Z build-std=core \
+    -Z unstable-options \
+    -Z json-target-spec \
+    --target triplet.json \
+    --release
+)
+echo "rootserver built: rootserver/target/triplet/release/rootserver"
+
 cargo +nightly build \
   -Z build-std=core \
   -Z unstable-options \

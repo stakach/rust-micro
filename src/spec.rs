@@ -43,6 +43,7 @@ pub fn test_main() {
     crate::interrupt::spec::test_interrupt();
     crate::vspace::spec::test_vspace();
     crate::boot::spec::test_boot();
+    crate::elf::spec::test_elf();
     integration_tests::test_integration();
 
     #[cfg(feature = "mcs")]
