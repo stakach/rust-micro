@@ -221,9 +221,16 @@ fn make_object_cap(
                 },
             })
         }
-        ObjectType::SchedContext | ObjectType::Reply => {
-            Err(RetypeError::InvalidArgument)
+        ObjectType::SchedContext => {
+            // Phase 32b — variable-sized object; caller's
+            // `user_size_bits` is recorded in the cap so the kernel
+            // can find the underlying `SchedContext` storage.
+            use crate::cap::SchedContextStorage;
+            let ptr = PPtr::<SchedContextStorage>::new(obj_addr)
+                .ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::SchedContext { ptr, size_bits: user_size_bits as u8 })
         }
+        ObjectType::Reply => Err(RetypeError::InvalidArgument),
         ObjectType::Arch(t) => {
             // x86_64 frame types — see object_type::X86_* constants.
             use crate::cap::{
@@ -314,8 +321,35 @@ pub mod spec {
         device_memory_restrictions();
         zero_objects_rejected();
         retype_into_paging_structs();
+        retype_into_sched_context();
 
         arch::log("Untyped retype tests completed\n");
+    }
+
+    /// Phase 32b — Untyped → SchedContext. Variable-sized, so we
+    /// pass `user_size_bits = MIN_SCHED_CONTEXT_BITS` (8). The
+    /// resulting cap should record that size.
+    fn retype_into_sched_context() {
+        use crate::cap::SchedContextStorage;
+        let base = 0x0080_0000;
+        let mut ut = UntypedState::new(base, 14, false);
+
+        let mut produced = Cap::Null;
+        retype(&mut ut, ObjectType::SchedContext,
+            crate::object_type::MIN_SCHED_CONTEXT_BITS, 1,
+            |c| produced = c)
+            .expect("retype SchedContext");
+        match produced {
+            Cap::SchedContext { ptr, size_bits } => {
+                let _: PPtr<SchedContextStorage> = ptr;
+                assert_eq!(ptr.addr(), base);
+                assert_eq!(size_bits, crate::object_type::MIN_SCHED_CONTEXT_BITS as u8);
+            }
+            other => panic!("expected Cap::SchedContext, got {:?}", other),
+        }
+        // Untyped advanced by exactly 1 << 8 = 256 bytes.
+        assert_eq!(ut.free_index_bytes, 256);
+        arch::log("  ✓ Untyped::Retype produces a typed SchedContext cap\n");
     }
 
     fn retype_into_paging_structs() {

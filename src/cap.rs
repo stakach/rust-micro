@@ -22,6 +22,7 @@ use crate::structures::arch::{
     AsidControlCap, AsidPoolCap, FrameCap, PageDirectoryCap, PageTableCap, PdptCap,
     Pml4Cap,
 };
+use crate::structures::SchedContextCap;
 use crate::types::seL4_Word as Word;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
@@ -50,6 +51,7 @@ pub mod tag {
     pub const IRQ_HANDLER: u64 = 16;
     pub const ZOMBIE: u64 = 18;
     pub const DOMAIN: u64 = 20;
+    pub const SCHED_CONTEXT: u64 = 22;
 
     // Arch (odd) tags — x86_64 specific subset we decode today.
     pub const FRAME: u64 = 1;
@@ -167,6 +169,10 @@ pub struct AsidPoolStorage;
 /// a per-Call kernel object; the kernel pool indexes via the
 /// PPtr's `(addr - 1)`.
 pub struct ReplyStorage;
+/// Storage backing a `Cap::SchedContext` (Phase 32b). Each SC
+/// occupies a 2^size_bits-byte block; the smallest is `MIN_SCHED_CONTEXT_BITS`
+/// (= 8 = 256 bytes — large enough for the refill array).
+pub struct SchedContextStorage;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum FrameSize {
@@ -333,6 +339,16 @@ pub enum Cap {
     AsidPool {
         ptr: PPtr<AsidPoolStorage>,
         asid_base: u16,
+    },
+    /// Phase 32b — MCS scheduling-context cap (tag 22). Names a
+    /// SchedContext kernel object whose `period`, `budget`, and
+    /// refill schedule control the bound TCB's CPU allocation.
+    /// `size_bits` records the underlying object's size — seL4
+    /// allows variable-sized SCs so larger budgets can hold more
+    /// `Refill` entries.
+    SchedContext {
+        ptr: PPtr<SchedContextStorage>,
+        size_bits: u8,
     },
     /// Any other arch-tagged cap (page tables, ASID pool, etc.).
     /// Stored as the raw two-word encoding; full decoding for the
@@ -540,6 +556,16 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 asid_base: c.capASIDBase() as u16,
             }
         }
+        tag::SCHED_CONTEXT => {
+            let c = SchedContextCap { words };
+            let Some(ptr) = PPtr::<SchedContextStorage>::new(c.capSCPtr()) else {
+                return Cap::Null;
+            };
+            Cap::SchedContext {
+                ptr,
+                size_bits: c.capSCSizeBits() as u8,
+            }
+        }
         t if tag::is_arch(t) => Cap::Arch { cap_type: t, words },
         _ => Cap::Null,
     }
@@ -678,6 +704,16 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             )
             .words
         }
+        Cap::SchedContext { ptr, size_bits } => {
+            // sched_context_cap (no explicit_params):
+            //   capSCPtr, capSCSizeBits, capType.
+            SchedContextCap::new(
+                ptr.addr(),
+                *size_bits as u64,
+                tag::SCHED_CONTEXT,
+            )
+            .words
+        }
         Cap::Frame { ptr, size, rights, mapped, asid, is_device } => {
             // Visible field order (no explicit_params on frame_cap):
             //   capFMappedASID, capFBasePtr, capType, capFSize,
@@ -745,6 +781,7 @@ pub mod spec {
         roundtrip_frame();
         roundtrip_paging_structs();
         roundtrip_asid_caps();
+        roundtrip_sched_context_cap();
         type_tag_dispatch();
 
         arch::log("Cap round-trip tests completed\n");
@@ -803,6 +840,19 @@ pub mod spec {
         assert_eq!(from_words(words), pml4);
 
         arch::log("  ✓ page-table / directory / PDPT / PML4 caps round-trip\n");
+    }
+
+    fn roundtrip_sched_context_cap() {
+        // capSCPtr is `field_ptr 48` → 4 KiB-aligned suffices.
+        // capSCSizeBits is `field 6` (0..63).
+        let sc = Cap::SchedContext {
+            ptr: PPtr::<SchedContextStorage>::new(0x0000_0000_0040_0000).unwrap(),
+            size_bits: 8,
+        };
+        let words = to_words(&sc);
+        assert_eq!(cap_type_of(words), tag::SCHED_CONTEXT);
+        assert_eq!(from_words(words), sc);
+        arch::log("  ✓ SchedContext cap round-trips\n");
     }
 
     fn roundtrip_asid_caps() {

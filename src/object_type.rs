@@ -48,6 +48,14 @@ pub const MIN_UNTYPED_SIZE_BITS: u32 = 4;
 /// Largest legal Untyped — the full virtual word size.
 pub const MAX_UNTYPED_SIZE_BITS: u32 = 47;
 
+/// Phase 32b — minimum size for a SchedContext object. seL4 uses 8
+/// bits (256 bytes) as the smallest size that fits the SC header
+/// plus a couple of refills.
+pub const MIN_SCHED_CONTEXT_BITS: u32 = 8;
+/// Largest sensible SchedContext — bounded to keep the field width
+/// (`capSCSizeBits`, 6 bits) addressable.
+pub const MAX_SCHED_CONTEXT_BITS: u32 = 16;
+
 // x86_64 arch object types — these sit above
 // `seL4_NonArchObjectTypeCount` in libsel4. Numbered to match
 // seL4's `seL4_X86_*Object` ordering.
@@ -148,7 +156,14 @@ pub fn size_in_bits(ty: ObjectType, user_size_bits: u32) -> Result<u32, SizeErro
         ObjectType::Tcb => Ok(TCB_SIZE_BITS),
         ObjectType::Endpoint => Ok(ENDPOINT_SIZE_BITS),
         ObjectType::Notification => Ok(NOTIFICATION_SIZE_BITS),
-        ObjectType::SchedContext | ObjectType::Reply => Err(SizeError::Unsupported),
+        // Phase 32b — SchedContext is variable-sized: caller supplies
+        // `user_size_bits` (= log2(bytes), at least
+        // `MIN_SCHED_CONTEXT_BITS`). seL4's minimum is 8 (256 B);
+        // the budget rises with size because each refill is ~16 B.
+        ObjectType::SchedContext => {
+            bounds_check(user_size_bits, MIN_SCHED_CONTEXT_BITS, MAX_SCHED_CONTEXT_BITS)
+        }
+        ObjectType::Reply => Err(SizeError::Unsupported),
         ObjectType::Arch(t) => match t {
             X86_4K => Ok(12),
             X86_2M => Ok(21),
@@ -217,9 +232,20 @@ pub mod spec {
             size_in_bits(ObjectType::Untyped, 1),
             Err(SizeError::OutOfRange { .. })
         ));
-        // SchedContext is unsupported in the non-MCS build.
+        // Phase 32b — SchedContext is variable-sized. user_size_bits
+        // below `MIN_SCHED_CONTEXT_BITS` is rejected as OutOfRange;
+        // legal sizes return the size_bits unchanged.
         assert!(matches!(
             size_in_bits(ObjectType::SchedContext, 0),
+            Err(SizeError::OutOfRange { .. })
+        ));
+        assert_eq!(
+            size_in_bits(ObjectType::SchedContext, MIN_SCHED_CONTEXT_BITS),
+            Ok(MIN_SCHED_CONTEXT_BITS)
+        );
+        // Reply still has no Untyped::Retype path (kernel allocates).
+        assert!(matches!(
+            size_in_bits(ObjectType::Reply, 0),
             Err(SizeError::Unsupported)
         ));
         arch::log("  ✓ size_in_bits rejects out-of-range and unsupported\n");

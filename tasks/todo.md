@@ -1,4 +1,106 @@
-# Active phase plan — Phase 31: ASID support — DONE
+# Active phase plan — Phase 32: MCS scheduler
+
+## Goal
+Replace the classic time-slice scheduler with seL4's MCS
+(Mixed-Criticality Systems) sporadic-server model. Today each
+TCB has a `time_slice: u32` decremented per PIT tick; when it
+hits zero we preempt. MCS instead gives each thread a
+*SchedContext* with a refill schedule (period + budget); each
+tick spends from the current refill; when budget runs out the
+thread blocks until the next scheduled refill.
+
+What's already in place:
+* `src/sched_context.rs` (gated `feature = "mcs"`) — `SchedContext`,
+  `Refill`, `refill_charge`, plus a small spec module.
+* `codegen/structures_64.bf` defines `sched_context_cap` and the
+  MCS variant of `reply_cap` under `#ifdef CONFIG_KERNEL_MCS`.
+  `build_support/bf.rs` defaults `CONFIG_KERNEL_MCS = false`,
+  so those blocks don't get generated today.
+
+## Plan (incremental — one phase per slice)
+
+- [x] 32a — MCS-only kernel. **DONE**
+  * `CONFIG_KERNEL_MCS = true` unconditionally in
+    `build_support/bf.rs::default_config`.
+  * `Cap::Reply` reshaped to MCS layout:
+    `{ ptr: PPtr<ReplyStorage>, can_grant: bool }` (drops the
+    non-MCS `tcb` + `master`).
+  * `feature = "mcs"` gates removed (`sched_context.rs`,
+    `main.rs`, `spec.rs`); the cargo feature is retained as
+    a no-op so existing `--features mcs` invocations still work.
+  * Codegen quirk: padding spanning multiple words is now
+    accepted in `lower()`. Only named fields need to fit in a
+    single word (the MCS notification block declares
+    `padding 3 * word_size`).
+  * `Notification::SIZE_BYTES` updated 32 → 64 in two specs
+    (the MCS notification carries `ntfnSchedContext` + 3-word
+    padding).
+
+- [x] 32b — typed Cap::SchedContext + retype. **DONE**
+  * `Cap::SchedContext { ptr, size_bits }` (tag 22) round-trips
+    through `SchedContextCap`.
+  * `ObjectType::SchedContext` is now variable-sized; valid
+    `user_size_bits` ∈ [`MIN_SCHED_CONTEXT_BITS`=8,
+    `MAX_SCHED_CONTEXT_BITS`=16].
+  * `Untyped::Retype(SchedContext, size_bits, n)` produces N
+    typed `Cap::SchedContext`s of the requested size, MDB-aware
+    via Phase 30 wiring.
+  * Specs: round-trip + retype-into-SchedContext.
+
+
+- [ ] 32b — Bind a SchedContext to a TCB.
+  * `Tcb::sc: Option<SchedContextId>` (kernel-side index into
+    a small SchedContext pool, like Endpoints).
+  * `TCB::SetSchedContext` invocation: takes a SchedContext cap
+    (in invoker's CSpace) and binds it to the target TCB.
+  * Spec: SetSchedContext stores the binding.
+
+- [ ] 32c — refill_charge ↔ PIT tick.
+  * Wire `pit_isr` (under `cfg(feature = "mcs")`) to call
+    `refill_charge(tcb.sc, ticks_elapsed)` instead of the
+    classic `time_slice -= 1`.
+  * On budget exhaustion: block the thread and stash a wake-up
+    timestamp; on next refill (= scheduler tick reaches the
+    refill's release_time) make the thread runnable again.
+  * Spec: prime an SC with budget=10, period=100; charge
+    9 ticks, thread runs; charge 1 more, thread blocks; advance
+    to release_time, thread wakes.
+
+- [ ] 32d — SchedControl invocation.
+  * `SchedControl::Configure(target_sc, period, budget,
+    extra_refills)` — sets the SC's refill schedule.
+  * Required to make the SC actually configurable from
+    userspace; otherwise the rootserver can't program a child's
+    deadline.
+
+- [ ] 32e — Rootserver demo: mixed-criticality.
+  * Rootserver retypes 2 SchedContexts:
+      (a) period=100, budget=80   — high-criticality task.
+      (b) period=100, budget=20   — best-effort task.
+  * Spawns child TCBs bound to each. Both run a SysYield loop;
+    the high-criticality one always gets ≥ 80 ticks per period
+    even when the best-effort child is hot. Verify via the
+    per-CPU SYSCALL counter we already added in Phase 28h.
+
+## Out of scope (future)
+* Replenishment scheduling on a wall clock vs scheduler ticks
+  — we'll drive everything from PIT ticks, not nanosecond
+  deadlines.
+* MCS Reply caps (we keep the non-MCS reply path; the MCS reply
+  shape is just a single capReplyPtr, no master, no TCB).
+* Donation across IPC (the "scheduling-context-passing" feature
+  where Call hands the caller's SC to the callee for the
+  duration of the call).
+
+## Verification
+* AY / rootserver demos unchanged on each phase.
+* New per-phase specs pass.
+* Spec count rises by ~5-8.
+
+## Review (filled on completion)
+
+
+# Phase 31: ASID support — DONE
 
 ## Review
 
