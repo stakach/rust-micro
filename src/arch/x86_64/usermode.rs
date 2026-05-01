@@ -60,7 +60,7 @@ use crate::tcb::{Tcb, ThreadStateType};
 
 #[rustfmt::skip]
 const SENDER_PAYLOAD: &[u8] = &[
-    0x48, 0xC7, 0xC2, 0x4D, 0x00, 0x00, 0x00, // mov rdx, 'M' (msg_regs[0])
+    0x48, 0xC7, 0xC2, 0x59, 0x00, 0x00, 0x00, // mov rdx, 'Y' (msg_regs[0])
     0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00, // mov rsi, 1   (MsgInfo: len=1)
     0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1   (cap_ptr)
     0x48, 0xC7, 0xC0, 0xFD, 0xFF, 0xFF, 0xFF, // mov rax, -3  (SysSend)
@@ -68,23 +68,98 @@ const SENDER_PAYLOAD: &[u8] = &[
     0xEB, 0xFE,                               // jmp $-0
 ];
 
+// Phase 21: receiver allocates a Frame from an Untyped (slot 2),
+// maps it at a fixed user-virtual address V, receives the
+// sender's byte, stores it through the new mapping, loads it back,
+// and prints it. If the assembled stream of syscalls works the
+// boot output is `AY` and the test exits.
+//
+// Hand-assembled. Layout:
+//
+//   // 1) putchar('A')
+//   48 C7 C7 41 00 00 00   mov rdi, 'A'
+//   48 C7 C0 F7 FF FF FF   mov rax, -9
+//   0F 05                  syscall
+//
+//   // 2) SysSend(cap=2 = Untyped, MsgInfo=UntypedRetype<<12,
+//   //           type=X86_4K=7, num=1, dest_offset=3)
+//   48 C7 C7 02 00 00 00   mov rdi, 2          ; cap_ptr
+//   48 C7 C6 00 10 00 00   mov rsi, 0x1000     ; (1<<12) MsgInfo
+//   48 C7 C2 07 00 00 00   mov rdx, 7          ; X86_4K
+//   49 C7 C2 01 00 00 00   mov r10, 1          ; (size_bits<<32)|num
+//   49 C7 C0 03 00 00 00   mov r8,  3          ; dest_offset
+//   48 C7 C0 FD FF FF FF   mov rax, -3         ; SysSend
+//   0F 05                  syscall
+//
+//   // 3) SysSend(cap=3 = Frame, MsgInfo=X86PageMap<<12, vaddr=V,
+//   //           rights=ReadWrite=3)
+//   48 C7 C7 03 00 00 00   mov rdi, 3
+//   48 C7 C6 00 70 02 00   mov rsi, 0x27000    ; (39<<12) PageMap
+//   48 BA <V64>            mov rdx, V          ; 0x0000_0100_0050_0000
+//   49 C7 C2 03 00 00 00   mov r10, 3          ; ReadWrite
+//   48 C7 C0 FD FF FF FF   mov rax, -3
+//   0F 05                  syscall
+//
+//   // 4) SysRecv(cap=1) — fetches the sender's byte into rdx.
+//   48 C7 C7 01 00 00 00   mov rdi, 1
+//   48 C7 C0 FB FF FF FF   mov rax, -5
+//   0F 05                  syscall
+//
+//   // 5) save received rdx, then store + load through V.
+//   48 89 D1               mov rcx, rdx        ; rcx = received byte
+//   48 BA <V64>            mov rdx, V
+//   88 0A                  mov [rdx], cl       ; store low byte
+//   48 0F B6 3A            movzx rdi, byte [rdx] ; load back
+//
+//   // 6) putchar(loaded byte)
+//   48 C7 C0 F7 FF FF FF   mov rax, -9
+//   0F 05                  syscall
+//
+//   // 7) spin
+//   EB FE                  jmp $-0
+//
+// V = 0x0000_0100_0050_0000 → little-endian: 00 00 50 00 00 01 00 00.
 #[rustfmt::skip]
 const RECEIVER_PAYLOAD: &[u8] = &[
-    // First, putchar('P') so we know the receiver started.
-    0x48, 0xC7, 0xC7, 0x50, 0x00, 0x00, 0x00, // mov rdi, 'P'
-    0x48, 0xC7, 0xC0, 0xF7, 0xFF, 0xFF, 0xFF, // mov rax, -9
-    0x0F, 0x05,                               // syscall
-    // Recv on cap_ptr=1.
-    0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
-    0x48, 0xC7, 0xC0, 0xFB, 0xFF, 0xFF, 0xFF, // mov rax, -5 (SysRecv)
-    0x0F, 0x05,                               // syscall
-    // Phase 15a: kernel parents msg_regs[0] into rdx on the way
-    // out, so the byte the sender shipped lives in rdx now.
-    // Print it.
-    0x48, 0x89, 0xD7,                         // mov rdi, rdx
-    0x48, 0xC7, 0xC0, 0xF7, 0xFF, 0xFF, 0xFF, // mov rax, -9
-    0x0F, 0x05,                               // syscall
-    0xEB, 0xFE,                               // jmp $-0
+    // 1) putchar('A')
+    0x48, 0xC7, 0xC7, 0x41, 0x00, 0x00, 0x00,
+    0x48, 0xC7, 0xC0, 0xF7, 0xFF, 0xFF, 0xFF,
+    0x0F, 0x05,
+
+    // 2) Untyped::Retype
+    0x48, 0xC7, 0xC7, 0x02, 0x00, 0x00, 0x00,         // rdi=2
+    0x48, 0xC7, 0xC6, 0x00, 0x10, 0x00, 0x00,         // rsi=0x1000
+    0x48, 0xC7, 0xC2, 0x07, 0x00, 0x00, 0x00,         // rdx=7
+    0x49, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00,         // r10=1
+    0x49, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00,         // r8=3
+    0x48, 0xC7, 0xC0, 0xFD, 0xFF, 0xFF, 0xFF,         // rax=-3
+    0x0F, 0x05,
+
+    // 3) Frame::Map(V, RW)
+    0x48, 0xC7, 0xC7, 0x03, 0x00, 0x00, 0x00,         // rdi=3
+    0x48, 0xC7, 0xC6, 0x00, 0x70, 0x02, 0x00,         // rsi=0x27000
+    0x48, 0xBA, 0x00, 0x00, 0x50, 0x00, 0x00, 0x01, 0x00, 0x00, // rdx=V
+    0x49, 0xC7, 0xC2, 0x03, 0x00, 0x00, 0x00,         // r10=3
+    0x48, 0xC7, 0xC0, 0xFD, 0xFF, 0xFF, 0xFF,         // rax=-3
+    0x0F, 0x05,
+
+    // 4) SysRecv(cap=1)
+    0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,         // rdi=1
+    0x48, 0xC7, 0xC0, 0xFB, 0xFF, 0xFF, 0xFF,         // rax=-5
+    0x0F, 0x05,
+
+    // 5) save rdx → rcx, reload V, store, load
+    0x48, 0x89, 0xD1,                                 // mov rcx, rdx
+    0x48, 0xBA, 0x00, 0x00, 0x50, 0x00, 0x00, 0x01, 0x00, 0x00, // mov rdx, V
+    0x88, 0x0A,                                       // mov [rdx], cl
+    0x48, 0x0F, 0xB6, 0x3A,                           // movzx rdi, byte [rdx]
+
+    // 6) putchar(rdi)
+    0x48, 0xC7, 0xC0, 0xF7, 0xFF, 0xFF, 0xFF,         // rax=-9
+    0x0F, 0x05,
+
+    // 7) spin
+    0xEB, 0xFE,
 ];
 
 #[repr(C, align(4096))]
@@ -94,6 +169,14 @@ static mut SENDER_CODE_PAGE: UserPage = UserPage([0; 4096]);
 static mut SENDER_STACK_PAGE: UserPage = UserPage([0; 4096]);
 static mut RECEIVER_CODE_PAGE: UserPage = UserPage([0; 4096]);
 static mut RECEIVER_STACK_PAGE: UserPage = UserPage([0; 4096]);
+
+/// Backing memory the receiver's Untyped cap describes. The user
+/// code retypes a 4 KiB Frame out of this pool and maps it; the
+/// store/load through the mapping must hit real RAM, so we back
+/// the Untyped with a 16 KiB BSS pool.
+#[repr(C, align(4096))]
+struct DemoPool([u8; 16 * 1024]);
+static mut DEMO_POOL: DemoPool = DemoPool([0; 16 * 1024]);
 
 const SENDER_CODE_VBASE: u64 = 0x0000_0100_0000_0000;
 const SENDER_STACK_VBASE: u64 = 0x0000_0100_0001_0000;
@@ -155,6 +238,19 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         // CNodes 1 and 2 each hold the endpoint cap at slot 1.
         s.cnodes[1].0[1] = Cte::with_cap(&ep_cap);
         s.cnodes[2].0[1] = Cte::with_cap(&ep_cap);
+
+        // Phase 21: receiver gets an Untyped cap at slot 2
+        // pointing at DEMO_POOL. The user payload retypes a 4 KiB
+        // frame out of this pool and maps it.
+        let pool_va = (&raw const DEMO_POOL) as u64;
+        let pool_pa = kernel_virt_to_phys(pool_va);
+        let untyped_cap = Cap::Untyped {
+            ptr: PPtr::<crate::cap::UntypedStorage>::new(pool_pa).unwrap(),
+            block_bits: 14, // 16 KiB
+            free_index: 0,
+            is_device: false,
+        };
+        s.cnodes[2].0[2] = Cte::with_cap(&untyped_cap);
 
         // Spawn the two TCBs.
         let sender = spawn_thread(

@@ -1,52 +1,78 @@
-# Active phase plan — Phase 20: TCB invocations
+# Active phase plan — Phase 21: user-mode dynamic allocation
 
 ## Goal
-Round out the TCB cap so userspace can fully configure new threads
-without the kernel hand-crafting them. Adds:
-* `TCB::WriteRegisters` — set the thread's saved RIP/RSP and a few
-  arg regs.
-* `TCB::ReadRegisters` — fan the thread's saved registers back to
-  the caller via `msg_regs`.
-* `TCB::SetSpace` — set the thread's CSpace root + VSpace root +
-  fault-EP cap.
-* `TCB::BindNotification` — bind a Notification cap to the TCB
-  (signal-on-fault later).
+Demonstrate the full seL4-shape flow from user mode: a ring-3
+thread retypes an Untyped into a Frame, maps the Frame at a
+chosen vaddr, writes to the mapped memory, reads it back, and
+prints the result. Proves Phase 16 (Untyped::Retype) and Phase 19
+(Frame::Map) work end-to-end from user space, not just spec.
 
-## ABI notes
-`SyscallArgs` is 6 words, so we have to pack carefully. seL4's full
-ABI uses the IPC buffer for overflow; we don't have user IPC
-buffers wired yet, so the invocation handlers below take the most
-useful subset.
+## Demo flow
+- Sender: `SysSend('Y' on endpoint cap=1)` (existing).
+- Receiver:
+  1. `SysDebugPutChar('A')` — proof we started.
+  2. `SysCall(cap=2 = Untyped, label=UntypedRetype, type=X86_4K,
+     num=1, dest_offset=3)` — retype a frame into slot 3.
+  3. `SysCall(cap=3 = Frame, label=X86PageMap, vaddr=V, rights=RW)`
+     — install the frame at user-virtual V.
+  4. `SysRecv(cap=1)` — receive the sender's 'Y'.
+  5. `mov [V], received_byte` — store through the new mapping.
+  6. `mov rdi, [V]` — load it back.
+  7. `SysDebugPutChar(rdi)` — print it.
 
-* `WriteRegisters(rip, rsp, arg0)`: a2 = rip, a3 = rsp, a4 = arg0.
-* `ReadRegisters(suspend_source)`: a2 ignored. Writes msg_regs[0]
-  = rip, msg_regs[1] = rsp, msg_regs[2] = rax. ipc_length = 3.
-* `SetSpace(fault_ep_cptr, cnode_cptr, vspace_cptr)`: a2..a4.
-  fault_ep_cptr can be 0 to mean "no fault handler". vspace
-  isn't fully wired (single shared address space), so we just
-  store the cap as opaque for now.
-* `BindNotification(ntfn_cptr)`: a2 = cptr to a Notification cap;
-  installs it as the TCB's bound notification.
+If we observe `AY` on serial we know:
+* Slot lookup works.
+* Untyped::Retype as a syscall works.
+* Frame::Map as a syscall works.
+* The new PTE actually points at the new frame (the byte loaded
+  matches the byte stored).
+* IPC still works.
 
 ## Plan
-- [x] 20a — TCB::WriteRegisters / ReadRegisters
-- [x] 20b — TCB::SetSpace (cspace_root + vspace_root + fault_ep)
-- [x] 20c — TCB::BindNotification (+ Unbind)
-- [x] 20d — specs for each
+- [x] 21a — Pre-populate receiver's CNode with an Untyped cap at
+  slot 2 (carved from `DEMO_POOL`, a 16 KiB BSS-aligned pool).
+- [x] 21b — Hand-assembled the new receiver payload (~140 bytes).
+- [x] 21c — Existing IPC_PRINTED threshold (≥ 2) already matches.
+- [x] 21d — Boot output reads `AY`.
+
+## ABI plumbing notes
+* MessageInfo for Retype: label = UntypedRetype = 1. Encoded
+  bits: `(label << 12) | (length & 0x7F)`. We only need length
+  for IPC payload, not for invocations — kernel reads label from
+  rsi.
+* SyscallArgs for Retype: a0 = cap_ptr to untyped, a2 =
+  object_type word (X86_4K = 7), a3 = (size_bits<<32) |
+  num_objects = 1, a4 = dest_offset = 3.
+* SyscallArgs for X86PageMap: a0 = cap_ptr to frame, a1 =
+  (X86PageMap << 12), a2 = vaddr, a3 = FrameRights::ReadWrite
+  (= 3).
 
 ## Verification
-* All previous specs pass.
-* New TCB invocation specs verify:
-  - WriteRegisters updates target.user_context.rcx/rsp/rdi
-  - ReadRegisters fans target's saved state into invoker's
-    msg_regs
-  - SetSpace updates target's cspace_root + records fault_ep
-  - BindNotification stamps target.bound_notification
+* All previous specs still pass.
+* IPC demo's payload bytes line up with the assembled
+  instructions (manual trace).
+* Boot output ends with `AY` then exit.
 
 ## Review
 
-* All 4 sub-tasks complete; 2 new specs (10 invocation total).
-* Tcb gained `vspace_root: Cap` (opaque storage; per-thread CR3
-  lands when ASID does) and `bound_notification: Option<u16>`.
-* Existing `fault_handler: Word` reused for SetSpace's fault EP.
-* User-mode IPC demo unchanged; spec count 126 → 128.
+* All 4 sub-tasks complete on the first build. The hand-assembled
+  payload happened to be correct on the first run — every byte
+  was checked against the manual encoding in the comment block.
+* Boot output: `AY`. The `Y` is the byte that came:
+  sender's user code → Cap::Endpoint → endpoint::transfer →
+  receiver's TCB.msg_regs[0] → Phase 15a fan-out into rdx →
+  user's `mov rcx, rdx` → user's store `mov [V], cl` → loaded
+  back via `movzx rdi, byte [V]` → SysDebugPutChar → serial.
+* This proves end-to-end:
+  - SysSend on Endpoint cap from ring 3
+  - SysSend on Untyped cap from ring 3 → Untyped::Retype
+    invocation places a Frame cap in the receiver's CSpace
+  - SysSend on Frame cap from ring 3 → Frame::Map invocation
+    installs the PTE
+  - The PTE actually backs real memory (DEMO_POOL) and the
+    page-table walk lands the user's load on the byte the user
+    just stored
+  - SysRecv on Endpoint from ring 3 returns the sender's byte in
+    rdx (Phase 15a fan-out)
+* Specs unchanged at 128 ✓; user-mode demo is now strictly
+  more impressive.
