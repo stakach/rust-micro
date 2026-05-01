@@ -18,7 +18,10 @@
 //! later phases inside small, well-encapsulated `unsafe` helpers.
 
 use crate::structures::*;
-use crate::structures::arch::{FrameCap, PageDirectoryCap, PageTableCap, PdptCap, Pml4Cap};
+use crate::structures::arch::{
+    AsidControlCap, AsidPoolCap, FrameCap, PageDirectoryCap, PageTableCap, PdptCap,
+    Pml4Cap,
+};
 use crate::types::seL4_Word as Word;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
@@ -54,6 +57,8 @@ pub mod tag {
     pub const PAGE_DIRECTORY: u64 = 5;
     pub const PDPT: u64 = 7;
     pub const PML4: u64 = 9;
+    pub const ASID_CONTROL: u64 = 11;
+    pub const ASID_POOL: u64 = 13;
 
     /// Returns true for all arch-specific cap tags. Mirrors
     /// `isArchCap` in seL4: arch caps occupy odd tag values.
@@ -154,6 +159,10 @@ pub struct PdptStorage;
 /// Storage backing a `Cap::PML4` — the apex of the x86_64 paging
 /// chain. One PML4 is one 4 KiB page of 512 PML4Es.
 pub struct Pml4Storage;
+/// Storage backing a `Cap::AsidPool` — one 4 KiB page holding 2^9
+/// (= 512) `asid_map` entries, plus an asid_base offset stored in
+/// the cap.
+pub struct AsidPoolStorage;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum FrameSize {
@@ -306,6 +315,18 @@ pub enum Cap {
         ptr: PPtr<Pml4Storage>,
         mapped: bool,
         asid: u16,
+    },
+    /// Phase 31 — singleton "ASID control" cap (tag 11). Holding it
+    /// permits `X86ASIDControlMakePool` to mint fresh `Cap::AsidPool`s
+    /// out of Untypeds. The kernel keeps the global pool-allocation
+    /// state behind the cap; the cap itself has no payload.
+    AsidControl,
+    /// Phase 31 — handle on a 4 KiB page of `asid_map` entries
+    /// (tag 13). `asid_base` is the lowest ASID this pool covers
+    /// (multiple of 512).
+    AsidPool {
+        ptr: PPtr<AsidPoolStorage>,
+        asid_base: u16,
     },
     /// Any other arch-tagged cap (page tables, ASID pool, etc.).
     /// Stored as the raw two-word encoding; full decoding for the
@@ -503,6 +524,17 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 asid: c.capPML4MappedASID() as u16,
             }
         }
+        tag::ASID_CONTROL => Cap::AsidControl,
+        tag::ASID_POOL => {
+            let c = AsidPoolCap { words };
+            let Some(ptr) = PPtr::<AsidPoolStorage>::new(c.capASIDPool()) else {
+                return Cap::Null;
+            };
+            Cap::AsidPool {
+                ptr,
+                asid_base: c.capASIDBase() as u16,
+            }
+        }
         t if tag::is_arch(t) => Cap::Arch { cap_type: t, words },
         _ => Cap::Null,
     }
@@ -627,6 +659,21 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             )
             .words
         }
+        Cap::AsidControl => {
+            let mut c = AsidControlCap::zeroed();
+            c = c.with_capType(tag::ASID_CONTROL);
+            c.words
+        }
+        Cap::AsidPool { ptr, asid_base } => {
+            // asid_pool_cap visible-field order (no explicit_params):
+            //   capType, capASIDBase, capASIDPool.
+            AsidPoolCap::new(
+                tag::ASID_POOL,
+                *asid_base as u64,
+                ptr.addr(),
+            )
+            .words
+        }
         Cap::Frame { ptr, size, rights, mapped, asid, is_device } => {
             // Visible field order (no explicit_params on frame_cap):
             //   capFMappedASID, capFBasePtr, capType, capFSize,
@@ -693,6 +740,7 @@ pub mod spec {
         roundtrip_arch_passthrough();
         roundtrip_frame();
         roundtrip_paging_structs();
+        roundtrip_asid_caps();
         type_tag_dispatch();
 
         arch::log("Cap round-trip tests completed\n");
@@ -751,6 +799,25 @@ pub mod spec {
         assert_eq!(from_words(words), pml4);
 
         arch::log("  ✓ page-table / directory / PDPT / PML4 caps round-trip\n");
+    }
+
+    fn roundtrip_asid_caps() {
+        // AsidControl is a singleton — no fields besides cap_type.
+        let words = to_words(&Cap::AsidControl);
+        assert_eq!(cap_type_of(words), tag::ASID_CONTROL);
+        assert_eq!(from_words(words), Cap::AsidControl);
+
+        // AsidPool: shift +11 on capASIDPool means we need a
+        // 2 KiB-aligned ptr. 4 KiB-aligned pool storage fits.
+        let pool = Cap::AsidPool {
+            ptr: PPtr::<AsidPoolStorage>::new(0x0000_0000_0030_4000).unwrap(),
+            asid_base: 0x200,
+        };
+        let words = to_words(&pool);
+        assert_eq!(cap_type_of(words), tag::ASID_POOL);
+        assert_eq!(from_words(words), pool);
+
+        arch::log("  ✓ AsidControl + AsidPool caps round-trip\n");
     }
 
     fn roundtrip_null() {
@@ -844,15 +911,15 @@ pub mod spec {
     }
 
     fn roundtrip_arch_passthrough() {
-        // Use tag 11 (asid_control) — still un-typed at this
-        // point. Earlier phases used 1 (frame) and 3
-        // (page_table); both now decode to typed variants.
+        // Use tag 15 (io_space_cap) — still un-typed. Earlier
+        // phases used 1 (frame), 3 (page_table), 11 (asid_control);
+        // those now all decode to typed variants.
         let mut words = [0u64; 2];
-        words[0] = 11u64 << 59;
+        words[0] = 15u64 << 59;
         let back = from_words(words);
         match back {
-            Cap::Arch { cap_type: 11, words: w } => assert_eq!(w, words),
-            other => panic!("expected Cap::Arch{{11,..}}, got {:?}", other),
+            Cap::Arch { cap_type: 15, words: w } => assert_eq!(w, words),
+            other => panic!("expected Cap::Arch{{15,..}}, got {:?}", other),
         }
         arch::log("  ✓ arch cap passes through opaquely (un-typed tags)\n");
     }

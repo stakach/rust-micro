@@ -1,4 +1,45 @@
-# Active phase plan — Phase 30: MDB linked-list — DONE
+# Active phase plan — Phase 31: ASID support — DONE
+
+## Review
+
+Promoted tags 11 (asid_control) and 13 (asid_pool) into typed
+`Cap::AsidControl` and `Cap::AsidPool` variants, and wired the
+two seL4 invocations:
+
+  * `Cap::AsidControl` is a singleton root cap (no payload).
+    `X86ASIDControlMakePool` carves 4 KiB out of an Untyped
+    for pool storage and tags the new `Cap::AsidPool` with a
+    fresh `asid_base` (kernel-side `NEXT_ASID_BASE` counter
+    bumps by 512 — one pool's worth of ASIDs).
+  * `Cap::AsidPool { ptr, asid_base }` lets userspace assign
+    an ASID to a `Cap::PML4` (the vspace root). `Assign` writes
+    `pool.asid_base + offset` into the PML4 cap's `asid` field;
+    a second Assign on a non-zero-ASID PML4 surfaces
+    `DeleteFirst`.
+
+Phase 31 keeps the work at the cap-tracking level only —
+hardware PCID integration (CR4.PCIDE + low-12-bits of CR3 +
+INVPCID for selective TLB flush) is a follow-up. Today's CR3
+swap unconditionally flushes the TLB; once PCID is plumbed,
+threads with the same ASID will keep their TLB entries across
+context switches.
+
+Pre-existing `roundtrip_arch_passthrough` spec switched its
+opaque-tag probe from 11 → 15 (io_space_cap) — 11 is now typed.
+
+152 → 154 specs. AY / rootserver demos unchanged.
+
+## Out of scope (future)
+* Hardware PCID enable + INVPCID instructions.
+* `asid_map[]` page contents — the AsidPool storage page is
+  allocated but its 512 entries aren't yet read/written. With
+  PCID-aware CR3 we'd track per-ASID metadata there.
+* Reclaiming an ASID when its PML4 is freed.
+* Cross-CPU ASID rebroadcast on Unmap (each CPU has its own
+  TLB/PCID state).
+
+
+# Phase 30: MDB linked-list — DONE
 
 ## Review
 
