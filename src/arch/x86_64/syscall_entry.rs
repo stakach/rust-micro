@@ -265,9 +265,13 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
     // TCB, so the per-thread user_context survives schedule()
     // returning a different current thread.
     use crate::kernel::KERNEL;
+    use core::sync::atomic::Ordering as AtomOrd;
     unsafe {
         if let Some(prev) = KERNEL.get().scheduler.current {
             KERNEL.get().scheduler.slab.get_mut(prev).user_context = *ctx;
+            IN_FLIGHT_INVOKER.store(prev.0 as u32, AtomOrd::Relaxed);
+        } else {
+            IN_FLIGHT_INVOKER.store(u32::MAX, AtomOrd::Relaxed);
         }
     }
 
@@ -328,18 +332,46 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
         };
         if let Some(next) = next {
             s.scheduler.current = Some(next);
-            // Reload the (possibly different) thread's context
-            // into the in-flight save area so the asm stub's
-            // `pop`/`sysretq` resumes that thread.
-            let mut new_ctx = s.scheduler.slab.get(next).user_context;
-            // Stamp the syscall return value into the user thread
-            // we're about to run. For a sender that just woke up
-            // from a blocking SysSend, the rax we set below is what
-            // user code observes after sysretq.
+            // Phase 15a: fan IPC delivery state from the receiving
+            // TCB into its user-visible registers. The receiver
+            // reads:
+            //   rax = 0                   (success)
+            //   rsi = MessageInfo (label + length packed)
+            //   rdi = badge of sender's cap
+            //   rdx, r10, r8, r9 = msg_regs[0..3]
+            // For non-IPC syscalls (or for the sender after its
+            // SysSend completes), rax = result and the rest of
+            // the user_context is left as the sender stored it.
+            let tcb = s.scheduler.slab.get(next);
+            let mut new_ctx = tcb.user_context;
+            let was_recv_path = matches!(
+                syscall,
+                Syscall::SysRecv | Syscall::SysNBRecv | Syscall::SysReplyRecv,
+            ) && Some(next) == s.scheduler.current;
+            // The "matches" above guards against the sender side:
+            // when a blocked sender wakes up, we don't want to
+            // overwrite its rdi/rdx with the receiver's view.
+            // Distinguish by checking whether `next` is the same
+            // thread that just issued the syscall.
+            let invoker = current_in_flight_invoker();
+            if was_recv_path && Some(next) == invoker {
+                // Pack MessageInfo back into rsi: bits 0..7 length,
+                // top bits label.
+                let mi = (tcb.ipc_label << 12) | (tcb.ipc_length as u64 & 0x7F);
+                new_ctx.rsi = mi;
+                new_ctx.rdi = tcb.ipc_badge;
+                new_ctx.rdx = tcb.msg_regs[0];
+                new_ctx.r10 = tcb.msg_regs[1];
+                new_ctx.r8 = tcb.msg_regs[2];
+                new_ctx.r9 = tcb.msg_regs[3];
+            }
             new_ctx.rax = match &result {
                 Ok(()) => 0,
                 Err(_) => u64::MAX,
             };
+            // Persist the user-visible regs back into the TCB so
+            // the next entry sees them too (idempotent).
+            s.scheduler.slab.get_mut(next).user_context = new_ctx;
             *ctx = new_ctx;
         } else {
             ctx.rax = match result {
@@ -349,6 +381,22 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, ctx: &mut UserContext) {
         }
     }
 }
+
+/// Best-effort — return the TCB that issued the in-flight syscall.
+/// We track this via a static populated at the top of the
+/// dispatcher (before any block() may clear scheduler.current).
+fn current_in_flight_invoker() -> Option<crate::tcb::TcbId> {
+    use core::sync::atomic::Ordering;
+    let raw = IN_FLIGHT_INVOKER.load(Ordering::Relaxed);
+    if raw == u32::MAX {
+        None
+    } else {
+        Some(crate::tcb::TcbId(raw as u16))
+    }
+}
+
+static IN_FLIGHT_INVOKER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 // ---------------------------------------------------------------------------
 // Specs
