@@ -950,7 +950,7 @@ fn is_derived_from(child: &Cap, parent: &Cap) -> bool {
                 CNode { ptr, .. } => inside(ptr.addr()),
                 Thread { tcb } => inside(tcb.addr()),
                 Untyped { ptr, .. } => inside(ptr.addr()) && ptr.addr() != base,
-                Reply { tcb, .. } => inside(tcb.addr()),
+                Reply { ptr, .. } => inside(ptr.addr()),
                 Frame { ptr, .. } => inside(ptr.addr()),
                 PageTable { ptr, .. } => inside(ptr.addr()),
                 PageDirectory { ptr, .. } => inside(ptr.addr()),

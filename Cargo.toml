@@ -13,8 +13,10 @@ default = ["arch-x86_64"]
 spec = []
 arch-x86_64 = []
 arch-aarch64 = []
-# Mixed-Criticality Systems — replaces the classic round-robin
-# scheduler with sporadic-server scheduling contexts. Phase 10a.
+# Mixed-Criticality Systems is the only scheduler model. The
+# `mcs` cargo feature is retained as a no-op so existing
+# `--features mcs` invocations don't break; nothing is gated on
+# it any more.
 mcs = []
 # Multi-CPU support — per-CPU state, IPI dispatch. Phase 10b.
 smp = []

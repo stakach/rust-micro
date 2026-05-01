@@ -35,7 +35,9 @@ fn test_sizes() {
     assert_eq!(UntypedCap::SIZE_BYTES, 16);
     assert_eq!(NotificationCap::SIZE_BYTES, 16);
     assert_eq!(Endpoint::SIZE_BYTES, 16);
-    assert_eq!(Notification::SIZE_BYTES, 32);
+    // Phase 32a — MCS notifications carry an extra word for
+    // `ntfnSchedContext` plus 3 words of padding, doubling the size.
+    assert_eq!(Notification::SIZE_BYTES, 64);
     assert_eq!(MdbNode::SIZE_BYTES, 16);
     assert_eq!(ThreadState::SIZE_BYTES, 24);
     arch::log("  ✓ struct byte sizes match seL4\n");

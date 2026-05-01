@@ -85,7 +85,6 @@ mod boot;
 // Phase 10a — MCS scheduling-context object (gated behind cargo
 // `mcs` feature). Adds sporadic-server refill bookkeeping on top of
 // the classic scheduler.
-#[cfg(feature = "mcs")]
 mod sched_context;
 
 // Phase 10b / 28 — multi-CPU support: per-CPU NodeState + IPI

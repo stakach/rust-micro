@@ -48,7 +48,6 @@ pub fn test_main() {
     crate::rootserver::spec::test_rootserver();
     integration_tests::test_integration();
 
-    #[cfg(feature = "mcs")]
     crate::sched_context::spec::test_sched_context();
     crate::smp::spec::test_smp();
     #[cfg(feature = "fastpath")]

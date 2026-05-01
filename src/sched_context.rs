@@ -16,10 +16,10 @@
 //! testable today; the scheduler hookup happens when the spec
 //! runner has a cargo-feature switch.
 //!
-//! Gated behind `feature = "mcs"` so it doesn't disturb the
-//! classic-mode kernel.
-
-#![cfg(feature = "mcs")]
+//! Phase 32a — always compiled. MCS is the only scheduler model
+//! (`CONFIG_KERNEL_MCS = true` in the codegen, no runtime feature
+//! gate). The `mcs` cargo feature is retained as a no-op so
+//! existing build invocations don't break.
 
 use crate::tcb::TcbId;
 use crate::types::seL4_Word as Word;

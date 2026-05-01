@@ -163,6 +163,10 @@ pub struct Pml4Storage;
 /// (= 512) `asid_map` entries, plus an asid_base offset stored in
 /// the cap.
 pub struct AsidPoolStorage;
+/// Storage backing a `Cap::Reply` (Phase 32a). MCS reply caps name
+/// a per-Call kernel object; the kernel pool indexes via the
+/// PPtr's `(addr - 1)`.
+pub struct ReplyStorage;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum FrameSize {
@@ -253,11 +257,13 @@ pub enum Cap {
     },
     /// Non-MCS reply cap: rooted at the TCB whose reply slot it points
     /// to, with a `master` flag distinguishing the per-TCB master cap
-    /// from a derived reply cap held by a sender.
+    /// MCS reply cap (Phase 32a). Names a Reply object the kernel
+    /// allocates per pending Call. The kernel pool is indexed via
+    /// `ptr.addr() - 1`. `can_grant` controls whether the reply
+    /// also transfers grant rights.
     Reply {
-        tcb: PPtr<Tcb>,
+        ptr: PPtr<ReplyStorage>,
         can_grant: bool,
-        master: bool,
     },
     CNode {
         ptr: PPtr<CNodeStorage>,
@@ -404,13 +410,12 @@ pub fn from_words(words: [Word; 2]) -> Cap {
         }
         tag::REPLY => {
             let c = ReplyCap { words };
-            let Some(tcb) = PPtr::<Tcb>::new(c.capTCBPtr()) else {
+            let Some(ptr) = PPtr::<ReplyStorage>::new(c.capReplyPtr()) else {
                 return Cap::Null;
             };
             Cap::Reply {
-                tcb,
+                ptr,
                 can_grant: c.capReplyCanGrant() != 0,
-                master: c.capReplyMaster() != 0,
             }
         }
         tag::CNODE => {
@@ -570,11 +575,10 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             ptr.addr(),                     // capNtfnPtr
         )
         .words,
-        Cap::Reply { tcb, can_grant, master } => ReplyCap::new(
-            *can_grant as u64,
-            *master as u64,
-            tcb.addr(),
+        Cap::Reply { ptr, can_grant } => ReplyCap::new(
+            ptr.addr(),
             tag::REPLY,
+            *can_grant as u64,
         )
         .words,
         Cap::CNode { ptr, radix, guard_size, guard } => CnodeCap::new(

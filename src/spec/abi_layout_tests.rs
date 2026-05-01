@@ -56,7 +56,9 @@ const _: () = assert!(CnodeCap::SIZE_BYTES == 16);
 const _: () = assert!(ThreadCap::SIZE_BYTES == 16);
 const _: () = assert!(IrqHandlerCap::SIZE_BYTES == 16);
 const _: () = assert!(Endpoint::SIZE_BYTES == 16);
-const _: () = assert!(Notification::SIZE_BYTES == 32);
+// Phase 32a — MCS notifications carry an extra word for
+// `ntfnSchedContext` plus 3 words of padding, doubling the size.
+const _: () = assert!(Notification::SIZE_BYTES == 64);
 const _: () = assert!(MdbNode::SIZE_BYTES == 16);
 const _: () = assert!(ThreadState::SIZE_BYTES == 24);
 

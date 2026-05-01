@@ -39,8 +39,12 @@ pub const WORD_SIZE: u64 = 64;
 pub const CANONICAL_SIZE: u64 = 48;
 
 pub fn default_config() -> HashMap<String, bool> {
+    // Phase 32 — we run kernel-MCS only. seL4-MCS is the modern
+    // path (sporadic-server scheduling, MCS-shaped reply caps,
+    // per-TCB SchedContext binding); nothing in this kernel
+    // depends on the non-MCS layout.
     [
-        ("CONFIG_KERNEL_MCS", false),
+        ("CONFIG_KERNEL_MCS", true),
         ("ENABLE_SMP_SUPPORT", false),
         ("CONFIG_HARDWARE_DEBUG_API", false),
         ("CONFIG_SET_TLS_BASE_SELF", false),
@@ -595,7 +599,11 @@ pub fn lower(module: &Module) -> Result<Vec<LoweredBlock>, String> {
         let mut fields_lowered = Vec::with_capacity(sized.len());
         for (name, size, sign_extend, shift) in sized {
             offset -= size;
-            if size > 0 {
+            // Named fields must fit inside a single word — getters /
+            // setters reference one `words[N]` slot. Padding has no
+            // accessor, so we let it span multiple words (the MCS
+            // notification block declares `padding 3 * word_size`).
+            if size > 0 && name.is_some() {
                 let lo_word = offset / WORD_SIZE as i64;
                 let hi_word = (offset + size - 1) / WORD_SIZE as i64;
                 if lo_word != hi_word {
