@@ -74,6 +74,24 @@ What's already in the repo:
     BSP (every TCB gets affinity=0 from `Tcb::default`); APs
     remain in HLT until 28d/e wire them into the scheduler.
 
+- [x] 28h — AP dispatches user threads end-to-end. **DONE**
+  * `ap_scheduler_loop` now wires per-CPU `SYSCALL_KERNEL_RSP`
+    + `TSS.rsp0` from its boot stack, then in each iteration
+    dispatches `current` via `enter_user_via_sysret` (with
+    optional CR3 swap) when the TCB has `cpu_context.cr3 != 0`.
+  * `cpu_context.cr3 != 0` gate prevents bare scheduler-test
+    TCBs from accidentally getting dispatched into RIP=0.
+  * `usermode::launch_smp_ping_thread()` builds an AP1-pinned
+    TCB whose user code loops on `SysYield`. BSP calls this
+    + `kick_cpu(1)` to start the ping thread.
+  * `smp::SYSCALL_COUNT_PER_CPU[]` per-CPU atomic — bumped in
+    `rust_syscall_dispatch` after BKL acquire — gives the BSP
+    a way to observe AP execution without touching BKL.
+  * Spec `ap_dispatches_user_thread_end_to_end` admits the ping
+    thread, kicks AP1, polls until AP1's syscall count climbs
+    past 64. The ping thread keeps running on AP1 throughout
+    the AY demo on BSP — true parallel SMP execution.
+
 - [x] 28g — TLB shootdown on Frame::Unmap. **DONE**
   * `usermode::unmap_user_4k_public(vaddr)` walks the live PML4,
     clears the PTE, `invlpg`s the calling CPU.

@@ -128,6 +128,28 @@ the architectural defaults**. Replicate every per-CPU MSR write
 in the AP init path. The BSP-only-ran-it bugs surface only under
 SMP and as cryptic page faults.
 
+## Pattern: gate AP dispatch on a "ready to run user code" predicate
+
+Symptom — once `ap_scheduler_loop` started actually dispatching
+threads via `enter_user_via_sysret`, the previous (passing) spec
+`ap_picks_thread_off_its_queue_via_reschedule` regressed:
+admitted a bare `Tcb::default()` (with `user_context.rcx = 0`,
+`cpu_context.cr3 = 0`); IPI ISR set `current=Some(it)`; AP1's
+loop body raced BSP's cleanup, dispatched the bare TCB,
+`sysretq` landed at RIP=0 → user `#PF` on BOOTBOOT's NX-marked
+identity-map → fatal "USER #PF with no current TCB".
+
+Fix — gate dispatch on `tcb.cpu_context.cr3 != 0`. A real
+user-mode thread must have a populated VSpace; a bare TCB used
+by scheduler-only specs to test queue mechanics doesn't, and
+`ap_scheduler_loop` now skips dispatch and HLTs.
+
+Rule — when you make a code path do a *real* user-mode entry,
+audit specs that admit bare TCBs to make sure none of them race
+your new entry path. Any TCB observable as "current" on a CPU
+must either be fully launchable, or the predicate that runs the
+launch path must filter it out.
+
 ## Pattern: x86_64 calling-convention plumbing
 
 - The `extern "C"` (System V) ABI puts the first arg in `rdi`,

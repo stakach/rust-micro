@@ -193,6 +193,20 @@ pub fn send_ipi(target_cpu: u32, kind: IpiKind) {
 /// outside the BKL to confirm the AP processed the IPI.
 pub static IPI_HANDLED_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Phase 28h — per-CPU SYSCALL count. Bumped by the dispatcher
+/// after BKL acquire, indexed by `arch::get_cpu_id()`. The SMP
+/// demo polls AP1's slot to confirm a thread is actually running
+/// + syscalling there. Hand-listed because `AtomicU32` isn't `Copy`
+/// (so `[AtomicU32::new(0); MAX_CPUS]` won't compile).
+pub static SYSCALL_COUNT_PER_CPU: [AtomicU32; MAX_CPUS] = [
+    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0),
+];
+const _: () = assert!(
+    MAX_CPUS == 4,
+    "SYSCALL_COUNT_PER_CPU is hand-listed for MAX_CPUS=4; bump it if you raise the cap",
+);
+
 /// Send a `Reschedule` IPI to `target_cpu`. Convenience wrapper
 /// around `send_ipi` for the common case. Caller holds BKL.
 #[cfg(target_arch = "x86_64")]
@@ -343,7 +357,52 @@ pub mod spec {
         cross_cpu_ipi_delivers_and_runs_isr();
         ap_picks_thread_off_its_queue_via_reschedule();
         shootdown_fans_invalidate_tlb_to_aps();
+        ap_dispatches_user_thread_end_to_end();
         arch::log("SMP tests completed\n");
+    }
+
+    /// Phase 28h — the SMP capstone. BSP launches a ping thread pinned
+    /// to CPU 1, kicks AP1, and polls `SYSCALL_COUNT_PER_CPU[1]` to
+    /// confirm the thread actually ran (each `SysYield` iteration
+    /// bumps the counter from inside `rust_syscall_dispatch` on AP1).
+    /// The ping thread keeps running after this spec returns; that's
+    /// fine — the AY demo on BSP runs in parallel without disturbance.
+    #[inline(never)]
+    fn ap_dispatches_user_thread_end_to_end() {
+        if crate::bootboot::get_num_cores() < 2 {
+            arch::log("  ✓ AP-dispatch test skipped (single CPU)\n");
+            return;
+        }
+
+        let before = SYSCALL_COUNT_PER_CPU[1].load(Ordering::SeqCst);
+
+        unsafe {
+            bkl_acquire();
+            let _id = crate::arch::x86_64::usermode::launch_smp_ping_thread();
+            bkl_release();
+        }
+
+        // Wait for AP1 to dispatch + the ping thread to syscall a
+        // healthy number of times. ~64 syscalls is plenty to prove
+        // the cycle works without flaking on slow hosts.
+        let target = before + 64;
+        let mut spins = 0u64;
+        loop {
+            let now = SYSCALL_COUNT_PER_CPU[1].load(Ordering::SeqCst);
+            if now >= target {
+                arch::log("  ✓ AP1 dispatched user thread; ");
+                arch::log("AP1 SYSCALL count climbed past 64\n");
+                return;
+            }
+            spins += 1;
+            if spins > 1_000_000_000 {
+                panic!(
+                    "AP1 syscall counter never advanced (got {}, want {})",
+                    now - before, 64,
+                );
+            }
+            core::hint::spin_loop();
+        }
     }
 
     /// Phase 28g — `shootdown_tlb(vaddr)` must fan an

@@ -170,6 +170,28 @@ static mut SENDER_STACK_PAGE: UserPage = UserPage([0; 4096]);
 static mut RECEIVER_CODE_PAGE: UserPage = UserPage([0; 4096]);
 static mut RECEIVER_STACK_PAGE: UserPage = UserPage([0; 4096]);
 
+/// Phase 28h — ping thread for the SMP demo. Runs on AP1 (or the
+/// first available AP) in user mode; loops on `SysYield` so each
+/// iteration ticks `smp::SYSCALL_COUNT_PER_CPU[1]` and the BSP can
+/// observe AP execution end-to-end.
+///
+/// Hand-assembled:
+///   00: 48 C7 C0 F9 FF FF FF    mov rax, -7   (SysYield)
+///   07: 0F 05                   syscall
+///   09: EB F5                   jmp -11       (back to byte 0)
+#[rustfmt::skip]
+const PING_PAYLOAD: &[u8] = &[
+    0x48, 0xC7, 0xC0, 0xF9, 0xFF, 0xFF, 0xFF, // mov rax, -7
+    0x0F, 0x05,                               // syscall
+    0xEB, 0xF5,                               // jmp -11
+];
+
+static mut PING_CODE_PAGE: UserPage = UserPage([0; 4096]);
+static mut PING_STACK_PAGE: UserPage = UserPage([0; 4096]);
+
+const PING_CODE_VBASE: u64 = 0x0000_0100_0010_0000;
+const PING_STACK_VBASE: u64 = 0x0000_0100_0011_0000;
+
 /// Backing memory the receiver's Untyped cap describes. The user
 /// code retypes a 4 KiB Frame out of this pool and maps it; the
 /// store/load through the mapping must hit real RAM, so we back
@@ -306,6 +328,52 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         let _ = receiver; // suppress unused if receiver isn't reached on first hop
         enter_user_via_sysret(&ctx);
     }
+}
+
+/// Phase 28h — set up a "ping" thread pinned to CPU 1 and kick AP1
+/// to dispatch it. The thread runs an endless `SysYield` loop in
+/// user mode; each iteration ticks `smp::SYSCALL_COUNT_PER_CPU[1]`
+/// so the BSP can verify a user thread is actually executing on
+/// AP1.
+///
+/// Caller-side (BSP) is responsible for ensuring `install_kernel_page_tables`
+/// has run (so make_user_pml4 can build a fresh PML4 with the kernel
+/// half mirrored). Returns the admitted TcbId so the caller can
+/// keep a handle if needed; for the spec we just discard.
+pub unsafe fn launch_smp_ping_thread() -> crate::tcb::TcbId {
+    install_kernel_page_tables();
+    copy_payload(&raw const PING_CODE_PAGE, PING_PAYLOAD);
+
+    let pml4 = super::paging::make_user_pml4();
+    map_user_4k_into_pml4(
+        pml4, PING_CODE_VBASE,
+        kernel_virt_to_phys((&raw const PING_CODE_PAGE) as u64),
+        false,
+    );
+    map_user_4k_into_pml4(
+        pml4, PING_STACK_VBASE,
+        kernel_virt_to_phys((&raw const PING_STACK_PAGE) as u64),
+        true,
+    );
+
+    let s = KERNEL.get();
+    let mut t = Tcb::default();
+    t.priority = 100;
+    t.state = ThreadStateType::Running;
+    t.affinity = 1; // pin to CPU 1 (AP1)
+    t.user_context = UserContext::for_entry(
+        PING_CODE_VBASE,
+        PING_STACK_VBASE + 0x1000 - 8,
+        /* arg0 */ 0,
+    );
+    t.cpu_context.cr3 = pml4;
+    let id = s.scheduler.admit(t);
+
+    // Reschedule IPI tells AP1 to run choose_thread. After the ISR
+    // returns, AP1's `ap_scheduler_loop` body sees `current=Some(id)`
+    // and dispatches.
+    crate::smp::kick_cpu(1);
+    id
 }
 
 unsafe fn spawn_thread(

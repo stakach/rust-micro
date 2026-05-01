@@ -238,26 +238,92 @@ fn ap_main(apic_id: arch::CpuId) -> ! {
     ap_scheduler_loop();
 }
 
-/// AP idle loop. Each iteration:
+/// AP scheduler loop. Each iteration:
 ///   1. takes the BKL,
-///   2. lets the IPI ISR / scheduler decide what should run on this
-///      CPU (today, just looks at this CPU's current pointer; once
-///      Phase 28f lands per-CPU SYSCALL_SAVE the AP will dispatch
-///      user threads here),
-///   3. releases the BKL,
-///   4. HLTs until an interrupt (typically a Reschedule IPI from
-///      another CPU or an IRQ).
+///   2. checks this CPU's `current` pointer — if `Some(tcb)`,
+///      sets up CR3 + per-CPU user_ctx and dispatches via
+///      `enter_user_via_sysret` (never returns to this loop;
+///      from then on the user thread cycles through
+///      SYSCALL → dispatcher → sysretq on this CPU),
+///   3. else releases the BKL and `sti; hlt`s until an IPI / IRQ
+///      wakes us.
 ///
-/// Interrupts are kept on while HLTed and off while inside the
-/// kernel. STI immediately followed by HLT is the canonical way
+/// Interrupts are kept off while inside the kernel and on while
+/// HLTed. STI immediately followed by HLT is the canonical way
 /// to atomically "enable interrupts and wait for one" on x86.
 fn ap_scheduler_loop() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Capture this CPU's BOOTBOOT-supplied stack — it doubles as
+        // the kernel-mode stack for SYSCALL re-entry and IRQ entry.
+        let my_ksp: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, rsp",
+                out(reg) my_ksp,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let my_cpu = arch::get_cpu_id();
+        crate::arch::x86_64::syscall_entry::set_syscall_kernel_rsp(my_ksp);
+        crate::arch::x86_64::gdt::set_kernel_rsp_for_cpu(my_cpu, my_ksp);
+    }
+
     loop {
-        // Tighten the kernel-vs-user-mode invariant: every wake-up
-        // immediately re-enters the kernel under BKL, then exits.
         smp::bkl_acquire();
-        // (Future: if `current` is Some(tcb), context-switch into
-        // it here. For Phase 28e we just observe the pick.)
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let my_cpu = arch::get_cpu_id();
+            let next = unsafe {
+                crate::kernel::KERNEL.get()
+                    .scheduler.current_for_cpu(my_cpu)
+            };
+            if let Some(tcb_id) = next {
+                // Only dispatch threads that have a real vspace
+                // (cr3 != 0). A bare scheduler-test TCB has cr3=0
+                // and would sysretq into RIP=0 → user PF. Specs
+                // that want to merely place a TCB on the AP's
+                // queue without dispatching should leave cr3=0.
+                let dispatchable = unsafe {
+                    crate::kernel::KERNEL.get()
+                        .scheduler.slab.get(tcb_id)
+                        .cpu_context.cr3 != 0
+                };
+                if dispatchable {
+                    let ctx_ptr = unsafe {
+                        let s = crate::kernel::KERNEL.get();
+                        let tcb = s.scheduler.slab.get(tcb_id);
+
+                        let cur_cr3: u64;
+                        core::arch::asm!(
+                            "mov {}, cr3",
+                            out(reg) cur_cr3,
+                            options(nomem, nostack, preserves_flags),
+                        );
+                        if cur_cr3 != tcb.cpu_context.cr3 {
+                            core::arch::asm!(
+                                "mov cr3, {}",
+                                in(reg) tcb.cpu_context.cr3,
+                                options(nostack, preserves_flags),
+                            );
+                        }
+
+                        let pcc = crate::arch::x86_64::syscall_entry
+                            ::current_cpu_user_ctx_mut();
+                        *pcc = tcb.user_context;
+                        pcc as *const crate::arch::x86_64::syscall_entry::UserContext
+                    };
+
+                    smp::bkl_release();
+                    unsafe {
+                        crate::arch::x86_64::syscall_entry::enter_user_via_sysret(ctx_ptr);
+                    }
+                    // unreachable
+                }
+            }
+        }
+
         smp::bkl_release();
 
         // Wait for next IPI / IRQ.

@@ -359,6 +359,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
     crate::smp::bkl_acquire();
     let _bkl = BklGuard;
 
+    // Phase 28h — bump the per-CPU syscall counter so the SMP
+    // ping demo (running on AP1) is observable from BSP.
+    crate::smp::SYSCALL_COUNT_PER_CPU[arch::get_cpu_id() as usize]
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
     // Phase 28f — recover the calling CPU's UserContext from the
     // per-CPU array. The asm stub wrote it via `gs:[16 + ...]`;
     // we look it up by APIC ID here.
