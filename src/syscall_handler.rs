@@ -58,19 +58,85 @@ pub fn handle_syscall(
     match syscall {
         Syscall::SysSend => handle_send(args, /* blocking */ true, /* call */ false),
         Syscall::SysNBSend => handle_send(args, /* blocking */ false, /* call */ false),
+        Syscall::SysCall => handle_send(args, /* blocking */ true, /* call */ true),
         Syscall::SysRecv => handle_recv(args, /* blocking */ true),
         Syscall::SysNBRecv => handle_recv(args, /* blocking */ false),
-        Syscall::SysCall | Syscall::SysReplyRecv | Syscall::SysReply => {
-            // These need reply-cap plumbing (Phase 14d).
-            Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability,
-            )))
+        Syscall::SysReply => handle_reply(args),
+        Syscall::SysReplyRecv => {
+            handle_reply(args)?;
+            handle_recv(args, /* blocking */ true)
         }
         Syscall::SysYield => Ok(()),
         Syscall::SysDebugPutChar | Syscall::SysDebugDumpScheduler => {
             let n = syscall as i32 as i64;
             handle_unknown_syscall(n, args, sink)
         }
+    }
+}
+
+/// SysReply: take the current thread's `reply_to` slot, transfer
+/// the in-flight message back to the original caller, and unblock
+/// them. Mirrors `seL4/src/object/reply.c::doReplyTransfer` for
+/// the non-MCS path.
+fn handle_reply(args: &SyscallArgs) -> KResult<()> {
+    use crate::kernel::KERNEL;
+    use crate::tcb::ThreadStateType;
+    use crate::types::seL4_Word as Word;
+
+    unsafe {
+        let s = KERNEL.get();
+        let current = s.scheduler.current.ok_or_else(|| {
+            KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            ))
+        })?;
+        let caller = match s.scheduler.slab.get(current).reply_to {
+            Some(c) => c,
+            None => {
+                // No one to reply to. seL4 silently no-ops here on
+                // non-MCS; we surface InvalidCapability so user
+                // code spots the mistake.
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )));
+            }
+        };
+        // Stage the reply message onto the current TCB so the
+        // common transfer machinery picks it up.
+        let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+        {
+            let me = s.scheduler.slab.get_mut(current);
+            me.ipc_label = info.label();
+            me.ipc_length = info.length() as u32;
+            me.msg_regs[0] = args.a2;
+            me.msg_regs[1] = args.a3;
+            me.msg_regs[2] = args.a4;
+            me.msg_regs[3] = args.a5;
+            me.reply_to = None; // consume the reply slot
+        }
+        // Copy from current → caller. We can reuse endpoint's
+        // transfer if we expose it; for clarity we inline the
+        // minimal copy here.
+        let (label, length, regs): (Word, u32, [Word; crate::tcb::SCRATCH_MSG_LEN]) = {
+            let me = s.scheduler.slab.get(current);
+            (me.ipc_label, me.ipc_length, me.msg_regs)
+        };
+        {
+            let r = s.scheduler.slab.get_mut(caller);
+            r.ipc_label = label;
+            r.ipc_length = length;
+            r.ipc_badge = 0; // reply has no badge
+            let n = (length as usize).min(r.msg_regs.len());
+            r.msg_regs[..n].copy_from_slice(&regs[..n]);
+        }
+        // Wake the caller from BlockedOnReply.
+        debug_assert_eq!(
+            s.scheduler.slab.get(caller).state,
+            ThreadStateType::BlockedOnReply,
+            "caller should be parked on Reply"
+        );
+        s.scheduler.make_runnable(caller);
+        Ok(())
     }
 }
 
@@ -84,7 +150,7 @@ pub fn handle_syscall(
 ///
 /// Looks up the cap in the current thread's CSpace, requires it to
 /// be a `Cap::Endpoint`, then drives `endpoint::send_ipc`.
-fn handle_send(args: &SyscallArgs, blocking: bool, _call: bool) -> KResult<()> {
+fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
     use crate::cap::Cap;
     use crate::cspace::lookup_cap;
     use crate::endpoint::{send_ipc, SendOptions};
@@ -129,7 +195,7 @@ fn handle_send(args: &SyscallArgs, blocking: bool, _call: bool) -> KResult<()> {
             snd.msg_regs[3] = args.a5;
         }
         let idx = crate::kernel::KernelState::endpoint_index(ep_ptr);
-        let opts = SendOptions { blocking, do_call: false, badge };
+        let opts = SendOptions { blocking, do_call: call, badge };
         // Split borrows: we need &mut endpoint AND &mut scheduler at
         // once. Take them through indexing on the same struct.
         let s_ptr: *mut crate::kernel::KernelState = s;
@@ -260,6 +326,7 @@ pub mod spec {
         sys_yield_succeeds();
         debug_dump_scheduler_writes_placeholder();
         sys_send_through_cspace_to_endpoint();
+        sys_call_then_reply_round_trip();
         arch::log("Syscall dispatcher tests completed\n");
     }
 
@@ -286,31 +353,25 @@ pub mod spec {
 
     fn ipc_syscalls_return_invalid_cap_in_phase5() {
         let mut sink = BufferSink::new();
-        // SysCall / SysReply / SysReplyRecv still return
-        // InvalidCapability — they need reply-cap plumbing
-        // (Phase 14d).
-        for s in &[Syscall::SysCall, Syscall::SysReply, Syscall::SysReplyRecv] {
-            let res = handle_syscall(*s, &SyscallArgs::default(), &mut sink);
-            match res {
-                Err(KException::SyscallError(SyscallError {
-                    code: seL4_Error::seL4_InvalidCapability,
-                })) => {}
-                other => panic!("expected InvalidCapability for {:?}, got {:?}", s, other),
-            }
-        }
-        // SysSend / SysRecv etc. now do CSpace lookup; with the
-        // default boot-thread cspace_root = Null they surface a
-        // lookup fault (InvalidRoot).
+        // All IPC syscalls now route through CSpace lookup. With
+        // the default boot-thread cspace_root = Null, every one
+        // surfaces a lookup fault (InvalidRoot) or a syscall
+        // error. SysReply specifically reports InvalidCapability
+        // because it skips CSpace lookup (uses tcb.reply_to) and
+        // the boot thread has no caller waiting.
         for s in &[
             Syscall::SysSend,
             Syscall::SysNBSend,
+            Syscall::SysCall,
             Syscall::SysRecv,
             Syscall::SysNBRecv,
+            Syscall::SysReply,
+            Syscall::SysReplyRecv,
         ] {
             let res = handle_syscall(*s, &SyscallArgs::default(), &mut sink);
             match res {
                 Err(KException::LookupFault(_)) => {}
-                Err(KException::SyscallError(_)) => {} // also acceptable
+                Err(KException::SyscallError(_)) => {}
                 other => panic!("expected fault for {:?}, got {:?}", s, other),
             }
         }
@@ -400,6 +461,112 @@ pub mod spec {
             s.scheduler.slab.get_mut(boot_tcb).cspace_root = Cap::Null;
         }
         arch::log("  ✓ SysSend looks up endpoint via CSpace + blocks sender\n");
+    }
+
+    /// Phase 15b: full Call → Recv → Reply round-trip without user
+    /// mode. Sets up two TCBs (caller + server), a shared
+    /// endpoint, and walks the dispatcher through SysCall on
+    /// caller, then SysRecv + SysReply impersonating the server.
+    #[inline(never)]
+    fn sys_call_then_reply_round_trip() {
+        use crate::cap::{Badge, Cap, EndpointRights};
+        use crate::cte::Cte;
+        use crate::endpoint::EpState;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::tcb::{Tcb, ThreadStateType};
+        use crate::types::seL4_Word as Word;
+
+        // Set up two TCBs in the slab and a shared endpoint cap
+        // in CNode 3 slot 1. Both TCBs cspace-root that CNode.
+        let (caller, server, ep_idx) = unsafe {
+            let s = KERNEL.get();
+            let cn = 3;
+            let ep_idx = 1; // endpoint slot 1 (avoid the endpoint
+                            // already wired up by the prior spec).
+            let ep_ptr = KernelState::endpoint_ptr(ep_idx);
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            let ep_cap = Cap::Endpoint {
+                ptr: ep_ptr,
+                badge: Badge(0xC0DE),
+                rights: EndpointRights {
+                    can_send: true, can_receive: true,
+                    can_grant: false, can_grant_reply: true,
+                },
+            };
+            s.cnodes[cn].0[1] = Cte::with_cap(&ep_cap);
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+
+            let mk_tcb = || {
+                let mut t = Tcb::default();
+                t.priority = 50;
+                t.state = ThreadStateType::Running;
+                t.cspace_root = Cap::CNode {
+                    ptr: cnode_ptr,
+                    radix: 5,
+                    guard_size: 59,
+                    guard: 0,
+                };
+                t
+            };
+            let caller = s.scheduler.admit(mk_tcb());
+            let server = s.scheduler.admit(mk_tcb());
+            (caller, server, ep_idx)
+        };
+
+        let mut sink = BufferSink::new();
+
+        // Server arrives first → blocks on Recv.
+        unsafe { KERNEL.get().scheduler.current = Some(server); }
+        let r = handle_syscall(Syscall::SysRecv,
+            &SyscallArgs { a0: 1, ..Default::default() }, &mut sink);
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(server).state,
+                ThreadStateType::BlockedOnReceive);
+            assert_eq!(s.endpoints[ep_idx].state, EpState::Recv);
+        }
+
+        // Caller does SysCall (a Send + auto-block-on-Reply).
+        // Sender stages 'X' as msg_regs[0], length=1.
+        unsafe { KERNEL.get().scheduler.current = Some(caller); }
+        let r = handle_syscall(Syscall::SysCall,
+            &SyscallArgs { a0: 1, a1: 1, a2: b'X' as Word, ..Default::default() },
+            &mut sink);
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            // Caller is parked on Reply; server is runnable with
+            // the message + caller in its reply_to slot.
+            assert_eq!(s.scheduler.slab.get(caller).state,
+                ThreadStateType::BlockedOnReply);
+            assert_eq!(s.scheduler.slab.get(server).reply_to, Some(caller));
+            assert_eq!(s.scheduler.slab.get(server).msg_regs[0], b'X' as Word);
+        }
+
+        // Server replies with 'Y'.
+        unsafe { KERNEL.get().scheduler.current = Some(server); }
+        let r = handle_syscall(Syscall::SysReply,
+            &SyscallArgs { a1: 1, a2: b'Y' as Word, ..Default::default() },
+            &mut sink);
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            // Caller is back to Running with reply payload in its
+            // msg_regs.
+            assert_eq!(s.scheduler.slab.get(caller).state,
+                ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], b'Y' as Word);
+            // Server's reply_to slot consumed.
+            assert_eq!(s.scheduler.slab.get(server).reply_to, None);
+            // Clean up — free the temp TCBs and reset current.
+            s.scheduler.slab.free(caller);
+            s.scheduler.slab.free(server);
+            // Restore boot thread (id 0 — first admitted) as
+            // current.
+            s.scheduler.current = Some(crate::tcb::TcbId(0));
+        }
+        arch::log("  ✓ SysCall → Recv → Reply round-trip\n");
     }
 
     #[inline(never)]

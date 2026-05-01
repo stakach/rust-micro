@@ -148,6 +148,12 @@ pub fn send_ipc(
             if !opts.blocking {
                 return IpcOutcome::Skipped;
             }
+            // Call vs Send: a Call waits for the matched receiver
+            // to issue Reply, so the sender goes straight to
+            // BlockedOnReply once the message is delivered.
+            // Without a receiver waiting it still queues on Send;
+            // the call-vs-send distinction is observed when the
+            // pair-up actually happens.
             sched.block(sender, ThreadStateType::BlockedOnSend);
             queue_push(ep, sched, sender);
             ep.state = EpState::Send;
@@ -158,6 +164,12 @@ pub fn send_ipc(
             let receiver = queue_pop_head(ep, sched)
                 .expect("Recv state must have at least one waiter");
             transfer(sched, sender, receiver, opts.badge);
+            if opts.do_call {
+                // Call: block sender BlockedOnReply, set the
+                // receiver's reply_to to the caller.
+                sched.block(sender, ThreadStateType::BlockedOnReply);
+                sched.slab.get_mut(receiver).reply_to = Some(sender);
+            }
             sched.make_runnable(receiver);
             if queue_is_empty(ep) {
                 ep.state = EpState::Idle;

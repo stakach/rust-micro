@@ -169,6 +169,13 @@ pub struct Tcb {
     /// schedule() calls.
     #[cfg(target_arch = "x86_64")]
     pub user_context: crate::arch::x86_64::syscall_entry::UserContext,
+    /// Phase 15b — non-MCS reply tracking. When this thread is on
+    /// the receive side of a Call, `reply_to` holds the TCB of the
+    /// caller that's waiting for SysReply. seL4 calls this
+    /// `tcbCaller` and stores it in a dedicated CSpace slot;
+    /// we keep it as a direct TcbId to skip the cap-derivation
+    /// dance (added later in Phase 17).
+    pub reply_to: Option<TcbId>,
 }
 
 impl Default for Tcb {
@@ -194,6 +201,7 @@ impl Default for Tcb {
             #[cfg(target_arch = "x86_64")]
             user_context:
                 crate::arch::x86_64::syscall_entry::UserContext::new_zero(),
+            reply_to: None,
         }
     }
 }
