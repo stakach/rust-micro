@@ -401,6 +401,37 @@ pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool) {
     map_user_4k_in(pml4, vaddr, paddr, writable);
 }
 
+/// Phase 28g — clear the 4 KiB PTE for `vaddr` in the live PML4
+/// and `invlpg` it on the calling CPU. The caller is responsible
+/// for fanning a TLB-shootdown IPI to other CPUs that may have
+/// the mapping cached.
+///
+/// Walks the page tables; if any intermediate level is missing or
+/// uses a 1G/2M page, leaves the structure alone (the cap-state
+/// invariant says we only Unmap pages that Frame::Map installed
+/// at 4 KiB granularity, but we're defensive).
+pub unsafe fn unmap_user_4k_public(vaddr: u64) {
+    use super::paging::{PTE_PRESENT, PTE_PS};
+    let pml4 = (read_cr3() & 0xFFFF_F000) as *mut u64;
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 { return; }
+    let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 { return; }
+    let pd = (pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pde = core::ptr::read_volatile(pd.add(pd_idx));
+    if pde & PTE_PRESENT == 0 || pde & PTE_PS != 0 { return; }
+    let pt = (pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
+
+    core::ptr::write_volatile(pt.add(pt_idx), 0);
+    asm!("invlpg [{a}]", a = in(reg) vaddr, options(nostack, preserves_flags));
+}
+
 /// Phase 24 — install a 4 KiB mapping into an explicit PML4
 /// (used at thread-spawn time before we've switched CR3 to it).
 pub unsafe fn map_user_4k_into_pml4(

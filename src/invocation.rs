@@ -151,14 +151,26 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
 }
 
 fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    let paddr = match target {
-        Cap::Frame { ptr, .. } => ptr.addr(),
+    let (paddr, mapped_vaddr) = match target {
+        Cap::Frame { ptr, mapped, .. } => (ptr.addr(), mapped),
         _ => unreachable!(),
     };
+
+    // Phase 28g — actually clear the PTE in the live page tables
+    // and fan a TLB shootdown to other CPUs. Outside spec mode the
+    // cap chain backs real mappings; spec mode synthesizes caps
+    // without a populated PML4, so we skip the hardware step there.
+    #[cfg(all(not(feature = "spec"), target_arch = "x86_64"))]
+    if let Some(vaddr) = mapped_vaddr {
+        unsafe {
+            crate::arch::x86_64::usermode::unmap_user_4k_public(vaddr);
+            crate::smp::shootdown_tlb(vaddr);
+        }
+    }
+    #[cfg(any(feature = "spec", not(target_arch = "x86_64")))]
+    let _ = mapped_vaddr;
+
     // Walk the CSpace and zero the mapping in the matching cap.
-    // Real hardware unmap (PTE clear + invlpg) belongs in the
-    // arch layer — we skip it for now since the spec only checks
-    // the cap-state side.
     unsafe {
         let s = KERNEL.get();
         let cspace_root = s.scheduler.slab.get(invoker).cspace_root;

@@ -74,6 +74,17 @@ What's already in the repo:
     BSP (every TCB gets affinity=0 from `Tcb::default`); APs
     remain in HLT until 28d/e wire them into the scheduler.
 
+- [x] 28g — TLB shootdown on Frame::Unmap. **DONE**
+  * `usermode::unmap_user_4k_public(vaddr)` walks the live PML4,
+    clears the PTE, `invlpg`s the calling CPU.
+  * `smp::shootdown_tlb(vaddr)` fans `InvalidateTlb { vaddr }`
+    IPIs to every other CPU. The IPI ISR runs `invlpg` on each.
+  * `decode_frame_unmap` now reads `cap.mapped` before clearing,
+    invokes the local unmap + remote shootdown when `Some(vaddr)`.
+    Spec mode skips the hardware step (no real PML4).
+  * Spec: `shootdown_fans_invalidate_tlb_to_aps` — BSP shoots down
+    a no-op vaddr; the IPI counter advances by N_APs.
+
 - [x] 28f — Per-CPU SYSCALL_SAVE / KERNEL_RSP via swapgs. **DONE**
   * `PerCpuSyscallArea { kernel_rsp, _pad, user_ctx }` —
     `static mut PER_CPU_SYSCALL: [PerCpuSyscallArea; MAX_CPUS]`.

@@ -200,6 +200,20 @@ pub fn kick_cpu(target_cpu: u32) {
     send_ipi(target_cpu, IpiKind::Reschedule);
 }
 
+/// Fan a TLB-shootdown for `vaddr` to every CPU other than the
+/// caller. Used by vspace ops (Frame::Unmap, etc.) after they
+/// clear a PTE locally; remote CPUs need to invalidate their
+/// cached translations. Caller holds BKL.
+#[cfg(target_arch = "x86_64")]
+pub fn shootdown_tlb(vaddr: u64) {
+    let me = crate::arch::get_cpu_id();
+    let n_cores = crate::bootboot::get_num_cores() as u32;
+    for cpu in 0..n_cores.min(MAX_CPUS as u32) {
+        if cpu == me { continue; }
+        send_ipi(cpu, IpiKind::InvalidateTlb { vaddr });
+    }
+}
+
 /// Maximum CPUs we'll ever run on. Picked small so the per-CPU
 /// arrays fit on the stack inside specs and on the BSS in the
 /// production kernel without alloc().
@@ -328,7 +342,49 @@ pub mod spec {
         bkl_acquire_release_round_trip();
         cross_cpu_ipi_delivers_and_runs_isr();
         ap_picks_thread_off_its_queue_via_reschedule();
+        shootdown_fans_invalidate_tlb_to_aps();
         arch::log("SMP tests completed\n");
+    }
+
+    /// Phase 28g — `shootdown_tlb(vaddr)` must fan an
+    /// `InvalidateTlb` IPI to every CPU other than the caller. We
+    /// fire one from BSP and watch each AP's IPI counter advance.
+    #[inline(never)]
+    fn shootdown_fans_invalidate_tlb_to_aps() {
+        let n_cores = crate::bootboot::get_num_cores() as u32;
+        if n_cores < 2 {
+            arch::log("  ✓ TLB-shootdown test skipped (single CPU)\n");
+            return;
+        }
+
+        let before = IPI_HANDLED_COUNT.load(Ordering::SeqCst);
+        let n_aps = n_cores - 1;
+
+        bkl_acquire();
+        // Pick a vaddr that BOOTBOOT does NOT map (kernel half,
+        // unused) so each AP's `invlpg` is a harmless no-op rather
+        // than perturbing a live mapping.
+        shootdown_tlb(0xFFFF_8000_DEAD_F000);
+        bkl_release();
+
+        // Each AP's ISR bumps the counter once per IPI it handles.
+        // Wait for at least n_aps increments.
+        let mut spins = 0u64;
+        loop {
+            let now = IPI_HANDLED_COUNT.load(Ordering::SeqCst);
+            if now.saturating_sub(before) >= n_aps {
+                break;
+            }
+            spins += 1;
+            if spins > 100_000_000 {
+                panic!(
+                    "shootdown didn't reach all APs (got {} of {})",
+                    now - before, n_aps,
+                );
+            }
+            core::hint::spin_loop();
+        }
+        arch::log("  ✓ shootdown_tlb fans InvalidateTlb to every other CPU\n");
     }
 
     /// Phase 28e — admit a TCB with `affinity = 1` (so it lands on
