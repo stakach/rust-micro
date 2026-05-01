@@ -287,11 +287,17 @@ pub mod spec {
     fn parses_embedded_rootserver() {
         let img = parse(crate::rootserver_image::ROOTSERVER_ELF)
             .expect("rootserver ELF parses");
-        // The linker script in rootserver/link.ld pins the entry at
-        // 0x100_0040_0000 (PML4[2] + 4 MiB).
-        assert_eq!(img.entry, 0x0000_0100_0040_0000,
-            "rootserver entry should match linker-script vaddr");
-        arch::log("  ✓ embedded rootserver ELF parses + entry point matches link.ld\n");
+        // The linker script pins the image at 0x100_0040_0000
+        // (PML4[2] + 4 MiB). The exact `_start` offset within the
+        // text segment depends on what other code the linker
+        // emitted ahead of it (panic_handler tables etc), but it
+        // must lie within the linker-chosen vaddr range.
+        const BASE: u64 = 0x0000_0100_0040_0000;
+        const MAX:  u64 = BASE + 0x10_0000; // 1 MiB headroom
+        assert!(img.entry >= BASE && img.entry < MAX,
+            "rootserver entry {:#x} should be within [{:#x}, {:#x})",
+            img.entry, BASE, MAX);
+        arch::log("  ✓ embedded rootserver ELF parses + entry within link.ld range\n");
     }
 
     #[inline(never)]

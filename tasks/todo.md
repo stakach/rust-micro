@@ -84,7 +84,37 @@ End state:
     Untyped retype) deferred to follow-up phases.
 
 
-- [ ] 29d — BootInfo + initial caps.
+- [x] 29d — BootInfo + initial caps. **DONE**
+  * Loader allocates + maps an IPC buffer page at
+    `ROOTSERVER_IPCBUF_VBASE` (0x100_0060_0000) and a BootInfo
+    page at `ROOTSERVER_BOOTINFO_VBASE` (0x100_0070_0000) into
+    the rootserver's PML4.
+  * `launch_rootserver()` allocates the rootserver's CNode at
+    `cnode_ptr(ROOTSERVER_CNODE_IDX=3)` and populates the
+    canonical seL4 initial slots:
+      0  Null
+      1  TCB (self)
+      2  CNode (self)
+      3  PML4 (vspace root)
+      9  Frame (BootInfo, R/O)
+      10 Frame (IPC buffer, R/W)
+      11 Untyped (16 KiB BSS pool)
+  * `t.cspace_root` and `t.vspace_root` populated so any future
+    invocation does cap lookup correctly.
+  * `build_bootinfo()` writes the full `seL4_BootInfo` struct
+    into the BootInfo page (kernel-virt mapping, before CR3
+    swap): nodeID, numNodes, ipcBuffer vaddr, untyped slot
+    region [11..12), the Untyped's paddr/sizeBits.
+  * Rootserver `_start(bootinfo: *const BootInfo)` now reads
+    the struct and prints
+        "[rootserver alive] node 0/4, 1 untyped(s) of 16384 bytes\n"
+    end-to-end through real Rust code in ring 3.
+  * Codegen note: rootserver triplet now sets
+    `code-model: large` so vaddrs above 32-bit don't overflow
+    R_X86_64_32 relocations from `core::fmt`.
+  * Loader handles overlapping PT_LOAD segments (lld may emit
+    several R-only segments sharing a 4 KiB page); tracks
+    seen pages in a fixed-size table to avoid double-allocation.
   * Mirror seL4's `seL4_BootInfo` shape (existing in types.rs);
     populate with: nodeID, numNodes, ipcBuffer vaddr, untyped
     list, slot ranges.

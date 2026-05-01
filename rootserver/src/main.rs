@@ -71,22 +71,97 @@ fn yield_now() {
 }
 
 // ---------------------------------------------------------------------------
-// Entry. Prints a sentinel string so the kernel's serial output
-// shows we're alive, then yields forever.
+// seL4_BootInfo subset. The kernel writes the full struct into our
+// BootInfo page; we only decode the fields we use here.
+//
+// Field offsets must match `crate::types::seL4_BootInfo` in the
+// kernel — keep them hand-listed for clarity since we don't share
+// the codegen.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SlotRegion { start: u64, end: u64 }
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct UntypedDesc {
+    paddr: u64,
+    size_bits: u8,
+    is_device: u8,
+    _padding: [u8; 6],
+}
+
+const MAX_BI_UNTYPED: usize = 230;
+
+#[repr(C)]
+struct BootInfo {
+    extra_len: u64,
+    node_id: u64,
+    num_nodes: u64,
+    num_iopt_levels: u64,
+    ipc_buffer: *mut u8,
+    empty: SlotRegion,
+    shared_frames: SlotRegion,
+    user_image_frames: SlotRegion,
+    user_image_paging: SlotRegion,
+    io_space_caps: SlotRegion,
+    extra_bi_pages: SlotRegion,
+    init_thread_cnode_size_bits: u64,
+    init_thread_domain: u64,
+    untyped: SlotRegion,
+    untyped_list: [UntypedDesc; MAX_BI_UNTYPED],
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for printing decimal numbers. No allocator, so we use a
+// fixed-size stack buffer.
+// ---------------------------------------------------------------------------
+
+fn print_str(s: &[u8]) {
+    for &b in s {
+        debug_put_char(b);
+    }
+}
+
+fn print_u64(mut n: u64) {
+    if n == 0 {
+        debug_put_char(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    print_str(&buf[i..]);
+}
+
+// ---------------------------------------------------------------------------
+// Entry. The kernel passes the BootInfo vaddr via `rdi` (System V
+// ABI first arg), so we read it directly from our argument.
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
 #[link_section = ".text._start"]
-pub unsafe extern "C" fn _start() -> ! {
-    // The kernel sets up rsp to point at the top of our user stack,
-    // so we can use Rust's normal stack-frame ABI from here.
-    let banner = b"[rootserver alive]\n";
-    for &b in banner {
-        debug_put_char(b);
-    }
+pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
+    let bi = &*bootinfo;
+    let n_untyped = bi.untyped.end - bi.untyped.start;
 
-    // Phase 29a sentinel — once Phase 29d wires BootInfo we'll read
-    // from gs:0 / a known vaddr to find untypeds and spawn workers.
+    print_str(b"[rootserver alive] node ");
+    print_u64(bi.node_id);
+    print_str(b"/");
+    print_u64(bi.num_nodes);
+    print_str(b", ");
+    print_u64(n_untyped);
+    print_str(b" untyped(s) of ");
+    print_u64(1u64 << bi.untyped_list[0].size_bits);
+    print_str(b" bytes\n");
+
+    // Phase 29g will retype `bi.untyped_list[0]` into a child TCB +
+    // CNode + Endpoint and IPC with it.
     loop {
         yield_now();
     }
