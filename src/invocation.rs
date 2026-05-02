@@ -509,6 +509,13 @@ fn map_paging_struct(
     use crate::arch::x86_64::usermode;
     let (paddr, current_mapped) = paging_struct_state(&target);
     if current_mapped.is_some() {
+        if INV_TRACE {
+            crate::arch::log("[map.lvl=");
+            log_dec(level as u64);
+            crate::arch::log(" cap-already-mapped@0x");
+            log_hex_u64(current_mapped.unwrap());
+            crate::arch::log("]\n");
+        }
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_DeleteFirst,
         )));
@@ -569,6 +576,13 @@ fn map_paging_struct(
         if missing_level == 0 {
             // Either the level is bogus or the target slot is
             // already populated.
+            if INV_TRACE {
+                crate::arch::log("[map.lvl=");
+                log_dec(level as u64);
+                crate::arch::log(" pd-slot-busy vaddr=0x");
+                log_hex_u64(vaddr);
+                crate::arch::log("]\n");
+            }
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst,
             )));

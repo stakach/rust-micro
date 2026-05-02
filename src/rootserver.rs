@@ -207,18 +207,15 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
 
     // The linker may emit several PT_LOAD segments that share a
     // single 4 KiB page (e.g. read-only data + .text both starting
-    // mid-page). We track already-allocated pages so we don't
-    // double-allocate or double-map; subsequent segments touching
-    // the same page just write into it at the right offset.
-    //
-    // Sized for sel4test-driver-class workloads: ~1000 unique pages
-    // for a single ~3.9 MiB LOAD segment. The Rust rootserver only
-    // needs a handful of these. 32 KiB on the kernel stack — fits
-    // comfortably in the BOOTBOOT 64 KiB initstack.
-    static mut SEEN: [PageMapping; 2048] =
-        [PageMapping { vaddr: 0, kvaddr: 0 }; 2048];
-    let seen: &mut [PageMapping; 2048] = unsafe { &mut SEEN };
-    for s in seen.iter_mut() { *s = PageMapping { vaddr: 0, kvaddr: 0 }; }
+    // mid-page). The IMAGE_PAGES table dedupes those overlapping
+    // pages and also feeds `userImageFrames` later — so its
+    // (vaddr, paddr, writable) entries are the ground truth for
+    // "which user pages the loader pre-mapped on the rootserver's
+    // behalf."
+    let seen: &mut [PageMapping; IMAGE_PAGES_CAP] = unsafe { &mut IMAGE_PAGES };
+    for s in seen.iter_mut() {
+        *s = PageMapping { vaddr: 0, paddr: 0, writable: false };
+    }
     let mut n_seen: usize = 0;
 
     // Phase 41 — track the highest vaddr any PT_LOAD segment
@@ -250,21 +247,30 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     // that's also a valid kernel-virtual pointer (BOOTBOOT identity
     // at PML4[0]) — the loader maps it user-side at `stack_base + i
     // * page` and the kernel can write into it via paddr-as-vaddr.
+    // Each aux page is also recorded in IMAGE_PAGES so it appears in
+    // userImageFrames; sel4utils then knows not to hand the same
+    // vaddr out to its heap allocator.
     for i in 0..ROOTSERVER_STACK_PAGES {
         let stack_phys = alloc_page();
-        map_user_4k_into_pml4(pml4, stack_base + i * page, stack_phys,
-            /* writable */ true);
+        let vaddr = stack_base + i * page;
+        map_user_4k_into_pml4(pml4, vaddr, stack_phys, /* writable */ true);
+        record_image_page(seen, &mut n_seen, vaddr, stack_phys, true)?;
     }
 
     // Allocate + map the IPC buffer page.
     let ipcbuf_phys = alloc_page();
     map_user_4k_into_pml4(pml4, ipc_buffer_vaddr, ipcbuf_phys, true);
+    record_image_page(seen, &mut n_seen, ipc_buffer_vaddr, ipcbuf_phys, true)?;
 
     // Allocate + map the BootInfo page (read-only — userspace reads
     // it but doesn't mutate). The kernel writes the struct via the
     // BOOTBOOT identity map before dispatch.
     let bi_phys = alloc_page();
     map_user_4k_into_pml4(pml4, bootinfo_vaddr, bi_phys, false);
+    record_image_page(seen, &mut n_seen, bootinfo_vaddr, bi_phys, false)?;
+
+    // Publish the count for the BootInfo builder.
+    IMAGE_PAGE_COUNT = n_seen;
 
     Ok(RootserverImage {
         pml4_paddr: pml4,
@@ -506,12 +512,47 @@ pub unsafe fn launch_rootserver() -> ! {
             });
     }
 
+    // Phase 42 — userImageFrames: install one `Cap::Frame` per page
+    // the loader pre-mapped for the rootserver (image + stack + IPC
+    // buffer + BootInfo). sel4utils' vspace bootstrap walks these
+    // and registers the mapped vaddrs as reserved, which keeps its
+    // heap allocator from picking vaddrs that overlap the loader's
+    // already-installed PTs (without this, allocman's PT_Map fails
+    // with `seL4_DeleteFirst` whenever it tries to reuse a PD slot
+    // the loader already populated).
+    let user_image_start: Word = (untyped_slot as Word) + 1 + DEVICE_UTS.len() as Word;
+    let n_image_pages = IMAGE_PAGE_COUNT;
+    for i in 0..n_image_pages {
+        let pm = IMAGE_PAGES[i];
+        let rights = if pm.writable {
+            crate::cap::FrameRights::ReadWrite
+        } else {
+            crate::cap::FrameRights::ReadOnly
+        };
+        s.cnodes[ROOTSERVER_CNODE_IDX].0[user_image_start as usize + i] =
+            Cte::with_cap(&Cap::Frame {
+                ptr: PPtr::<FrameStorage>::new(pm.paddr).expect("image page paddr"),
+                size: FrameSize::Small,
+                rights,
+                mapped: Some(pm.vaddr),
+                asid: 0,
+                is_device: false,
+            });
+    }
+    let user_image_end: Word = user_image_start + n_image_pages as Word;
+
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)
     // before the CR3 swap; the rootserver reads it through its
     // user-half mapping after sysretq.
     let bi_ptr = phys_to_kernel_virt(img.bootinfo_paddr) as *mut seL4_BootInfo;
-    let bi = build_bootinfo(img.ipc_buffer_vaddr, ut_paddr, ut_size_bits);
+    let bi = build_bootinfo(
+        img.ipc_buffer_vaddr,
+        ut_paddr,
+        ut_size_bits,
+        user_image_start,
+        user_image_end,
+    );
     core::ptr::write(bi_ptr, bi);
 
     // Demote the boot thread out of the way.
@@ -576,6 +617,8 @@ unsafe fn build_bootinfo(
     ipc_buffer_vaddr: u64,
     untyped_paddr: u64,
     untyped_size_bits: u8,
+    user_image_start: Word,
+    user_image_end: Word,
 ) -> seL4_BootInfo {
     let mut empty_untypeds = [seL4_UntypedDesc::default();
         CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
@@ -647,9 +690,18 @@ unsafe fn build_bootinfo(
         numNodes: n_cores,
         numIOPTLevels: 0,
         ipcBuffer: ipc_buffer_vaddr as *mut crate::types::seL4_IPCBuffer,
-        empty: seL4_SlotRegion { start: untyped_end, end: cnode_slots },
+        empty: seL4_SlotRegion { start: user_image_end, end: cnode_slots },
         sharedFrames: seL4_SlotRegion { start: 0, end: 0 },
-        userImageFrames: seL4_SlotRegion { start: 0, end: 0 },
+        userImageFrames: seL4_SlotRegion {
+            start: user_image_start,
+            end: user_image_end,
+        },
+        // userImagePaging would describe the PT/PD/PDPT caps backing
+        // the rootserver image's mappings. Our loader's PT/PD/PDPT
+        // pages are pulled from a kernel-image pool (`KPT_POOL`) and
+        // never exposed as caps; sel4utils tolerates an empty range
+        // here as long as userImageFrames is correct (it can't unmap
+        // image pages but we don't need that for sel4test bring-up).
         userImagePaging: seL4_SlotRegion { start: 0, end: 0 },
         ioSpaceCaps: seL4_SlotRegion { start: 0, end: 0 },
         extraBIPages: seL4_SlotRegion { start: 0, end: 0 },
@@ -668,14 +720,32 @@ unsafe fn build_bootinfo(
 #[allow(dead_code)]
 fn _silence_seL4_slotpos_unused(_: seL4_SlotPos) {}
 
-/// Tracks "this page-aligned vaddr has already been allocated +
-/// mapped, with kernel-virt = `kvaddr`". Used so multiple PT_LOAD
-/// segments that share a 4 KiB page don't fight over allocation.
+/// Tracks "this page-aligned vaddr has been mapped at `paddr`". The
+/// loader uses it to dedupe overlapping PT_LOAD segments; later the
+/// BootInfo builder iterates IMAGE_PAGES to emit `userImageFrames`
+/// Frame caps so sel4utils' vspace allocator knows which user vaddrs
+/// the loader pre-reserved for the rootserver image, stack, IPC
+/// buffer and BootInfo page.
 #[derive(Copy, Clone)]
-struct PageMapping {
-    vaddr: u64,
-    kvaddr: u64,
+pub struct PageMapping {
+    pub vaddr: u64,
+    pub paddr: u64,
+    /// True if the page was mapped writable (for the eventual Frame
+    /// cap rights — readonly = ReadOnly, writable = ReadWrite).
+    pub writable: bool,
 }
+
+/// Capacity of the per-rootserver page-mapping table. Sized for
+/// sel4test-driver-class workloads (~3.6 MiB image ≈ 900 pages plus
+/// stack/IPC/BootInfo aux pages).
+pub const IMAGE_PAGES_CAP: usize = 2048;
+
+/// All user-image pages the loader installed in the rootserver's
+/// PML4. Populated by `load()`, consumed by `install_rootserver_initial_caps`
+/// to materialise `userImageFrames`.
+pub static mut IMAGE_PAGES: [PageMapping; IMAGE_PAGES_CAP] =
+    [PageMapping { vaddr: 0, paddr: 0, writable: false }; IMAGE_PAGES_CAP];
+pub static mut IMAGE_PAGE_COUNT: usize = 0;
 
 unsafe fn load_segment(
     pml4: u64,
@@ -694,18 +764,13 @@ unsafe fn load_segment(
         // Find or allocate the kernel-virt backing for this page.
         // `alloc_page` returns a paddr that doubles as a valid
         // kernel-virtual pointer (BOOTBOOT identity at PML4[0]).
+        let writable = seg.writable();
         let kva = match find_seen(seen, *n_seen, page_vaddr) {
             Some(kv) => kv,
             None => {
                 let phys = alloc_page();
-                map_user_4k_into_pml4(
-                    pml4, page_vaddr, phys, /* writable */ seg.writable(),
-                );
-                if *n_seen >= seen.len() {
-                    return Err(LoadError::UnalignedSegment); // pool small
-                }
-                seen[*n_seen] = PageMapping { vaddr: page_vaddr, kvaddr: phys };
-                *n_seen += 1;
+                map_user_4k_into_pml4(pml4, page_vaddr, phys, writable);
+                record_image_page(seen, n_seen, page_vaddr, phys, writable)?;
                 phys
             }
         };
@@ -734,10 +799,25 @@ unsafe fn load_segment(
 fn find_seen(seen: &[PageMapping], n: usize, vaddr: u64) -> Option<u64> {
     for i in 0..n {
         if seen[i].vaddr == vaddr {
-            return Some(seen[i].kvaddr);
+            return Some(seen[i].paddr);
         }
     }
     None
+}
+
+fn record_image_page(
+    seen: &mut [PageMapping],
+    n_seen: &mut usize,
+    vaddr: u64,
+    paddr: u64,
+    writable: bool,
+) -> Result<(), LoadError> {
+    if *n_seen >= seen.len() {
+        return Err(LoadError::UnalignedSegment); // pool small
+    }
+    seen[*n_seen] = PageMapping { vaddr, paddr, writable };
+    *n_seen += 1;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
