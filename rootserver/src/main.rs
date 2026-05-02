@@ -482,6 +482,8 @@ struct BootInfo {
     extra_bi_pages: SlotRegion,
     init_thread_cnode_size_bits: u64,
     init_thread_domain: u64,
+    /// Phase 36c — per-CPU SchedControl caps under MCS.
+    schedcontrol: SlotRegion,
     untyped: SlotRegion,
     untyped_list: [UntypedDesc; MAX_BI_UNTYPED],
 }

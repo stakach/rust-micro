@@ -268,8 +268,10 @@ pub struct seL4_IPCBuffer {
 }
 
 /// The boot-info frame the kernel hands to the initial thread. The
-/// type is laid out exactly like the C `seL4_BootInfo` for
-/// non-MCS / non-IOMMU.
+/// type is laid out exactly like the C `seL4_BootInfo` under
+/// `CONFIG_KERNEL_MCS=true` — Phase 32a flipped MCS on, and Phase
+/// 36c added the `schedcontrol` slot region between
+/// `initThreadDomain` and `untyped` to match upstream.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct seL4_BootInfo {
@@ -286,8 +288,11 @@ pub struct seL4_BootInfo {
     pub extraBIPages: seL4_SlotRegion,
     pub initThreadCNodeSizeBits: seL4_Word,
     pub initThreadDomain: seL4_Domain,
-    // CONFIG_KERNEL_MCS would slot a `schedcontrol: seL4_SlotRegion`
-    // here; we don't enable MCS, so the field is absent.
+    /// Phase 36c — per-CPU SchedControl caps under MCS. Slot
+    /// region inside the rootserver's CNode; one cap per CPU
+    /// in `[start, end)`. Populated empty (`start == end`) for
+    /// now until the initial-cap layout fix lands (audit item 4).
+    pub schedcontrol: seL4_SlotRegion,
     pub untyped: seL4_SlotRegion,
     pub untypedList: [seL4_UntypedDesc; CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS],
 }

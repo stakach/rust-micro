@@ -101,6 +101,19 @@ fn test_runtime_offsets() {
     assert_eq!(off(&bi.ipcBuffer as *const _ as *const u8), 32);
     // empty starts after ipcBuffer (a pointer = 8 bytes on x86_64).
     assert_eq!(off(&bi.empty as *const _ as *const u8), 40);
+    // Phase 36c — schedcontrol region sits between initThreadDomain
+    // and untyped under CONFIG_KERNEL_MCS=true. Cumulative layout
+    // (each SlotRegion = 16 bytes; each Word = 8):
+    //   ipcBuffer @  32, empty @  40, sharedFrames @  56,
+    //   userImageFrames @  72, userImagePaging @  88,
+    //   ioSpaceCaps @ 104, extraBIPages @ 120,
+    //   initThreadCNodeSizeBits @ 136, initThreadDomain @ 144,
+    //   schedcontrol @ 152, untyped @ 168, untypedList @ 184.
+    assert_eq!(off(&bi.initThreadCNodeSizeBits as *const _ as *const u8), 136);
+    assert_eq!(off(&bi.initThreadDomain        as *const _ as *const u8), 144);
+    assert_eq!(off(&bi.schedcontrol            as *const _ as *const u8), 152);
+    assert_eq!(off(&bi.untyped                 as *const _ as *const u8), 168);
+    assert_eq!(off(&bi.untypedList             as *const _ as *const u8), 184);
     arch::log("  ✓ seL4_BootInfo field offsets match libsel4 layout\n");
 }
 

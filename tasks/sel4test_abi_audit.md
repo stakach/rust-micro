@@ -33,13 +33,13 @@ Upstream reference: `./seL4/libsel4/include/sel4/...` and
 | sharedFrames..extraBIPages | 56..96 | same | **MATCH** |
 | initThreadCNodeSizeBits | 104 | 104 | **MATCH** |
 | initThreadDomain | 112 | 112 | **MATCH** |
-| **schedcontrol (MCS only)** | **120** (CONFIG_KERNEL_MCS=true) | **MISSING** — comment in `types.rs` claims MCS is off, but `bf.rs` flipped it to true in 32a | **GAP** |
-| untyped | 136 | 120 (off-by-16) | **GAP** (consequence of missing schedcontrol) |
-| untypedList | 152 | 136 | **GAP** |
+| **schedcontrol (MCS only)** | **152** (CONFIG_KERNEL_MCS=true) | **152** — Phase 36c added `seL4_SlotRegion` between `initThreadDomain` and `untyped`; populated `start == end == 0` (empty region) until per-CPU SchedControl caps land in the audit-item-4 follow-up | **MATCH** |
+| untyped | 168 | 168 | **MATCH** |
+| untypedList | 184 | 184 | **MATCH** |
 
-**Fix:** add `pub schedcontrol: seL4_SlotRegion` between
-`initThreadDomain` and `untyped`. Update the
-`abi_layout_tests` spec.
+(Original audit numbers had this off by 32 — corrected when the
+spec was wired up, since each prior `seL4_SlotRegion` is 16 bytes
+not 8; cumulative offset shifts compound.)
 
 ## Syscall numbers
 

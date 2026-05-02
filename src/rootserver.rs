@@ -441,6 +441,10 @@ unsafe fn build_bootinfo(ipc_buffer_paddr: u64, _untyped_paddr: u64) -> seL4_Boo
         extraBIPages: seL4_SlotRegion { start: 0, end: 0 },
         initThreadCNodeSizeBits: 5,
         initThreadDomain: 0,
+        // Phase 36c — empty schedcontrol region. Once we install
+        // per-core SchedControl caps in the rootserver's CNode
+        // (audit follow-up), this becomes [start, start + ncores).
+        schedcontrol: seL4_SlotRegion { start: 0, end: 0 },
         untyped: seL4_SlotRegion { start: 11, end: 12 },
         untypedList: empty_untypeds,
     }
