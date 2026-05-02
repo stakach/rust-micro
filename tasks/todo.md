@@ -61,13 +61,26 @@ in the same commit)
   * Microtest case: `tcb_configure` issues the invocation
     against a freshly retyped TCB.
 
-- [ ] 34c — IPC buffer for long messages.
-  * Sender's `ipc_buffer_paddr` is already provided by the
-    rootserver bootstrap. Read words 4..length out of it on
-    `Send`/`Call`; write them into the receiver's IPC buffer
-    on transfer.
-  * Microtest: round-trip a 16-word message through an
-    endpoint.
+- [x] 34c — IPC buffer for long messages. **DONE**
+  * Added `Tcb.ipc_buffer_paddr: Word`. The rootserver-launch
+    path sets it from the loader's `img.ipc_buffer_paddr`.
+  * `seL4_TCB_SetIPCBuffer(target, vaddr, frame_cptr)`
+    invocation records both the vaddr (for userspace's view)
+    and the Frame cap's paddr (for kernel-side direct access
+    via the BOOTBOOT 1 GiB identity map).
+  * `handle_send` extends the staging step: when
+    `msginfo.length > 4`, words 4..length are pulled from the
+    sender's IPC buffer (`paddr + 8` to skip the seL4 tag word).
+  * `endpoint::transfer` mirrors: words 4..length get written
+    into the receiver's IPC buffer at the same offset.
+  * Kernel spec `long_message_via_ipc_buffer` round-trips an
+    8-word message through two TCBs with separate IPC buffers
+    and verifies both register-resident words 0..3 and
+    buffer-resident words 4..7 land correctly at the
+    receiver.
+  * Microtest case `tcb_set_ipc_buffer` smoke-tests the
+    invocation. End-to-end long-msg round-trip from userspace
+    waits on richer harness machinery (34d/e).
 
 - [ ] 34d — Cap transfer over IPC (`extraCaps`).
   * IPC buffer carries an `extraCaps[N]` (cptr) array and

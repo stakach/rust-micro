@@ -134,6 +134,14 @@ pub struct Tcb {
     pub fault_handler: Word,
     /// User-mode IPC-buffer virtual address.
     pub ipc_buffer: Word,
+    /// Phase 34c — physical address of the user-mode IPC buffer
+    /// page. Set by `seL4_TCB_SetIPCBuffer` (or implicitly at
+    /// rootserver-launch time). Needed because the kernel
+    /// reads/writes message words 4..length through this paddr —
+    /// walking user page tables on every IPC would be too slow,
+    /// and the BOOTBOOT 1 GiB identity map makes paddr access a
+    /// direct dereference.
+    pub ipc_buffer_paddr: Word,
     /// Intrusive scheduler-list links. `None` for a thread that
     /// isn't currently enqueued.
     pub sched_next: Option<TcbId>,
@@ -213,6 +221,7 @@ impl Default for Tcb {
             time_slice: 0,
             fault_handler: 0,
             ipc_buffer: 0,
+            ipc_buffer_paddr: 0,
             sched_next: None,
             sched_prev: None,
             ep_next: None,

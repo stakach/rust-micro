@@ -292,6 +292,10 @@ pub unsafe fn launch_rootserver() -> ! {
         /* rdi (arg0) */ ROOTSERVER_BOOTINFO_VBASE,
     );
     t.cpu_context.cr3 = img.pml4_paddr;
+    // Phase 34c — register the rootserver's IPC buffer with the
+    // kernel so long-message IPC can read/write it via paddr.
+    t.ipc_buffer = ROOTSERVER_IPCBUF_VBASE;
+    t.ipc_buffer_paddr = img.ipc_buffer_paddr;
     t.cspace_root = cnode_cap;
     t.vspace_root = Cap::PML4 {
         ptr: PPtr::<Pml4Storage>::new(img.pml4_paddr).expect("pml4 paddr"),

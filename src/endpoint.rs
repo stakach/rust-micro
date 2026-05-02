@@ -260,6 +260,17 @@ fn transfer(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) 
     let n = (length as usize).min(r.msg_regs.len());
     r.msg_regs[..n].copy_from_slice(&regs[..n]);
 
+    // Phase 34c — fan words 4..length out to the receiver's IPC
+    // buffer page so userspace can read them. Words 0..3 ride in
+    // registers (rdx/r10/r8/r9 below) and don't need the buffer.
+    if length > 4 && r.ipc_buffer_paddr != 0 {
+        let buf = (r.ipc_buffer_paddr as *mut u64).wrapping_add(1); // skip tag word
+        let max = (length as usize).min(regs.len());
+        for i in 4..max {
+            unsafe { core::ptr::write_volatile(buf.add(i), regs[i]); }
+        }
+    }
+
     // Phase 29h — fan the IPC payload into the receiver's
     // user-visible registers immediately. The dispatcher's existing
     // tail only fans-in when the in-flight syscall is the receiver's
@@ -305,8 +316,85 @@ pub mod spec {
         non_blocking_send_with_no_receiver();
         cancel_ipc_unblocks_thread();
         multiple_senders_queue_in_order();
+        long_message_via_ipc_buffer();
 
         arch::log("Endpoint IPC tests completed\n");
+    }
+
+    /// Phase 34c — long-message IPC. With both TCBs sporting an
+    /// `ipc_buffer_paddr`, words 4..length should round-trip
+    /// through the buffer. Words 0..3 ride in `msg_regs[0..4]`.
+    #[inline(never)]
+    fn long_message_via_ipc_buffer() {
+        // Two backing pages — one per TCB. They sit in BSS so
+        // `&raw mut` doubles as a kernel-virt address; for the
+        // kernel-side spec that's all we need (we don't go
+        // through the BOOTBOOT identity map here, we just want
+        // any writable u64 storage shared between sender and
+        // receiver via a known address).
+        #[repr(C, align(4096))]
+        struct IpcPage([u64; 512]);
+        static mut SENDER_BUF: IpcPage = IpcPage([0; 512]);
+        static mut RECEIVER_BUF: IpcPage = IpcPage([0; 512]);
+
+        let mut sched = Scheduler::new();
+        let mut ep = Endpoint::new();
+
+        let sender = sched.admit(runnable(50));
+        let receiver = sched.admit(runnable(50));
+        unsafe {
+            sched.slab.get_mut(sender).ipc_buffer_paddr =
+                (&raw mut SENDER_BUF) as u64;
+            sched.slab.get_mut(receiver).ipc_buffer_paddr =
+                (&raw mut RECEIVER_BUF) as u64;
+        }
+
+        // Stage an 8-word message. Words 0..3 in msg_regs (the
+        // syscall-stage path normally fills these from a2..a5);
+        // words 4..7 in the sender's IPC buffer at offset
+        // `tag_word + i = 1 + i` (we mirror seL4's layout).
+        {
+            let s = sched.slab.get_mut(sender);
+            s.ipc_label = 0xABCD;
+            s.ipc_length = 8;
+            s.msg_regs[0] = 0x1000;
+            s.msg_regs[1] = 0x1001;
+            s.msg_regs[2] = 0x1002;
+            s.msg_regs[3] = 0x1003;
+            s.msg_regs[4] = 0x1004;
+            s.msg_regs[5] = 0x1005;
+            s.msg_regs[6] = 0x1006;
+            s.msg_regs[7] = 0x1007;
+        }
+        // Receiver waits.
+        receive_ipc(&mut ep, &mut sched, receiver, RecvOptions::blocking());
+        // Sender sends.
+        send_ipc(&mut ep, &mut sched, sender, SendOptions::blocking(0));
+
+        // Receiver's msg_regs should mirror the sender for words
+        // 0..7, AND the receiver's ipc_buffer should hold words
+        // 4..7 at offsets 5..8 (after the 1-word tag).
+        unsafe {
+            let r = sched.slab.get(receiver);
+            for (i, &expect) in [
+                0x1000u64, 0x1001, 0x1002, 0x1003,
+                0x1004, 0x1005, 0x1006, 0x1007,
+            ].iter().enumerate() {
+                assert_eq!(r.msg_regs[i], expect,
+                    "msg_regs[{}] was {:#x} expected {:#x}",
+                    i, r.msg_regs[i], expect);
+            }
+            assert_eq!(r.ipc_length, 8);
+            for i in 4..8 {
+                let buf = (&raw mut RECEIVER_BUF) as *mut u64;
+                let got = core::ptr::read_volatile(buf.add(1 + i));
+                let expect = 0x1000u64 + i as u64;
+                assert_eq!(got, expect,
+                    "RECEIVER_BUF[{}] was {:#x} expected {:#x}",
+                    i, got, expect);
+            }
+        }
+        arch::log("  ✓ 8-word IPC routes 4..length through ipc_buffer\n");
     }
 
     #[inline(never)]

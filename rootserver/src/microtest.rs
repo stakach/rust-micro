@@ -28,6 +28,7 @@ const CASES: &[TestCase] = &[
     TestCase { name: "syscall_round_trip",   body: tests::syscall_round_trip },
     TestCase { name: "untyped_retype_tcb",   body: tests::untyped_retype_tcb },
     TestCase { name: "tcb_configure",        body: tests::tcb_configure },
+    TestCase { name: "tcb_set_ipc_buffer",   body: tests::tcb_set_ipc_buffer },
 ];
 
 /// Entry point invoked from `_start` when `--features microtest`
@@ -96,6 +97,28 @@ mod tests {
         Ok(())
     }
 
+    /// Phase 34c — `seL4_TCB_SetIPCBuffer` records the IPC-buffer
+    /// vaddr and looks up the backing Frame's paddr. Smoke-test
+    /// the invocation; the kernel-side spec covers actual long-
+    /// message round-trips.
+    pub(super) fn tcb_set_ipc_buffer() -> TestResult {
+        let frame_slot: u64 = 13;
+        let r = untyped_retype(
+            CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE,
+            PAGING_BITS, 1, frame_slot,
+        );
+        if r != 0 { return Err("retype frame failed"); }
+        let target = FIRST_EMPTY_SLOT; // TCB from `untyped_retype_tcb`
+        let msg_info = LBL_TCB_SET_IPC_BUFFER << 12;
+        let buffer_vaddr = 0x0000_0100_0090_0000u64;
+        let r = unsafe {
+            syscall5(SYS_SEND, target, msg_info,
+                     buffer_vaddr, frame_slot, 0)
+        };
+        if r != 0 { return Err("SetIPCBuffer failed"); }
+        Ok(())
+    }
+
     /// Phase 34b — `seL4_TCB_Configure` should accept the same
     /// fault_ep / cspace / vspace fields as the per-field
     /// invocations in one shot, plus the priority. The TCB we
@@ -128,6 +151,7 @@ mod tests {
 }
 
 const LBL_TCB_CONFIGURE: u64 = 5;
+const LBL_TCB_SET_IPC_BUFFER: u64 = 10;
 
 /// 6-register SYSCALL — like `syscall5` but exposes the sixth arg
 /// (r9 / `args.a5`). Used by tests that need to set the priority

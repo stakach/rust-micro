@@ -236,15 +236,39 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
         // can copy it to the receiver. seL4_MessageInfo decode lives
         // in types::seL4_MessageInfo_t — we keep it minimal here.
         let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+        let length = info.length() as u32;
         {
             let snd = s.scheduler.slab.get_mut(current);
             snd.ipc_label = info.label();
-            snd.ipc_length = info.length() as u32;
+            snd.ipc_length = length;
             snd.ipc_badge = badge;
             snd.msg_regs[0] = args.a2;
             snd.msg_regs[1] = args.a3;
             snd.msg_regs[2] = args.a4;
             snd.msg_regs[3] = args.a5;
+            // Phase 34c — long messages: words 4..length come from
+            // the sender's user-mode IPC buffer page. seL4's IPC
+            // buffer layout is `tag, msg[0..120], ...`; we mirror
+            // the `msg[]` offset (word 1 from the buffer base in
+            // u64 units, i.e. byte offset 8). Words 0..3 of the
+            // message live in registers (a2..a5) and are NOT read
+            // from the buffer.
+            if length as usize > snd.msg_regs.len()
+                && snd.ipc_buffer_paddr != 0
+            {
+                // Buffer is too long for our scratch — clamp.
+                // (Real seL4 supports up to 120 message words; we
+                // only carry SCRATCH_MSG_LEN in the kernel.)
+            }
+            if length > 4 && snd.ipc_buffer_paddr != 0 {
+                let buf_paddr = snd.ipc_buffer_paddr;
+                let buf = (buf_paddr as *const u64).wrapping_add(1); // skip tag word
+                let max = (length as usize)
+                    .min(snd.msg_regs.len());
+                for i in 4..max {
+                    snd.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
+                }
+            }
         }
         let idx = crate::kernel::KernelState::endpoint_index(ep_ptr);
         let opts = SendOptions { blocking, do_call: call, badge };

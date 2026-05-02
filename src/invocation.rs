@@ -1422,6 +1422,26 @@ fn decode_tcb(
                 }
                 Ok(())
             }
+            // Phase 34c — set the user-mode IPC buffer. ABI:
+            //   a2 = vaddr the user mapped its IPC buffer at
+            //   a3 = Frame cap_ptr backing that mapping; the
+            //        kernel reads its paddr to access the buffer
+            //        directly (BOOTBOOT 1 GiB identity map).
+            InvocationLabel::TCBSetIPCBuffer => {
+                let vaddr = args.a2;
+                let frame_cptr = args.a3;
+                let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                let frame_cap = crate::cspace::lookup_cap(s, &inv_cspace, frame_cptr)?;
+                let paddr = match frame_cap {
+                    Cap::Frame { ptr, .. } => ptr.addr(),
+                    _ => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability))),
+                };
+                let t = s.scheduler.slab.get_mut(id);
+                t.ipc_buffer = vaddr;
+                t.ipc_buffer_paddr = paddr;
+                Ok(())
+            }
             InvocationLabel::TCBBindNotification => {
                 // a2 = ntfn_cptr.
                 let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
