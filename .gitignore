@@ -16,5 +16,18 @@ disk.img
 /vendor/libsel4-build/out/
 /vendor/libsel4-build/.venv/
 
+# vendor/sel4test/ is bootstrapped on first run by its build.sh —
+# upstream component checkouts at SHAs pinned in sel4test-manifest.
+# Only build.sh + README live in-tree; the rest is regenerable.
+/vendor/sel4test/projects/
+/vendor/sel4test/tools/
+/vendor/sel4test/kernel
+/vendor/sel4test/build/
+/vendor/sel4test/.venv/
+/vendor/sel4test/.sel4_cache/
+/vendor/sel4test/init-build.sh
+/vendor/sel4test/griddle
+/vendor/sel4test/easy-settings.cmake
+
 # Local agent state from Claude Code.
 /.claude/
