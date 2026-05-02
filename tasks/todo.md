@@ -34,15 +34,22 @@ between us and a system that could host a userspace driver:
     `yield` between PIT ticks — the children themselves yield
     after each char.
 
-- [ ] 33b — IRQ → Notification end-to-end.
-  * Install `IDT[vec]` for the master/slave PIC IRQ range so
-    every hardware IRQ funnels through a single dispatch
-    that calls `interrupt::handle_interrupt`.
-  * Add an IRQ-driven demo: rootserver retypes a Notification,
-    issues `IRQControl::IssueIRQHandler` for some IRQ, binds
-    the notification, waits on it. Trigger the IRQ (e.g.
-    arm the PIT and let it fire on a vector other than 0).
-  * Spec: signal arrives via the IRQ path, waiter unblocks.
+- [x] 33b — IRQ → Notification end-to-end. **DONE**
+  * Generic `irq_entry!` macro generates one naked stub per
+    IRQ vector (IRQ 1..15); each pushes the 15 GPRs and calls
+    `irq_dispatch` with `(&mut IretqContext, irq_num)`. The
+    dispatcher signals any bound notification, EOIs the PIC,
+    and reuses `swap_iretq_context_if_preempted` so a higher-
+    priority wake preempts the running thread on `iretq`.
+  * Refactored PIT entry to use the shared `IretqContext` +
+    swap helper. Both entries now follow the same shape.
+  * IRQ 1's IDT entry is set to DPL=3 for the demo so user
+    `int 0x21` is allowed; rootserver retypes a Notification,
+    issues `IRQControl::IssueIRQHandler`, binds the
+    notification, fires `int 0x21`, then `SysRecv` returns
+    immediately because the IRQ already signalled. Demo
+    prints `[rootserver got irq signal -- IRQ -> Notification
+    path live]`.
 
 - [ ] 33c — SC donation across IPC.
   * On `seL4_Call` (with the caller bound to an SC), record

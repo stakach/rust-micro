@@ -315,6 +315,9 @@ pub unsafe fn launch_rootserver() -> ! {
     // Pinned at slot 14 by convention (kernel + rootserver agree).
     s.cnodes[ROOTSERVER_CNODE_IDX].0[14] =
         Cte::with_cap(&Cap::SchedControl { core: 0 });
+    // Phase 33b — give the rootserver an IRQControl cap so it can
+    // `IRQControl::IssueIRQHandler` for the userspace-driver demo.
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[4] = Cte::with_cap(&Cap::IrqControl);
 
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)

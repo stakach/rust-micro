@@ -38,10 +38,14 @@ const LBL_TCB_RESUME: u64 = 13;
 const LBL_SCHED_CONTROL_CONFIGURE: u64 = 33;
 const LBL_SCHED_CONTEXT_BIND: u64 = 34;
 const LBL_TCB_SET_PRIORITY: u64 = 6;
+/// Phase 33b — IRQ-handler invocations.
+const LBL_IRQ_ISSUE_IRQ_HANDLER: u64 = 26;
+const LBL_IRQ_SET_IRQ_HANDLER: u64 = 28;
 
 /// `seL4_ObjectType` values we use here.
 const OBJ_TCB: u64 = 1;
 const OBJ_ENDPOINT: u64 = 2;
+const OBJ_NOTIFICATION: u64 = 3;
 /// `ObjectType::SchedContext` — order in `object_type.rs`. We use the
 /// minimum 8 bits = 256 bytes per SC, well above the SchedContext
 /// struct's footprint.
@@ -66,6 +70,13 @@ const SLOT_SC_HIGH: u64 = 15;
 const SLOT_SC_LOW: u64 = 16;
 const SLOT_TCB_HIGH: u64 = 17;
 const SLOT_TCB_LOW: u64 = 18;
+/// Phase 33b — slot the kernel installs a `Cap::IrqControl` into.
+const SLOT_IRQ_CONTROL: u64 = 4;
+/// IRQ demo slots.
+const SLOT_IRQ_NTFN: u64 = 19;
+const SLOT_IRQ_HANDLER: u64 = 20;
+/// IRQ used in the demo (PIC1 line 1 → IDT vector 0x21).
+const DEMO_IRQ: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // Syscall stubs. The x86_64 SYSCALL ABI puts the syscall number in
@@ -208,6 +219,24 @@ fn sched_control_configure(
 fn sched_context_bind(sc_cptr: u64, tcb_cptr: u64) -> u64 {
     let msg_info = LBL_SCHED_CONTEXT_BIND << 12;
     unsafe { syscall5(SYS_SEND, sc_cptr, msg_info, tcb_cptr, 0, 0) }
+}
+
+/// `IRQControl::IssueIRQHandler(irq, dest_slot)`. The kernel
+/// installs an `IRQHandler { irq }` cap at `dest_slot` of the
+/// invoker's CSpace.
+#[inline(always)]
+fn irq_control_issue_handler(irq_control: u64, irq: u64, dest_slot: u64) -> u64 {
+    let msg_info = LBL_IRQ_ISSUE_IRQ_HANDLER << 12;
+    unsafe { syscall5(SYS_SEND, irq_control, msg_info, irq, dest_slot, 0) }
+}
+
+/// `IRQHandler::SetIRQHandler(notification_cap)`. Binds the IRQ
+/// to a notification — when the IRQ fires, the kernel signals
+/// the notification.
+#[inline(always)]
+fn irq_handler_set_notification(irq_handler: u64, notification_cap: u64) -> u64 {
+    let msg_info = LBL_IRQ_SET_IRQ_HANDLER << 12;
+    unsafe { syscall5(SYS_SEND, irq_handler, msg_info, notification_cap, 0, 0) }
 }
 
 /// IPC `Send` on an Endpoint cap. `length` words are taken from
@@ -477,15 +506,53 @@ pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_str(b" from child]\n");
 
     // -----------------------------------------------------------------
-    // Phase 32g — mixed-criticality demo. The 3rd '\n' just printed
-    // flips the kernel into MCS-demo mode. From here we set up two
-    // SC-bound children and let MCS arbitrate between them.
+    // Phase 33b — IRQ → Notification demo. Issue an IRQHandler for
+    // a free vector, bind a notification, fire the IRQ via `int
+    // 0x21`, then `SysRecv` on the notification (which returns
+    // immediately since the IRQ already signalled it).
+    // -----------------------------------------------------------------
+    irq_demo();
+
+    // -----------------------------------------------------------------
+    // Phase 32g — mixed-criticality demo. The kernel's exit hook
+    // counts H/B prints from the children to verify MCS budget
+    // enforcement.
     // -----------------------------------------------------------------
     spawn_mcs_children();
 
     loop {
         yield_now();
     }
+}
+
+unsafe fn irq_demo() {
+    // 1. Retype a notification out of the rootserver's Untyped.
+    let r = untyped_retype(
+        CAP_INIT_UNTYPED, OBJ_NOTIFICATION,
+        /* user_size_bits */ 0, /* num_objects */ 1, SLOT_IRQ_NTFN);
+    if r != 0 { print_str(b"[irq retype ntfn FAILED]\n"); return; }
+
+    // 2. Issue an IRQHandler for IRQ 1 into slot SLOT_IRQ_HANDLER.
+    let r = irq_control_issue_handler(SLOT_IRQ_CONTROL, DEMO_IRQ, SLOT_IRQ_HANDLER);
+    if r != 0 { print_str(b"[irq issue handler FAILED]\n"); return; }
+
+    // 3. Bind the notification to the IRQ.
+    let r = irq_handler_set_notification(SLOT_IRQ_HANDLER, SLOT_IRQ_NTFN);
+    if r != 0 { print_str(b"[irq set ntfn FAILED]\n"); return; }
+
+    // 4. Fire the IRQ. Vector 0x21 = PIC1_VECTOR_BASE (0x20) + 1.
+    //    The kernel installs IDT[0x21] with DPL=3 for the demo, so
+    //    user-mode `int 0x21` is allowed.
+    asm!("int 0x21", options(nostack, preserves_flags));
+
+    // 5. Wait on the notification. The IRQ already signalled, so
+    //    this returns immediately with rax=0.
+    let (rax, _badge, _info, _payload) = ep_recv(SLOT_IRQ_NTFN);
+    if rax != 0 {
+        print_str(b"[irq recv FAILED]\n");
+        return;
+    }
+    print_str(b"[rootserver got irq signal -- IRQ -> Notification path live]\n");
 }
 
 unsafe fn spawn_mcs_children() {

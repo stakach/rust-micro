@@ -144,37 +144,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[no_mangle]
 pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot the PIT IRQ entry produces on the kernel stack. The
-/// 15 GPRs are pushed in `rax..r15` order (rax first, r15 last,
-/// so r15 sits at the lowest address and rax at the highest).
-/// On top of that the CPU has already pushed the standard 5-word
-/// iretq frame: RIP, CS, RFLAGS, RSP, SS. We pass `&mut` to this
-/// struct into the Rust dispatcher; rewriting the iretq fields
-/// + GPRs swaps which thread `iretq` returns to.
-#[repr(C)]
-pub struct IretqContext {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rbp: u64,
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rbx: u64,
-    pub rax: u64,
-    // CPU-pushed iretq frame:
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-}
+use super::interrupts::IretqContext;
 
 /// Naked entry. The CPU has already pushed the iretq frame (RIP,
 /// CS, RFLAGS, RSP, SS). We push every GPR so the Rust ISR can
@@ -256,92 +226,12 @@ extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
     crate::sched_context::mcs_tick(/* delta_ticks */ 1);
     super::pic::eoi(0);
 
-    // Phase 33a — IRQ-driven preemption. If we interrupted user
-    // mode and `mcs_tick` (or any other tick handler) cleared
-    // `current`, switch contexts here rather than `iretq`-ing
-    // back to the now-blocked thread.
-    if !from_user {
-        return;
-    }
-    unsafe {
-        let s = crate::kernel::KERNEL.get();
-        // Pick the thread to resume. If `current` is still set,
-        // either nothing changed (resume the same one) or the
-        // wake path made someone else current — either way, ride
-        // it. If `current` is None (block path), pick the next
-        // runnable.
-        let next = match s.scheduler.current() {
-            Some(t) => Some(t),
-            None => s.scheduler.choose_thread(),
-        };
-        let next = match next {
-            Some(t) => t,
-            None => return, // nobody to run; let iretq go to whoever
-                            // was interrupted (likely the idle loop).
-        };
-        // Same thread we interrupted? Nothing to do — keep ctx.
-        if Some(next) == interrupted {
-            s.scheduler.set_current(Some(next));
-            return;
-        }
-
-        // Save the interrupted thread's full state into its TCB
-        // so it can resume later. Skip if we have no record of
-        // who was running.
-        if let Some(prev) = interrupted {
-            let prev_tcb = s.scheduler.slab.get_mut(prev);
-            prev_tcb.user_context.rax = ctx.rax;
-            prev_tcb.user_context.rbx = ctx.rbx;
-            prev_tcb.user_context.rcx = ctx.rip; // sysret/iretq RIP
-            prev_tcb.user_context.rdx = ctx.rdx;
-            prev_tcb.user_context.rsi = ctx.rsi;
-            prev_tcb.user_context.rdi = ctx.rdi;
-            prev_tcb.user_context.rbp = ctx.rbp;
-            prev_tcb.user_context.r8 = ctx.r8;
-            prev_tcb.user_context.r9 = ctx.r9;
-            prev_tcb.user_context.r10 = ctx.r10;
-            prev_tcb.user_context.r11 = ctx.rflags; // RFLAGS slot
-            prev_tcb.user_context.r12 = ctx.r12;
-            prev_tcb.user_context.r13 = ctx.r13;
-            prev_tcb.user_context.r14 = ctx.r14;
-            prev_tcb.user_context.r15 = ctx.r15;
-            prev_tcb.user_context.rsp = ctx.rsp;
-        }
-
-        // Load the new thread's user context into the iretq frame.
-        let next_ctx = s.scheduler.slab.get(next).user_context;
-        ctx.rax = next_ctx.rax;
-        ctx.rbx = next_ctx.rbx;
-        ctx.rip = next_ctx.rcx; // RIP from the rcx slot
-        ctx.rdx = next_ctx.rdx;
-        ctx.rsi = next_ctx.rsi;
-        ctx.rdi = next_ctx.rdi;
-        ctx.rbp = next_ctx.rbp;
-        ctx.r8 = next_ctx.r8;
-        ctx.r9 = next_ctx.r9;
-        ctx.r10 = next_ctx.r10;
-        ctx.rflags = next_ctx.r11; // RFLAGS from the r11 slot
-        ctx.r12 = next_ctx.r12;
-        ctx.r13 = next_ctx.r13;
-        ctx.r14 = next_ctx.r14;
-        ctx.r15 = next_ctx.r15;
-        ctx.rsp = next_ctx.rsp;
-        // CS / SS stay as the iretq frame already has them
-        // (USER_CS / USER_DS); all our user threads share those.
-
-        // Swap CR3 if the new thread runs in a different vspace.
-        let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
-        if next_cr3 != 0 {
-            let cur_cr3: u64;
-            core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
-                options(nomem, nostack, preserves_flags));
-            if next_cr3 != cur_cr3 {
-                core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                    options(nostack, preserves_flags));
-            }
-        }
-        s.scheduler.set_current(Some(next));
-    }
+    // Phase 33a — IRQ-driven preemption. If `mcs_tick` (or any
+    // other tick handler) cleared `current`, switch contexts here
+    // rather than `iretq`-ing back to the now-blocked thread.
+    super::interrupts::swap_iretq_context_if_preempted(
+        ctx, from_user, interrupted,
+    );
 }
 
 struct BklGuard;
