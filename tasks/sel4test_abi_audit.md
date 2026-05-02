@@ -156,32 +156,18 @@ Upstream `seL4_RootCNodeCapSlots` (libsel4 `bootinfo_types.h`):
 
 ## Summary — current state
 
-All six major audit gaps are now closed (Phases 36b–36g). The
-kernel-side prerequisites for a sel4test bring-up are largely
-in place:
+All six audit gaps and their follow-ups are closed:
 
 | # | Gap | Phase | Status |
 | - | --- | ----- | ------ |
-| 1 | api-master → api-mcs | 36b | DONE |
-| 2 | bi.schedcontrol slot region | 36c | DONE |
-| 3 | Reply caps via Call/Reply | 36d | DONE |
-| 4 | Initial-cap slot layout | 36e | MOSTLY DONE |
-| 5 | TCBConfigure full args + extraCaps | 36f | STAGING IN PLACE |
-| 6 | WriteRegisters full register set | 36g | DONE (Read still pending) |
+| 1 | api-master → api-mcs                | 36b      | DONE |
+| 2 | bi.schedcontrol slot region          | 36c      | DONE |
+| 3 | Reply caps via Call/Reply            | 36d      | DONE |
+| 4 | Initial-cap slot layout              | 36e+37a/b| DONE |
+| 5 | TCBConfigure full args + extraCaps   | 36f+37c  | DONE |
+| 6 | Read/WriteRegisters full register set | 36g+37d  | DONE |
 
-Remaining smaller follow-ups inside item 4:
-  * `Cap::AsidPool` at slot 6 (rootserver-side retype + install).
-  * `Cap::SchedContext` for the initial thread at slot 14.
-
-Inside item 5 (mechanical now that staging is plumbed):
-  * Read cspace_data / vspace_data from msg_regs.
-  * Read ipc_buffer / ipc_buffer_frame from msg_regs / extraCaps.
-
-Inside item 6:
-  * Symmetric upstream-shape ReadRegisters.
-
-Next step is building **libsel4** standalone against our generated
-headers and bringing up *one* sel4test case end-to-end — the
-follow-on to Phase 34's original plan. From there each failing
-test surfaces one more concrete gap, much smaller than the audit
-items above.
+Next step is building **libsel4** standalone against our
+generated headers and bringing up *one* sel4test case end-to-end.
+From there each failing test surfaces one more concrete gap,
+much smaller than the audit's six.

@@ -1,3 +1,16 @@
+# Phase 37: smaller audit follow-ups — DONE (37a–37d)
+
+- 37a — pre-allocated `Cap::AsidPool` at slot 6.
+- 37b — pre-allocated `Cap::SchedContext` (InitThreadSC) at
+        slot 14, bound to the rootserver TCB.
+- 37c — TCBConfigure honours upstream-shape extraCaps +
+        msg-words layout (cspace_data, vspace_data, ipc_buffer,
+        ipc_buffer_frame), plus legacy form for back-compat.
+- 37d — symmetric upstream-shape ReadRegisters; first 4 returned
+        words fan into invoker's rdx/r10/r8/r9 + rsi (msginfo)
+        for direct delivery via the syscall return path.
+
+
 # Phase 36: ABI audit + parity fixes — DONE (36a–36g)
 
 Audit doc: `tasks/sel4test_abi_audit.md`. All six major gaps the
