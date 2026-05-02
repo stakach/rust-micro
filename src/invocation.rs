@@ -1387,6 +1387,17 @@ fn decode_untyped_retype(
             }
         };
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
+        if INV_TRACE {
+            crate::arch::log("[ut.dst cn=");
+            log_dec(cnode_idx as u64);
+            crate::arch::log(" sl=");
+            log_dec(dest_offset as u64);
+            crate::arch::log(" ni=0x");
+            log_hex_u64(node_index);
+            crate::arch::log(" nd=");
+            log_dec(node_depth as u64);
+            crate::arch::log("]\n");
+        }
         let cnode_slots = &mut s.cnodes[cnode_idx].0;
 
         // Verify the destination range is empty — Retype refuses
@@ -1846,6 +1857,17 @@ fn cnode_move(
         }
         let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
 
+        if INV_TRACE {
+            crate::arch::log("[mov src=cn");
+            log_dec(src_cnode_idx as u64);
+            crate::arch::log("/sl");
+            log_dec(src_res.slot_index as u64);
+            crate::arch::log(" dst=cn");
+            log_dec(dest_cnode_idx as u64);
+            crate::arch::log("/sl");
+            log_dec(dest_res.slot_index as u64);
+            crate::arch::log("]\n");
+        }
         // Snapshot src cap before mutating either slot — both might
         // be in the same CNode, in which case the borrow checker
         // would object to two simultaneous &mut on the same array.
@@ -1873,6 +1895,13 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
     } else {
         crate::cspace::WORD_BITS
     };
+    if INV_TRACE {
+        crate::arch::log("[del idx=0x");
+        log_hex_u64(args.a2);
+        crate::arch::log(" d=");
+        log_dec(depth as u64);
+        crate::arch::log("]\n");
+    }
     unsafe {
         let s = KERNEL.get();
         let res = crate::cspace::resolve_address_bits(
@@ -1883,11 +1912,14 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         }
         let cnode_idx = KernelState::cnode_index(res.slot_ptr);
         let slot = &mut s.cnodes[cnode_idx].0[res.slot_index];
+        if INV_TRACE {
+            crate::arch::log("[del -> cnode=");
+            log_dec(cnode_idx as u64);
+            crate::arch::log(" slot=");
+            log_dec(res.slot_index as u64);
+            crate::arch::log("]\n");
+        }
         slot.set_cap(&Cap::Null);
-        // Phase 30 — also clear the MDB edge so children of the
-        // deleted slot become orphaned (revoking the deleted slot
-        // can't reach them, which matches seL4's "delete unlinks
-        // but doesn't recursively delete" semantics).
         slot.set_parent(None);
     }
     Ok(())
