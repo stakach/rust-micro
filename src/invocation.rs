@@ -445,9 +445,11 @@ fn decode_pdpt_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
 // ---------------------------------------------------------------------------
 
 /// Counter for the next pool's `asid_base`. Each MakePool bumps
-/// by 512 (one pool's worth of ASIDs).
+/// by 512 (one pool's worth of ASIDs). Phase 37a reserves bases
+/// 0..511 for the rootserver's pre-allocated `InitThreadASIDPool`
+/// at slot 6, so the first runtime MakePool returns base 512.
 static NEXT_ASID_BASE: core::sync::atomic::AtomicU16 =
-    core::sync::atomic::AtomicU16::new(0);
+    core::sync::atomic::AtomicU16::new(512);
 
 fn decode_asid_control(
     label: InvocationLabel,

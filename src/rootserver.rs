@@ -119,6 +119,14 @@ struct UntypedPool([u8; 64 * 1024]);
 static mut ROOTSERVER_UNTYPED_POOL: UntypedPool = UntypedPool([0; 64 * 1024]);
 const ROOTSERVER_UNTYPED_BITS: u8 = 16;
 
+/// Phase 37a — backing storage for the rootserver's pre-allocated
+/// AsidPool (one 4 KiB page, holds 512 PML4 paddrs in seL4). The
+/// kernel installs `Cap::AsidPool { ptr: ROOTSERVER_ASID_POOL_PADDR,
+/// asid_base: 0 }` at canonical slot 6 of the rootserver's CNode.
+#[repr(C, align(4096))]
+struct AsidPoolPage([u8; 4096]);
+static mut ROOTSERVER_ASID_POOL: AsidPoolPage = AsidPoolPage([0; 4096]);
+
 // ---------------------------------------------------------------------------
 // Output of the loader.
 // ---------------------------------------------------------------------------
@@ -307,6 +315,28 @@ pub unsafe fn launch_rootserver() -> ! {
     };
     let id = s.scheduler.admit(t);
 
+    // Phase 37b — pre-allocate the InitThreadSC. The rootserver
+    // gets a SchedContext bound to it from the start; the cap
+    // sits at canonical slot 14 (`seL4_CapInitThreadSC`). Period
+    // and budget are large enough that the rootserver effectively
+    // never runs out of budget — we treat it as the boot thread,
+    // not a budget-constrained worker.
+    let init_sc_idx = s.alloc_sched_context()
+        .expect("init thread SC pool slot");
+    {
+        let sc = &mut s.sched_contexts[init_sc_idx];
+        *sc = crate::sched_context::SchedContext::new(
+            /* period */ 1_000_000, /* budget */ 1_000_000);
+        sc.refills[0] = crate::sched_context::Refill {
+            release_time: 0,
+            amount: 1_000_000,
+        };
+        sc.head = 0;
+        sc.count = 1;
+        sc.bound_tcb = Some(id);
+    }
+    s.scheduler.slab.get_mut(id).sc = Some(init_sc_idx as u16);
+
     // Populate the rootserver's CNode with the canonical initial
     // cap layout (subset of seL4's seL4_RootCNodeCapSlots). The
     // rootserver's own startup code can now invoke any of these by
@@ -341,12 +371,27 @@ pub unsafe fn launch_rootserver() -> ! {
     });
     // Phase 33b / 36e — IRQControl at canonical slot 4.
     s.cnodes[ROOTSERVER_CNODE_IDX].0[4] = Cte::with_cap(&Cap::IrqControl);
-    // Phase 36e — ASIDControl at canonical slot 5. The matching
-    // initial AsidPool at slot 6 is left as a follow-up (we don't
-    // pre-allocate one for the rootserver yet).
+    // Phase 36e — ASIDControl at canonical slot 5.
     s.cnodes[ROOTSERVER_CNODE_IDX].0[5] = Cte::with_cap(&Cap::AsidControl);
-    // Slots 6, 7, 8, 11, 12, 13, 15: empty (no AsidPool / IO / Domain
-    // / SMMU / SMC support).
+    // Phase 37a — pre-allocated InitThreadASIDPool at canonical
+    // slot 6. asid_base = 0 (rootserver gets the first 512 ASIDs).
+    let asid_pool_va = (&raw const ROOTSERVER_ASID_POOL) as u64;
+    let asid_pool_pa =
+        crate::arch::x86_64::paging::kernel_virt_to_phys(asid_pool_va);
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[6] = Cte::with_cap(&Cap::AsidPool {
+        ptr: PPtr::<crate::cap::AsidPoolStorage>::new(asid_pool_pa)
+            .expect("asid pool paddr"),
+        asid_base: 0,
+    });
+    // Slots 7, 8, 11, 12, 13, 15: empty (no IO / Domain / SMMU /
+    // SMC support).
+    // Phase 37b — InitThreadSC at canonical slot 14. The
+    // SchedContext object was allocated above and bound to the
+    // rootserver TCB.
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[14] = Cte::with_cap(&Cap::SchedContext {
+        ptr: KernelState::sched_context_ptr(init_sc_idx),
+        size_bits: crate::object_type::MIN_SCHED_CONTEXT_BITS as u8,
+    });
     // Phase 36e — per-CPU SchedControl caps in the schedcontrol
     // region [16, 16+ncores). bi.schedcontrol points at this range.
     let n_cores = crate::bootboot::get_num_cores() as usize;

@@ -127,10 +127,13 @@ Upstream `seL4_RootCNodeCapSlots` (libsel4 `bootinfo_types.h`):
   * `bi.empty = {21, 64}`.
   * `bi.initThreadCNodeSizeBits = 6`.
 
-  Still missing (smaller follow-ups):
-    - `Cap::AsidPool` at slot 6 (need to retype one for the
-      rootserver).
-    - `Cap::SchedContext` for the initial thread at slot 14.
+  Phase 37 follow-ups (now landed):
+    - **37a** — pre-allocated `Cap::AsidPool` at slot 6. The
+      rootserver gets `asid_base = 0`; `NEXT_ASID_BASE` reserves
+      0..511 for it.
+    - **37b** — pre-allocated `Cap::SchedContext` (the InitThread
+      SC) at slot 14, bound to the rootserver TCB with a
+      hand-picked period/budget large enough to never throttle.
 
 ## TCB invocation surface
 
