@@ -25,10 +25,11 @@ mod microtest;
 // a separate crate.
 // ---------------------------------------------------------------------------
 
-const SYS_DEBUG_PUT_CHAR: i64 = -9;
-const SYS_YIELD: i64 = -7;
-const SYS_SEND: i64 = -3;
-const SYS_RECV: i64 = -5;
+// Phase 36b — MCS syscall numbering (api-mcs block).
+const SYS_DEBUG_PUT_CHAR: i64 = -12;
+const SYS_YIELD: i64 = -11;
+const SYS_SEND: i64 = -5;
+const SYS_RECV: i64 = -7;
 
 /// `InvocationLabel`s we issue. Phase 32a flipped CONFIG_KERNEL_MCS
 /// on so the TCB labels shifted: SetSpace went 10 → 11, Resume
@@ -147,24 +148,25 @@ const VSPACE_STACK_VADDR: u64 = NEW_VSPACE_FRAME_VADDR + 32 * 0x1000;
 /// Hand-assembled child code: send IPC carrying 0xBEEF over the
 /// endpoint at slot 12, then yield-loop forever.
 ///
-///   mov rax, -3       ; SYS_SEND
+/// Phase 36b: syscall numbers shifted to the MCS layout.
+///   mov rax, -5       ; SYS_SEND   (was -3 pre-MCS)
 ///   mov rdi, 12       ; endpoint cap_ptr
 ///   mov rsi, 1        ; MessageInfo: length=1, label=0
 ///   mov rdx, 0xBEEF   ; payload
 ///   syscall
 /// .loop:
-///   mov rax, -7       ; SYS_YIELD
+///   mov rax, -11      ; SYS_YIELD  (was -7 pre-MCS)
 ///   syscall
 ///   jmp .loop
 static VSPACE_CHILD_CODE: [u8; 41] = [
-    0x48, 0xC7, 0xC0, 0xFD, 0xFF, 0xFF, 0xFF, // mov rax, -3
+    0x48, 0xC7, 0xC0, 0xFB, 0xFF, 0xFF, 0xFF, // mov rax, -5
     0x48, 0xC7, 0xC7, 0x0C, 0x00, 0x00, 0x00, // mov rdi, 12
     0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00, // mov rsi, 1
     0x48, 0xC7, 0xC2, 0xEF, 0xBE, 0x00, 0x00, // mov rdx, 0xBEEF
     0x0F, 0x05,                               // syscall
-    0x48, 0xC7, 0xC0, 0xF9, 0xFF, 0xFF, 0xFF, // mov rax, -7
+    0x48, 0xC7, 0xC0, 0xF5, 0xFF, 0xFF, 0xFF, // mov rax, -11
     0x0F, 0x05,                               // syscall
-    0xEB, 0xF5,                               // jmp -11 → mov rax, -7
+    0xEB, 0xF5,                               // jmp -11 → mov rax, -11
 ];
 
 // ---------------------------------------------------------------------------

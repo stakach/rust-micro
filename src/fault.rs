@@ -235,13 +235,12 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(handler).msg_regs[2], 0x4);
         }
 
-        // Handler does SysReply to resume the faulter.
+        // Handler does SysReply to resume the faulter. Phase 36b —
+        // SysReply isn't a syscall under MCS, so we call the
+        // handler directly.
         unsafe { KERNEL.get().scheduler.set_current(Some(handler)); }
-        let r = crate::syscall_handler::handle_syscall(
-            crate::syscalls::Syscall::SysReply,
-            &crate::syscall_handler::SyscallArgs::default(),
-            &mut SinkVoid,
-        );
+        let r = crate::syscall_handler::handle_reply(
+            &crate::syscall_handler::SyscallArgs::default());
         assert!(r.is_ok());
 
         unsafe {

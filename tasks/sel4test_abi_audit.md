@@ -65,16 +65,14 @@ DebugPutChar = -9
 DebugDumpScheduler = -10
 ```
 
-**Status: GAP — biggest single ABI break.** Every sel4test syscall
-would target the wrong handler.
-
-**Fix:** switch `build_support/xml.rs::generate_syscalls` to read
-the `api-mcs` block when `CONFIG_KERNEL_MCS=true`. Implement the
-new syscalls (Wait/NBWait are notification-only Recv variants;
-NBSendRecv/NBSendWait are Send+Recv composites). Drop the
-standalone `SysReply` syscall handler — Reply is a cap invocation
-under MCS (which depends on Phase 34e's reply-cap follow-up
-landing).
+**Status: ~~GAP~~ → FIXED in Phase 36b.** Codegen now reads
+`api-mcs` when `CONFIG_KERNEL_MCS=true`. Wait / NBWait alias
+to handle_recv (blocking and non-blocking respectively);
+NBSendRecv / NBSendWait stub IllegalOperation until proper
+composite-IPC support lands. SysReply is no longer a userspace
+syscall — kernel specs and `SysReplyRecv` call `handle_reply`
+directly; the cap-based Reply replacement still depends on
+Phase 34e's follow-up.
 
 ## InvocationLabel numbering
 

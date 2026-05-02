@@ -391,7 +391,7 @@ unsafe extern "C" fn microtest_cap_transfer_child() -> ! {
 const LBL_TCB_CONFIGURE: u64 = 5;
 const LBL_TCB_SET_IPC_BUFFER: u64 = 10;
 const LBL_CNODE_COPY: u64 = 21;
-const SYS_NB_SEND: i64 = -4;
+const SYS_NB_SEND: i64 = -6;
 /// `seL4_ObjectType::Reply` numeric tag (mirrors `object_type.rs`).
 const OBJ_REPLY: u64 = 6;
 /// Bit position of `extraCaps` in `seL4_MessageInfo` (sits just above

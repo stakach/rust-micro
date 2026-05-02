@@ -241,15 +241,19 @@ fn expect_close(toks: &[CondTok<'_>], pos: &mut usize, name: &str) -> Result<(),
 // ---------------------------------------------------------------------------
 // Syscall codegen.
 //
-// Numbers descend from -1: first listed is -1, second is -2, ... The
-// generator filters by the active <api-master|api-mcs> tag (we use
-// api-master) and applies <condition> gates on debug syscalls.
+// Numbers descend from -1: first listed is -1, second is -2, ...
+// Phase 36b — when CONFIG_KERNEL_MCS=true we read the <api-mcs>
+// block (matches sel4test's libsel4 expectations: NBSendRecv,
+// NBSendWait, Wait, NBWait — and notably no standalone Reply,
+// since reply under MCS is via cap invocation). When MCS is off
+// we fall back to <api-master>.
 // ---------------------------------------------------------------------------
 
 pub fn render_syscalls(xml: &str, cfg: &HashMap<&'static str, bool>) -> Result<String, String> {
-    // Slurp the api-master block.
-    let api_block = pick_block(xml, "api-master")
-        .ok_or_else(|| "syscall.xml: <api-master> missing".to_string())?;
+    let mcs_on = *cfg.get("CONFIG_KERNEL_MCS").unwrap_or(&false);
+    let block_name = if mcs_on { "api-mcs" } else { "api-master" };
+    let api_block = pick_block(xml, block_name)
+        .ok_or_else(|| format!("syscall.xml: <{block_name}> missing"))?;
     let api_syscalls: Vec<(String, Option<String>)> = parse_syscall_configs(api_block)?;
 
     let debug_block = pick_block(xml, "debug").unwrap_or("");

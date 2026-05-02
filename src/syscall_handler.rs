@@ -61,10 +61,29 @@ pub fn handle_syscall(
         Syscall::SysCall => handle_send(args, /* blocking */ true, /* call */ true),
         Syscall::SysRecv => handle_recv(args, /* blocking */ true),
         Syscall::SysNBRecv => handle_recv(args, /* blocking */ false),
-        Syscall::SysReply => handle_reply(args),
+        // Phase 36b — under MCS there's no standalone Reply syscall;
+        // reply is via Send on a Cap::Reply. Until the cap-based
+        // reply IPC integration lands (the 34e follow-up), the
+        // existing `handle_reply` path stays callable directly from
+        // kernel specs but isn't reachable from userspace.
         Syscall::SysReplyRecv => {
             handle_reply(args)?;
             handle_recv(args, /* blocking */ true)
+        }
+        // Phase 36b — MCS notification-only Recv variants. Forward
+        // to handle_recv for now; the difference (Wait doesn't
+        // capture a reply cap because the receiver isn't a server
+        // expecting a Call) will matter once cap-based reply lands.
+        Syscall::SysWait => handle_recv(args, /* blocking */ true),
+        Syscall::SysNBWait => handle_recv(args, /* blocking */ false),
+        // Phase 36b — atomic Send+Recv composites. Not implemented
+        // yet; surface IllegalOperation so user code spots the gap.
+        Syscall::SysNBSendRecv | Syscall::SysNBSendWait => {
+            Err(crate::error::KException::SyscallError(
+                crate::error::SyscallError::new(
+                    crate::types::seL4_Error::seL4_IllegalOperation,
+                ),
+            ))
         }
         Syscall::SysYield => {
             // Phase 29h — when the rootserver demo is live, yield
@@ -110,7 +129,12 @@ pub fn handle_syscall(
 /// the in-flight message back to the original caller, and unblock
 /// them. Mirrors `seL4/src/object/reply.c::doReplyTransfer` for
 /// the non-MCS path.
-fn handle_reply(args: &SyscallArgs) -> KResult<()> {
+///
+/// Phase 36b — under MCS there's no standalone `SysReply` syscall.
+/// This entry remains callable from kernel-side specs and from
+/// `SysReplyRecv` until the 34e follow-up (cap-based Reply)
+/// replaces it.
+pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
     use crate::kernel::KERNEL;
     use crate::tcb::ThreadStateType;
     use crate::types::seL4_Word as Word;
@@ -490,7 +514,8 @@ pub mod spec {
             Syscall::SysCall,
             Syscall::SysRecv,
             Syscall::SysNBRecv,
-            Syscall::SysReply,
+            // Phase 36b — SysReply removed under MCS; SysReplyRecv
+            // still goes through the dispatcher.
             Syscall::SysReplyRecv,
         ] {
             let res = handle_syscall(*s, &SyscallArgs::default(), &mut sink);
@@ -669,11 +694,14 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(server).msg_regs[0], b'X' as Word);
         }
 
-        // Server replies with 'Y'.
+        // Server replies with 'Y'. Phase 36b — `SysReply` is no
+        // longer a userspace syscall under MCS; the kernel-side
+        // `handle_reply` is still the function that performs the
+        // transfer, callable directly.
         unsafe { KERNEL.get().scheduler.set_current(Some(server)); }
-        let r = handle_syscall(Syscall::SysReply,
-            &SyscallArgs { a1: 1, a2: b'Y' as Word, ..Default::default() },
-            &mut sink);
+        let r = handle_reply(
+            &SyscallArgs { a1: 1, a2: b'Y' as Word, ..Default::default() });
+        let _ = &mut sink; // keep `sink` borrow check happy across the move
         assert!(r.is_ok());
         unsafe {
             let s = KERNEL.get();

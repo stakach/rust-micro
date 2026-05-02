@@ -153,7 +153,13 @@ fn test_cap_rights_constants() {
 fn test_syscall_decoding() {
     assert_eq!(Syscall::from_i32(-1), Some(Syscall::SysCall));
     assert_eq!(Syscall::from_i32(-2), Some(Syscall::SysReplyRecv));
-    assert_eq!(Syscall::from_i32(-9), Some(Syscall::SysDebugPutChar));
+    // Phase 36b — MCS layout (api-mcs block):
+    //   -3 NBSendRecv, -4 NBSendWait, -5 Send, -6 NBSend,
+    //   -7 Recv, -8 NBRecv, -9 Wait, -10 NBWait, -11 Yield,
+    //   -12 DebugPutChar.
+    assert_eq!(Syscall::from_i32(-5),  Some(Syscall::SysSend));
+    assert_eq!(Syscall::from_i32(-9),  Some(Syscall::SysWait));
+    assert_eq!(Syscall::from_i32(-12), Some(Syscall::SysDebugPutChar));
     assert_eq!(Syscall::from_i32(0), None);
     assert_eq!(Syscall::from_i32(-1000), None);
     arch::log("  ✓ Syscall::from_i32 decodes per generator output\n");

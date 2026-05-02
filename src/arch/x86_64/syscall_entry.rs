@@ -702,7 +702,9 @@ pub mod spec {
         ctx.rdi = b'!' as u64;
         ctx.rax = 0xDEAD_BEEF;
 
-        super::rust_syscall_dispatch(-9i64 as u64);
+        // Phase 36b — SysDebugPutChar moved from -9 to -12 in the
+        // MCS syscall layout.
+        super::rust_syscall_dispatch(-12i64 as u64);
 
         let ctx = super::current_cpu_user_ctx_mut();
         assert_eq!(ctx.rax, 0, "dispatcher should set rax=0 on success");
