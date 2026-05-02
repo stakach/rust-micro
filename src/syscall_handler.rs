@@ -404,6 +404,13 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
             // rsi unchanged from its outgoing tag (label = 1 =
             // UntypedRetype) and interpreted it as InvalidArgument.
             other => {
+                // Reset ipc_length before the invocation; the
+                // *reply* length is decided by the invocation
+                // (ReadRegisters/RDMSR/FailedLookup with level
+                // info set it explicitly). Without this, the reply
+                // msginfo would carry the SENT length and userspace
+                // would read garbage past the actual return data.
+                s.scheduler.slab.get_mut(current).ipc_length = 0;
                 let result = crate::invocation::decode_invocation(other, args, current);
                 if call {
                     let label: u64 = match &result {
@@ -412,7 +419,8 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                         Err(_) => 0xFFFF,
                     };
                     let inv_tcb = s.scheduler.slab.get_mut(current);
-                    let mi = (label << 12) | (inv_tcb.ipc_length as u64 & 0x7F);
+                    let length = inv_tcb.ipc_length as u64 & 0x7F;
+                    let mi = (label << 12) | length;
                     inv_tcb.user_context.rsi = mi;
                     inv_tcb.user_context.rdi = 0; // no badge on reply
                     // Fan msg_regs into the IPC return registers so
@@ -421,6 +429,18 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                     inv_tcb.user_context.r8  = inv_tcb.msg_regs[1];
                     inv_tcb.user_context.r9  = inv_tcb.msg_regs[2];
                     inv_tcb.user_context.r15 = inv_tcb.msg_regs[3];
+                    // libsel4's seL4_GetMR(i) reads from the IPC
+                    // buffer (not registers), so also stage there.
+                    // Buffer layout: word 0 = tag, words 1..N = msg.
+                    let ipc_paddr = inv_tcb.ipc_buffer_paddr;
+                    if ipc_paddr != 0 {
+                        let buf = (ipc_paddr as *mut u64).wrapping_add(1);
+                        let n = (length as usize).min(inv_tcb.msg_regs.len());
+                        for i in 0..n {
+                            core::ptr::write_volatile(
+                                buf.add(i), inv_tcb.msg_regs[i]);
+                        }
+                    }
                 }
                 // SysCall + invocation always returns Ok at the
                 // syscall level — the invocation error is in the
