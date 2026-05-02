@@ -356,6 +356,12 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
 /// allocator. Sized for sel4test-driver-class workloads (~3.9 MiB
 /// of LOAD segments + aux). Called before specs run so the
 /// rootserver-loader spec can `super::load()` the live initrd ELF.
+///
+/// Phase 42 — also reserves a separate "rootserver Untyped" region
+/// that gets handed to the rootserver as the backing memory of a
+/// Cap::Untyped. sel4test's vka allocator carves TCBs / CNodes /
+/// frames / page tables out of this; sized large enough to run the
+/// full sel4test suite (~64 MiB).
 #[cfg(target_arch = "x86_64")]
 pub fn reserve_user_page_region() -> Result<(), BootError> {
     use crate::arch;
@@ -377,6 +383,26 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
         crate::rootserver::install_user_page_region(
             user_pages_base, USER_PAGES_SIZE);
     }
+
+    // Phase 42 — sel4test's allocman needs to carve TCBs, CNodes,
+    // frames, page tables for hundreds of tests. 64 MiB of Untyped
+    // is enough; the chunk is power-of-2 sized + power-of-2 aligned
+    // so it satisfies seL4's Untyped invariants.
+    const ROOTSERVER_UT_SIZE_BITS: u32 = 26; // 64 MiB
+    const ROOTSERVER_UT_SIZE: u64 = 1u64 << ROOTSERVER_UT_SIZE_BITS;
+    let ut_base = carve_chunk(&mut free, ROOTSERVER_UT_SIZE, ROOTSERVER_UT_SIZE_BITS)?;
+
+    arch::log("boot: reserved rootserver-ut @0x");
+    log_hex64(ut_base);
+    arch::log(".."); log_hex64(ut_base + ROOTSERVER_UT_SIZE);
+    arch::log(" (size_bits="); log_count(ROOTSERVER_UT_SIZE_BITS as usize);
+    arch::log(")\n");
+
+    unsafe {
+        crate::rootserver::install_rootserver_untyped(
+            ut_base, ROOTSERVER_UT_SIZE_BITS as u8);
+    }
+
     Ok(())
 }
 

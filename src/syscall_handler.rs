@@ -390,11 +390,44 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                 let _woken = crate::notification::signal(ntfn, sched, badge.0);
                 return Ok(());
             }
-            // Phase 16: non-IPC cap on a Send/Call → invocation
+            // Phase 16 / 42: non-IPC cap on a Send/Call → invocation
             // dispatch. Staging above already populated msg_regs +
             // pending_extra_caps, so the handler can use them.
+            //
+            // Phase 42 — for SysCall, encode the result as a reply
+            // msginfo (label = error code, 0 = success) into the
+            // caller's rsi so libsel4's `seL4_MessageInfo_get_label`
+            // reads the right value. Invocations that return data
+            // (ReadRegisters, DangerousRDMSR) also stage values in
+            // msg_regs[0..3]; the dispatcher tail fans those into
+            // r10/r8/r9/r15. Without this, sel4test's allocman saw
+            // rsi unchanged from its outgoing tag (label = 1 =
+            // UntypedRetype) and interpreted it as InvalidArgument.
             other => {
-                return crate::invocation::decode_invocation(other, args, current);
+                let result = crate::invocation::decode_invocation(other, args, current);
+                if call {
+                    let label: u64 = match &result {
+                        Ok(()) => 0,
+                        Err(KException::SyscallError(SyscallError { code })) => *code as u64,
+                        Err(_) => 0xFFFF,
+                    };
+                    let inv_tcb = s.scheduler.slab.get_mut(current);
+                    let mi = (label << 12) | (inv_tcb.ipc_length as u64 & 0x7F);
+                    inv_tcb.user_context.rsi = mi;
+                    inv_tcb.user_context.rdi = 0; // no badge on reply
+                    // Fan msg_regs into the IPC return registers so
+                    // invocation results (e.g. RDMSR) reach userspace.
+                    inv_tcb.user_context.r10 = inv_tcb.msg_regs[0];
+                    inv_tcb.user_context.r8  = inv_tcb.msg_regs[1];
+                    inv_tcb.user_context.r9  = inv_tcb.msg_regs[2];
+                    inv_tcb.user_context.r15 = inv_tcb.msg_regs[3];
+                }
+                // SysCall + invocation always returns Ok at the
+                // syscall level — the invocation error is in the
+                // reply label. SysSend + invocation propagates
+                // errors so kernel-side specs that assert on Err
+                // still work.
+                return if call { Ok(()) } else { result };
             }
         };
         let idx = crate::kernel::KernelState::endpoint_index(ep_ptr);

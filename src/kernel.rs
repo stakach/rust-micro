@@ -39,11 +39,14 @@ pub const MAX_SCHED_CONTEXTS: usize = 16;
 pub const MAX_REPLIES: usize = 16;
 
 /// CTEs per pre-allocated CNode in the in-kernel pool.
-/// Phase 36e bumped from 5 → 6 (32 → 64 slots) so the
-/// rootserver's CNode has room for the canonical initial-cap
-/// layout (slots 0..15) + per-CPU SchedControl region (16..19) +
-/// Untyped (20) + plenty of empty slots for tests.
-pub const CNODE_RADIX: u8 = 6;
+///
+/// Phase 36e bumped from 5 → 6 (32 → 64 slots) for the canonical
+/// initial-cap layout. Phase 42 bumped further to 12 (4096 slots)
+/// because sel4test's allocman walks `bi.empty` to allocate
+/// hundreds of caps for tests; 64 slots ran out almost immediately.
+/// Each Cte is 32 bytes → ~128 KiB per CNode × MAX_CNODES = ~512
+/// KiB of static memory, comfortably within the kernel's BSS.
+pub const CNODE_RADIX: u8 = 12;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 
 /// Maximum pre-allocated CNodes.

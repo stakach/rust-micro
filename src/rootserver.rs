@@ -123,15 +123,28 @@ const ROOTSERVER_STACK_PAGES: u64 = 4;
 /// rootserver's own CNode.
 pub const ROOTSERVER_CNODE_IDX: usize = 3;
 
-/// Backing memory for the rootserver's only Untyped cap. Phase 33d
-/// bumped this from 16 KiB to 64 KiB so the rootserver can carve a
-/// fresh PML4 + PDPT + PD + PT + Frame on top of the earlier 32g
-/// retypes. block_bits=16 → 65 536 bytes. Reserved as a static so
-/// the physical address is stable across runs.
-#[repr(C, align(4096))]
-struct UntypedPool([u8; 64 * 1024]);
-static mut ROOTSERVER_UNTYPED_POOL: UntypedPool = UntypedPool([0; 64 * 1024]);
-const ROOTSERVER_UNTYPED_BITS: u8 = 16;
+/// Phase 42 — backing memory for the rootserver's Untyped cap is
+/// reserved at boot from BOOTBOOT free memory rather than from
+/// kernel BSS (kernel-image BSS is constrained by the high-memory
+/// virtual region; sel4test needs tens of MiB). `boot.rs` calls
+/// `install_rootserver_untyped` with the chunk's paddr + power-of-2
+/// size_bits before the rootserver dispatch.
+struct RootserverUntyped {
+    base_paddr: u64,
+    size_bits: u8,
+}
+
+static mut ROOTSERVER_UT: RootserverUntyped = RootserverUntyped {
+    base_paddr: 0,
+    size_bits: 0,
+};
+
+/// Wire the boot-time-reserved rootserver Untyped region. Call once
+/// before `launch_rootserver`. paddr must be 2^size_bits-aligned.
+pub unsafe fn install_rootserver_untyped(base_paddr: u64, size_bits: u8) {
+    ROOTSERVER_UT.base_paddr = base_paddr;
+    ROOTSERVER_UT.size_bits = size_bits;
+}
 
 /// Phase 37a — backing storage for the rootserver's pre-allocated
 /// AsidPool (one 4 KiB page, holds 512 PML4 paddrs in seL4). The
@@ -456,15 +469,15 @@ pub unsafe fn launch_rootserver() -> ! {
         s.cnodes[ROOTSERVER_CNODE_IDX].0[schedcontrol_start + core] =
             Cte::with_cap(&Cap::SchedControl { core: core as u32 });
     }
-    // Phase 36e — Untyped at slot 20 (after the schedcontrol region).
-    // bi.untyped points here.
-    let untyped_pool_va = (&raw const ROOTSERVER_UNTYPED_POOL) as u64;
-    let untyped_pool_pa =
-        crate::arch::x86_64::paging::kernel_virt_to_phys(untyped_pool_va);
+    // Phase 36e / 42 — Untyped at slot 20 (after the schedcontrol
+    // region). bi.untyped points here. Backing memory is reserved
+    // at boot from BOOTBOOT free memory (see install_rootserver_untyped).
+    let ut_paddr = ROOTSERVER_UT.base_paddr;
+    let ut_size_bits = ROOTSERVER_UT.size_bits;
     let untyped_slot: usize = 20;
     s.cnodes[ROOTSERVER_CNODE_IDX].0[untyped_slot] = Cte::with_cap(&Cap::Untyped {
-        ptr: PPtr::<UntypedStorage>::new(untyped_pool_pa).expect("ut paddr"),
-        block_bits: ROOTSERVER_UNTYPED_BITS,
+        ptr: PPtr::<UntypedStorage>::new(ut_paddr).expect("ut paddr"),
+        block_bits: ut_size_bits,
         free_index: 0,
         is_device: false,
     });
@@ -474,7 +487,7 @@ pub unsafe fn launch_rootserver() -> ! {
     // before the CR3 swap; the rootserver reads it through its
     // user-half mapping after sysretq.
     let bi_ptr = phys_to_kernel_virt(img.bootinfo_paddr) as *mut seL4_BootInfo;
-    let bi = build_bootinfo(img.ipc_buffer_vaddr, untyped_pool_pa);
+    let bi = build_bootinfo(img.ipc_buffer_vaddr, ut_paddr, ut_size_bits);
     core::ptr::write(bi_ptr, bi);
 
     // Demote the boot thread out of the way.
@@ -535,40 +548,47 @@ unsafe fn phys_to_kernel_virt(paddr: u64) -> u64 {
     paddr + offset
 }
 
-unsafe fn build_bootinfo(ipc_buffer_vaddr: u64, _untyped_paddr: u64) -> seL4_BootInfo {
+unsafe fn build_bootinfo(
+    ipc_buffer_vaddr: u64,
+    untyped_paddr: u64,
+    untyped_size_bits: u8,
+) -> seL4_BootInfo {
     let mut empty_untypeds = [seL4_UntypedDesc::default();
         CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
-    // Describe the single rootserver Untyped (slot 11).
+    // Phase 42 — single Untyped at slot 20 covering the boot-time-
+    // reserved chunk. sel4test's allocman carves all its TCBs /
+    // CNodes / frames / page tables out of this.
     empty_untypeds[0] = seL4_UntypedDesc {
-        paddr: _untyped_paddr,
-        sizeBits: ROOTSERVER_UNTYPED_BITS,
+        paddr: untyped_paddr,
+        sizeBits: untyped_size_bits,
         isDevice: 0,
         padding: [0; 6],
     };
 
     let n_cores = crate::bootboot::get_num_cores() as Word;
-    // Phase 36e — canonical slot layout under MCS:
+    // Phase 36e / 42 — canonical slot layout under MCS:
     //   0..15  initial caps (some Null where unsupported)
     //   16..(16+n_cores)  per-CPU SchedControl
     //   20     first Untyped
-    //   21..64 empty
+    //   21..(1 << CNODE_RADIX)  empty (sel4test allocates here)
     let schedcontrol_start: Word = 16;
     let schedcontrol_end: Word = schedcontrol_start + n_cores.min(4);
     let untyped_start: Word = 20;
     let untyped_end: Word = untyped_start + 1;
+    let cnode_slots: Word = 1u64 << crate::kernel::CNODE_RADIX;
     seL4_BootInfo {
         extraLen: 0,
         nodeID: 0,
         numNodes: n_cores,
         numIOPTLevels: 0,
         ipcBuffer: ipc_buffer_vaddr as *mut crate::types::seL4_IPCBuffer,
-        empty: seL4_SlotRegion { start: untyped_end, end: 64 },
+        empty: seL4_SlotRegion { start: untyped_end, end: cnode_slots },
         sharedFrames: seL4_SlotRegion { start: 0, end: 0 },
         userImageFrames: seL4_SlotRegion { start: 0, end: 0 },
         userImagePaging: seL4_SlotRegion { start: 0, end: 0 },
         ioSpaceCaps: seL4_SlotRegion { start: 0, end: 0 },
         extraBIPages: seL4_SlotRegion { start: 0, end: 0 },
-        initThreadCNodeSizeBits: 6,
+        initThreadCNodeSizeBits: crate::kernel::CNODE_RADIX as Word,
         initThreadDomain: 0,
         schedcontrol: seL4_SlotRegion {
             start: schedcontrol_start,

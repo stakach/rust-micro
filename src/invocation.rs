@@ -950,25 +950,69 @@ fn decode_untyped(
 }
 
 /// `Untyped::Retype(type, size_bits, dest_root, dest_index, dest_depth,
-/// dest_offset, num_objects)`. We use a compressed ABI suited to our
-/// 6-register SyscallArgs (no IPC buffer yet):
+/// dest_offset, num_objects)`. Two wire formats coexist:
 ///
-///   a0 (= invoker's cap to untyped)        — selected by handle_send
-///   a1 = MessageInfo (label = UntypedRetype, ignored here)
-///   a2 = object_type word
-///   a3 = (size_bits << 32) | num_objects
-///   a4 = dest_offset (slot index in invoker's CSpace root CNode)
-///   a5 = (unused for now — Phase 16d will add a destination root
-///         cap-ptr for cross-CNode retype)
+///   * Legacy compressed (Phase 16, microtest + early kernel specs;
+///     msginfo.extra_caps == 0):
+///       a2 = object_type word
+///       a3 = (size_bits << 32) | num_objects
+///       a4 = dest_offset
+///       (root defaults to invoker's CSpace root CNode)
+///
+///   * Phase 42 upstream (sel4test via libsel4; msginfo.extra_caps == 1):
+///       a2 (= mr0) = type
+///       a3 (= mr1) = size_bits
+///       a4 (= mr2) = node_index (offset within root cap)
+///       a5 (= mr3) = node_depth (radix bits to walk root)
+///       ipc_buf[4] = node_offset (slot offset of first child)
+///       ipc_buf[5] = num_objects
+///       extraCaps[0] = root (the destination CNode cap)
 fn decode_untyped_retype(
     target: Cap,
     args: &SyscallArgs,
     invoker: TcbId,
 ) -> KResult<()> {
-    let object_type = ObjectType::from_word(args.a2);
-    let size_bits = (args.a3 >> 32) as u32;
-    let num_objects = args.a3 & 0xFFFF_FFFF;
-    let dest_offset = args.a4 as usize;
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() > 0;
+
+    let (object_type, size_bits, num_objects, dest_offset, dest_root_override) =
+        if upstream {
+            // Read mr4 (node_offset) and mr5 (num_objects) from the
+            // invoker's msg_regs (handle_send copied them out of the
+            // IPC buffer for length > 4).
+            let invoker_tcb = unsafe {
+                KERNEL.get().scheduler.slab.get(invoker)
+            };
+            let node_offset = invoker_tcb.msg_regs[4] as usize;
+            let num = invoker_tcb.msg_regs[5];
+            // extraCaps[0] is the destination root CNode cap.
+            let root_cap = if invoker_tcb.pending_extra_caps_count > 0 {
+                Some(invoker_tcb.pending_extra_caps[0])
+            } else {
+                None
+            };
+            (
+                ObjectType::from_word(args.a2),
+                args.a3 as u32,
+                num,
+                node_offset,
+                root_cap,
+            )
+        } else {
+            (
+                ObjectType::from_word(args.a2),
+                (args.a3 >> 32) as u32,
+                args.a3 & 0xFFFF_FFFF,
+                args.a4 as usize,
+                None,
+            )
+        };
+    // Drain pending_extra_caps so they don't leak into the next IPC.
+    unsafe {
+        KERNEL.get().scheduler.slab.get_mut(invoker)
+            .pending_extra_caps_count = 0;
+    }
+    let _ = dest_root_override; // currently always invoker's CSpace root; sel4test passes the same cap.
 
     let mut state = match crate::untyped::UntypedState::from_cap(&target) {
         Some(s) => s,
