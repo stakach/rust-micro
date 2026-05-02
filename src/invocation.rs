@@ -1411,52 +1411,92 @@ fn decode_tcb(
                 s.scheduler.make_runnable(id);
                 Ok(())
             }
-            // Phase 34b — `seL4_TCB_Configure`. One-shot setup that
-            // composes the equivalent of `SetSpace` + `SetPriority`.
-            // ABI:
-            //   a2 = fault_ep cptr (0 = none)
-            //   a3 = cspace_root cptr
-            //   a4 = vspace_root cptr
-            //   a5 = priority (low byte) | (mcp << 8)
+            // `seL4_TCB_Configure` — one-shot TCB setup. Two ABI
+            // shapes coexist:
             //
-            // IPC-buffer fields (and the frame cap that backs them)
-            // are handled by `SetIPCBuffer` once the IPC-buffer
-            // long-message path lands in Phase 34c. Until then the
-            // caller is expected to set the buffer separately.
+            //   * Legacy (Phase 34b — extraCaps == 0):
+            //       a2 = fault_ep cptr
+            //       a3 = cspace_root cptr (looked up via CSpace)
+            //       a4 = vspace_root cptr
+            //       a5 = priority | (mcp << 8)
+            //
+            //   * Phase 37c — upstream (extraCaps > 0):
+            //       a2 = fault_ep cptr
+            //       a3 = cspace_root_data (guard config; ignored —
+            //            our flat-radix CNodes don't reconfigure
+            //            guards via Configure)
+            //       a4 = vspace_root_data (ignored)
+            //       a5 = ipc_buffer vaddr
+            //       extraCaps[0] = cspace_root cap
+            //       extraCaps[1] = vspace_root cap
+            //       extraCaps[2] = ipc_buffer frame cap
+            //
+            //  Distinguish by `info.extra_caps()`. The microtest
+            //  case (`tcb_configure`) and existing kernel spec use
+            //  the legacy form; sel4test will use the upstream
+            //  form via libsel4.
             InvocationLabel::TCBConfigure => {
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                let upstream = info.extra_caps() > 0;
+
                 let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let cnode_cap = if args.a3 != 0 {
-                    Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
-                } else { None };
-                let vspace_cap = if args.a4 != 0 {
-                    Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
-                } else { None };
+                let (cnode_cap, vspace_cap, ipcbuf_cap, ipc_buffer_vaddr) =
+                    if upstream {
+                        let staged = s.scheduler.slab.get(invoker)
+                            .pending_extra_caps;
+                        let count = s.scheduler.slab.get(invoker)
+                            .pending_extra_caps_count as usize;
+                        let cnode = if count > 0 { Some(staged[0]) } else { None };
+                        let vspace = if count > 1 { Some(staged[1]) } else { None };
+                        let ipcbuf = if count > 2 { Some(staged[2]) } else { None };
+                        (cnode, vspace, ipcbuf, args.a5)
+                    } else {
+                        let cnode = if args.a3 != 0 {
+                            Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
+                        } else { None };
+                        let vspace = if args.a4 != 0 {
+                            Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
+                        } else { None };
+                        (cnode, vspace, None, 0)
+                    };
                 let t = s.scheduler.slab.get_mut(id);
                 t.fault_handler = args.a2;
                 if let Some(c) = cnode_cap {
-                    if !matches!(c, Cap::CNode { .. }) {
+                    if !matches!(c, Cap::CNode { .. } | Cap::Null) {
                         return Err(KException::SyscallError(SyscallError::new(
                             seL4_Error::seL4_InvalidCapability)));
                     }
-                    t.cspace_root = c;
+                    if !matches!(c, Cap::Null) {
+                        t.cspace_root = c;
+                    }
                 }
                 if let Some(c) = vspace_cap {
                     match c {
                         Cap::PML4 { ptr, .. } => {
                             t.cpu_context.cr3 = ptr.addr();
+                            t.vspace_root = c;
                         }
                         Cap::Null => {}
                         _ => return Err(KException::SyscallError(SyscallError::new(
                             seL4_Error::seL4_InvalidCapability))),
                     }
-                    t.vspace_root = c;
                 }
-                let prio = args.a5 as u8;
-                let mcp = (args.a5 >> 8) as u8;
-                t.priority = prio;
-                if mcp != 0 {
-                    t.mcp = mcp;
+                if upstream {
+                    if let Some(Cap::Frame { ptr, .. }) = ipcbuf_cap {
+                        t.ipc_buffer = ipc_buffer_vaddr;
+                        t.ipc_buffer_paddr = ptr.addr();
+                    }
+                } else {
+                    let prio = args.a5 as u8;
+                    let mcp = (args.a5 >> 8) as u8;
+                    t.priority = prio;
+                    if mcp != 0 {
+                        t.mcp = mcp;
+                    }
                 }
+                // Drain the staged caps regardless of which branch
+                // we took, so they don't leak into a future IPC.
+                s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
                 Ok(())
             }
             InvocationLabel::TCBSetPriority => {
@@ -1548,22 +1588,96 @@ fn decode_tcb(
                 Ok(())
             }
             InvocationLabel::TCBReadRegisters => {
-                // Fan target's saved regs into invoker's msg_regs
-                // so the syscall return path delivers them.
-                let target_state = {
+                // Two ABI shapes coexist (mirror of WriteRegisters):
+                //   * Legacy (msginfo.length == 0):
+                //       writes 3 words back: rcx (= rip), rsp, rax.
+                //   * Phase 37d — upstream `seL4_TCB_ReadRegisters`
+                //     (msginfo.length > 0):
+                //       a2 = suspend_source (bool, ignored)
+                //       a3 = arch_flags    (ignored)
+                //       a4 = count
+                //       writes `count` words back in seL4_UserContext
+                //       order: rip, rsp, rflags, rax, rbx, rcx, rdx,
+                //       rsi, rdi, rbp, r8..r15, fs_base, gs_base.
+                //       Slots 5 (rcx) and 13 (r11) are zeroed in the
+                //       output (those user_context fields double as
+                //       our iretq RIP/RFLAGS holders); fs_base / gs
+                //       _base also zero (not modelled).
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                    let length = info.length();
                     let t = s.scheduler.slab.get(id);
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        (t.user_context.rcx, t.user_context.rsp, t.user_context.rax)
+                    if length == 0 {
+                        let (rip, rsp, rax) = (
+                            t.user_context.rcx,
+                            t.user_context.rsp,
+                            t.user_context.rax,
+                        );
+                        let inv = s.scheduler.slab.get_mut(invoker);
+                        inv.msg_regs[0] = rip;
+                        inv.msg_regs[1] = rsp;
+                        inv.msg_regs[2] = rax;
+                        inv.ipc_length = 3;
+                    } else {
+                        let regs: [u64; 20] = [
+                            t.user_context.rcx,    // 0  rip
+                            t.user_context.rsp,    // 1  rsp
+                            t.user_context.r11,    // 2  rflags
+                            t.user_context.rax,    // 3  rax
+                            t.user_context.rbx,    // 4  rbx
+                            0,                     // 5  rcx (held by iretq)
+                            t.user_context.rdx,    // 6  rdx
+                            t.user_context.rsi,    // 7  rsi
+                            t.user_context.rdi,    // 8  rdi
+                            t.user_context.rbp,    // 9  rbp
+                            t.user_context.r8,     // 10 r8
+                            t.user_context.r9,     // 11 r9
+                            t.user_context.r10,    // 12 r10
+                            0,                     // 13 r11 (held by iretq)
+                            t.user_context.r12,    // 14 r12
+                            t.user_context.r13,    // 15 r13
+                            t.user_context.r14,    // 16 r14
+                            t.user_context.r15,    // 17 r15
+                            0,                     // 18 fs_base (not modelled)
+                            0,                     // 19 gs_base (not modelled)
+                        ];
+                        let count = (args.a4 as usize).min(regs.len());
+                        let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                        let inv = s.scheduler.slab.get_mut(invoker);
+                        let in_regs = count.min(inv.msg_regs.len());
+                        for i in 0..in_regs {
+                            inv.msg_regs[i] = regs[i];
+                        }
+                        inv.ipc_length = count as u32;
+                        // Spill words past msg_regs[] into the
+                        // invoker's IPC buffer so userspace's
+                        // libsel4 stub can read the whole array.
+                        if count > inv.msg_regs.len() && ipc_paddr != 0 {
+                            let buf = (ipc_paddr as *mut u64).wrapping_add(1);
+                            for i in inv.msg_regs.len()..count {
+                                core::ptr::write_volatile(buf.add(i), regs[i]);
+                            }
+                        }
+                        // Phase 37d — fan the first 4 returned
+                        // words into the invoker's user_context so
+                        // the syscall return path delivers them
+                        // via rdx/r10/r8/r9 the way SysRecv does.
+                        // SysSend doesn't normally fan in (it's a
+                        // sender-side syscall), but ReadRegisters
+                        // is one of the few invocations that
+                        // produce a return message.
+                        if count > 0 { inv.user_context.rdx = regs[0]; }
+                        if count > 1 { inv.user_context.r10 = regs[1]; }
+                        if count > 2 { inv.user_context.r8  = regs[2]; }
+                        if count > 3 { inv.user_context.r9  = regs[3]; }
+                        // Also pack the returned msginfo (length=
+                        // count, label=0) into rsi so userspace
+                        // can decode it with seL4_MessageInfo_get_*.
+                        let mi = (count as u64) & 0x7F;
+                        inv.user_context.rsi = mi;
                     }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    { (0u64, 0u64, 0u64) }
-                };
-                let inv = s.scheduler.slab.get_mut(invoker);
-                inv.msg_regs[0] = target_state.0;
-                inv.msg_regs[1] = target_state.1;
-                inv.msg_regs[2] = target_state.2;
-                inv.ipc_length = 3;
+                }
                 Ok(())
             }
             InvocationLabel::TCBSetSpace => {

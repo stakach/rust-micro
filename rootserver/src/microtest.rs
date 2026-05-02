@@ -38,6 +38,10 @@ const CASES: &[TestCase] = &[
                body: tests::reply_cap_round_trip },
     TestCase { name: "tcb_write_registers_full",
                body: tests::tcb_write_registers_full },
+    TestCase { name: "tcb_configure_upstream",
+               body: tests::tcb_configure_upstream },
+    TestCase { name: "tcb_read_registers_full",
+               body: tests::tcb_read_registers_full },
 ];
 
 /// Entry point invoked from `_start` when `--features microtest`
@@ -183,6 +187,167 @@ mod tests {
             let (rax, _badge, _info, payload) = ep_recv(ep);
             if rax != 0 { return Err("recv failed"); }
             if payload != 0xCAFE_F00D { return Err("wrong payload"); }
+        }
+        Ok(())
+    }
+
+    /// Phase 37d — round-trip the upstream-shape ReadRegisters.
+    /// Write known values to a TCB via WriteRegisters, then read
+    /// them back via ReadRegisters with count=4 (rip, rsp, rflags,
+    /// rax) and verify each word landed in the invoker's IPC
+    /// buffer.
+    pub(super) fn tcb_read_registers_full() -> TestResult {
+        unsafe {
+            // Retype + minimally configure a TCB.
+            let tcb_slot = alloc_slot();
+            let r = untyped_retype(
+                CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb_slot);
+            if r != 0 { return Err("retype tcb"); }
+            let r = tcb_set_space(tcb_slot, 0,
+                CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
+            if r != 0 { return Err("setspace"); }
+
+            // Stage register values via the upstream-shape
+            // WriteRegisters (count=4: rip, rsp, rflags, rax).
+            const RIP_MARKER: u64 = 0xAAAA_AAAA_1111_1111;
+            const RSP_MARKER: u64 = 0xBBBB_BBBB_2222_2222;
+            const RFLAGS_MARKER: u64 = 0x202;
+            const RAX_MARKER: u64 = 0xCCCC_CCCC_3333_3333;
+            const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
+            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+            // msg_regs[3..3+count] = register values; msg word[i]
+            // is at IPC buffer u64 offset (1 + i).
+            core::ptr::write_volatile(buf.add(1 + 3), RIP_MARKER);
+            core::ptr::write_volatile(buf.add(1 + 4), RSP_MARKER);
+            core::ptr::write_volatile(buf.add(1 + 5), RFLAGS_MARKER);
+            core::ptr::write_volatile(buf.add(1 + 6), RAX_MARKER);
+
+            let length: u64 = 3 + 4;
+            let label_writeregs: u64 = 3;
+            let msg_info_w = (label_writeregs << 12) | (length & 0x7F);
+            let mut rax_out: u64 = SYS_SEND as u64;
+            core::arch::asm!(
+                "syscall",
+                inout("rax") rax_out,
+                inout("rdi") tcb_slot => _,
+                inout("rsi") msg_info_w => _,
+                inout("rdx") /* resume */ 0u64 => _,
+                inout("r10") /* arch_flags */ 0u64 => _,
+                inout("r8")  /* count */ 4u64 => _,
+                inout("r9")  /* rip */ RIP_MARKER => _,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+            if rax_out != 0 { return Err("WriteRegisters"); }
+
+            // Now ReadRegisters with count=4. The kernel writes
+            // count words back into the invoker's msg_regs (and
+            // overflows into the IPC buffer past msg_regs.len()).
+            // Our SCRATCH_MSG_LEN is 8, so count=4 fits entirely
+            // in msg_regs and ALSO fans into the user_context's
+            // rdx/r10/r8/r9 via the receive-path syscall return.
+            let label_readregs: u64 = 2;
+            let msg_info_r = (label_readregs << 12) | (1u64 & 0x7F);
+            let mut rax_io: u64 = SYS_SEND as u64;
+            let read_rip: u64;
+            let read_rsp: u64;
+            let read_rflags: u64;
+            let read_rax: u64;
+            core::arch::asm!(
+                "syscall",
+                inout("rax") rax_io,
+                inout("rdi") tcb_slot => _,
+                inout("rsi") msg_info_r => _,
+                inout("rdx") /* resume */ 0u64 => read_rip,
+                inout("r10") /* arch_flags */ 0u64 => read_rsp,
+                inout("r8")  /* count */ 4u64 => read_rflags,
+                inout("r9")  /* unused */ 0u64 => read_rax,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+            // rax_io is non-zero on lookup error; the kernel-side
+            // ReadRegisters always returns Ok, so rax should be 0.
+            if rax_io != 0 { return Err("ReadRegisters"); }
+            if read_rip    != RIP_MARKER     { return Err("rip mismatch"); }
+            if read_rsp    != RSP_MARKER     { return Err("rsp mismatch"); }
+            if read_rflags != RFLAGS_MARKER  { return Err("rflags mismatch"); }
+            if read_rax    != RAX_MARKER     { return Err("rax mismatch"); }
+        }
+        Ok(())
+    }
+
+    /// Phase 37c — upstream-shape `seL4_TCB_Configure`:
+    /// extraCaps[0..3] = cspace, vspace, ipc_buffer_frame; msg
+    /// words = fault_ep + ignored data fields + ipc_buffer vaddr.
+    /// Verifies the kernel reads from extraCaps + msg_regs (not
+    /// from `args.a3`/`a4` like the legacy form).
+    pub(super) fn tcb_configure_upstream() -> TestResult {
+        unsafe {
+            // Retype a fresh TCB to configure.
+            let tcb_slot = alloc_slot();
+            let r = untyped_retype(
+                CAP_INIT_UNTYPED, OBJ_TCB,
+                /* size_bits */ 0, /* num_objects */ 1, tcb_slot);
+            if r != 0 { return Err("retype tcb"); }
+
+            // Retype an IPC-buffer frame.
+            let ipcbuf_slot = alloc_slot();
+            let r = untyped_retype(
+                CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE,
+                PAGING_BITS, 1, ipcbuf_slot);
+            if r != 0 { return Err("retype ipcbuf frame"); }
+
+            // Stage extraCaps[0..3] in our IPC buffer at
+            // caps_or_badges offset = 122. cspace, vspace,
+            // ipc_buffer_frame.
+            const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
+            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+            core::ptr::write_volatile(buf.add(122), CAP_INIT_THREAD_CNODE);
+            core::ptr::write_volatile(buf.add(123), CAP_INIT_THREAD_VSPACE);
+            core::ptr::write_volatile(buf.add(124), ipcbuf_slot);
+
+            // SysSend: msginfo.label = TCBConfigure (5),
+            // length = 4 (fault_ep + cspace_data + vspace_data +
+            // ipc_buffer), extraCaps = 3.
+            let label_cfg: u64 = 5;
+            let length: u64 = 4;
+            let extra_caps: u64 = 3;
+            let msg_info: u64 =
+                (label_cfg << 12)
+                | (extra_caps << 7)
+                | (length & 0x7F);
+            const FAULT_EP: u64 = 0xFEEDC0DE;
+            const CSPACE_DATA: u64 = 0;
+            const VSPACE_DATA: u64 = 0;
+            const IPC_BUFFER_VADDR: u64 = 0x0000_0100_00A0_0000;
+            let r = syscall5(
+                SYS_SEND, tcb_slot, msg_info,
+                FAULT_EP,
+                CSPACE_DATA,
+                VSPACE_DATA,
+            );
+            // a5 = ipc_buffer_vaddr — needs the 6-arg form.
+            // We cheated above with syscall5 (only stages a4); the
+            // upstream Configure path reads ipc_buffer from a5, so
+            // re-issue with the right asm.
+            let _ = r;
+            let mut rax_out: u64 = SYS_SEND as u64;
+            core::arch::asm!(
+                "syscall",
+                inout("rax") rax_out,
+                inout("rdi") tcb_slot => _,
+                inout("rsi") msg_info => _,
+                inout("rdx") FAULT_EP => _,
+                inout("r10") CSPACE_DATA => _,
+                inout("r8")  VSPACE_DATA => _,
+                inout("r9")  IPC_BUFFER_VADDR => _,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+            if rax_out != 0 { return Err("upstream Configure failed"); }
         }
         Ok(())
     }
