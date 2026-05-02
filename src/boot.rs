@@ -347,7 +347,79 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
     arch::log("  tcb   @0x"); log_hex64(mem.tcb); arch::log("\n");
     arch::log("  ipc   @0x"); log_hex64(mem.ipc_buf); arch::log("\n");
     arch::log("  bi    @0x"); log_hex64(mem.boot_info); arch::log("\n");
+
     Ok(mem)
+}
+
+/// Phase 41 — reserve a contiguous chunk of BOOTBOOT-identity-
+/// mapped low memory for the rootserver loader's user-page
+/// allocator. Sized for sel4test-driver-class workloads (~3.9 MiB
+/// of LOAD segments + aux). Called before specs run so the
+/// rootserver-loader spec can `super::load()` the live initrd ELF.
+#[cfg(target_arch = "x86_64")]
+pub fn reserve_user_page_region() -> Result<(), BootError> {
+    use crate::arch;
+
+    let mut entries = [MemEntry { region: PRegion::new(0, 0), kind: MemKind::Used };
+        MAX_FREEMEM_REGIONS];
+    let n = read_bootboot_mmap(&mut entries);
+    let mut free = extract_free(&entries[..n])?;
+
+    const USER_PAGES_SIZE: u64 = 16 * 1024 * 1024;
+    let user_pages_base = carve_chunk(&mut free, USER_PAGES_SIZE, 12)?;
+
+    arch::log("boot: reserved user-pages @0x");
+    log_hex64(user_pages_base);
+    arch::log(".."); log_hex64(user_pages_base + USER_PAGES_SIZE);
+    arch::log("\n");
+
+    unsafe {
+        crate::rootserver::install_user_page_region(
+            user_pages_base, USER_PAGES_SIZE);
+    }
+    Ok(())
+}
+
+/// Carve a contiguous chunk of `size` bytes (aligned to `1 << align_bits`)
+/// out of the free-region list. Returns the chunk's base paddr and
+/// shrinks the free region accordingly. Used by `kernel_init` for
+/// out-of-band reservations like the rootserver user-page region.
+fn carve_chunk(
+    free: &mut RegionList,
+    size: u64,
+    align_bits: u32,
+) -> Result<u64, BootError> {
+    for i in 0..free.len {
+        let f = free.entries[i];
+        let base = align_up(f.start, align_bits);
+        if base.checked_add(size).map(|e| e <= f.end).unwrap_or(false) {
+            let chunk_end = base + size;
+            // Splice: keep prefix below chunk, suffix above.
+            let prefix = PRegion::new(f.start, base);
+            let suffix = PRegion::new(chunk_end, f.end);
+            free.entries[i] = prefix;
+            if !suffix.is_empty() {
+                if free.len >= MAX_FREEMEM_REGIONS {
+                    return Err(BootError::TooManyRegions);
+                }
+                let mut j = free.len;
+                while j > i + 1 {
+                    free.entries[j] = free.entries[j - 1];
+                    j -= 1;
+                }
+                free.entries[i + 1] = suffix;
+                free.len += 1;
+            }
+            if free.entries[i].is_empty() {
+                for j in i..(free.len - 1) {
+                    free.entries[j] = free.entries[j + 1];
+                }
+                free.len -= 1;
+            }
+            return Ok(base);
+        }
+    }
+    Err(BootError::NoSuitableRegion)
 }
 
 #[cfg(target_arch = "x86_64")]

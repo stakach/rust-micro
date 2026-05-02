@@ -71,6 +71,16 @@ fi
 PATH="$VENV/bin:$PATH"
 export PATH
 
+# Homebrew installs GNU cpio as keg-only (to avoid shadowing
+# macOS's BSD cpio), so /opt/homebrew/bin/cpio doesn't exist.
+# sel4test's CMake invokes `cpio --append` which BSD cpio doesn't
+# support — surface GNU cpio's bin on PATH explicitly.
+GCPIO=$(ls -d /opt/homebrew/Cellar/cpio/*/bin 2>/dev/null | head -1)
+if [ -n "$GCPIO" ] && [ -x "$GCPIO/cpio" ]; then
+  PATH="$GCPIO:$PATH"
+  export PATH
+fi
+
 fetch_pinned https://github.com/seL4/sel4test.git           "$SEL4TEST_SHA"           projects/sel4test
 fetch_pinned https://github.com/seL4/seL4_libs.git          "$SEL4_LIBS_SHA"          projects/seL4_libs
 fetch_pinned https://github.com/seL4/util_libs.git          "$UTIL_LIBS_SHA"          projects/util_libs
@@ -143,7 +153,7 @@ echo ">> building sel4test-driver"
 ninja sel4test-driver
 
 # Stage the rootserver ELF where scripts/make_image.sh expects it.
-DRIVER_ELF="$HERE/build/sel4test-driver/sel4test-driver"
+DRIVER_ELF="$HERE/build/apps/sel4test-driver/sel4test-driver"
 if [ ! -f "$DRIVER_ELF" ]; then
   echo "error: expected sel4test-driver ELF at $DRIVER_ELF" >&2
   exit 1

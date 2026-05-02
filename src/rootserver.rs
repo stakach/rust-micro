@@ -46,36 +46,64 @@ use crate::types::{
 
 // ---------------------------------------------------------------------------
 // Page pool — backing memory for the rootserver's user-mode pages.
-// Sized for the current rootserver image (≈5 KiB total) with plenty
-// of headroom for Phase 29d/g additions (BootInfo, IPC buffer, child
-// thread pages).
+//
+// Phase 41 — instead of preallocating in kernel BSS (which doesn't
+// scale; sel4test-driver alone is ~3.9 MiB of LOAD segments), we
+// reserve a contiguous chunk of BOOTBOOT-identity-mapped low memory
+// at boot time and hand out paddrs from it. `alloc_page` returns
+// the paddr; because BOOTBOOT identity-maps the lower 1 GiB at
+// PML4[0], that paddr also serves as a valid kernel-virtual pointer
+// for the loader to memcpy ELF data into the page. No translation
+// step needed.
+//
+// `boot::kernel_init` carves the chunk via `crate::boot::reserve`
+// and calls `install_user_page_region` before the loader runs.
 // ---------------------------------------------------------------------------
 
-#[repr(C, align(4096))]
-struct Page([u8; 4096]);
+struct UserPageRegion {
+    base_paddr: u64,
+    size: u64,
+    used: u64,
+}
 
-const PAGE_POOL_SIZE: usize = 32;
-static mut ROOTSERVER_PAGE_POOL: [Page; PAGE_POOL_SIZE] =
-    [const { Page([0; 4096]) }; PAGE_POOL_SIZE];
-static mut ROOTSERVER_PAGE_USED: usize = 0;
+static mut USER_PAGE_REGION: UserPageRegion = UserPageRegion {
+    base_paddr: 0,
+    size: 0,
+    used: 0,
+};
 
-unsafe fn alloc_page() -> *mut Page {
-    assert!(ROOTSERVER_PAGE_USED < PAGE_POOL_SIZE,
-        "rootserver page pool exhausted");
-    let p = &raw mut ROOTSERVER_PAGE_POOL[ROOTSERVER_PAGE_USED];
-    ROOTSERVER_PAGE_USED += 1;
-    // Zero-initialised already, but BSS may not be — be explicit.
+/// Wire the boot-time-reserved low-memory region into the loader.
+/// Call exactly once at boot, before `launch_rootserver`.
+pub unsafe fn install_user_page_region(base_paddr: u64, size: u64) {
+    USER_PAGE_REGION.base_paddr = base_paddr;
+    USER_PAGE_REGION.size = size;
+    USER_PAGE_REGION.used = 0;
+}
+
+/// Allocate a 4 KiB page from the user-page region. Returns the
+/// paddr — also a valid kernel-virtual pointer (BOOTBOOT identity
+/// at PML4[0]). The page is zero-filled before return.
+unsafe fn alloc_page() -> u64 {
+    let region = &raw mut USER_PAGE_REGION;
+    let used = (*region).used;
+    assert!(used + 4096 <= (*region).size,
+        "rootserver user-page region exhausted: {}/{} bytes used",
+        used, (*region).size);
+    let paddr = (*region).base_paddr + used;
+    (*region).used = used + 4096;
+    // Zero the page via paddr-as-vaddr (BOOTBOOT identity).
+    let p = paddr as *mut u8;
     for i in 0..4096 {
-        core::ptr::write_volatile((p as *mut u8).add(i), 0);
+        core::ptr::write_volatile(p.add(i), 0);
     }
-    p
+    paddr
 }
 
 /// Reset the page pool. Used by spec teardown to keep multiple
 /// loader runs deterministic.
 #[cfg(feature = "spec")]
 pub unsafe fn reset_page_pool() {
-    ROOTSERVER_PAGE_USED = 0;
+    USER_PAGE_REGION.used = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,24 +112,10 @@ pub unsafe fn reset_page_pool() {
 // known offsets above the image.
 // ---------------------------------------------------------------------------
 
-/// Top end of the user stack (vaddr just past the highest byte the
-/// stack can use). 64 KiB above the image base, matching the
-/// AY-demo convention.
-pub const ROOTSERVER_STACK_VTOP: u64 = 0x0000_0100_0050_0000;
-
-const STACK_PAGE_VBASE: u64 = ROOTSERVER_STACK_VTOP - 0x1000;
-
-/// Vaddr where the rootserver finds its IPC buffer (one 4 KiB page).
-/// Maps to `seL4_CapInitThreadIPCBuffer` (slot 10) in the rootserver's
-/// CNode.
-pub const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
-
-/// Vaddr where the rootserver finds its `seL4_BootInfo` struct.
-/// Maps to `seL4_CapBootInfoFrame` (slot 9). The kernel writes the
-/// struct here before dispatch and passes this vaddr to `_start` via
-/// `rdi`, so the rootserver can read it without any prior cap
-/// invocation.
-pub const ROOTSERVER_BOOTINFO_VBASE: u64 = 0x0000_0100_0070_0000;
+/// Number of 4 KiB pages reserved for the rootserver's user stack.
+/// Sized for sel4test-driver-class workloads; the legacy Rust
+/// rootserver only uses a fraction.
+const ROOTSERVER_STACK_PAGES: u64 = 4;
 
 /// Kernel-side CNode index reserved for the rootserver's CSpace.
 /// Matches the existing convention from the AY demo (CNodes 1, 2 went
@@ -139,14 +153,22 @@ pub struct RootserverImage {
     /// User-mode entry point (= ELF `e_entry`).
     pub entry: Word,
     /// Top of the user stack — the value `_start` reads as RSP.
+    /// Phase 41 — derived at load time from the parsed ELF's
+    /// highest PT_LOAD vaddr, so an arbitrary upstream rootserver
+    /// (sel4test-driver, hello.elf, Rust rootserver, ...) gets aux
+    /// allocations placed cleanly above its image.
     pub stack_top: Word,
-    /// Physical address of the rootserver's IPC buffer page. The
-    /// kernel maps it at `ROOTSERVER_IPCBUF_VBASE` and stores a
-    /// Frame cap pointing at this paddr in slot 10 of the
-    /// rootserver's CNode.
+    /// User vaddr the IPC buffer page is mapped at (chosen
+    /// dynamically — see `stack_top`). seL4_BootInfo.ipcBuffer
+    /// holds this; the kernel also stores it on the rootserver TCB.
+    pub ipc_buffer_vaddr: u64,
+    /// User vaddr the BootInfo page is mapped at (chosen
+    /// dynamically — see `stack_top`). Passed to `_start` in `rdi`.
+    pub bootinfo_vaddr: u64,
+    /// Physical address of the rootserver's IPC buffer page —
+    /// stored in the Frame cap at slot 10 of the rootserver's CNode.
     pub ipc_buffer_paddr: u64,
-    /// Physical address of the BootInfo page. Maps at
-    /// `ROOTSERVER_BOOTINFO_VBASE`; slot 9.
+    /// Physical address of the BootInfo page; slot 9.
     pub bootinfo_paddr: u64,
 }
 
@@ -175,34 +197,68 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     // mid-page). We track already-allocated pages so we don't
     // double-allocate or double-map; subsequent segments touching
     // the same page just write into it at the right offset.
-    let mut seen: [PageMapping; 32] = [PageMapping { vaddr: 0, kvaddr: 0 }; 32];
+    //
+    // Sized for sel4test-driver-class workloads: ~1000 unique pages
+    // for a single ~3.9 MiB LOAD segment. The Rust rootserver only
+    // needs a handful of these. 32 KiB on the kernel stack — fits
+    // comfortably in the BOOTBOOT 64 KiB initstack.
+    static mut SEEN: [PageMapping; 2048] =
+        [PageMapping { vaddr: 0, kvaddr: 0 }; 2048];
+    let seen: &mut [PageMapping; 2048] = unsafe { &mut SEEN };
+    for s in seen.iter_mut() { *s = PageMapping { vaddr: 0, kvaddr: 0 }; }
     let mut n_seen: usize = 0;
 
+    // Phase 41 — track the highest vaddr any PT_LOAD segment
+    // covers. Auxiliary allocations (stack, IPC buffer, BootInfo)
+    // get placed past this so they can't collide with the ELF's
+    // own layout, regardless of which rootserver the user packed
+    // into the initrd.
+    let mut image_top: u64 = 0;
+
     for seg in img.load_segments() {
-        load_segment(pml4, &seg, &mut seen, &mut n_seen)?;
+        load_segment(pml4, &seg, seen, &mut n_seen)?;
+        let seg_end = seg.vaddr + seg.mem_size;
+        if seg_end > image_top {
+            image_top = seg_end;
+        }
     }
 
-    // Allocate + map the user stack page.
-    let stack_p = alloc_page();
-    let stack_phys = kernel_virt_to_phys(stack_p as u64);
-    map_user_4k_into_pml4(pml4, STACK_PAGE_VBASE, stack_phys, /* writable */ true);
+    // Round the auxiliary base up to a 4 KiB boundary, then leave a
+    // one-page guard so a stack overflow in the rootserver hits an
+    // unmapped page rather than scribbling onto its own .bss.
+    let page = 0x1000u64;
+    let aux_base = (image_top + page - 1) & !(page - 1);
+    let stack_base = aux_base + page; // skip guard page
+    let stack_top = stack_base + ROOTSERVER_STACK_PAGES * page;
+    let ipc_buffer_vaddr = stack_top + page; // skip another guard
+    let bootinfo_vaddr = ipc_buffer_vaddr + page;
+
+    // Allocate + map the stack pages. `alloc_page` returns a paddr
+    // that's also a valid kernel-virtual pointer (BOOTBOOT identity
+    // at PML4[0]) — the loader maps it user-side at `stack_base + i
+    // * page` and the kernel can write into it via paddr-as-vaddr.
+    for i in 0..ROOTSERVER_STACK_PAGES {
+        let stack_phys = alloc_page();
+        map_user_4k_into_pml4(pml4, stack_base + i * page, stack_phys,
+            /* writable */ true);
+    }
 
     // Allocate + map the IPC buffer page.
-    let ipcbuf_p = alloc_page();
-    let ipcbuf_phys = kernel_virt_to_phys(ipcbuf_p as u64);
-    map_user_4k_into_pml4(pml4, ROOTSERVER_IPCBUF_VBASE, ipcbuf_phys, true);
+    let ipcbuf_phys = alloc_page();
+    map_user_4k_into_pml4(pml4, ipc_buffer_vaddr, ipcbuf_phys, true);
 
     // Allocate + map the BootInfo page (read-only — userspace reads
-    // it but doesn't mutate). The kernel writes the struct via
-    // its kernel-half mapping before dispatch.
-    let bi_p = alloc_page();
-    let bi_phys = kernel_virt_to_phys(bi_p as u64);
-    map_user_4k_into_pml4(pml4, ROOTSERVER_BOOTINFO_VBASE, bi_phys, false);
+    // it but doesn't mutate). The kernel writes the struct via the
+    // BOOTBOOT identity map before dispatch.
+    let bi_phys = alloc_page();
+    map_user_4k_into_pml4(pml4, bootinfo_vaddr, bi_phys, false);
 
     Ok(RootserverImage {
         pml4_paddr: pml4,
         entry: img.entry,
-        stack_top: ROOTSERVER_STACK_VTOP,
+        stack_top,
+        ipc_buffer_vaddr,
+        bootinfo_vaddr,
         ipc_buffer_paddr: ipcbuf_phys,
         bootinfo_paddr: bi_phys,
     })
@@ -300,12 +356,12 @@ pub unsafe fn launch_rootserver() -> ! {
     t.user_context = UserContext::for_entry(
         img.entry,
         img.stack_top - 8,
-        /* rdi (arg0) */ ROOTSERVER_BOOTINFO_VBASE,
+        /* rdi (arg0) */ img.bootinfo_vaddr,
     );
     t.cpu_context.cr3 = img.pml4_paddr;
     // Phase 34c — register the rootserver's IPC buffer with the
     // kernel so long-message IPC can read/write it via paddr.
-    t.ipc_buffer = ROOTSERVER_IPCBUF_VBASE;
+    t.ipc_buffer = img.ipc_buffer_vaddr;
     t.ipc_buffer_paddr = img.ipc_buffer_paddr;
     t.cspace_root = cnode_cap;
     t.vspace_root = Cap::PML4 {
@@ -357,7 +413,7 @@ pub unsafe fn launch_rootserver() -> ! {
         ptr: PPtr::<FrameStorage>::new(img.bootinfo_paddr).expect("bi paddr"),
         size: FrameSize::Small,
         rights: FrameRights::ReadOnly,
-        mapped: Some(ROOTSERVER_BOOTINFO_VBASE),
+        mapped: Some(img.bootinfo_vaddr),
         asid: 0,
         is_device: false,
     });
@@ -365,7 +421,7 @@ pub unsafe fn launch_rootserver() -> ! {
         ptr: PPtr::<FrameStorage>::new(img.ipc_buffer_paddr).expect("ipc paddr"),
         size: FrameSize::Small,
         rights: FrameRights::ReadWrite,
-        mapped: Some(ROOTSERVER_IPCBUF_VBASE),
+        mapped: Some(img.ipc_buffer_vaddr),
         asid: 0,
         is_device: false,
     });
@@ -418,7 +474,7 @@ pub unsafe fn launch_rootserver() -> ! {
     // before the CR3 swap; the rootserver reads it through its
     // user-half mapping after sysretq.
     let bi_ptr = phys_to_kernel_virt(img.bootinfo_paddr) as *mut seL4_BootInfo;
-    let bi = build_bootinfo(img.ipc_buffer_paddr, untyped_pool_pa);
+    let bi = build_bootinfo(img.ipc_buffer_vaddr, untyped_pool_pa);
     core::ptr::write(bi_ptr, bi);
 
     // Demote the boot thread out of the way.
@@ -464,15 +520,22 @@ pub unsafe fn launch_rootserver() -> ! {
 /// KERNEL_VIRT_TO_PHYS_OFFSET`. We avoid exposing the offset
 /// directly; just invert `kernel_virt_to_phys`.
 unsafe fn phys_to_kernel_virt(paddr: u64) -> u64 {
-    // KERNEL_VIRT_TO_PHYS_OFFSET is set by `install_kernel_page_tables`.
-    // Recover it by translating a known kernel symbol.
-    let probe_va = (&raw const ROOTSERVER_PAGE_POOL) as u64;
+    // Phase 41 — two regimes:
+    //   * paddrs in BOOTBOOT's lower-1 GiB identity map (which is
+    //     where alloc_page hands out pages) — kvaddr == paddr.
+    //   * paddrs in the kernel-image's high-memory mapping — kvaddr
+    //     = paddr + KERNEL_VIRT_TO_PHYS_OFFSET (recovered by
+    //     translating a known kernel-image symbol).
+    if paddr < 0x4000_0000 {
+        return paddr;
+    }
+    let probe_va = (&raw const USER_PAGE_REGION) as u64;
     let probe_pa = kernel_virt_to_phys(probe_va);
     let offset = probe_va - probe_pa;
     paddr + offset
 }
 
-unsafe fn build_bootinfo(ipc_buffer_paddr: u64, _untyped_paddr: u64) -> seL4_BootInfo {
+unsafe fn build_bootinfo(ipc_buffer_vaddr: u64, _untyped_paddr: u64) -> seL4_BootInfo {
     let mut empty_untypeds = [seL4_UntypedDesc::default();
         CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
     // Describe the single rootserver Untyped (slot 11).
@@ -498,7 +561,7 @@ unsafe fn build_bootinfo(ipc_buffer_paddr: u64, _untyped_paddr: u64) -> seL4_Boo
         nodeID: 0,
         numNodes: n_cores,
         numIOPTLevels: 0,
-        ipcBuffer: ROOTSERVER_IPCBUF_VBASE as *mut crate::types::seL4_IPCBuffer,
+        ipcBuffer: ipc_buffer_vaddr as *mut crate::types::seL4_IPCBuffer,
         empty: seL4_SlotRegion { start: untyped_end, end: 64 },
         sharedFrames: seL4_SlotRegion { start: 0, end: 0 },
         userImageFrames: seL4_SlotRegion { start: 0, end: 0 },
@@ -544,20 +607,21 @@ unsafe fn load_segment(
     let mut page_vaddr = start_page;
     while page_vaddr < end_page {
         // Find or allocate the kernel-virt backing for this page.
+        // `alloc_page` returns a paddr that doubles as a valid
+        // kernel-virtual pointer (BOOTBOOT identity at PML4[0]).
         let kva = match find_seen(seen, *n_seen, page_vaddr) {
             Some(kv) => kv,
             None => {
-                let p = alloc_page() as u64;
-                let phys = kernel_virt_to_phys(p);
+                let phys = alloc_page();
                 map_user_4k_into_pml4(
                     pml4, page_vaddr, phys, /* writable */ seg.writable(),
                 );
                 if *n_seen >= seen.len() {
                     return Err(LoadError::UnalignedSegment); // pool small
                 }
-                seen[*n_seen] = PageMapping { vaddr: page_vaddr, kvaddr: p };
+                seen[*n_seen] = PageMapping { vaddr: page_vaddr, kvaddr: phys };
                 *n_seen += 1;
-                p
+                phys
             }
         };
 
@@ -614,7 +678,7 @@ pub mod spec {
     fn loads_and_maps_segments() {
         unsafe {
             super::reset_page_pool();
-            let used_before = super::ROOTSERVER_PAGE_USED;
+            let used_before = super::USER_PAGE_REGION.used;
             let result = super::load().expect("rootserver loads");
 
             // Entry must equal the ELF's e_entry (sanity vs the
@@ -622,8 +686,20 @@ pub mod spec {
             let img = crate::elf::parse(super::rootserver_elf()).unwrap();
             assert_eq!(result.entry, img.entry);
 
-            // Stack-top is the documented constant.
-            assert_eq!(result.stack_top, super::ROOTSERVER_STACK_VTOP);
+            // Stack-top must sit above the highest PT_LOAD vaddr —
+            // Phase 41 made aux placement dynamic per ELF.
+            let mut image_top: u64 = 0;
+            for seg in img.load_segments() {
+                let end = seg.vaddr + seg.mem_size;
+                if end > image_top { image_top = end; }
+            }
+            assert!(result.stack_top > image_top,
+                "stack_top {:#x} must be past image_top {:#x}",
+                result.stack_top, image_top);
+            assert!(result.ipc_buffer_vaddr > result.stack_top,
+                "IPC buffer must sit above stack");
+            assert!(result.bootinfo_vaddr > result.ipc_buffer_vaddr,
+                "BootInfo must sit above IPC buffer");
 
             // PML4 is non-zero and 4 KiB-aligned.
             assert!(result.pml4_paddr != 0);
@@ -635,12 +711,13 @@ pub mod spec {
             for seg in img.load_segments() {
                 seg_pages += (seg.mem_size + 0xFFF) / 0x1000;
             }
-            let used_after = super::ROOTSERVER_PAGE_USED;
+            let used_after = super::USER_PAGE_REGION.used;
+            let pages_alloc = (used_after - used_before) / 0x1000;
             assert!(
-                (used_after - used_before) as u64 >= seg_pages + 1,
+                pages_alloc >= seg_pages + 1,
                 "expected ≥{} pages allocated, got {}",
                 seg_pages + 1,
-                used_after - used_before,
+                pages_alloc,
             );
             arch::log("  ✓ rootserver loads + segments map into a fresh PML4\n");
         }

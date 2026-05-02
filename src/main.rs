@@ -200,6 +200,22 @@ fn bsp_main() -> ! {
         arch::log("All APs up\n");
     }
 
+    // Phase 41 — reserve the rootserver user-page region from
+    // BOOTBOOT free memory before specs run. The rootserver-loader
+    // spec calls super::load() which allocates from this region,
+    // and sel4test-driver's image alone is ~3.9 MiB — too big for
+    // a kernel-image BSS pool.
+    #[cfg(target_arch = "x86_64")]
+    if let Err(e) = boot::reserve_user_page_region() {
+        arch::log("boot: reserve_user_page_region failed: ");
+        match e {
+            boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
+            boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
+            boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
+        }
+        arch::log("\n");
+    }
+
     #[cfg(feature = "spec")]
     spec::test_main();
 

@@ -40,7 +40,11 @@ use super::msr::{rdmsr, IA32_APIC_BASE_MSR};
 #[repr(C, align(4096))]
 pub struct PtPage(pub [u64; 512]);
 
-const POOL_SIZE: usize = 32;
+// Sized for sel4test-driver-class workloads: each PML4 + PDPT/PD/PT
+// installed for the rootserver's vaddr range comes from this pool,
+// plus large-page splits when the loader walks into BOOTBOOT's
+// 2 MiB identity entries. 64 pages is generous for current needs.
+const POOL_SIZE: usize = 64;
 
 #[no_mangle]
 pub static mut KPT_POOL: [PtPage; POOL_SIZE] = [const { PtPage([0; 512]) }; POOL_SIZE];

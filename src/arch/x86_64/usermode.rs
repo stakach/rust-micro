@@ -556,7 +556,36 @@ unsafe fn ensure_user_table(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
     let entry = core::ptr::read_volatile(entry_ptr);
     if entry & PTE_PRESENT != 0 {
         if entry & PTE_PS != 0 {
-            panic!("ensure_user_table: walked into a large page");
+            // 2 MiB large page (PD slot with PS=1). Split it into a
+            // PT of 512 4 KiB entries so the rootserver can mutate
+            // sub-pages without disturbing the rest of the 2 MiB
+            // region — BOOTBOOT identity-maps the lower 1 GiB at
+            // PML4[0] with 2 MiB pages, and rootservers laying out
+            // in PML4[0] (e.g. sel4test-driver at 0x400000) need
+            // 4 KiB granularity in those regions.
+            let large_paddr = entry & 0x000F_FFFF_FFE0_0000;
+            // Carry the entry's low flag bits, dropping PS. PAT
+            // moves between bit positions for 2 MiB vs 4 KiB
+            // entries, but BOOTBOOT identity entries don't set
+            // PAT — masking PS is sufficient here.
+            let leaf_flags = (entry & 0xFFF) & !PTE_PS;
+            let pt_v = super::paging::alloc_user_table_va();
+            for i in 0..512 {
+                let leaf = (large_paddr + (i as u64) * 0x1000) | leaf_flags;
+                core::ptr::write_volatile(pt_v.add(i), leaf);
+            }
+            let pt_p = kernel_virt_to_phys(pt_v as u64);
+            // Replace the PD entry with a pointer at the new PT
+            // (PS=0). The requested mid-flags (PRESENT|RW|USER)
+            // overwrite the original — note that user-mode access
+            // also requires US=1 in the leaf PT entries, so the
+            // 511 leaves still mapping BOOTBOOT identity remain
+            // kernel-only (their leaf_flags inherited PS=0/US=0).
+            // Only the leaf the rootserver later overwrites with
+            // its own US=1 entry becomes user-accessible.
+            let new_pd = (pt_p & 0x000F_FFFF_FFFF_F000) | flags;
+            core::ptr::write_volatile(entry_ptr, new_pd);
+            return pt_p as *mut u64;
         }
         let updated = entry | flags;
         if updated != entry {
