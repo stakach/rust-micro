@@ -64,7 +64,9 @@ VENV="$HERE/.venv"
 if [ ! -x "$VENV/bin/python" ]; then
   echo ">> creating venv at $VENV"
   python3 -m venv "$VENV"
-  "$VENV/bin/pip" install --quiet pyyaml jinja2 ply future six lxml
+  "$VENV/bin/pip" install --quiet \
+    pyyaml jinja2 ply future six lxml \
+    protobuf
 fi
 PATH="$VENV/bin:$PATH"
 export PATH
