@@ -32,3 +32,9 @@ vmx = []
 # legacy demos. Kernel-side this is a no-op flag (the sentinel
 # matcher in syscall_entry runs unconditionally).
 microtest = []
+# Phase 38d — replace the embedded rootserver ELF with the
+# `vendor/libsel4-build/out/hello.elf` C program built against the
+# real upstream libsel4. Used to validate our kernel's SYSCALL ABI
+# matches what libsel4-compiled code emits, as a stepping stone
+# toward running sel4test.
+libsel4-hello = []

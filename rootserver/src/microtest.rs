@@ -225,51 +225,55 @@ mod tests {
             let length: u64 = 3 + 4;
             let label_writeregs: u64 = 3;
             let msg_info_w = (label_writeregs << 12) | (length & 0x7F);
-            let mut rax_out: u64 = SYS_SEND as u64;
+            // Phase 38c — upstream SYSCALL ABI: nr in rdx, msg regs
+            // in r10/r8/r9/r15. 38c-followup: rax is preserved by
+            // the kernel; success/failure is signalled via
+            // msginfo/faults, not via rax.
             core::arch::asm!(
                 "syscall",
-                inout("rax") rax_out,
-                inout("rdi") tcb_slot => _,
-                inout("rsi") msg_info_w => _,
-                inout("rdx") /* resume */ 0u64 => _,
-                inout("r10") /* arch_flags */ 0u64 => _,
-                inout("r8")  /* count */ 4u64 => _,
-                inout("r9")  /* rip */ RIP_MARKER => _,
+                in("rdx") SYS_SEND as u64,
+                in("rdi") tcb_slot,
+                in("rsi") msg_info_w,
+                in("r10") /* a2 = resume */ 0u64,
+                in("r8")  /* a3 = arch_flags */ 0u64,
+                in("r9")  /* a4 = count */ 4u64,
+                in("r15") /* a5 = rip */ RIP_MARKER,
+                lateout("rax") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
             );
-            if rax_out != 0 { return Err("WriteRegisters"); }
 
             // Now ReadRegisters with count=4. The kernel writes
             // count words back into the invoker's msg_regs (and
             // overflows into the IPC buffer past msg_regs.len()).
             // Our SCRATCH_MSG_LEN is 8, so count=4 fits entirely
             // in msg_regs and ALSO fans into the user_context's
-            // rdx/r10/r8/r9 via the receive-path syscall return.
+            // r10/r8/r9/r15 via the receive-path syscall return
+            // (Phase 38c — upstream seL4 IPC return ABI).
             let label_readregs: u64 = 2;
             let msg_info_r = (label_readregs << 12) | (1u64 & 0x7F);
-            let mut rax_io: u64 = SYS_SEND as u64;
             let read_rip: u64;
             let read_rsp: u64;
             let read_rflags: u64;
             let read_rax: u64;
             core::arch::asm!(
                 "syscall",
-                inout("rax") rax_io,
-                inout("rdi") tcb_slot => _,
-                inout("rsi") msg_info_r => _,
-                inout("rdx") /* resume */ 0u64 => read_rip,
-                inout("r10") /* arch_flags */ 0u64 => read_rsp,
-                inout("r8")  /* count */ 4u64 => read_rflags,
-                inout("r9")  /* unused */ 0u64 => read_rax,
+                in("rdx") SYS_SEND as u64,
+                in("rdi") tcb_slot,
+                in("rsi") msg_info_r,
+                inout("r10") /* a2 = resume */ 0u64 => read_rip,
+                inout("r8")  /* a3 = arch_flags */ 0u64 => read_rsp,
+                inout("r9")  /* a4 = count */ 4u64 => read_rflags,
+                inout("r15") /* a5 = unused */ 0u64 => read_rax,
+                lateout("rax") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
             );
-            // rax_io is non-zero on lookup error; the kernel-side
-            // ReadRegisters always returns Ok, so rax should be 0.
-            if rax_io != 0 { return Err("ReadRegisters"); }
+            // rax is preserved (Phase 38c-followup) so we can no
+            // longer detect lookup errors here; we just verify the
+            // returned register values match.
             if read_rip    != RIP_MARKER     { return Err("rip mismatch"); }
             if read_rsp    != RSP_MARKER     { return Err("rsp mismatch"); }
             if read_rflags != RFLAGS_MARKER  { return Err("rflags mismatch"); }
@@ -333,21 +337,21 @@ mod tests {
             // upstream Configure path reads ipc_buffer from a5, so
             // re-issue with the right asm.
             let _ = r;
-            let mut rax_out: u64 = SYS_SEND as u64;
+            // Phase 38c — upstream SYSCALL ABI; rax preserved.
             core::arch::asm!(
                 "syscall",
-                inout("rax") rax_out,
-                inout("rdi") tcb_slot => _,
-                inout("rsi") msg_info => _,
-                inout("rdx") FAULT_EP => _,
-                inout("r10") CSPACE_DATA => _,
-                inout("r8")  VSPACE_DATA => _,
-                inout("r9")  IPC_BUFFER_VADDR => _,
+                in("rdx") SYS_SEND as u64,
+                in("rdi") tcb_slot,
+                in("rsi") msg_info,
+                in("r10") /* a2 */ FAULT_EP,
+                in("r8")  /* a3 */ CSPACE_DATA,
+                in("r9")  /* a4 */ VSPACE_DATA,
+                in("r15") /* a5 */ IPC_BUFFER_VADDR,
+                lateout("rax") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
             );
-            if rax_out != 0 { return Err("upstream Configure failed"); }
         }
         Ok(())
     }
@@ -411,21 +415,21 @@ mod tests {
             let length: u64 = 3 + regs.len() as u64;
             let label_writeregs: u64 = 3; // TCBWriteRegisters
             let msg_info = (label_writeregs << 12) | (length & 0x7F);
-            let mut rax_out: u64 = SYS_SEND as u64;
+            // Phase 38c — upstream SYSCALL ABI; rax preserved.
             core::arch::asm!(
                 "syscall",
-                inout("rax") rax_out,
-                inout("rdi") tcb_slot => _,
-                inout("rsi") msg_info => _,
-                inout("rdx") /* a2 */ 1u64 => _,
-                inout("r10") /* a3 */ 0u64 => _,
-                inout("r8")  /* a4 */ regs.len() as u64 => _,
-                inout("r9")  /* a5 */ regs[0] => _,
+                in("rdx") SYS_SEND as u64,
+                in("rdi") tcb_slot,
+                in("rsi") msg_info,
+                in("r10") /* a2 */ 1u64,
+                in("r8")  /* a3 */ 0u64,
+                in("r9")  /* a4 */ regs.len() as u64,
+                in("r15") /* a5 */ regs[0],
+                lateout("rax") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
             );
-            if rax_out != 0 { return Err("WriteRegisters"); }
 
             // Receive the child's IPC: payload should equal RAX_PAYLOAD.
             let (rax, _badge, _info, payload) = ep_recv(ep);
@@ -470,21 +474,22 @@ mod tests {
             // test.
             syscall0(SYS_YIELD);
 
-            // SysCall(ep, length=1, payload=0xCAFE). Same clobber
-            // story as the server's Recv asm above — every reg
-            // SYSCALL or the kernel's reply transfer might touch
-            // needs lateout, otherwise Rust silently keeps live
-            // values in those registers and we read garbage back.
+            // SysCall(ep, length=1, payload=0xCAFE). Phase 38c —
+            // upstream SYSCALL ABI: payload is msg_reg[0] which lives
+            // in r10 both on send and on receive (the kernel's reply
+            // transfer fans msg_regs back into r10/r8/r9/r15). 38c-
+            // followup: rax is preserved.
             let mut payload_io: u64 = 0xCAFE;
             core::arch::asm!(
                 "syscall",
-                inout("rax") SYS_CALL as u64 => _,
+                in("rdx") SYS_CALL as u64,
                 inout("rdi") ep => _,
                 inout("rsi") /* length=1 */ 1u64 => _,
-                inout("rdx") payload_io,
+                inout("r10") payload_io,
+                lateout("rax") _,
                 lateout("r8")  _,
                 lateout("r9")  _,
-                lateout("r10") _,
+                lateout("r15") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
@@ -702,28 +707,29 @@ unsafe extern "C" fn microtest_send_child() -> ! {
 unsafe extern "C" fn microtest_reply_server() -> ! {
     let ep = REPLY_CAP_EP_SLOT.load(AtomicOrdering::Relaxed);
     let reply = REPLY_CAP_REPLY_SLOT.load(AtomicOrdering::Relaxed);
-    // SysRecv with reply cptr in rdx (= args.a2). The kernel sets
-    // rdx on return to msg_regs[0], so we read the payload back
-    // through the inout. SYSCALL clobbers rcx + r11; the kernel's
-    // IPC delivery also rewrites rax/rsi/rdi/rdx/r10/r8/r9 with
-    // the received message, so they all need lateout — without
-    // it Rust may keep live values in those registers across
+    // Phase 38c — upstream SYSCALL ABI: SysRecv with reply cptr in
+    // r10 (= args.a2). The kernel sets r10 on return to msg_regs[0],
+    // so we read the payload back through the inout. SYSCALL clobbers
+    // rcx + r11; the kernel's IPC delivery rewrites rax/rsi/rdi/r10/
+    // r8/r9/r15 with the received message, so they all need lateout —
+    // without it Rust may keep live values in those registers across
     // the syscall.
-    let mut rdx_io: u64 = reply;
+    let mut r10_io: u64 = reply;
     core::arch::asm!(
         "syscall",
-        inout("rax") SYS_RECV as u64 => _,
+        in("rdx") SYS_RECV as u64,
         in("rdi") ep,
-        inout("rdx") rdx_io,
+        inout("r10") r10_io,
+        lateout("rax") _,
         lateout("rsi") _,
         lateout("r8")  _,
         lateout("r9")  _,
-        lateout("r10") _,
+        lateout("r15") _,
         lateout("rcx") _,
         lateout("r11") _,
         options(nostack, preserves_flags),
     );
-    let payload = rdx_io;
+    let payload = r10_io;
     // Send reply: target = the reply cap, length=1, payload+1.
     let _ = syscall5(SYS_SEND, reply, /* length */ 1,
                      payload.wrapping_add(1), 0, 0);
@@ -782,27 +788,28 @@ const OBJ_REPLY: u64 = 6;
 const MSG_EXTRA_CAPS_SHIFT: u64 = 7;
 
 /// 6-register SYSCALL — like `syscall5` but exposes the sixth arg
-/// (r9 / `args.a5`). Used by tests that need to set the priority
-/// field of `TCB::Configure`, which lives at a5.
+/// (r15 / `args.a5`). Used by tests that need to set the priority
+/// field of `TCB::Configure`, which lives at a5. Phase 38c —
+/// upstream SYSCALL ABI; rax preserved (38c-followup) so we always
+/// return 0 here.
 #[inline(always)]
 unsafe fn syscall_configure_with_prio(
     target: u64, msg_info: u64,
     fault_ep: u64, cspace: u64, vspace: u64, prio: u64,
 ) -> u64 {
-    let mut ret: u64;
     asm!(
         "syscall",
-        in("rax") SYS_SEND as u64,
+        in("rdx") SYS_SEND as u64,
         in("rdi") target,
         in("rsi") msg_info,
-        in("rdx") fault_ep,
-        in("r10") cspace,
-        in("r8")  vspace,
-        in("r9")  prio,
-        lateout("rax") ret,
+        in("r10") /* a2 */ fault_ep,
+        in("r8")  /* a3 */ cspace,
+        in("r9")  /* a4 */ vspace,
+        in("r15") /* a5 */ prio,
+        lateout("rax") _,
         lateout("rcx") _,
         lateout("r11") _,
         options(nostack, preserves_flags),
     );
-    ret
+    0
 }

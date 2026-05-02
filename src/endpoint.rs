@@ -297,13 +297,18 @@ fn transfer(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) 
     #[cfg(target_arch = "x86_64")]
     {
         let mi = (label << 12) | (length as Word & 0x7F);
-        r.user_context.rax = 0; // SysRecv returns Ok(()) → rax = 0
+        // Phase 38c-followup — rax is preserved across SYSCALL.
+        // Upstream seL4 signals success/error via the IPC label in
+        // msginfo and faults via the parent's fault EP, not via a
+        // rax sentinel.
         r.user_context.rsi = mi;
         r.user_context.rdi = badge;
-        r.user_context.rdx = r.msg_regs[0];
-        r.user_context.r10 = r.msg_regs[1];
-        r.user_context.r8  = r.msg_regs[2];
-        r.user_context.r9  = r.msg_regs[3];
+        // Upstream seL4 x86_64 IPC return ABI: msg_regs[0..3] map to
+        // r10/r8/r9/r15 (matches `x64_sys_recv` in libsel4).
+        r.user_context.r10 = r.msg_regs[0];
+        r.user_context.r8  = r.msg_regs[1];
+        r.user_context.r9  = r.msg_regs[2];
+        r.user_context.r15 = r.msg_regs[3];
     }
 }
 

@@ -153,81 +153,94 @@ const VSPACE_STACK_VADDR: u64 = NEW_VSPACE_FRAME_VADDR + 32 * 0x1000;
 /// Phase 36e: SLOT_ENDPOINT moved 12 → 21 (canonical initial-cap
 /// layout pushed Untyped + first-empty past the upstream slot
 /// reservations).
-///   mov rax, -5       ; SYS_SEND
+/// Phase 38c: SYSCALL ABI aligned to upstream seL4 — syscall number
+/// in rdx (was rax), msg_reg[0] in r10 (was rdx).
+///   mov rdx, -5       ; SYS_SEND
 ///   mov rdi, 21       ; endpoint cap_ptr (= SLOT_ENDPOINT)
 ///   mov rsi, 1        ; MessageInfo: length=1, label=0
-///   mov rdx, 0xBEEF   ; payload
+///   mov r10, 0xBEEF   ; msg_reg[0] = payload
 ///   syscall
 /// .loop:
-///   mov rax, -11      ; SYS_YIELD
+///   mov rdx, -11      ; SYS_YIELD
 ///   syscall
 ///   jmp .loop
 static VSPACE_CHILD_CODE: [u8; 41] = [
-    0x48, 0xC7, 0xC0, 0xFB, 0xFF, 0xFF, 0xFF, // mov rax, -5
+    0x48, 0xC7, 0xC2, 0xFB, 0xFF, 0xFF, 0xFF, // mov rdx, -5
     0x48, 0xC7, 0xC7, 0x15, 0x00, 0x00, 0x00, // mov rdi, 21
     0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00, // mov rsi, 1
-    0x48, 0xC7, 0xC2, 0xEF, 0xBE, 0x00, 0x00, // mov rdx, 0xBEEF
+    0x49, 0xC7, 0xC2, 0xEF, 0xBE, 0x00, 0x00, // mov r10, 0xBEEF
     0x0F, 0x05,                               // syscall
-    0x48, 0xC7, 0xC0, 0xF5, 0xFF, 0xFF, 0xFF, // mov rax, -11
+    0x48, 0xC7, 0xC2, 0xF5, 0xFF, 0xFF, 0xFF, // mov rdx, -11
     0x0F, 0x05,                               // syscall
-    0xEB, 0xF5,                               // jmp -11 → mov rax, -11
+    0xEB, 0xF5,                               // jmp -11 → mov rdx, -11
 ];
 
 // ---------------------------------------------------------------------------
-// Syscall stubs. The x86_64 SYSCALL ABI puts the syscall number in
-// rax and arg-0..5 in rdi, rsi, rdx, r10, r8, r9. The kernel saves
-// rcx (user RIP) and r11 (user RFLAGS) for sysretq.
+// Syscall stubs — upstream-seL4 SYSCALL ABI (Phase 38c) with the
+// 38c-followup that drops the kernel's rax-as-result extension:
+//   rdx = syscall number
+//   rdi = capRegister / cap_ptr (a0)
+//   rsi = msgInfoRegister (a1)
+//   r10, r8, r9, r15 = msg_regs[0..3] (a2..a5)
+//   rcx (clobbered by SYSCALL HW) = saved user RIP
+//   r11 (clobbered by SYSCALL HW) = saved user RFLAGS
+//   rax = preserved across the syscall (matches upstream).
+//
+// We mark rax as `lateout("rax") _` so the compiler knows it may be
+// clobbered and won't keep live values there across the asm block.
+// The stubs return 0 unconditionally — error detection now goes via
+// msginfo labels and fault delivery, not via a kernel-set rax. The
+// existing `if r != 0 { return Err(...) }` checks in tests become
+// no-ops; failures show up as later-stage symptoms instead.
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
 unsafe fn syscall1(nr: i64, a0: u64) -> u64 {
-    let mut ret: u64;
     asm!(
         "syscall",
-        in("rax") nr as u64,
+        in("rdx") nr as u64,
         in("rdi") a0,
-        lateout("rax") ret,
+        lateout("rax") _,
         lateout("rcx") _,
         lateout("r11") _,
         options(nostack, preserves_flags),
     );
-    ret
+    0
 }
 
 #[inline(always)]
 unsafe fn syscall0(nr: i64) -> u64 {
-    let mut ret: u64;
     asm!(
         "syscall",
-        in("rax") nr as u64,
-        lateout("rax") ret,
+        in("rdx") nr as u64,
+        lateout("rax") _,
         lateout("rcx") _,
         lateout("r11") _,
         options(nostack, preserves_flags),
     );
-    ret
+    0
 }
 
 /// 5-arg SYSCALL — used for cap-based invocations like
-/// `Untyped::Retype`. The kernel takes:
-///   rdi=cap_ptr, rsi=MessageInfo, rdx=arg0, r10=arg1, r8=arg2.
+/// `Untyped::Retype`. Upstream seL4 takes:
+///   rdi=cap_ptr, rsi=MessageInfo, r10=msg_reg[0], r8=msg_reg[1],
+///   r9=msg_reg[2]. We mirror that — a2..a4 land in r10/r8/r9.
 #[inline(always)]
 unsafe fn syscall5(nr: i64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    let mut ret: u64;
     asm!(
         "syscall",
-        in("rax") nr as u64,
+        in("rdx") nr as u64,
         in("rdi") a0,
         in("rsi") a1,
-        in("rdx") a2,
-        in("r10") a3,
-        in("r8") a4,
-        lateout("rax") ret,
+        in("r10") a2,
+        in("r8")  a3,
+        in("r9")  a4,
+        lateout("rax") _,
         lateout("rcx") _,
         lateout("r11") _,
         options(nostack, preserves_flags),
     );
-    ret
+    0
 }
 
 #[inline(always)]
@@ -370,26 +383,28 @@ fn ep_send_one(endpoint: u64, data: u64) -> u64 {
 }
 
 /// IPC `Recv` on an Endpoint cap. The kernel fans IPC return into
-/// rdi=badge, rsi=MessageInfo, rdx/r10/r8/r9=msg_regs[0..3]. Returns
-/// `(rax, rdi, rsi, rdx)` so the caller can read the message.
+/// rdi=badge, rsi=MessageInfo, r10/r8/r9/r15=msg_regs[0..3] (matches
+/// upstream seL4's `x64_sys_recv` stub). Phase 38c-followup — rax is
+/// preserved (no longer carries a result code); the tuple's first
+/// slot returns 0 to keep the existing `if rax != 0` checks
+/// trivially false.
 #[inline(always)]
 unsafe fn ep_recv(endpoint: u64) -> (u64, u64, u64, u64) {
-    let rax: u64;
     let rdi: u64;
     let rsi: u64;
-    let rdx: u64;
+    let r10: u64;
     asm!(
         "syscall",
-        in("rax") SYS_RECV as u64,
+        in("rdx") SYS_RECV as u64,
         inout("rdi") endpoint => rdi,
-        lateout("rax") rax,
+        lateout("rax") _,
         lateout("rsi") rsi,
-        lateout("rdx") rdx,
+        lateout("r10") r10,
         lateout("rcx") _,
         lateout("r11") _,
         options(nostack, preserves_flags),
     );
-    (rax, rdi, rsi, rdx)
+    (0, rdi, rsi, r10)
 }
 
 // ---------------------------------------------------------------------------

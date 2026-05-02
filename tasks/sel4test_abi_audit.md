@@ -156,18 +156,28 @@ Upstream `seL4_RootCNodeCapSlots` (libsel4 `bootinfo_types.h`):
 
 ## Summary — current state
 
-All six audit gaps and their follow-ups are closed:
+All six audit gaps + the Phase 38 SYSCALL-ABI followups are closed:
 
 | # | Gap | Phase | Status |
 | - | --- | ----- | ------ |
-| 1 | api-master → api-mcs                | 36b      | DONE |
-| 2 | bi.schedcontrol slot region          | 36c      | DONE |
-| 3 | Reply caps via Call/Reply            | 36d      | DONE |
-| 4 | Initial-cap slot layout              | 36e+37a/b| DONE |
-| 5 | TCBConfigure full args + extraCaps   | 36f+37c  | DONE |
-| 6 | Read/WriteRegisters full register set | 36g+37d  | DONE |
+| 1 | api-master → api-mcs                  | 36b       | DONE |
+| 2 | bi.schedcontrol slot region            | 36c       | DONE |
+| 3 | Reply caps via Call/Reply              | 36d       | DONE |
+| 4 | Initial-cap slot layout                | 36e+37a/b | DONE |
+| 5 | TCBConfigure full args + extraCaps     | 36f+37c   | DONE |
+| 6 | Read/WriteRegisters full register set  | 36g+37d   | DONE |
+| 7 | x86_64 SYSCALL register convention     | 38c       | DONE |
+| 8 | rax preservation (upstream-compatible) | 38c-fu    | DONE |
 
-Next step is building **libsel4** standalone against our
-generated headers and bringing up *one* sel4test case end-to-end.
-From there each failing test surfaces one more concrete gap,
-much smaller than the audit's six.
+Phase 38b/c/d brought up libsel4 standalone end-to-end:
+
+* `vendor/libsel4-build/` — Python-codegen + `libsel4.a` build,
+  driven from a hand-written `autoconf.h`.
+* `vendor/libsel4-build/src/hello.c` — minimal C user program
+  that uses libsel4's unmodified `seL4_DebugPutChar` /
+  `seL4_Yield` stubs.
+* `--features libsel4-hello` swaps the embedded `ROOTSERVER_ELF`
+  to `hello.elf`. Boots cleanly, prints "HELLO from libsel4\n".
+
+Next step is bringing up *one* sel4test case end-to-end. From
+there each failing test surfaces one more concrete gap.

@@ -676,13 +676,16 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             #[cfg(target_arch = "x86_64")]
             {
                 let mi = (label << 12) | (length as crate::types::seL4_Word & 0x7F);
-                r.user_context.rax = 0;
+                // Phase 38c-followup — rax is preserved across
+                // SYSCALL (matches upstream). Reply success is
+                // signalled via the IPC label, not via rax.
                 r.user_context.rsi = mi;
                 r.user_context.rdi = 0;
-                r.user_context.rdx = r.msg_regs[0];
-                r.user_context.r10 = r.msg_regs[1];
-                r.user_context.r8  = r.msg_regs[2];
-                r.user_context.r9  = r.msg_regs[3];
+                // Upstream seL4 IPC return ABI: msg_regs -> r10/r8/r9/r15.
+                r.user_context.r10 = r.msg_regs[0];
+                r.user_context.r8  = r.msg_regs[1];
+                r.user_context.r9  = r.msg_regs[2];
+                r.user_context.r15 = r.msg_regs[3];
             }
         }
         debug_assert!(matches!(
@@ -1662,15 +1665,16 @@ fn decode_tcb(
                         // Phase 37d — fan the first 4 returned
                         // words into the invoker's user_context so
                         // the syscall return path delivers them
-                        // via rdx/r10/r8/r9 the way SysRecv does.
-                        // SysSend doesn't normally fan in (it's a
-                        // sender-side syscall), but ReadRegisters
-                        // is one of the few invocations that
-                        // produce a return message.
-                        if count > 0 { inv.user_context.rdx = regs[0]; }
-                        if count > 1 { inv.user_context.r10 = regs[1]; }
-                        if count > 2 { inv.user_context.r8  = regs[2]; }
-                        if count > 3 { inv.user_context.r9  = regs[3]; }
+                        // via r10/r8/r9/r15 (upstream seL4 IPC
+                        // return ABI) the way SysRecv does. SysSend
+                        // doesn't normally fan in (it's a sender-
+                        // side syscall), but ReadRegisters is one
+                        // of the few invocations that produce a
+                        // return message.
+                        if count > 0 { inv.user_context.r10 = regs[0]; }
+                        if count > 1 { inv.user_context.r8  = regs[1]; }
+                        if count > 2 { inv.user_context.r9  = regs[2]; }
+                        if count > 3 { inv.user_context.r15 = regs[3]; }
                         // Also pack the returned msginfo (length=
                         // count, label=0) into rsi so userspace
                         // can decode it with seL4_MessageInfo_get_*.

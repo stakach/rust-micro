@@ -58,6 +58,11 @@ use crate::tcb::{Tcb, ThreadStateType};
 //   eb fe                  jmp $-0
 // ---------------------------------------------------------------------------
 
+// NOTE: Phase 38c — payload uses pre-MCS syscall numbering AND the
+// old (rax-based) SYSCALL ABI. No active caller; kept as reference
+// for the early Phase 14d two-thread demo. If this is ever
+// reactivated it must be rewritten for the upstream seL4 ABI:
+// `mov rdx, -5` (SysSend MCS), msg_regs[0] in r10 not rdx, etc.
 #[rustfmt::skip]
 const SENDER_PAYLOAD: &[u8] = &[
     0x48, 0xC7, 0xC2, 0x59, 0x00, 0x00, 0x00, // mov rdx, 'Y' (msg_regs[0])
@@ -119,6 +124,9 @@ const SENDER_PAYLOAD: &[u8] = &[
 //   EB FE                  jmp $-0
 //
 // V = 0x0000_0100_0050_0000 → little-endian: 00 00 50 00 00 01 00 00.
+//
+// NOTE: Phase 38c — same caveat as SENDER_PAYLOAD: pre-MCS numbering
+// + old (rax-based) ABI. Dead code; kept for reference only.
 #[rustfmt::skip]
 const RECEIVER_PAYLOAD: &[u8] = &[
     // 1) putchar('A')
@@ -175,13 +183,16 @@ static mut RECEIVER_STACK_PAGE: UserPage = UserPage([0; 4096]);
 /// iteration ticks `smp::SYSCALL_COUNT_PER_CPU[1]` and the BSP can
 /// observe AP execution end-to-end.
 ///
+/// Phase 38c rewrote this for the upstream seL4 SYSCALL ABI:
+/// syscall number lives in `rdx` (was `rax`). MCS SysYield = -11.
+///
 /// Hand-assembled:
-///   00: 48 C7 C0 F9 FF FF FF    mov rax, -7   (SysYield)
+///   00: 48 C7 C2 F5 FF FF FF    mov rdx, -11  (SysYield, MCS)
 ///   07: 0F 05                   syscall
 ///   09: EB F5                   jmp -11       (back to byte 0)
 #[rustfmt::skip]
 const PING_PAYLOAD: &[u8] = &[
-    0x48, 0xC7, 0xC0, 0xF9, 0xFF, 0xFF, 0xFF, // mov rax, -7
+    0x48, 0xC7, 0xC2, 0xF5, 0xFF, 0xFF, 0xFF, // mov rdx, -11
     0x0F, 0x05,                               // syscall
     0xEB, 0xF5,                               // jmp -11
 ];
@@ -407,6 +418,10 @@ unsafe fn copy_payload(page_va: *const UserPage, src: &[u8]) {
 // ---------------------------------------------------------------------------
 // Phase 13c single-thread launch — kept for backward compatibility.
 // Either this or `launch_two_thread_ipc_demo` runs at boot, never both.
+//
+// NOTE: Phase 38c — payload uses pre-MCS DebugPutChar number (-9)
+// and the old (rax-based) SYSCALL ABI. No active caller; rewriting
+// would require rdx in place of rax and -12 in place of -9.
 // ---------------------------------------------------------------------------
 
 #[rustfmt::skip]

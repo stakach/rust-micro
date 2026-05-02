@@ -7,12 +7,19 @@
 //! match the SYSRET semantics; real exercise of this path lands in
 //! Phase 11c when we have a ring-3 thread to run.
 //!
-//! ABI for the stub (matches the x86_64 user-mode SYSCALL convention
-//! that seL4 itself uses):
-//!   rax = syscall number
-//!   rdi..r9 = up to six args
+//! ABI for the stub (matches upstream seL4's x86_64 user-mode SYSCALL
+//! convention — see seL4/src/arch/x86/64/traps.S `handle_fastsyscall`):
+//!   rdx = syscall number
+//!   rdi = capRegister (cap_ptr) / first arg
+//!   rsi = msgInfoRegister
+//!   r10, r8, r9, r15 = msg_regs[0..3]
 //!   rcx (clobbered by SYSCALL) = saved user RIP
 //!   r11 (clobbered by SYSCALL) = saved user RFLAGS
+//!   rax = preserved across SYSCALL (Phase 38c-followup). Upstream
+//!         libsel4 stubs don't list rax as a clobber; we honour that
+//!         so optimized libsel4-built code can keep live values in
+//!         rax across the syscall. Errors are signalled out of band
+//!         via msginfo labels and faults, not via a rax sentinel.
 
 use crate::arch::x86_64::gdt::{KERNEL_CS, USER32_CS};
 use crate::arch::x86_64::msr::*;
@@ -306,10 +313,11 @@ pub unsafe extern "C" fn syscall_entry() {
         "mov rsp, gs:[0]",
 
         // Call the Rust dispatcher. ABI:
-        //   rdi = syscall number (we put rax there)
+        //   rdi = syscall number (upstream seL4 ABI puts it in rdx;
+        //         our save area at offset 24 holds the saved rdx)
         // The dispatcher recovers its UserContext via
         // `arch::get_cpu_id()` indexing into `PER_CPU_SYSCALL`.
-        "mov rdi, gs:[16 + 0]",
+        "mov rdi, gs:[16 + 24]",
         "call {handler}",
 
         // Restore user GPRs (rcx and r11 carry the SYSRET targets).
@@ -396,19 +404,24 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
         }
     }
 
+    // Upstream seL4 x86_64 SYSCALL ABI: rdi = capRegister (a0),
+    // rsi = msgInfoRegister (a1), r10/r8/r9/r15 = msg_regs[0..3]
+    // (= a2..a5). rdx is the syscall number (consumed in the asm stub).
     let args = SyscallArgs {
         a0: ctx.rdi,
         a1: ctx.rsi,
-        a2: ctx.rdx,
-        a3: ctx.r10, // x86_64 user ABI puts a3 in r10 for SYSCALL
-        a4: ctx.r8,
-        a5: ctx.r9,
+        a2: ctx.r10,
+        a3: ctx.r8,
+        a4: ctx.r9,
+        a5: ctx.r15,
     };
     let syscall = match Syscall::from_i32(number as i32) {
         Some(s) => s,
         None => {
+            // Phase 38c-followup — rax is preserved across SYSCALL
+            // (matches upstream seL4); errors are signalled out of
+            // band (faults / IPC label), not via a rax sentinel.
             arch::log("[unknown syscall]\n");
-            ctx.rax = u64::MAX;
             return;
         }
     };
@@ -549,12 +562,12 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
                 }
             }
             // Phase 15a: fan IPC delivery state from the receiving
-            // TCB into its user-visible registers. The receiver
-            // reads:
-            //   rax = 0                   (success)
+            // TCB into its user-visible registers. Mirrors upstream
+            // seL4's IPC return ABI (`x64_sys_recv`):
+            //   rax = 0                   (success — our extension)
             //   rsi = MessageInfo (label + length packed)
             //   rdi = badge of sender's cap
-            //   rdx, r10, r8, r9 = msg_regs[0..3]
+            //   r10, r8, r9, r15 = msg_regs[0..3]
             // For non-IPC syscalls (or for the sender after its
             // SysSend completes), rax = result and the rest of
             // the user_context is left as the sender stored it.
@@ -576,32 +589,30 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
                 let mi = (tcb.ipc_label << 12) | (tcb.ipc_length as u64 & 0x7F);
                 new_ctx.rsi = mi;
                 new_ctx.rdi = tcb.ipc_badge;
-                new_ctx.rdx = tcb.msg_regs[0];
-                new_ctx.r10 = tcb.msg_regs[1];
-                new_ctx.r8 = tcb.msg_regs[2];
-                new_ctx.r9 = tcb.msg_regs[3];
+                new_ctx.r10 = tcb.msg_regs[0];
+                new_ctx.r8  = tcb.msg_regs[1];
+                new_ctx.r9  = tcb.msg_regs[2];
+                new_ctx.r15 = tcb.msg_regs[3];
             }
-            // Phase 36g — `rax` is the in-flight syscall's return
-            // value, so only stamp it onto the invoker. If we land
-            // here picking a *different* thread (e.g. a freshly
-            // dispatched child whose registers were written via
-            // TCB::WriteRegisters before resume), keep that
-            // thread's saved `rax` intact.
-            if Some(next) == invoker {
-                new_ctx.rax = match &result {
-                    Ok(()) => 0,
-                    Err(_) => u64::MAX,
-                };
-            }
+            // Phase 38c-followup — rax is preserved across SYSCALL
+            // (matches upstream seL4: their `handle_fastsyscall`
+            // saves and restores rax around `c_handle_syscall`).
+            // Errors are signalled out of band — invocations that
+            // produce return data write it to the IPC buffer + msg
+            // regs and pack the status into msginfo's label, faults
+            // go via the parent's fault EP. Keeping `rax` clobber-
+            // free is required so libsel4-built code (whose stubs
+            // don't list rax as a clobber) doesn't lose loop
+            // counters across the syscall.
+            let _ = &result;
             // Persist the user-visible regs back into the TCB so
             // the next entry sees them too (idempotent).
             s.scheduler.slab.get_mut(next).user_context = new_ctx;
             *ctx = new_ctx;
         } else {
-            ctx.rax = match result {
-                Ok(()) => 0,
-                Err(_) => u64::MAX,
-            };
+            // No next-thread to dispatch; current ctx is preserved.
+            // rax is left as the user wrote it (upstream ABI).
+            let _ = result;
         }
     }
 }
@@ -699,34 +710,40 @@ pub mod spec {
     /// in ring 3 at a kernel RIP), so we exercise the same code
     /// path one frame higher up. Identical to what the entry stub
     /// does after register save.
+    ///
+    /// Phase 38c-followup — rax is preserved across SYSCALL
+    /// (upstream ABI), so this spec asserts the dispatcher leaves
+    /// the user's rax untouched rather than stamping a result.
     #[inline(never)]
     pub fn dispatcher_emits_byte_for_sys_debug_put_char() {
-        // SysDebugPutChar = -9. ABI: rdi = arg0 (the byte).
-        // Phase 28f — the dispatcher reads its UserContext from the
-        // calling CPU's `PER_CPU_SYSCALL` slot, so we plant the
-        // synthetic context there before invoking it.
+        // SysDebugPutChar = -12 (MCS layout). ABI: rdi = arg0 (byte).
         let ctx = super::current_cpu_user_ctx_mut();
         *ctx = UserContext::default();
         ctx.rdi = b'!' as u64;
         ctx.rax = 0xDEAD_BEEF;
 
-        // Phase 36b — SysDebugPutChar moved from -9 to -12 in the
-        // MCS syscall layout.
         super::rust_syscall_dispatch(-12i64 as u64);
 
         let ctx = super::current_cpu_user_ctx_mut();
-        assert_eq!(ctx.rax, 0, "dispatcher should set rax=0 on success");
+        assert_eq!(ctx.rax, 0xDEAD_BEEF,
+                   "dispatcher must preserve user's rax (upstream ABI)");
         arch::log("  ✓ rust_syscall_dispatch handles SysDebugPutChar\n");
     }
 
+    /// Phase 38c-followup — unknown syscalls are still rejected,
+    /// but `rax` is preserved (no longer stamped with u64::MAX).
+    /// The dispatcher just logs `[unknown syscall]` and returns;
+    /// userspace would normally see this via a fault delivery to
+    /// the parent's fault EP.
     #[inline(never)]
     pub fn dispatcher_signals_unknown_via_max_rax() {
         let ctx = super::current_cpu_user_ctx_mut();
         *ctx = UserContext::default();
-        ctx.rax = 0;
+        ctx.rax = 0xFEED_CAFE;
         super::rust_syscall_dispatch(99u64);
         let ctx = super::current_cpu_user_ctx_mut();
-        assert_eq!(ctx.rax, u64::MAX, "unknown syscall returns -1");
+        assert_eq!(ctx.rax, 0xFEED_CAFE,
+                   "kernel preserves rax even on unknown-syscall exit");
         arch::log("  ✓ rust_syscall_dispatch flags unknown syscalls\n");
     }
 }
