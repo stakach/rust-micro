@@ -219,7 +219,13 @@ extern "C" fn handle_page_fault_typed(
         fsr: error_code,
         instruction: (error_code & (1 << 4)) != 0,
     };
-    crate::arch::log("[user #PF: delivering to fault EP]\n");
+    crate::arch::log("[user #PF: cr2=0x");
+    log_hex64(cr2);
+    crate::arch::log(" err=0x");
+    log_hex64(error_code);
+    crate::arch::log(" rip=0x");
+    log_hex64(saved_rip);
+    crate::arch::log("]\n");
     if crate::fault::deliver_fault(faulter, fault).is_err() {
         crate::arch::log("[no fault handler — suspending thread]\n");
         unsafe {

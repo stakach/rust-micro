@@ -135,6 +135,7 @@ if [ ! -f CMakeCache.txt ]; then
   ../init-build.sh \
     -DPLATFORM=x86_64 \
     -DSIMULATION=ON \
+    -DMCS=ON \
     -DKernelIsMCS=ON \
     -DKernelMaxNumNodes=4 \
     -DKernelPrinting=ON \

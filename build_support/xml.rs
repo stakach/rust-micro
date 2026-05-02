@@ -38,7 +38,11 @@ pub fn default_config() -> HashMap<&'static str, bool> {
         ("CONFIG_IOMMU", false),
         ("CONFIG_ENABLE_BENCHMARKS", false),
         ("CONFIG_BENCHMARK_TRACK_UTILISATION", false),
-        ("CONFIG_DEBUG_BUILD", false),
+        // Phase 41 — sel4test-driver issues SysDebugHalt /
+        // SysDebugCapIdentify / SysDebugNameThread during init.
+        // Enable in the codegen so the Syscall enum recognises
+        // them; handlers stub them as no-ops in syscall_handler.rs.
+        ("CONFIG_DEBUG_BUILD", true),
         ("CONFIG_DANGEROUS_CODE_INJECTION", false),
         // Phase 41 — sel4test-driver's startup writes IA32_FS_BASE
         // (and friends) directly via this syscall rather than

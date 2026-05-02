@@ -122,6 +122,37 @@ pub fn handle_syscall(
             let n = syscall as i32 as i64;
             handle_unknown_syscall(n, args, sink)
         }
+        // Phase 41 — debug syscalls sel4test-driver issues during
+        // init. Stubbed as no-ops (SysDebugCapIdentify returns 0
+        // = CapNull). They're CONFIG_DEBUG_BUILD-only and not
+        // load-bearing; full implementations are follow-ups.
+        Syscall::SysDebugHalt => {
+            crate::arch::log("[sel4test SysDebugHalt — exiting QEMU]\n");
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::qemu_exit(0);
+            #[cfg(not(target_arch = "x86_64"))]
+            Ok(())
+        }
+        Syscall::SysDebugCapIdentify => {
+            // Stub: return CapNull (0) via msg_regs[0]/r10.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use crate::kernel::KERNEL;
+                if let Some(cur) = KERNEL.get().scheduler.current() {
+                    let t = KERNEL.get().scheduler.slab.get_mut(cur);
+                    t.msg_regs[0] = 0;
+                    t.ipc_length = 1;
+                }
+            }
+            Ok(())
+        }
+        Syscall::SysDebugSnapshot
+        | Syscall::SysDebugNameThread
+        | Syscall::SysDebugSendIPI => {
+            // Best-effort no-ops. Names would print to serial; we
+            // skip for now.
+            Ok(())
+        }
         Syscall::SysSetTLSBase => {
             // Phase 41 — set IA32_FS_BASE for the current thread.
             // sel4test-driver's musllibc uses this to anchor TLS at
