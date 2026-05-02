@@ -36,6 +36,8 @@ const CASES: &[TestCase] = &[
                body: tests::child_cap_transfer_round_trip },
     TestCase { name: "reply_cap_round_trip",
                body: tests::reply_cap_round_trip },
+    TestCase { name: "tcb_write_registers_full",
+               body: tests::tcb_write_registers_full },
 ];
 
 /// Entry point invoked from `_start` when `--features microtest`
@@ -181,6 +183,91 @@ mod tests {
             let (rax, _badge, _info, payload) = ep_recv(ep);
             if rax != 0 { return Err("recv failed"); }
             if payload != 0xCAFE_F00D { return Err("wrong payload"); }
+        }
+        Ok(())
+    }
+
+    /// Phase 36g — write the full upstream-shape register set on
+    /// a fresh TCB and verify each register landed where it
+    /// should. The parent retypes a TCB, configures CSpace +
+    /// VSpace via SetSpace, then issues `TCB::WriteRegisters`
+    /// with `msginfo.length = 3 + count`, count=4 (rip, rsp,
+    /// rflags, rax). The child reads its own `rax` register and
+    /// sends it back via IPC; the parent verifies the value.
+    pub(super) fn tcb_write_registers_full() -> TestResult {
+        unsafe {
+            let ep = make_endpoint()?;
+            WRITE_REGS_EP_SLOT.store(ep, AtomicOrdering::Relaxed);
+
+            let tcb_slot = alloc_slot();
+            let r = untyped_retype(
+                CAP_INIT_UNTYPED, OBJ_TCB, /* size_bits */ 0,
+                /* num_objects */ 1, tcb_slot);
+            if r != 0 { return Err("retype tcb"); }
+            let r = tcb_set_space(tcb_slot, /* fault_ep */ 0,
+                CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
+            if r != 0 { return Err("setspace"); }
+            let r = tcb_set_priority(tcb_slot, 100);
+            if r != 0 { return Err("setprio"); }
+
+            // Stage the register values into our IPC buffer at
+            // msg[3..3+count] so the staging in handle_send picks
+            // them up and the kernel reads them via msg_regs[3..].
+            let stack_top = (&raw mut WRITE_REGS_STACK as u64) + 4096 - 8;
+            const RAX_PAYLOAD: u64 = 0x1234_5678_9ABC_DEF0;
+            // rip, rsp, rflags, rax — first 4 fields of seL4_UserContext.
+            // We need only up to index 3 (rax) to land; rcx (slot 5)
+            // is our iretq RIP slot and the kernel skips it. Slot 4
+            // (rbx) is unused here.
+            let regs: [u64; 4] = [
+                microtest_write_regs_child as u64,  // rip
+                stack_top,                          // rsp
+                0x202,                              // rflags (IF=1)
+                RAX_PAYLOAD,                        // rax
+            ];
+            // Stage into our IPC buffer at msg[3..3+4]. msg[i] is
+            // at IPC-buffer u64 offset (1 + i).
+            const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
+            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+            for (i, &v) in regs.iter().enumerate() {
+                core::ptr::write_volatile(buf.add(1 + 3 + i), v);
+            }
+
+            // SysSend to the TCB cap. The standard `syscall5`
+            // helper only stages 5 user args (rdi..r8), so we
+            // open-code an asm! to also fill r9 (= args.a5).
+            //   a2 = resume_target = 1
+            //   a3 = arch_flags    = 0
+            //   a4 = count         = 4
+            //   a5 = msg_regs[3]   = rip (the first reg value)
+            //   msginfo.length = 3 + count = 7 — kernel handler
+            //   routes into the upstream-shape WriteRegisters
+            //   branch.
+            let length: u64 = 3 + regs.len() as u64;
+            let label_writeregs: u64 = 3; // TCBWriteRegisters
+            let msg_info = (label_writeregs << 12) | (length & 0x7F);
+            let mut rax_out: u64 = SYS_SEND as u64;
+            core::arch::asm!(
+                "syscall",
+                inout("rax") rax_out,
+                inout("rdi") tcb_slot => _,
+                inout("rsi") msg_info => _,
+                inout("rdx") /* a2 */ 1u64 => _,
+                inout("r10") /* a3 */ 0u64 => _,
+                inout("r8")  /* a4 */ regs.len() as u64 => _,
+                inout("r9")  /* a5 */ regs[0] => _,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+            if rax_out != 0 { return Err("WriteRegisters"); }
+
+            // Receive the child's IPC: payload should equal RAX_PAYLOAD.
+            let (rax, _badge, _info, payload) = ep_recv(ep);
+            if rax != 0 { return Err("ep_recv"); }
+            if payload != RAX_PAYLOAD {
+                return Err("rax did not match");
+            }
         }
         Ok(())
     }
@@ -417,9 +504,11 @@ struct ChildStack([u8; 4096]);
 static mut CHILD_SEND_STACK: ChildStack = ChildStack([0; 4096]);
 static mut CHILD_CAP_TRANSFER_STACK: ChildStack = ChildStack([0; 4096]);
 static mut REPLY_CAP_SERVER_STACK: ChildStack = ChildStack([0; 4096]);
+static mut WRITE_REGS_STACK: ChildStack = ChildStack([0; 4096]);
 
 static REPLY_CAP_EP_SLOT: AtomicU64 = AtomicU64::new(0);
 static REPLY_CAP_REPLY_SLOT: AtomicU64 = AtomicU64::new(0);
+static WRITE_REGS_EP_SLOT: AtomicU64 = AtomicU64::new(0);
 
 /// Per-test endpoint slot, written by the parent before spawn so
 /// the child can pick it up in its entry routine. The child
@@ -473,6 +562,29 @@ unsafe extern "C" fn microtest_reply_server() -> ! {
     // Send reply: target = the reply cap, length=1, payload+1.
     let _ = syscall5(SYS_SEND, reply, /* length */ 1,
                      payload.wrapping_add(1), 0, 0);
+    loop { syscall0(SYS_YIELD); }
+}
+
+/// Phase 36g — child for `tcb_write_registers_full`. The parent
+/// sets THIS function's registers via the upstream-shape
+/// WriteRegisters: rip, rsp, rflags, rax (msg payload), and
+/// other GPRs. The child sends `rax` over the configured endpoint
+/// so the parent can verify all the regs landed correctly.
+#[no_mangle]
+#[link_section = ".text.microtest_write_regs_child"]
+unsafe extern "C" fn microtest_write_regs_child() -> ! {
+    // Snapshot rax FIRST — Rust's atomic load + the function's
+    // standard prologue can both touch rax and would clobber the
+    // value WriteRegisters staged. The asm! captures rax into a
+    // u64 with no Rust code in between.
+    let rax_value: u64;
+    core::arch::asm!(
+        "mov {}, rax",
+        out(reg) rax_value,
+        options(nostack, preserves_flags),
+    );
+    let ep = WRITE_REGS_EP_SLOT.load(AtomicOrdering::Relaxed);
+    let _ = syscall5(SYS_SEND, ep, /* length */ 1, rax_value, 0, 0);
     loop { syscall0(SYS_YIELD); }
 }
 

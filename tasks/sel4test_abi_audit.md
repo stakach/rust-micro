@@ -138,7 +138,7 @@ Upstream `seL4_RootCNodeCapSlots` (libsel4 `bootinfo_types.h`):
 | --- | --- | --- | --- |
 | Configure | sets fault_ep + cspace + cspace_data + vspace + vspace_data + ipc_buffer + ipc_buffer_frame + priority + mcp | sets fault_ep + cspace + vspace + priority + mcp | **DIFF** (cspace_data / vspace_data / ipc_buffer / ipc_buffer_frame missing). Phase 36f moved msg + extraCaps staging in `handle_send` to before the cap-type match, so adding these fields to `decode_tcb`'s TCBConfigure handler is now mechanical (read msg_regs[3..] + pending_extra_caps[]). Left as a follow-up because none of microtest's current cases need it. |
 | SetIPCBuffer | vaddr + frame_cap | vaddr + frame_cap | **MATCH** (Phase 34c) |
-| WriteRegisters / ReadRegisters | full register set | rip + rsp + arg0 only | **GAP** (sel4test register tests would fail) |
+| WriteRegisters / ReadRegisters | full register set | rip + rsp + arg0 + (Phase 36g) full upstream `seL4_UserContext` write path when `msginfo.length > 0` (resume_target/arch_flags/count + first-18-of-20 register fields). Legacy 3-arg form retained for back-compat. ReadRegisters is still rip + rsp + rax-only — sel4test cases that *read* full register sets would fail; counted as a smaller follow-up. | **MOSTLY MATCH** |
 | BindNotification / Unbind | works | works | **MATCH** |
 
 ## IPC features

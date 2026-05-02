@@ -581,10 +581,18 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
                 new_ctx.r8 = tcb.msg_regs[2];
                 new_ctx.r9 = tcb.msg_regs[3];
             }
-            new_ctx.rax = match &result {
-                Ok(()) => 0,
-                Err(_) => u64::MAX,
-            };
+            // Phase 36g — `rax` is the in-flight syscall's return
+            // value, so only stamp it onto the invoker. If we land
+            // here picking a *different* thread (e.g. a freshly
+            // dispatched child whose registers were written via
+            // TCB::WriteRegisters before resume), keep that
+            // thread's saved `rax` intact.
+            if Some(next) == invoker {
+                new_ctx.rax = match &result {
+                    Ok(()) => 0,
+                    Err(_) => u64::MAX,
+                };
+            }
             // Persist the user-visible regs back into the TCB so
             // the next entry sees them too (idempotent).
             s.scheduler.slab.get_mut(next).user_context = new_ctx;

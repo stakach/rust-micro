@@ -1463,15 +1463,85 @@ fn decode_tcb(
                 Ok(())
             }
             InvocationLabel::TCBWriteRegisters => {
-                // a2 = rip, a3 = rsp, a4 = arg0 (rdi).
-                let t = s.scheduler.slab.get_mut(id);
+                // Two ABI shapes coexist:
+                //   * Legacy (msginfo.length == 0):
+                //       a2 = rip, a3 = rsp, a4 = arg0 (rdi).
+                //   * Phase 36g — upstream `seL4_TCB_WriteRegisters`
+                //     (msginfo.length > 0):
+                //       a2 = resume_target (bool, ignored)
+                //       a3 = arch_flags    (ignored)
+                //       a4 = count
+                //       msg_regs[3..3+count] = register values in
+                //       seL4_UserContext order: rip, rsp, rflags,
+                //       rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9,
+                //       r10, r11, r12, r13, r14, r15, fs_base,
+                //       gs_base. We honour the first 18 (skipping
+                //       fs/gs base — not modelled).
                 #[cfg(target_arch = "x86_64")]
                 {
-                    t.user_context.rcx = args.a2;
-                    t.user_context.rsp = args.a3;
-                    t.user_context.rdi = args.a4;
-                    // Default user RFLAGS — IF=1, bit 1 reserved=1.
-                    t.user_context.r11 = 0x202;
+                    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                    let length = info.length();
+                    if length == 0 {
+                        let t = s.scheduler.slab.get_mut(id);
+                        t.user_context.rcx = args.a2;
+                        t.user_context.rsp = args.a3;
+                        t.user_context.rdi = args.a4;
+                        t.user_context.r11 = 0x202;
+                    } else {
+                        let count = args.a4 as usize;
+                        let inv = s.scheduler.slab.get(invoker);
+                        // Snapshot the staged registers so we can
+                        // mutably borrow the target TCB next.
+                        let mut regs: [u64; 20] = [0; 20];
+                        for i in 0..count.min(18) {
+                            // Wire layout: register values start at
+                            // msg word index 3 (after resume_target,
+                            // arch_flags, count). msg_regs holds
+                            // the first SCRATCH_MSG_LEN words; in
+                            // our layout msg_regs[3] = a5 = first
+                            // register value.
+                            let idx = 3 + i;
+                            if idx < inv.msg_regs.len() {
+                                regs[i] = inv.msg_regs[idx];
+                            } else if inv.ipc_buffer_paddr != 0 {
+                                let buf = (inv.ipc_buffer_paddr as *const u64)
+                                    .wrapping_add(1);
+                                regs[i] = core::ptr::read_volatile(buf.add(idx));
+                            }
+                        }
+                        let t = s.scheduler.slab.get_mut(id);
+                        let n = count;
+                        if n > 0  { t.user_context.rcx = regs[0]; }   // rip
+                        if n > 1  { t.user_context.rsp = regs[1]; }
+                        if n > 2  { t.user_context.r11 = regs[2]; }   // rflags
+                        if n > 3  { t.user_context.rax = regs[3]; }
+                        if n > 4  { t.user_context.rbx = regs[4]; }
+                        // Slot 5 is "rcx" in the upstream userctx,
+                        // but we already use TCB.user_context.rcx
+                        // as the iretq RIP slot. The real rcx is
+                        // unused at sysretq (= caller RIP); skip.
+                        if n > 6  { t.user_context.rdx = regs[6]; }
+                        if n > 7  { t.user_context.rsi = regs[7]; }
+                        if n > 8  { t.user_context.rdi = regs[8]; }
+                        if n > 9  { t.user_context.rbp = regs[9]; }
+                        if n > 10 { t.user_context.r8  = regs[10]; }
+                        if n > 11 { t.user_context.r9  = regs[11]; }
+                        if n > 12 { t.user_context.r10 = regs[12]; }
+                        // Slot 13 is "r11" in upstream — same slot
+                        // as our rflags; would clobber if we wrote
+                        // it. Skip.
+                        if n > 14 { t.user_context.r12 = regs[14]; }
+                        if n > 15 { t.user_context.r13 = regs[15]; }
+                        if n > 16 { t.user_context.r14 = regs[16]; }
+                        if n > 17 { t.user_context.r15 = regs[17]; }
+                        // fs_base / gs_base (slots 18, 19) ignored.
+                        // resume_target (args.a2) — sel4test sets
+                        // this when it wants the target started in
+                        // one shot. Honour it.
+                        if args.a2 != 0 {
+                            s.scheduler.make_runnable(id);
+                        }
+                    }
                 }
                 Ok(())
             }
