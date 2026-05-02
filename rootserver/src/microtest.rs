@@ -34,6 +34,8 @@ const CASES: &[TestCase] = &[
     TestCase { name: "child_send_round_trip", body: tests::child_send_round_trip },
     TestCase { name: "child_cap_transfer_round_trip",
                body: tests::child_cap_transfer_round_trip },
+    TestCase { name: "reply_cap_round_trip",
+               body: tests::reply_cap_round_trip },
 ];
 
 /// Entry point invoked from `_start` when `--features microtest`
@@ -179,6 +181,66 @@ mod tests {
             let (rax, _badge, _info, payload) = ep_recv(ep);
             if rax != 0 { return Err("recv failed"); }
             if payload != 0xCAFE_F00D { return Err("wrong payload"); }
+        }
+        Ok(())
+    }
+
+    /// Phase 36d — Reply caps wired through Call/Reply. Server
+    /// child Recv's on an endpoint with a Reply cap registered
+    /// in `args.a2`. The parent does a SysCall carrying 0xCAFE.
+    /// The kernel pairs them up, binds the Reply object to the
+    /// parent, and wakes the server. The server replies via
+    /// `Send` on the Reply cap with payload = 0xCAFE + 1; the
+    /// kernel routes that into `decode_reply`, which wakes the
+    /// parent with rdx = 0xCAFF.
+    pub(super) fn reply_cap_round_trip() -> TestResult {
+        unsafe {
+            // Retype an Endpoint and a Reply object.
+            let ep = make_endpoint()?;
+            let reply_slot = alloc_slot();
+            let r = untyped_retype(
+                CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, reply_slot);
+            if r != 0 { return Err("retype reply"); }
+
+            REPLY_CAP_EP_SLOT.store(ep, AtomicOrdering::Relaxed);
+            REPLY_CAP_REPLY_SLOT.store(reply_slot, AtomicOrdering::Relaxed);
+
+            // Spawn the server.
+            let stack_top = (&raw mut REPLY_CAP_SERVER_STACK as u64)
+                + 4096 - 8;
+            let _slot = spawn_child(microtest_reply_server, stack_top)?;
+
+            // Yield once so the server has a chance to issue Recv
+            // before our Call lands. Without this our Call could
+            // be queued (sender-blocks-then-receiver-arrives
+            // path), which exercises a different code path —
+            // valid but more involved to reason about for a smoke
+            // test.
+            syscall0(SYS_YIELD);
+
+            // SysCall(ep, length=1, payload=0xCAFE). Same clobber
+            // story as the server's Recv asm above — every reg
+            // SYSCALL or the kernel's reply transfer might touch
+            // needs lateout, otherwise Rust silently keeps live
+            // values in those registers and we read garbage back.
+            let mut payload_io: u64 = 0xCAFE;
+            core::arch::asm!(
+                "syscall",
+                inout("rax") SYS_CALL as u64 => _,
+                inout("rdi") ep => _,
+                inout("rsi") /* length=1 */ 1u64 => _,
+                inout("rdx") payload_io,
+                lateout("r8")  _,
+                lateout("r9")  _,
+                lateout("r10") _,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack, preserves_flags),
+            );
+            let reply_payload = payload_io;
+            if reply_payload != 0xCAFE + 1 {
+                return Err("reply payload mismatch");
+            }
         }
         Ok(())
     }
@@ -354,6 +416,10 @@ mod tests {
 struct ChildStack([u8; 4096]);
 static mut CHILD_SEND_STACK: ChildStack = ChildStack([0; 4096]);
 static mut CHILD_CAP_TRANSFER_STACK: ChildStack = ChildStack([0; 4096]);
+static mut REPLY_CAP_SERVER_STACK: ChildStack = ChildStack([0; 4096]);
+
+static REPLY_CAP_EP_SLOT: AtomicU64 = AtomicU64::new(0);
+static REPLY_CAP_REPLY_SLOT: AtomicU64 = AtomicU64::new(0);
 
 /// Per-test endpoint slot, written by the parent before spawn so
 /// the child can pick it up in its entry routine. The child
@@ -369,6 +435,44 @@ unsafe extern "C" fn microtest_send_child() -> ! {
     let ep = CHILD_SEND_EP_SLOT.load(AtomicOrdering::Relaxed);
     // SysSend(ep, msg_info=length=1, payload=0xCAFEF00D).
     let _ = syscall5(SYS_SEND, ep, /* length */ 1, 0xCAFE_F00D, 0, 0);
+    loop { syscall0(SYS_YIELD); }
+}
+
+/// Phase 36d server thread: Recv on the endpoint with a Reply
+/// cap registered (via SysRecv arg a2). When a Call arrives,
+/// reply with payload = received_payload + 1 via Send-on-
+/// Cap::Reply. The kernel routes Send to `decode_reply` because
+/// the target cap is a `Cap::Reply`.
+#[no_mangle]
+#[link_section = ".text.microtest_reply_server"]
+unsafe extern "C" fn microtest_reply_server() -> ! {
+    let ep = REPLY_CAP_EP_SLOT.load(AtomicOrdering::Relaxed);
+    let reply = REPLY_CAP_REPLY_SLOT.load(AtomicOrdering::Relaxed);
+    // SysRecv with reply cptr in rdx (= args.a2). The kernel sets
+    // rdx on return to msg_regs[0], so we read the payload back
+    // through the inout. SYSCALL clobbers rcx + r11; the kernel's
+    // IPC delivery also rewrites rax/rsi/rdi/rdx/r10/r8/r9 with
+    // the received message, so they all need lateout — without
+    // it Rust may keep live values in those registers across
+    // the syscall.
+    let mut rdx_io: u64 = reply;
+    core::arch::asm!(
+        "syscall",
+        inout("rax") SYS_RECV as u64 => _,
+        in("rdi") ep,
+        inout("rdx") rdx_io,
+        lateout("rsi") _,
+        lateout("r8")  _,
+        lateout("r9")  _,
+        lateout("r10") _,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack, preserves_flags),
+    );
+    let payload = rdx_io;
+    // Send reply: target = the reply cap, length=1, payload+1.
+    let _ = syscall5(SYS_SEND, reply, /* length */ 1,
+                     payload.wrapping_add(1), 0, 0);
     loop { syscall0(SYS_YIELD); }
 }
 
@@ -392,6 +496,8 @@ const LBL_TCB_CONFIGURE: u64 = 5;
 const LBL_TCB_SET_IPC_BUFFER: u64 = 10;
 const LBL_CNODE_COPY: u64 = 21;
 const SYS_NB_SEND: i64 = -6;
+const SYS_RECV: i64 = -7;
+const SYS_CALL: i64 = -1;
 /// `seL4_ObjectType::Reply` numeric tag (mirrors `object_type.rs`).
 const OBJ_REPLY: u64 = 6;
 /// Bit position of `extraCaps` in `seL4_MessageInfo` (sits just above

@@ -147,7 +147,7 @@ thread, and surface SchedControl caps via the (still-to-add)
 | --- | --- | --- | --- |
 | Long messages (`length > 4`) via IPC buffer | ✓ | ✓ (Phase 34c) | **MATCH** |
 | Cap transfer via `extraCaps` | ✓ | ✓ (Phase 34d) | **MATCH** |
-| Reply caps via `Cap::Reply` | ✓ — caller doesn't pre-allocate; receiver issues `Recv` with a designated reply slot | partial — Reply object pool + retype works (34e), but reply IPC still routes through `Tcb.reply_to: Option<TcbId>` | **GAP** (the 34e follow-up) |
+| Reply caps via `Cap::Reply` | ✓ — caller doesn't pre-allocate; receiver issues `Recv` with a designated reply slot | ~~GAP~~ → FIXED in 36d. `Recv(ep, ?, replyCap)` registers `Tcb.pending_reply`; Call binds `Reply.bound_tcb` to caller; Send-on-Cap::Reply walks the binding to wake the caller. Legacy `Tcb.reply_to` stash kept as a fallback for kernel specs. | **MATCH** |
 | Wait / NBWait (notification-only Recv) | ✓ | **MISSING** | **GAP** |
 | NBSendRecv / NBSendWait | ✓ | **MISSING** | **GAP** |
 

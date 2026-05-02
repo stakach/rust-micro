@@ -218,6 +218,15 @@ pub struct Tcb {
     /// the receiver named in `receiveIndex`.
     pub pending_extra_caps: [crate::cap::Cap; 3],
     pub pending_extra_caps_count: u8,
+    /// Phase 36d — reply slot the thread offered when it issued
+    /// `Recv` (or `Wait`) and is happy to receive Call IPCs. The
+    /// pool index points at a `Reply` object that the kernel will
+    /// bind to the caller when a Call lands on this thread. The
+    /// caller then wakes via Send-on-Cap::Reply, which uses the
+    /// bound TCB to find them. `None` means "I'm a passive
+    /// receiver — no Reply available; fall back to the legacy
+    /// `reply_to` stash". Cleared once a Call binds the Reply.
+    pub pending_reply: Option<u16>,
 }
 
 impl Default for Tcb {
@@ -252,6 +261,7 @@ impl Default for Tcb {
             active_sc: None,
             pending_extra_caps: [crate::cap::Cap::Null; 3],
             pending_extra_caps_count: 0,
+            pending_reply: None,
         }
     }
 }

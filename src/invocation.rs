@@ -54,6 +54,7 @@ pub fn decode_invocation(
         Cap::AsidPool { .. } => decode_asid_pool(target, label, args, invoker),
         Cap::SchedContext { .. } => decode_sched_context(target, label, args, invoker),
         Cap::SchedControl { .. } => decode_sched_control(label, args, invoker),
+        Cap::Reply { .. } => decode_reply(target, args, invoker),
         Cap::Null => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidCapability,
         ))),
@@ -599,6 +600,106 @@ fn decode_asid_pool(
 /// proper per-pool free-bitmap living in the AsidPool storage page.
 static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(1);
+
+// ---------------------------------------------------------------------------
+// Phase 36d — Reply cap invocations. Send on a Cap::Reply wakes
+// the TCB the kernel bound to it during the originating Call. The
+// reply message rides in args.a2..a5 (and the IPC buffer for
+// length > 4). Mirrors seL4 MCS's `seL4_Send(replyCap, msginfo)`.
+// ---------------------------------------------------------------------------
+
+fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    let reply_ptr = match target {
+        Cap::Reply { ptr, .. } => ptr,
+        _ => unreachable!(),
+    };
+    unsafe {
+        let s = KERNEL.get();
+        let idx = KernelState::reply_index(reply_ptr);
+        let caller = match s.replies[idx].bound_tcb {
+            Some(c) => c,
+            None => return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability))),
+        };
+        // Stage the reply message on the invoker so the existing
+        // transfer machinery (used by handle_reply too) sees the
+        // right msg_regs. Then route through `do_reply_transfer`.
+        let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+        {
+            let me = s.scheduler.slab.get_mut(invoker);
+            me.ipc_label = info.label();
+            me.ipc_length = info.length() as u32;
+            me.msg_regs[0] = args.a2;
+            me.msg_regs[1] = args.a3;
+            me.msg_regs[2] = args.a4;
+            me.msg_regs[3] = args.a5;
+        }
+        // Read words 4..length from the invoker's IPC buffer if
+        // the message is longer than the register fast-path.
+        {
+            let me = s.scheduler.slab.get_mut(invoker);
+            let length = me.ipc_length as usize;
+            if length > 4 && me.ipc_buffer_paddr != 0 {
+                let buf = (me.ipc_buffer_paddr as *const u64).wrapping_add(1);
+                let max = length.min(me.msg_regs.len());
+                for i in 4..max {
+                    me.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
+                }
+            }
+        }
+        // Transfer payload caller-ward and wake them.
+        let (label, length, regs) = {
+            let me = s.scheduler.slab.get(invoker);
+            (me.ipc_label, me.ipc_length, me.msg_regs)
+        };
+        {
+            let r = s.scheduler.slab.get_mut(caller);
+            r.ipc_label = label;
+            r.ipc_length = length;
+            r.ipc_badge = 0;
+            let n = (length as usize).min(r.msg_regs.len());
+            r.msg_regs[..n].copy_from_slice(&regs[..n]);
+            // Mirror words 4..length into the caller's IPC buffer.
+            if length > 4 && r.ipc_buffer_paddr != 0 {
+                let buf = (r.ipc_buffer_paddr as *mut u64).wrapping_add(1);
+                let max = (length as usize).min(regs.len());
+                for i in 4..max {
+                    core::ptr::write_volatile(buf.add(i), regs[i]);
+                }
+            }
+            // Fan the reply into the caller's saved user_context
+            // so its blocked SysCall returns with the right
+            // register values. Mirrors the receive-side fan-in
+            // that `endpoint::transfer` does for SysRecv.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mi = (label << 12) | (length as crate::types::seL4_Word & 0x7F);
+                r.user_context.rax = 0;
+                r.user_context.rsi = mi;
+                r.user_context.rdi = 0;
+                r.user_context.rdx = r.msg_regs[0];
+                r.user_context.r10 = r.msg_regs[1];
+                r.user_context.r8  = r.msg_regs[2];
+                r.user_context.r9  = r.msg_regs[3];
+            }
+        }
+        debug_assert!(matches!(
+            s.scheduler.slab.get(caller).state,
+            crate::tcb::ThreadStateType::BlockedOnReply
+        ));
+        // Phase 33c — return the donated SC.
+        s.scheduler.slab.get_mut(invoker).active_sc = None;
+        s.scheduler.make_runnable(caller);
+        // Clear the reply binding — the slot is reusable for the
+        // next Call once the receiver Recv's on the same Reply
+        // cap (or a different one).
+        s.replies[idx].bound_tcb = None;
+        // Also clear the legacy stash so a stale `reply_to`
+        // doesn't double-wake.
+        s.scheduler.slab.get_mut(invoker).reply_to = None;
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Phase 32c — SchedContext invocations.

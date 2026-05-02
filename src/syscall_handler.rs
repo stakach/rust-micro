@@ -359,6 +359,22 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         })?;
         let cspace_root = s.scheduler.slab.get(current).cspace_root;
         let target = lookup_cap(s, &cspace_root, args.a0)?;
+        // Phase 36d — if the receiver passed a Reply cap cptr in
+        // `args.a2`, register the Reply object so any incoming
+        // Call binds it to the caller. This is how seL4 MCS
+        // models `seL4_Recv(ep, &sender, replyCap)`. cptr 0 means
+        // "no reply" — we fall back to the legacy Tcb.reply_to
+        // path that handle_reply / SysReplyRecv still consult.
+        if args.a2 != 0 {
+            if let Ok(Cap::Reply { ptr, .. }) =
+                lookup_cap(s, &cspace_root, args.a2)
+            {
+                let reply_idx =
+                    crate::kernel::KernelState::reply_index(ptr) as u16;
+                s.scheduler.slab.get_mut(current).pending_reply =
+                    Some(reply_idx);
+            }
+        }
         let ep_ptr = match target {
             Cap::Endpoint { ptr, rights, .. } => {
                 if !rights.can_receive {

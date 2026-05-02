@@ -178,6 +178,21 @@ pub fn send_ipc(
                 if donated.is_some() {
                     sched.slab.get_mut(receiver).active_sc = donated;
                 }
+                // Phase 36d — if the receiver registered a Reply
+                // slot via `Recv(ep, reply=cptr)`, bind that Reply
+                // object to the caller. Send-on-Cap::Reply later
+                // looks up `bound_tcb` to wake the caller. The
+                // legacy `reply_to` path stays in place for
+                // backward compat with kernel specs that don't
+                // wire a Reply cap.
+                if let Some(reply_idx) =
+                    sched.slab.get_mut(receiver).pending_reply.take()
+                {
+                    unsafe {
+                        let s = crate::kernel::KERNEL.get();
+                        s.replies[reply_idx as usize].bound_tcb = Some(sender);
+                    }
+                }
             }
             sched.make_runnable(receiver);
             if queue_is_empty(ep) {
