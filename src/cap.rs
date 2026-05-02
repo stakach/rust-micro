@@ -216,17 +216,25 @@ pub enum FrameRights {
 
 impl FrameRights {
     pub const fn to_word(self) -> u64 {
+        // seL4_CapRights_t bits: 0 = can_write, 1 = can_read,
+        // 2 = can_grant, 3 = can_grant_reply.
         match self {
             Self::KernelOnly => 0,
-            Self::ReadOnly => 1,
-            Self::ReadWrite => 3,
+            Self::ReadOnly => 0b010,
+            Self::ReadWrite => 0b011,
         }
     }
     pub const fn from_word(w: u64) -> Self {
-        match w {
-            1 => Self::ReadOnly,
-            3 => Self::ReadWrite,
-            _ => Self::KernelOnly,
+        let can_write = (w & 0b001) != 0;
+        let can_read  = (w & 0b010) != 0;
+        if can_write {
+            // Write implies read in our model — there's no WriteOnly
+            // FrameRights variant.
+            Self::ReadWrite
+        } else if can_read {
+            Self::ReadOnly
+        } else {
+            Self::KernelOnly
         }
     }
 }

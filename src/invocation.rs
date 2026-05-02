@@ -160,25 +160,22 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             if let Err(missing) = usermode::map_user_4k_into_foreign_pml4(
                 pml4_paddr, vaddr, paddr, writable)
             {
-                // map_user_4k_into_foreign_pml4 returns 1..4 for missing
-                // PML4/PDPT/PD/PT entries respectively. Map to the
-                // bit-position constants seL4_MappingFailedLookupLevel()
-                // expects in IPC buffer word 2 (mr2):
-                //   PML4 missing → can't happen for canonical user
-                //                  vaddrs in our setup; we'd surface
-                //                  it as PDPT-level missing (39).
-                //   PDPT missing → SEL4_MAPPING_LOOKUP_NO_PDPT = 39
-                //   PD missing   → SEL4_MAPPING_LOOKUP_NO_PD   = 30
-                //   PT missing   → SEL4_MAPPING_LOOKUP_NO_PT   = 21
-                //   leaf busy    → DeleteFirst, no lookup level.
+                // map_user_4k_into_foreign_pml4 returns 1..4 for the
+                // *level whose entry is empty*. The next-higher
+                // table needs to be allocated + installed. Translate
+                // to seL4_MappingFailedLookupLevel() bit-positions:
+                //   missing=1 (PML4 entry empty)  → need PDPT (39)
+                //   missing=2 (PDPT entry empty)  → need PD   (30)
+                //   missing=3 (PD entry empty)    → need PT   (21)
+                //   missing=4 (PT slot busy)      → DeleteFirst.
                 if missing == 4 {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_DeleteFirst)));
                 }
                 let level: u64 = match missing {
-                    1 | 2 => 39, // PML4 or PDPT missing
-                    3     => 30, // PD missing
-                    _     => 21, // PT missing (missing == 4 handled above)
+                    1 => 39, // PML4 entry empty → need PDPT
+                    2 => 30, // PDPT entry empty → need PD
+                    _ => 21, // PD entry empty   → need PT
                 };
                 let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
                 inv_tcb.msg_regs[2] = level;
@@ -1060,19 +1057,24 @@ fn decode_untyped_retype(
 
     if upstream {
         let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
-        crate::arch::log("[retype t=");
-        let mut tmp = [0u8; 4]; let mut ti = 4; let mut t = args.a2;
-        if t == 0 { crate::arch::log("0"); }
-        while t > 0 { ti -= 1; tmp[ti] = b'0' + (t % 10) as u8; t /= 10; }
-        if let Ok(s) = core::str::from_utf8(&tmp[ti..]) { crate::arch::log(s); }
-        crate::arch::log(" sb="); let mut tmp = [0u8; 4]; let mut ti = 4; let mut t = args.a3;
-        if t == 0 { crate::arch::log("0"); }
-        while t > 0 { ti -= 1; tmp[ti] = b'0' + (t % 10) as u8; t /= 10; }
-        if let Ok(s) = core::str::from_utf8(&tmp[ti..]) { crate::arch::log(s); }
-        crate::arch::log(" n="); let mut tmp = [0u8; 8]; let mut ti = 8; let mut t = inv_tcb.msg_regs[5];
-        if t == 0 { crate::arch::log("0"); }
-        while t > 0 { ti -= 1; tmp[ti] = b'0' + (t % 10) as u8; t /= 10; }
-        if let Ok(s) = core::str::from_utf8(&tmp[ti..]) { crate::arch::log(s); }
+        crate::arch::log("[ut t=");
+        let mut buf = [b'0'; 2]; let v = args.a2 as u8;
+        buf[0] = b'0' + (v / 10); buf[1] = b'0' + (v % 10);
+        if let Ok(s) = core::str::from_utf8(&buf) { crate::arch::log(s); }
+        crate::arch::log(" sb=");
+        let mut buf = [b'0'; 2]; let v = args.a3 as u8;
+        buf[0] = b'0' + (v / 10); buf[1] = b'0' + (v % 10);
+        if let Ok(s) = core::str::from_utf8(&buf) { crate::arch::log(s); }
+        crate::arch::log(" off=");
+        let mut buf = [b'0'; 4]; let mut v = inv_tcb.msg_regs[4]; let mut i = 4;
+        if v == 0 { crate::arch::log("0"); }
+        while v > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
+        crate::arch::log(" n=");
+        let mut buf = [b'0'; 4]; let mut v = inv_tcb.msg_regs[5]; let mut i = 4;
+        if v == 0 { crate::arch::log("0"); }
+        while v > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
         crate::arch::log("]\n");
     }
 

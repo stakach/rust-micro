@@ -46,6 +46,19 @@ pub trait DebugSink {
     fn put_byte(&mut self, byte: u8);
 }
 
+/// Best-effort cap-type tag for `seL4_DebugCapIdentify`. Upstream
+/// returns cap-specific tag values (cap_endpoint_cap = 4 etc.);
+/// libsel4allocman's debug-build sanity checks only care that 0 =
+/// null and any other value = non-null. We honour that contract:
+/// 0 for Null, 1 for everything else.
+#[cfg(target_arch = "x86_64")]
+fn debug_cap_type_tag(cap: &crate::cap::Cap) -> u64 {
+    match cap {
+        crate::cap::Cap::Null => 0,
+        _ => 1,
+    }
+}
+
 /// Dispatcher. Mirrors `handleSyscall` in seL4 (non-MCS variant):
 /// IPC syscalls route through the relevant invocation path via
 /// CSpace lookup against the current thread's CTable; the debug
@@ -134,14 +147,26 @@ pub fn handle_syscall(
             Ok(())
         }
         Syscall::SysDebugCapIdentify => {
-            // Stub: return CapNull (0) via msg_regs[0]/r10.
+            // libsel4's seL4_DebugCapIdentify reads the result from
+            // the rdi-out of x64_sys_send_recv (= caller's user_context
+            // .rdi after sysretq). We honestly identify the cap by
+            // looking it up in the invoker's CSpace and returning a
+            // type tag; null slots return 0 so libsel4allocman's
+            // `vka_cspace_free` debug check sees them as free.
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 use crate::kernel::KERNEL;
                 if let Some(cur) = KERNEL.get().scheduler.current() {
+                    let cspace_root = KERNEL.get().scheduler.slab
+                        .get(cur).cspace_root;
+                    let tag = match crate::cspace::lookup_cap(
+                        KERNEL.get(), &cspace_root, args.a0)
+                    {
+                        Ok(cap) => debug_cap_type_tag(&cap),
+                        Err(_) => 0,
+                    };
                     let t = KERNEL.get().scheduler.slab.get_mut(cur);
-                    t.msg_regs[0] = 0;
-                    t.ipc_length = 1;
+                    t.user_context.rdi = tag;
                 }
             }
             Ok(())
