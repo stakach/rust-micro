@@ -91,20 +91,34 @@ pub unsafe fn make_user_pml4() -> u64 {
     kernel_virt_to_phys(new_va as u64)
 }
 
-/// Phase 33d — clone the live CR3's PML4 into `target_paddr`, used
-/// when a fresh PML4 is carved out of an Untyped via
-/// `Untyped::Retype`. The kernel half (and BOOTBOOT identity map)
-/// must be present in any user PML4 we later dispatch a thread on,
-/// otherwise SYSCALL entries land in unmapped memory.
+/// Phase 33d — clone *only* the kernel-half + BOOTBOOT-identity
+/// entries of the live PML4 into a freshly-retyped target PML4.
+/// The user-half (PML4[1..256]) is zeroed so the new vspace starts
+/// out empty above PML4[0] — true isolation from the rootserver's
+/// own image at PML4[2].
 ///
-/// Relies on the BOOTBOOT 1 GiB identity map: low-memory paddrs
-/// (where rootserver Untyped pools live) double as kernel-virt
-/// addresses. If we ever move the Untyped pool out of low memory
-/// this routine will need a real phys->virt translation.
+/// Why we still copy PML4[0] and PML4[256..512]:
+///   * PML4[0] — BOOTBOOT 1 GiB identity map for low memory. The
+///     kernel walks user page tables via paddr (which doubles as
+///     kernel-virt under that identity map), so this entry must
+///     stay present even on isolated user vspaces.
+///   * PML4[256..512] — kernel half. SYSCALL entry restores
+///     `gs:[OFF_CTX + ...]` from PER_CPU_SYSCALL (a kernel-virt
+///     address); without this entry the very first kernel-mode
+///     instruction after a child SYSCALL would page-fault.
 pub unsafe fn clone_live_pml4_to_paddr(target_paddr: u64) {
     let live = (read_cr3() & 0xFFFF_F000) as *const u64;
     let target = (target_paddr & 0xFFFF_F000) as *mut u64;
+    // Zero the whole page first — Untyped retypes don't clear memory,
+    // and we don't want stale entries left over from prior retypes
+    // that landed on the same paddr.
     for i in 0..512 {
+        ptr::write_volatile(target.add(i), 0);
+    }
+    // Copy PML4[0] (identity map) and PML4[256..512] (kernel half).
+    let identity = ptr::read_volatile(live);
+    ptr::write_volatile(target, identity);
+    for i in 256..512 {
         let entry = ptr::read_volatile(live.add(i));
         ptr::write_volatile(target.add(i), entry);
     }

@@ -98,13 +98,19 @@ between us and a system that could host a userspace driver:
     endpoint at slot 12 carrying 0xBEEF; the rootserver
     `SysRecv`s it and prints
     `[vspace child sent 0xbeef via new PML4]`.
-  * The "isolation" here is partial — the new PML4 was
-    cloned from the live one so it shares PD[2]'s PT with
-    the rootserver's own vspace, which lets us re-use the
-    existing PT entries for the child's code/stack vaddrs.
-    Full isolation (independent user-half page tables) would
-    require either Frame-cap copies with independent
-    `mapped` state or a kernel-mediated frame-init path.
+  * **Full isolation now landed.** `clone_live_pml4_to_paddr`
+    only copies PML4[0] (BOOTBOOT identity) and
+    PML4[256..512] (kernel half) from the live PML4 — the
+    user half is left empty. The dispatch demo retypes a
+    fresh scratch PT (slot 26) into the rootserver's own PD
+    at PD[4], maps the code Frame at `OWN_SCRATCH_VADDR` to
+    memcpy the child stub, then `X86PageUnmap`s and re-maps
+    the same Frame at `VSPACE_CODE_VADDR` in the new PML4
+    via the 33d-setup PT (slot 24). No memory is shared
+    between the two user vspaces beyond the slot-12
+    endpoint cap (kept in the shared CSpace, not in either
+    user half). Output: `[vspace child sent 0xbeef via
+    isolated PML4]`.
 
 ## Verification
 * Spec count rises by ~4–6.

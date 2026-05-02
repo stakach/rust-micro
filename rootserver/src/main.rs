@@ -49,6 +49,7 @@ const LBL_X86_PDPT_MAP: u64 = 39;
 const LBL_X86_PAGE_DIRECTORY_MAP: u64 = 41;
 const LBL_X86_PAGE_TABLE_MAP: u64 = 43;
 const LBL_X86_PAGE_MAP: u64 = 45;
+const LBL_X86_PAGE_UNMAP: u64 = 46;
 
 /// `seL4_ObjectType` values we use here.
 const OBJ_TCB: u64 = 1;
@@ -108,20 +109,37 @@ const SLOT_NEW_FRAME: u64 = 25;
 /// live PML4 by the kernel-half copy.
 const NEW_VSPACE_FRAME_VADDR: u64 = 0x0000_0080_0000_0000;
 
-/// Phase 33d follow-up — child dispatch into the new VSpace.
-/// Slots for the code/stack frame caps and the child TCB. We place
-/// the code + stack at unused PT entries inside the rootserver's
-/// existing image PT (PD[2], the rootserver's image PD), since the
-/// new PML4 was cloned from the live one and still shares that PT.
-/// That avoids needing fresh PD/PT entries for the child's vaddrs.
-const SLOT_VSPACE_CODE_FRAME: u64 = 26;
-const SLOT_VSPACE_STACK_FRAME: u64 = 27;
-const SLOT_VSPACE_CHILD_TCB: u64 = 28;
-/// Vaddr where we map the child's code frame. Inside PD[2]'s PT
-/// (unused PT slot — the rootserver image only fills PT[0..~16]).
-const VSPACE_CODE_VADDR: u64 = 0x0000_0100_0040_0000 + 200 * 0x1000; // PT[200]
-/// Stack frame at a different unused PT entry.
-const VSPACE_STACK_VADDR: u64 = 0x0000_0100_0040_0000 + 300 * 0x1000; // PT[300]
+/// Phase 33d follow-up — full-isolation child dispatch.
+///
+/// The new PML4 (slot 21) is cloned with kernel-half + identity
+/// only, so the child runs in a vspace where PML4[1..256] is
+/// initially empty — the rootserver image at PML4[2] is *not*
+/// visible. We use the PDPT/PD/PT chain installed by
+/// `multi_vspace_demo` (slots 22/23/24, rooted at PML4[1] of the
+/// new PML4) to map the child's code + stack at fresh PT entries.
+///
+/// To bootstrap the code page's contents, the rootserver maps the
+/// (initially-blank) frame in its OWN vspace at a scratch vaddr
+/// inside a freshly-retyped PT (slot 26) installed at PD[4] of
+/// the rootserver's PD. After memcpy, `X86PageUnmap` clears the
+/// cap's `mapped` flag so we can re-map the same Frame in the
+/// new vspace.
+const SLOT_OWN_SCRATCH_PT: u64 = 26;
+const SLOT_VSPACE_CODE_FRAME: u64 = 27;
+const SLOT_VSPACE_STACK_FRAME: u64 = 28;
+const SLOT_VSPACE_CHILD_TCB: u64 = 29;
+/// Vaddr inside the rootserver's own vspace where we temporarily
+/// stage the child's code page for memcpy. PD[4] is empty in the
+/// rootserver's PD (PD[2] is the image PT), so we can install a
+/// fresh PT there without colliding with the rootserver's own
+/// mappings.
+const OWN_SCRATCH_VADDR: u64 = 0x0000_0100_0080_0000;
+/// Vaddrs in the new vspace where the child runs. Both share
+/// slot 24's PT (mapped at PML4[1] PDPT[0] PD[0] in the new PML4),
+/// so they fall in the same 2 MiB window. PT[0] is occupied by
+/// the 33d demo frame; we use PT[16] / PT[32] which are unused.
+const VSPACE_CODE_VADDR: u64 = NEW_VSPACE_FRAME_VADDR + 16 * 0x1000;
+const VSPACE_STACK_VADDR: u64 = NEW_VSPACE_FRAME_VADDR + 32 * 0x1000;
 
 /// Hand-assembled child code: send IPC carrying 0xBEEF over the
 /// endpoint at slot 12, then yield-loop forever.
@@ -322,6 +340,15 @@ fn paging_struct_map(struct_cptr: u64, label: u64, vaddr: u64, vspace_cptr: u64)
 fn page_map(frame_cptr: u64, vaddr: u64, rights: u64, vspace_cptr: u64) -> u64 {
     let msg_info = LBL_X86_PAGE_MAP << 12;
     unsafe { syscall5(SYS_SEND, frame_cptr, msg_info, vaddr, rights, vspace_cptr) }
+}
+
+/// `X86Page::Unmap()`. The kernel clears the cap's `mapped` field
+/// (so the Frame can be remapped elsewhere) and, outside spec
+/// mode, walks the live CR3's page tables to clear the leaf PTE.
+#[inline(always)]
+fn page_unmap(frame_cptr: u64) -> u64 {
+    let msg_info = LBL_X86_PAGE_UNMAP << 12;
+    unsafe { syscall5(SYS_SEND, frame_cptr, msg_info, 0, 0, 0) }
 }
 
 /// IPC `Send` on an Endpoint cap. `length` words are taken from
@@ -696,66 +723,77 @@ unsafe fn multi_vspace_demo() {
     print_str(b"[multi-vspace setup ok -- PML4/PDPT/PD/PT/Frame mapped]\n");
 }
 
-/// Phase 33d follow-up — dispatch a child TCB into the new VSpace
-/// created by `multi_vspace_demo`.
+/// Phase 33d follow-up — fully-isolated child dispatch.
 ///
-/// Strategy: the new PML4 is a *clone* of the rootserver's live one,
-/// so all of the rootserver's existing user mappings (image at
-/// PML4[2], etc.) are present in both vspaces. We allocate two
-/// fresh frames (code, stack), map them at unused PT slots inside
-/// the rootserver's image PT (PD[2]), and dispatch a child TCB with
-/// the new PML4 as its CR3. Same vaddrs map to the same paddrs in
-/// both vspaces (they share PD[2]'s PT), so the child can execute
-/// the child-code frame at its known vaddr.
+/// The new PML4 is cloned with kernel-half + identity only, so the
+/// child runs in a vspace where the user-half (PML4[1..256]) is
+/// entirely fresh — the rootserver image at PML4[2] is invisible.
+/// To make the child runnable we:
+///   1. retype a fresh PT (`SLOT_OWN_SCRATCH_PT`) and map it into
+///      a free slot of the rootserver's own PD (PD[4]) so the
+///      rootserver can stage memory at `OWN_SCRATCH_VADDR`.
+///   2. retype a code Frame, map it at `OWN_SCRATCH_VADDR`,
+///      memcpy the hand-assembled child stub, then `X86PageUnmap`
+///      to release the Frame's `mapped` flag.
+///   3. retype a stack Frame.
+///   4. map the code Frame at `VSPACE_CODE_VADDR` and the stack
+///      Frame at `VSPACE_STACK_VADDR` in the new vspace
+///      (both share the existing 33d-setup PT at slot 24).
+///   5. retype a child TCB, `SetSpace` with the new PML4 + shared
+///      CNode, `WriteRegisters`, `SetPriority`, `Resume`.
+///   6. block on `SysRecv` for the child's 0xBEEF IPC over the
+///      shared endpoint at slot 12.
 ///
-/// True isolation between the rootserver and the child is *not*
-/// achieved here — they share the image-PT — but the child does
-/// run with its own CR3 + TCB, exercising the SetSpace + dispatch
-/// path through a freshly-retyped PML4.
+/// No memory is shared between the rootserver and child user
+/// vspaces beyond the slot-12 endpoint cap (which is in the shared
+/// CSpace, not in either vspace's user half).
 unsafe fn vspace_child_dispatch_demo() {
-    // Retype code + stack frames out of the rootserver's Untyped.
+    // Step 1 — install a scratch PT in the rootserver's own vspace.
+    let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE,
+                           PAGING_BITS, 1, SLOT_OWN_SCRATCH_PT);
+    if r != 0 { print_str(b"[vspace retype own PT FAILED]\n"); return; }
+    let r = paging_struct_map(SLOT_OWN_SCRATCH_PT, LBL_X86_PAGE_TABLE_MAP,
+                              OWN_SCRATCH_VADDR, CAP_INIT_THREAD_VSPACE);
+    if r != 0 { print_str(b"[vspace own PT map FAILED]\n"); return; }
+
+    // Step 2 — code Frame, mapped at OWN_SCRATCH_VADDR, populated,
+    // then unmapped from own vspace.
     let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE,
                            PAGING_BITS, 1, SLOT_VSPACE_CODE_FRAME);
     if r != 0 { print_str(b"[vspace retype code FAILED]\n"); return; }
+    let r = page_map(SLOT_VSPACE_CODE_FRAME, OWN_SCRATCH_VADDR,
+                     /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+    if r != 0 { print_str(b"[vspace code stage map FAILED]\n"); return; }
+    let dst = OWN_SCRATCH_VADDR as *mut u8;
+    for (i, &b) in VSPACE_CHILD_CODE.iter().enumerate() {
+        core::ptr::write_volatile(dst.add(i), b);
+    }
+    let r = page_unmap(SLOT_VSPACE_CODE_FRAME);
+    if r != 0 { print_str(b"[vspace code unmap FAILED]\n"); return; }
+
+    // Step 3 — stack Frame. No staging needed (zero-init is fine
+    // for an initial stack).
     let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE,
                            PAGING_BITS, 1, SLOT_VSPACE_STACK_FRAME);
     if r != 0 { print_str(b"[vspace retype stack FAILED]\n"); return; }
 
-    // Map the code frame in the rootserver's own vspace. We pass
-    // `vspace_cptr = CAP_INIT_THREAD_VSPACE` (slot 3) so the kernel
-    // takes the foreign-vspace path with the rootserver's PML4 as
-    // the target — under the spec feature this also bypasses the
-    // legacy "current CR3" no-op gate.
+    // Step 4 — install both frames in the *new* vspace via the
+    // existing 33d-setup PT (slot 24, mapped at PML4[1] PDPT[0]
+    // PD[0] of the new PML4).
     let r = page_map(SLOT_VSPACE_CODE_FRAME, VSPACE_CODE_VADDR,
-                     /* RW */ 3, CAP_INIT_THREAD_VSPACE);
-    if r != 0 { print_str(b"[vspace code map FAILED]\n"); return; }
-
-    // Copy the child's machine code into the freshly-mapped page.
-    let dst = VSPACE_CODE_VADDR as *mut u8;
-    for (i, &b) in VSPACE_CHILD_CODE.iter().enumerate() {
-        core::ptr::write_volatile(dst.add(i), b);
-    }
-
-    // Map the stack frame in the rootserver's own vspace too. The
-    // cloned PML4 shares the same PT, so the child accesses the
-    // same paddr at the same vaddr.
+                     3, SLOT_NEW_PML4);
+    if r != 0 { print_str(b"[vspace code map new FAILED]\n"); return; }
     let r = page_map(SLOT_VSPACE_STACK_FRAME, VSPACE_STACK_VADDR,
-                     /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+                     3, SLOT_NEW_PML4);
     if r != 0 { print_str(b"[vspace stack map FAILED]\n"); return; }
 
-    // Retype the child TCB.
+    // Step 5 — retype + dispatch the child.
     let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB,
                            /* user_size_bits */ 0, 1, SLOT_VSPACE_CHILD_TCB);
     if r != 0 { print_str(b"[vspace retype tcb FAILED]\n"); return; }
-
-    // SetSpace on the child: share the rootserver's CSpace (so
-    // `int 0x?? endpoint` invocations can find the slot-12 endpoint
-    // we IPC over) but pin the *new* PML4 as its vspace. This is
-    // the moment a fresh CR3 is wired into a TCB.
     let r = tcb_set_space(SLOT_VSPACE_CHILD_TCB, /* fault_ep */ 0,
                           CAP_INIT_THREAD_CNODE, SLOT_NEW_PML4);
     if r != 0 { print_str(b"[vspace setspace FAILED]\n"); return; }
-
     let stack_top = VSPACE_STACK_VADDR + 4096 - 8;
     let r = tcb_write_registers(SLOT_VSPACE_CHILD_TCB,
                                 VSPACE_CODE_VADDR, stack_top, /* arg0 */ 0);
@@ -765,8 +803,7 @@ unsafe fn vspace_child_dispatch_demo() {
     let r = tcb_resume(SLOT_VSPACE_CHILD_TCB);
     if r != 0 { print_str(b"[vspace resume FAILED]\n"); return; }
 
-    // The child sends 0xBEEF on slot 12 once it runs. Block here
-    // until it does — confirms the new vspace dispatched cleanly.
+    // Step 6 — wait for the child's 0xBEEF IPC.
     let (rax, _badge, _info, payload) = ep_recv(SLOT_ENDPOINT);
     if rax != 0 {
         print_str(b"[vspace recv FAILED]\n");
@@ -774,7 +811,7 @@ unsafe fn vspace_child_dispatch_demo() {
     }
     print_str(b"[vspace child sent 0x");
     print_hex(payload);
-    print_str(b" via new PML4]\n");
+    print_str(b" via isolated PML4]\n");
 }
 
 unsafe fn spawn_mcs_children() {
