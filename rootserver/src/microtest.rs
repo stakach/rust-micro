@@ -31,6 +31,9 @@ const CASES: &[TestCase] = &[
     TestCase { name: "tcb_set_ipc_buffer",   body: tests::tcb_set_ipc_buffer },
     TestCase { name: "ipc_extra_cap_staging", body: tests::ipc_extra_cap_staging },
     TestCase { name: "untyped_retype_reply", body: tests::untyped_retype_reply },
+    TestCase { name: "child_send_round_trip", body: tests::child_send_round_trip },
+    TestCase { name: "child_cap_transfer_round_trip",
+               body: tests::child_cap_transfer_round_trip },
 ];
 
 /// Entry point invoked from `_start` when `--features microtest`
@@ -70,6 +73,70 @@ pub unsafe fn run() {
     print_str(b"[microtest done]\n");
 }
 
+// ---------------------------------------------------------------------------
+// Helpers — slot allocator + spawn_child wrapper. Tests share a
+// running counter (`NEXT_SLOT`) so they don't have to coordinate
+// CNode-slot assignments by hand. Slots are *not* freed between
+// tests — once we land Delete with proper MDB tear-down we can
+// recycle, but for now the rootserver's CNode (radix=5 = 32 slots)
+// has plenty of headroom.
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// First slot the harness will hand out. Slots 0..11 are reserved
+/// for the canonical initial-cap layout (TCB, CNode, PML4,
+/// IRQControl, BootInfo Frame, IPC Frame, Untyped); slot 14 is
+/// SchedControl. Slots 12-13 are consumed by the `untyped_retype_tcb`
+/// + `tcb_set_ipc_buffer` cases, slot 15 by `untyped_retype_reply`,
+/// so we begin handing out from 16.
+static NEXT_SLOT: AtomicU64 = AtomicU64::new(16);
+
+#[allow(dead_code)]
+fn alloc_slot() -> u64 {
+    NEXT_SLOT.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// Spawn a child TCB sharing the rootserver's CSpace + VSpace.
+/// `entry` is a Rust extern-C function in the rootserver's image
+/// (the cloned PML4 keeps it accessible at the same vaddr). The
+/// caller provides a stack-top vaddr from a `static mut` array.
+///
+/// Returns the slot the new TCB cap landed in. The harness keeps
+/// the cap around until the kernel naturally tears down on
+/// teardown — there's no Delete cycle yet.
+#[allow(dead_code)]
+unsafe fn spawn_child(
+    entry: unsafe extern "C" fn() -> !,
+    stack_top: u64,
+) -> Result<u64, &'static str> {
+    let slot = alloc_slot();
+    let r = untyped_retype(
+        CAP_INIT_UNTYPED, OBJ_TCB,
+        /* user_size_bits */ 0, /* num_objects */ 1, slot,
+    );
+    if r != 0 { return Err("retype TCB"); }
+    let r = tcb_set_space(slot, /* fault_ep */ 0,
+        CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
+    if r != 0 { return Err("setspace"); }
+    let r = tcb_write_registers(slot, entry as u64, stack_top, /* arg0 */ 0);
+    if r != 0 { return Err("writeregs"); }
+    let r = tcb_set_priority(slot, 100);
+    if r != 0 { return Err("setprio"); }
+    let r = tcb_resume(slot);
+    if r != 0 { return Err("resume"); }
+    Ok(slot)
+}
+
+/// Retype an Endpoint into a fresh slot and return its cptr.
+#[allow(dead_code)]
+unsafe fn make_endpoint() -> Result<u64, &'static str> {
+    let slot = alloc_slot();
+    let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_ENDPOINT, 0, 1, slot);
+    if r != 0 { return Err("retype endpoint"); }
+    Ok(slot)
+}
+
 mod tests {
     use super::*;
 
@@ -95,6 +162,74 @@ mod tests {
         );
         if r != 0 {
             return Err("retype failed");
+        }
+        Ok(())
+    }
+
+    /// Phase 35a — spawn a child, have it send a one-word IPC,
+    /// the parent receives and verifies the payload. Exercises
+    /// the spawn_child helper, the shared-CSpace dispatch path,
+    /// and end-to-end IPC delivery.
+    pub(super) fn child_send_round_trip() -> TestResult {
+        unsafe {
+            let ep = make_endpoint()?;
+            CHILD_SEND_EP_SLOT.store(ep, AtomicOrdering::Relaxed);
+            let stack_top = (&raw mut CHILD_SEND_STACK as u64) + 4096 - 8;
+            let _slot = spawn_child(microtest_send_child, stack_top)?;
+            let (rax, _badge, _info, payload) = ep_recv(ep);
+            if rax != 0 { return Err("recv failed"); }
+            if payload != 0xCAFE_F00D { return Err("wrong payload"); }
+        }
+        Ok(())
+    }
+
+    /// Phase 35a — round-trip a cap through IPC. Child mints an
+    /// IPC carrying a single extra cap (the rootserver's CNode
+    /// cap at slot 2) into the parent's CNode at receiveIndex.
+    /// Parent verifies the cap landed at the named slot.
+    pub(super) fn child_cap_transfer_round_trip() -> TestResult {
+        unsafe {
+            let ep = make_endpoint()?;
+            // Cap to transfer = the rootserver's own CNode cap
+            // (slot 2). We want to see a copy land in the parent
+            // CSpace at a fresh `dest_slot`.
+            let dest_slot = alloc_slot();
+            CHILD_CAP_TRANSFER_EP_SLOT.store(ep, AtomicOrdering::Relaxed);
+            CHILD_CAP_TRANSFER_CAP_SLOT.store(
+                CAP_INIT_THREAD_CNODE, AtomicOrdering::Relaxed);
+
+            // Parent sets up its IPC buffer with the receive
+            // descriptor pointing at `dest_slot` of its own CSpace
+            // (receiveCNode = 0 means use cspace_root).
+            const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
+            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+            core::ptr::write_volatile(buf.add(125), 0);          // receiveCNode = own
+            core::ptr::write_volatile(buf.add(126), dest_slot);  // receiveIndex
+            core::ptr::write_volatile(buf.add(127), 64);         // receiveDepth (ignored)
+
+            let stack_top = (&raw mut CHILD_CAP_TRANSFER_STACK as u64) + 4096 - 8;
+            let _slot = spawn_child(microtest_cap_transfer_child, stack_top)?;
+
+            let (rax, _badge, _info, _payload) = ep_recv(ep);
+            if rax != 0 { return Err("recv failed"); }
+
+            // The kernel should have written a cap into our CSpace
+            // at `dest_slot`. We verify by issuing a CNode::Copy
+            // from `dest_slot` into another fresh slot — if the
+            // src slot held a cap, the copy succeeds (rax = 0).
+            let copy_dest = alloc_slot();
+            let copy_msg = (LBL_CNODE_COPY << 12) | 0;
+            let r = syscall5(
+                SYS_SEND,
+                CAP_INIT_THREAD_CNODE,
+                copy_msg,
+                copy_dest,
+                dest_slot,
+                /* rights word — ignored by Copy */ 0,
+            );
+            if r != 0 {
+                return Err("transferred cap not present at dest_slot");
+            }
         }
         Ok(())
     }
@@ -213,8 +348,49 @@ mod tests {
     }
 }
 
+// Stacks for the child threads spawned by the multi-thread tests.
+// Each test uses its own static so concurrent stacks don't alias.
+#[repr(C, align(16))]
+struct ChildStack([u8; 4096]);
+static mut CHILD_SEND_STACK: ChildStack = ChildStack([0; 4096]);
+static mut CHILD_CAP_TRANSFER_STACK: ChildStack = ChildStack([0; 4096]);
+
+/// Per-test endpoint slot, written by the parent before spawn so
+/// the child can pick it up in its entry routine. The child
+/// reads via `core::ptr::read_volatile` to defeat constant
+/// propagation across the bare-metal boundary.
+static CHILD_SEND_EP_SLOT: AtomicU64 = AtomicU64::new(0);
+static CHILD_CAP_TRANSFER_EP_SLOT: AtomicU64 = AtomicU64::new(0);
+static CHILD_CAP_TRANSFER_CAP_SLOT: AtomicU64 = AtomicU64::new(0);
+
+#[no_mangle]
+#[link_section = ".text.microtest_send_child"]
+unsafe extern "C" fn microtest_send_child() -> ! {
+    let ep = CHILD_SEND_EP_SLOT.load(AtomicOrdering::Relaxed);
+    // SysSend(ep, msg_info=length=1, payload=0xCAFEF00D).
+    let _ = syscall5(SYS_SEND, ep, /* length */ 1, 0xCAFE_F00D, 0, 0);
+    loop { syscall0(SYS_YIELD); }
+}
+
+#[no_mangle]
+#[link_section = ".text.microtest_cap_transfer_child"]
+unsafe extern "C" fn microtest_cap_transfer_child() -> ! {
+    // The parent has set up the rootserver's IPC buffer with the
+    // cptr we want to transfer at caps_or_badges[0]; we just send
+    // with msginfo.extraCaps = 1.
+    const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
+    let cap = CHILD_CAP_TRANSFER_CAP_SLOT.load(AtomicOrdering::Relaxed);
+    let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+    core::ptr::write_volatile(buf.add(122), cap);
+    let ep = CHILD_CAP_TRANSFER_EP_SLOT.load(AtomicOrdering::Relaxed);
+    let msg_info: u64 = (1u64 << MSG_EXTRA_CAPS_SHIFT); // length=0, extraCaps=1
+    let _ = syscall5(SYS_SEND, ep, msg_info, 0, 0, 0);
+    loop { syscall0(SYS_YIELD); }
+}
+
 const LBL_TCB_CONFIGURE: u64 = 5;
 const LBL_TCB_SET_IPC_BUFFER: u64 = 10;
+const LBL_CNODE_COPY: u64 = 21;
 const SYS_NB_SEND: i64 = -4;
 /// `seL4_ObjectType::Reply` numeric tag (mirrors `object_type.rs`).
 const OBJ_REPLY: u64 = 6;
