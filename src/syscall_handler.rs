@@ -227,81 +227,43 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
         })?;
         let cspace_root = s.scheduler.slab.get(current).cspace_root;
         let target = lookup_cap(s, &cspace_root, args.a0)?;
-        let (ep_ptr, badge) = match target {
-            Cap::Endpoint { ptr, badge, rights } => {
-                if !rights.can_send {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )));
-                }
-                (ptr, badge.0)
-            }
-            // Phase 18a: Send on a Notification cap is signal().
-            Cap::Notification { ptr, badge, rights } => {
-                if !rights.can_send {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )));
-                }
-                let idx = crate::kernel::KernelState::ntfn_index(ptr);
-                let s_ptr: *mut crate::kernel::KernelState = s;
-                let ntfn = &mut (*s_ptr).notifications[idx];
-                let sched = &mut (*s_ptr).scheduler;
-                let _woken = crate::notification::signal(ntfn, sched, badge.0);
-                return Ok(());
-            }
-            // Phase 16: non-IPC cap on a Send/Call → invocation
-            // dispatch.
-            other => {
-                return crate::invocation::decode_invocation(other, args, current);
-            }
-        };
-        // Stage the message on the sender TCB so endpoint::send_ipc
-        // can copy it to the receiver. seL4_MessageInfo decode lives
-        // in types::seL4_MessageInfo_t — we keep it minimal here.
+
+        // Phase 36f — stage msg_regs + pending_extra_caps for ALL
+        // SysSend / SysCall paths, not just the Endpoint branch.
+        // This is what lets decode_invocation handlers (TCB::Configure
+        // etc.) read message words past a5 and look up extra caps
+        // the user packed into its IPC buffer's caps_or_badges[]
+        // array. For Endpoint targets, downstream `send_ipc` reads
+        // the same staged state; for Notifications the staging is
+        // harmless since signal() doesn't touch it.
         let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
         let length = info.length() as u32;
         {
             let snd = s.scheduler.slab.get_mut(current);
             snd.ipc_label = info.label();
             snd.ipc_length = length;
-            snd.ipc_badge = badge;
+            // ipc_badge gets overwritten below for Endpoint targets;
+            // initialize to 0 so non-Endpoint paths see a clean
+            // value.
+            snd.ipc_badge = 0;
             snd.msg_regs[0] = args.a2;
             snd.msg_regs[1] = args.a3;
             snd.msg_regs[2] = args.a4;
             snd.msg_regs[3] = args.a5;
             // Phase 34c — long messages: words 4..length come from
-            // the sender's user-mode IPC buffer page. seL4's IPC
-            // buffer layout is `tag, msg[0..120], ...`; we mirror
-            // the `msg[]` offset (word 1 from the buffer base in
-            // u64 units, i.e. byte offset 8). Words 0..3 of the
-            // message live in registers (a2..a5) and are NOT read
-            // from the buffer.
-            if length as usize > snd.msg_regs.len()
-                && snd.ipc_buffer_paddr != 0
-            {
-                // Buffer is too long for our scratch — clamp.
-                // (Real seL4 supports up to 120 message words; we
-                // only carry SCRATCH_MSG_LEN in the kernel.)
-            }
+            // the sender's IPC buffer page (tag word at offset 0,
+            // msg[] starts at offset 1).
             if length > 4 && snd.ipc_buffer_paddr != 0 {
                 let buf_paddr = snd.ipc_buffer_paddr;
-                let buf = (buf_paddr as *const u64).wrapping_add(1); // skip tag word
-                let max = (length as usize)
-                    .min(snd.msg_regs.len());
+                let buf = (buf_paddr as *const u64).wrapping_add(1);
+                let max = (length as usize).min(snd.msg_regs.len());
                 for i in 4..max {
                     snd.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
                 }
             }
-
             snd.pending_extra_caps_count = 0;
         }
-        // Phase 34d — stage caps the sender wants to transfer.
-        // seL4's IPC buffer layout: [tag, msg[120], userData,
-        // caps_or_badges[3], receiveCNode, receiveIndex,
-        // receiveDepth]. caps_or_badges starts at word 122 from
-        // the buffer base. Done in a separate scope so the
-        // `snd` mutable borrow doesn't conflict with lookup_cap.
+        // Phase 34d — stage caps from caps_or_badges[].
         let n_caps = info.extra_caps() as usize;
         if n_caps > 0 {
             let (buf_paddr, snd_cspace) = {
@@ -329,6 +291,41 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                 snd.pending_extra_caps_count = count;
             }
         }
+
+        let (ep_ptr, badge) = match target {
+            Cap::Endpoint { ptr, badge, rights } => {
+                if !rights.can_send {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )));
+                }
+                // Now that staging happens up-front, write the
+                // Endpoint's badge onto the sender. (Non-Endpoint
+                // paths leave it at 0 from staging.)
+                s.scheduler.slab.get_mut(current).ipc_badge = badge.0;
+                (ptr, badge.0)
+            }
+            // Phase 18a: Send on a Notification cap is signal().
+            Cap::Notification { ptr, badge, rights } => {
+                if !rights.can_send {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )));
+                }
+                let idx = crate::kernel::KernelState::ntfn_index(ptr);
+                let s_ptr: *mut crate::kernel::KernelState = s;
+                let ntfn = &mut (*s_ptr).notifications[idx];
+                let sched = &mut (*s_ptr).scheduler;
+                let _woken = crate::notification::signal(ntfn, sched, badge.0);
+                return Ok(());
+            }
+            // Phase 16: non-IPC cap on a Send/Call → invocation
+            // dispatch. Staging above already populated msg_regs +
+            // pending_extra_caps, so the handler can use them.
+            other => {
+                return crate::invocation::decode_invocation(other, args, current);
+            }
+        };
         let idx = crate::kernel::KernelState::endpoint_index(ep_ptr);
         let opts = SendOptions { blocking, do_call: call, badge };
         // Split borrows: we need &mut endpoint AND &mut scheduler at
