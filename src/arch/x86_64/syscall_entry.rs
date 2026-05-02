@@ -421,7 +421,26 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
             // Phase 38c-followup — rax is preserved across SYSCALL
             // (matches upstream seL4); errors are signalled out of
             // band (faults / IPC label), not via a rax sentinel.
-            arch::log("[unknown syscall]\n");
+            arch::log("[unknown syscall nr=");
+            let signed = number as i64;
+            let abs = if signed < 0 { (-signed) as u64 } else { signed as u64 };
+            if signed < 0 { arch::log("-"); }
+            let mut buf = [0u8; 20];
+            let mut i = buf.len();
+            let mut n = abs;
+            if n == 0 {
+                arch::log("0");
+            } else {
+                while n > 0 {
+                    i -= 1;
+                    buf[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                }
+                if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+                    arch::log(s);
+                }
+            }
+            arch::log("]\n");
             return;
         }
     };

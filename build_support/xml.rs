@@ -40,8 +40,15 @@ pub fn default_config() -> HashMap<&'static str, bool> {
         ("CONFIG_BENCHMARK_TRACK_UTILISATION", false),
         ("CONFIG_DEBUG_BUILD", false),
         ("CONFIG_DANGEROUS_CODE_INJECTION", false),
-        ("CONFIG_KERNEL_X86_DANGEROUS_MSR", false),
-        ("CONFIG_SET_TLS_BASE_SELF", false),
+        // Phase 41 — sel4test-driver's startup writes IA32_FS_BASE
+        // (and friends) directly via this syscall rather than
+        // SysSetTLSBase. Enable in the enum so our kernel handles
+        // the call; handler in src/syscall_handler.rs.
+        ("CONFIG_KERNEL_X86_DANGEROUS_MSR", true),
+        // Phase 41 — provides the cleaner SetTLSBase syscall (-32).
+        // We accept either path; sel4test ends up using the dangerous
+        // WRMSR variant in practice but it's cheap to leave both on.
+        ("CONFIG_SET_TLS_BASE_SELF", true),
         ("CONFIG_ARCH_IA32", false),
         ("CONFIG_ARCH_X86_64", true),
         ("CONFIG_X86_64", true),

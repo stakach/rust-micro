@@ -122,6 +122,46 @@ pub fn handle_syscall(
             let n = syscall as i32 as i64;
             handle_unknown_syscall(n, args, sink)
         }
+        Syscall::SysSetTLSBase => {
+            // Phase 41 — set IA32_FS_BASE for the current thread.
+            // sel4test-driver's musllibc uses this to anchor TLS at
+            // a known vaddr. We just write the MSR for now; per-TCB
+            // save/restore on context switch is a follow-up — for
+            // the smoke test the rootserver is the only thread
+            // touching FS_BASE.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use crate::arch::x86_64::msr::{wrmsr, IA32_FS_BASE};
+                wrmsr(IA32_FS_BASE, args.a0);
+            }
+            Ok(())
+        }
+        Syscall::SysX86DangerousWRMSR => {
+            // Phase 41 — WRMSR(reg, value). Used by sel4test-driver
+            // to set FS_BASE (its preferred TLS path). args.a0 = MSR
+            // index, args.a1 = value.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                crate::arch::x86_64::msr::wrmsr(args.a0 as u32, args.a1);
+            }
+            Ok(())
+        }
+        Syscall::SysX86DangerousRDMSR => {
+            // RDMSR(reg) — reads an MSR and returns the value via
+            // the IPC return path. args.a0 = MSR index. Result in
+            // msg_regs[0] (= r10 under upstream IPC return ABI).
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let value = crate::arch::x86_64::msr::rdmsr(args.a0 as u32);
+                use crate::kernel::KERNEL;
+                if let Some(cur) = KERNEL.get().scheduler.current() {
+                    let t = KERNEL.get().scheduler.slab.get_mut(cur);
+                    t.msg_regs[0] = value;
+                    t.ipc_length = 1;
+                }
+            }
+            Ok(())
+        }
     }
 }
 

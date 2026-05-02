@@ -140,6 +140,7 @@ if [ ! -f CMakeCache.txt ]; then
     -DKernelPrinting=ON \
     -DKernelDebugBuild=ON \
     -DKernelMaxNumBootinfoUntypedCaps=230 \
+    -DKernelSetTLSBaseSelf=ON \
     -DTRIPLE=x86_64-elf \
     -DCMAKE_TOOLCHAIN_FILE=../kernel/llvm.cmake \
     -DCMAKE_AR=/opt/homebrew/bin/x86_64-elf-ar \
