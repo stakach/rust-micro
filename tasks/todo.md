@@ -1,4 +1,4 @@
-# Active phase plan — Phase 33: round out the kernel
+# Phase 33: round out the kernel — DONE (33a–33d)
 
 ## Goal
 After Phase 32 the MCS scheduler runs but four gaps stand
