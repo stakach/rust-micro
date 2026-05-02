@@ -57,7 +57,7 @@ fi
 exec qemu-system-x86_64 \
   -drive format=raw,file="$IMAGE" \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
-  -m 512M \
+  -m 1024M \
   -smp 4 \
   -serial stdio \
   -monitor none \

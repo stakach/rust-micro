@@ -388,7 +388,7 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
     // frames, page tables for hundreds of tests. 64 MiB of Untyped
     // is enough; the chunk is power-of-2 sized + power-of-2 aligned
     // so it satisfies seL4's Untyped invariants.
-    const ROOTSERVER_UT_SIZE_BITS: u32 = 26; // 64 MiB
+    const ROOTSERVER_UT_SIZE_BITS: u32 = 27; // 128 MiB
     const ROOTSERVER_UT_SIZE: u64 = 1u64 << ROOTSERVER_UT_SIZE_BITS;
     let ut_base = carve_chunk(&mut free, ROOTSERVER_UT_SIZE, ROOTSERVER_UT_SIZE_BITS)?;
 

@@ -1294,17 +1294,24 @@ fn decode_untyped_retype(
         crate::arch::log("]\n");
     }
 
-    let (object_type, size_bits, num_objects, dest_offset, dest_root_override) =
+    // Phase 42 — full upstream ABI for the destination cap layout:
+    //   extraCaps[0] = root cap (dest CSpace root)
+    //   args.a4 (mr2) = node_index — cptr to dest CNode under root
+    //   args.a5 (mr3) = node_depth — bits to walk for node_index
+    //   msg_regs[4]   = node_offset — offset within dest CNode
+    //   msg_regs[5]   = num_objects
+    // When node_depth == 0, the root cap itself is the dest CNode.
+    // Without this, sel4test's allocman (which carves through a
+    // sub-CNode it built for its bookkeeping) would have all its
+    // children land in the rootserver's flat root CNode, colliding
+    // with later device-UT bisects targeting the same offsets.
+    let (object_type, size_bits, num_objects, node_index, node_depth, node_offset, root_cap_opt) =
         if upstream {
-            // Read mr4 (node_offset) and mr5 (num_objects) from the
-            // invoker's msg_regs (handle_send copied them out of the
-            // IPC buffer for length > 4).
             let invoker_tcb = unsafe {
                 KERNEL.get().scheduler.slab.get(invoker)
             };
             let node_offset = invoker_tcb.msg_regs[4] as usize;
             let num = invoker_tcb.msg_regs[5];
-            // extraCaps[0] is the destination root CNode cap.
             let root_cap = if invoker_tcb.pending_extra_caps_count > 0 {
                 Some(invoker_tcb.pending_extra_caps[0])
             } else {
@@ -1314,6 +1321,8 @@ fn decode_untyped_retype(
                 ObjectType::from_word(args.a2),
                 args.a3 as u32,
                 num,
+                args.a4,
+                args.a5 as u32,
                 node_offset,
                 root_cap,
             )
@@ -1322,6 +1331,8 @@ fn decode_untyped_retype(
                 ObjectType::from_word(args.a2),
                 (args.a3 >> 32) as u32,
                 args.a3 & 0xFFFF_FFFF,
+                0,
+                0,
                 args.a4 as usize,
                 None,
             )
@@ -1331,7 +1342,6 @@ fn decode_untyped_retype(
         KERNEL.get().scheduler.slab.get_mut(invoker)
             .pending_extra_caps_count = 0;
     }
-    let _ = dest_root_override; // currently always invoker's CSpace root; sel4test passes the same cap.
 
     let mut state = match crate::untyped::UntypedState::from_cap(&target) {
         Some(s) => s,
@@ -1342,12 +1352,33 @@ fn decode_untyped_retype(
         }
     };
 
-    // Resolve the destination CNode page from the invoker's CSpace
-    // root.
+    let dest_offset = node_offset;
+
+    // Resolve the destination CNode. When extraCaps[0] is provided
+    // (upstream path), walk it with node_depth bits to land on the
+    // actual dest CNode. Otherwise fall back to the invoker's
+    // cspace_root — keeps the legacy microtest path working.
     unsafe {
         let s = KERNEL.get();
-        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-        let cnode_ptr = match cspace_root {
+        let dest_cnode_cap: Cap = if let Some(root_cap) = root_cap_opt {
+            if node_depth == 0 {
+                // Per upstream: depth=0 means use root cap directly
+                // as the destination CNode.
+                root_cap
+            } else {
+                let res = crate::cspace::resolve_address_bits(
+                    s, &root_cap, node_index, node_depth)?;
+                if res.bits_remaining != 0 {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_FailedLookup)));
+                }
+                let cnode_idx = KernelState::cnode_index(res.slot_ptr);
+                s.cnodes[cnode_idx].0[res.slot_index].cap()
+            }
+        } else {
+            s.scheduler.slab.get(invoker).cspace_root
+        };
+        let cnode_ptr = match dest_cnode_cap {
             Cap::CNode { ptr, .. } => ptr,
             _ => {
                 return Err(KException::SyscallError(SyscallError::new(
@@ -1532,13 +1563,13 @@ fn decode_untyped_retype(
         // both share the same base paddr and the search hits the
         // parent first, leaving the source slot's free_index stale
         // and causing the next retype to re-allocate the same memory.
+        let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
         let source_resolved = crate::cspace::resolve_address_bits(
-            KERNEL.get(), &cspace_root, args.a0, crate::cspace::WORD_BITS);
+            s, &invoker_cspace, args.a0, crate::cspace::WORD_BITS);
         if let Ok(res) = source_resolved {
             if res.bits_remaining == 0 {
                 let src_idx = KernelState::cnode_index(res.slot_ptr);
-                let s2 = KERNEL.get();
-                s2.cnodes[src_idx].0[res.slot_index].set_cap(&state.to_cap());
+                s.cnodes[src_idx].0[res.slot_index].set_cap(&state.to_cap());
             }
         }
     }
@@ -1687,46 +1718,82 @@ fn is_derived_from(child: &Cap, parent: &Cap) -> bool {
 fn cnode_copy_or_mint(
     target: Cap,
     args: &SyscallArgs,
-    _invoker: TcbId,
+    invoker: TcbId,
     mint: bool,
 ) -> KResult<()> {
-    let dest_index = args.a2 as usize;
-    let src_index = args.a3 as usize;
-    let _badge_or_rights = args.a4;
-
-    let cnode_ptr = match target {
-        Cap::CNode { ptr, .. } => ptr,
-        _ => unreachable!(),
+    // Two ABI shapes coexist:
+    //   * Phase 16 legacy (microtest, extra_caps == 0):
+    //       a2 = dest_index, a3 = src_index (same CNode = `target`),
+    //       a4 = badge_or_rights (Mint only).
+    //       depth defaults to WORD_BITS, src_root = target.
+    //   * Phase 42 upstream (sel4test, extra_caps > 0):
+    //       a2 = dest_index, a3 = dest_depth,
+    //       a4 = src_index,  a5 = src_depth,
+    //       extraCaps[0] = src_root,
+    //       msg_regs[4] = rights, msg_regs[5] = badge (Mint).
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() > 0;
+    let (dest_index, dest_depth, src_index, src_depth, badge) = if upstream {
+        let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
+        let b = inv_tcb.msg_regs[5];
+        (args.a2, args.a3 as u32, args.a4, args.a5 as u32, b)
+    } else {
+        (args.a2, crate::cspace::WORD_BITS,
+         args.a3, crate::cspace::WORD_BITS, args.a4)
     };
+    let dest_root = target;
     unsafe {
         let s = KERNEL.get();
-        let idx = KernelState::cnode_index(cnode_ptr);
-        let slots = &mut s.cnodes[idx].0;
-        if dest_index >= slots.len() || src_index >= slots.len() {
+        let inv_tcb = s.scheduler.slab.get_mut(invoker);
+        let src_root = if upstream && inv_tcb.pending_extra_caps_count > 0 {
+            let c = inv_tcb.pending_extra_caps[0];
+            inv_tcb.pending_extra_caps_count = 0;
+            c
+        } else {
+            inv_tcb.cspace_root
+        };
+
+        let dest_res = crate::cspace::resolve_address_bits(
+            s, &dest_root, dest_index, dest_depth)?;
+        if dest_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_RangeError,
-            )));
+                seL4_Error::seL4_FailedLookup)));
         }
-        if !slots[dest_index].cap().is_null() {
+        let dest_cnode_idx = KernelState::cnode_index(dest_res.slot_ptr);
+
+        let src_res = crate::cspace::resolve_address_bits(
+            s, &src_root, src_index, src_depth)?;
+        if src_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_DeleteFirst,
-            )));
+                seL4_Error::seL4_FailedLookup)));
         }
-        let mut copy = slots[src_index].cap();
+        let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
+
+        let mut copy = s.cnodes[src_cnode_idx].0[src_res.slot_index].cap();
+        if !s.cnodes[dest_cnode_idx].0[dest_res.slot_index].cap().is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst)));
+        }
         if mint {
-            // Mint can re-badge an Endpoint/Notification cap.
-            if let Cap::Endpoint { ref mut badge, .. } = copy {
-                *badge = crate::cap::Badge(_badge_or_rights);
-            }
-            if let Cap::Notification { ref mut badge, .. } = copy {
-                *badge = crate::cap::Badge(_badge_or_rights);
+            // Mint can re-badge an Endpoint/Notification cap. The
+            // badge lives in mr5 per the upstream layout above; the
+            // legacy 4-arg form put it in `args.a4`.
+            match &mut copy {
+                Cap::Endpoint { badge: b, .. } => {
+                    *b = crate::cap::Badge(badge);
+                }
+                Cap::Notification { badge: b, .. } => {
+                    *b = crate::cap::Badge(badge);
+                }
+                _ => {}
             }
         }
-        slots[dest_index].set_cap(&copy);
+        s.cnodes[dest_cnode_idx].0[dest_res.slot_index].set_cap(&copy);
         // Phase 30 — the new cap is derived from the source slot;
         // its MDB parent is the source CTE.
-        let src_id = crate::cte::MdbId::pack(idx as u8, src_index as u16);
-        slots[dest_index].set_parent(Some(src_id));
+        let src_id = crate::cte::MdbId::pack(
+            src_cnode_idx as u8, src_res.slot_index as u16);
+        s.cnodes[dest_cnode_idx].0[dest_res.slot_index].set_parent(Some(src_id));
     }
     Ok(())
 }
@@ -1734,57 +1801,94 @@ fn cnode_copy_or_mint(
 fn cnode_move(
     target: Cap,
     args: &SyscallArgs,
-    _invoker: TcbId,
+    invoker: TcbId,
     _mutate: bool,
 ) -> KResult<()> {
-    let dest_index = args.a2 as usize;
-    let src_index = args.a3 as usize;
-    let cnode_ptr = match target {
-        Cap::CNode { ptr, .. } => ptr,
-        _ => unreachable!(),
+    // Two ABI shapes coexist (mirrors `cnode_copy_or_mint`):
+    //   * legacy (microtest): a2 = dest, a3 = src, both in `target`'s
+    //     CNode, depth = WORD_BITS.
+    //   * upstream (sel4test): a2/a3 = dest_idx/dest_depth, a4/a5 =
+    //     src_idx/src_depth, extraCaps[0] = src_root.
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() > 0;
+    let (dest_index, dest_depth, src_index, src_depth) = if upstream {
+        (args.a2, args.a3 as u32, args.a4, args.a5 as u32)
+    } else {
+        (args.a2, crate::cspace::WORD_BITS,
+         args.a3, crate::cspace::WORD_BITS)
     };
+    let dest_root = target;
     unsafe {
         let s = KERNEL.get();
-        let idx = KernelState::cnode_index(cnode_ptr);
-        let slots = &mut s.cnodes[idx].0;
-        if dest_index >= slots.len() || src_index >= slots.len() {
+        let inv_tcb = s.scheduler.slab.get_mut(invoker);
+        let src_root = if upstream && inv_tcb.pending_extra_caps_count > 0 {
+            let c = inv_tcb.pending_extra_caps[0];
+            inv_tcb.pending_extra_caps_count = 0;
+            c
+        } else {
+            inv_tcb.cspace_root
+        };
+
+        // Resolve dest slot via the dest_root cap.
+        let dest_res = crate::cspace::resolve_address_bits(
+            s, &dest_root, dest_index, dest_depth)?;
+        if dest_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_RangeError,
-            )));
+                seL4_Error::seL4_FailedLookup)));
         }
-        if !slots[dest_index].cap().is_null() {
+        let dest_cnode_idx = KernelState::cnode_index(dest_res.slot_ptr);
+
+        let src_res = crate::cspace::resolve_address_bits(
+            s, &src_root, src_index, src_depth)?;
+        if src_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_DeleteFirst,
-            )));
+                seL4_Error::seL4_FailedLookup)));
         }
-        let cap = slots[src_index].cap();
-        slots[dest_index].set_cap(&cap);
-        slots[src_index].set_cap(&Cap::Null);
+        let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
+
+        // Snapshot src cap before mutating either slot — both might
+        // be in the same CNode, in which case the borrow checker
+        // would object to two simultaneous &mut on the same array.
+        let src_cap = s.cnodes[src_cnode_idx].0[src_res.slot_index].cap();
+        if !s.cnodes[dest_cnode_idx].0[dest_res.slot_index].cap().is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst)));
+        }
+        s.cnodes[dest_cnode_idx].0[dest_res.slot_index].set_cap(&src_cap);
+        s.cnodes[src_cnode_idx].0[src_res.slot_index].set_cap(&Cap::Null);
     }
     Ok(())
 }
 
 fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
-    let index = args.a2 as usize;
-    let cnode_ptr = match target {
-        Cap::CNode { ptr, .. } => ptr,
-        _ => unreachable!(),
+    // Upstream `seL4_CNode_Delete` ABI:
+    //   target   = the CNode cap containing the slot to clear
+    //   a2 (mr0) = index (cptr to slot under `target`)
+    //   a3 (mr1) = depth (bits to walk for index)
+    // Microtest legacy callers pass depth=WORD_BITS implicitly; the
+    // resolve-with-depth path handles both.
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let depth = if info.length() >= 2 {
+        args.a3 as u32
+    } else {
+        crate::cspace::WORD_BITS
     };
     unsafe {
         let s = KERNEL.get();
-        let idx = KernelState::cnode_index(cnode_ptr);
-        let slots = &mut s.cnodes[idx].0;
-        if index >= slots.len() {
+        let res = crate::cspace::resolve_address_bits(
+            s, &target, args.a2, depth)?;
+        if res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_RangeError,
-            )));
+                seL4_Error::seL4_FailedLookup)));
         }
-        slots[index].set_cap(&Cap::Null);
+        let cnode_idx = KernelState::cnode_index(res.slot_ptr);
+        let slot = &mut s.cnodes[cnode_idx].0[res.slot_index];
+        slot.set_cap(&Cap::Null);
         // Phase 30 — also clear the MDB edge so children of the
         // deleted slot become orphaned (revoking the deleted slot
         // can't reach them, which matches seL4's "delete unlinks
         // but doesn't recursively delete" semantics).
-        slots[index].set_parent(None);
+        slot.set_parent(None);
     }
     Ok(())
 }

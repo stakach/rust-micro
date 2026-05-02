@@ -491,7 +491,7 @@ pub unsafe fn launch_rootserver() -> ! {
     // platsupport can `vka_utspace_alloc_at` the right paddr and
     // hand userspace a device Frame.
     const DEVICE_UTS: &[(u64, u8)] = &[
-        (0x00000000, 20),
+        (0x00080000, 19),
         (0xFEC00000, 12),
         (0xFED00000, 12),
         (0xFEE00000, 12),
@@ -589,10 +589,15 @@ unsafe fn build_bootinfo(
     };
     // Phase 42 — device untypeds for the regions sel4platsupport
     // expects to be able to map_paddr into:
-    //   * Low 1 MiB (0x00000–0xFFFFF): BIOS data area, ACPI RSDP,
-    //     legacy interrupt vector table, VGA/BIOS ROM. sel4test's
-    //     bootstrap calls `vka_utspace_alloc_at(0xE0000, …)` for
-    //     ACPI table discovery; without this it bails early.
+    //   * Upper-half low memory (0x80000–0xFFFFF): BIOS extension
+    //     area, ACPI RSDP, system BIOS. sel4test's bootstrap calls
+    //     `vka_utspace_alloc_at(0xE0000, …)` for ACPI table
+    //     discovery; without this it bails early. We can't expose
+    //     a device UT starting at paddr=0 yet because `Cap::Untyped`
+    //     stores its base via `PPtr<NonZeroU64>` and forcing the
+    //     niche to 1 leaks +1 into every child paddr in `retype`.
+    //     Starting at 0x80000 is enough to cover everything sel4test
+    //     touches in the conventional 1 MiB.
     //   * 0xFEC00000 (4 KiB): IOAPIC MMIO.
     //   * 0xFED00000 (4 KiB): HPET MMIO.
     //   * 0xFEE00000 (4 KiB): LAPIC MMIO.
@@ -600,8 +605,8 @@ unsafe fn build_bootinfo(
     // user's allocator can bisect down to a 4 KiB device frame
     // matching the requested paddr.
     empty_untypeds[1] = seL4_UntypedDesc {
-        paddr: 0x00000000,
-        sizeBits: 20, // 1 MiB
+        paddr: 0x00080000,
+        sizeBits: 19, // 512 KiB — covers 0x80000..0xFFFFF
         isDevice: 1,
         padding: [0; 6],
     };
