@@ -421,10 +421,23 @@ fn map_paging_struct(
             #[cfg(not(feature = "spec"))]
             { usermode::install_user_table(level, vaddr, paddr) }
             #[cfg(feature = "spec")]
-            { let _ = (level, usermode::install_user_table); true }
+            { let _ = (level, vaddr, paddr); Ok(()) }
         }
     };
-    if !installed {
+    if let Err(missing_level) = installed {
+        if missing_level == 0 {
+            // Either the level is bogus or the target slot is
+            // already populated.
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
+        // Stage missing-level for seL4_MappingFailedLookupLevel.
+        unsafe {
+            let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+            inv_tcb.msg_regs[2] = missing_level as u64;
+            inv_tcb.ipc_length = 3;
+        }
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_FailedLookup,
         )));

@@ -612,7 +612,7 @@ unsafe fn ensure_user_table(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
 /// Returns false if a parent entry is missing (caller should map
 /// the higher-level structure first) or if the target entry is
 /// already present (caller should Unmap first).
-pub unsafe fn install_user_table(level: u32, vaddr: u64, table_paddr: u64) -> bool {
+pub unsafe fn install_user_table(level: u32, vaddr: u64, table_paddr: u64) -> Result<(), u32> {
     let pml4 = (read_cr3() & 0xFFFF_F000) as *mut u64;
     install_user_table_in(pml4, level, vaddr, table_paddr)
 }
@@ -630,7 +630,7 @@ pub unsafe fn install_user_table_in_paddr(
     level: u32,
     vaddr: u64,
     table_paddr: u64,
-) -> bool {
+) -> Result<(), u32> {
     // BOOTBOOT identity-maps low memory 1:1 in the kernel half, so a
     // physical address < 1 GiB also names a kernel-virt address.
     let pml4 = (pml4_paddr & 0xFFFF_F000) as *mut u64;
@@ -679,12 +679,18 @@ pub unsafe fn map_user_4k_into_foreign_pml4(
     Ok(())
 }
 
+/// Install a paging-structure entry. Returns Ok(()) on success.
+/// On Err, the value is the seL4_MappingFailedLookupLevel value
+/// (21=PT, 30=PD, 39=PDPT) — i.e. the bit-position of the *missing*
+/// parent entry, so callers can populate the FailedLookup mr2.
+/// Returns 0 on "slot already present" (caller surfaces as
+/// DeleteFirst).
 unsafe fn install_user_table_in(
     pml4: *mut u64,
     level: u32,
     vaddr: u64,
     table_paddr: u64,
-) -> bool {
+) -> Result<(), u32> {
     use super::paging::PTE_PS;
     let flags = PTE_PRESENT | PTE_RW | PTE_USER;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
@@ -696,31 +702,31 @@ unsafe fn install_user_table_in(
         2 => {
             let e = core::ptr::read_volatile(pml4.add(pml4_idx));
             if e & PTE_PRESENT == 0 || e & PTE_PS != 0 {
-                return false;
+                return Err(39); // need PDPT (= PML4 missing)
             }
             ((e & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pdpt_idx)
         }
         1 => {
             let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
             if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
-                return false;
+                return Err(39); // need PDPT (PML4 entry missing)
             }
             let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
             let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
             if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
-                return false;
+                return Err(30); // need PD (PDPT entry missing)
             }
             ((pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pd_idx)
         }
-        _ => return false,
+        _ => return Err(0),
     };
 
     let cur = core::ptr::read_volatile(entry_ptr);
     if cur & PTE_PRESENT != 0 {
-        return false;
+        return Err(0); // already present — caller maps to DeleteFirst
     }
     core::ptr::write_volatile(entry_ptr, (table_paddr & !0xFFF) | flags);
-    true
+    Ok(())
 }
 
 // Make Syscall referenced so unused-import lint doesn't fire when
