@@ -637,6 +637,32 @@ pub unsafe fn install_user_table_in_paddr(
     install_user_table_in(pml4, level, vaddr, table_paddr)
 }
 
+/// Diagnostic helper — prints a one-line trace of a page-table walk
+/// step, e.g. `[pd[511]=0x0000000005000007]`. Disabled by default;
+/// flip the const to true while debugging Frame::Map failures.
+const MAP_WALK_TRACE: bool = false;
+
+unsafe fn map_walk_log(level: &str, idx: usize, entry: u64) {
+    if !MAP_WALK_TRACE { return; }
+    crate::arch::log("[");
+    crate::arch::log(level);
+    crate::arch::log("[");
+    let mut buf = [b'0'; 4]; let mut v = idx as u64; let mut i = 4;
+    if v == 0 { crate::arch::log("0"); }
+    while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
+    crate::arch::log("]=0x");
+    let mut buf = [b'0'; 16]; let mut v = entry; let mut i = 16;
+    while v > 0 && i > 0 {
+        i -= 1;
+        let nib = (v & 0xF) as u8;
+        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+        v >>= 4;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf) { crate::arch::log(s); }
+    crate::arch::log("]\n");
+}
+
 /// Phase 33d — map a 4 KiB frame into a foreign PML4. Walks the
 /// PML4 → PDPT → PD → PT chain (which the caller must have set up
 /// via the paging-struct `Map` invocations) and installs the leaf
@@ -653,21 +679,25 @@ pub unsafe fn map_user_4k_into_foreign_pml4(
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
     let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
     let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+    map_walk_log("pml4", pml4_idx, pml4e);
     if pml4e & PTE_PRESENT == 0 || pml4e & super::paging::PTE_PS != 0 {
         return Err(1);
     }
     let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+    map_walk_log("pdpt", pdpt_idx, pdpte);
     if pdpte & PTE_PRESENT == 0 || pdpte & super::paging::PTE_PS != 0 {
         return Err(2);
     }
     let pd = (pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pde = core::ptr::read_volatile(pd.add(pd_idx));
+    map_walk_log("pd", pd_idx, pde);
     if pde & PTE_PRESENT == 0 || pde & super::paging::PTE_PS != 0 {
         return Err(3);
     }
     let pt = (pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let cur = core::ptr::read_volatile(pt.add(pt_idx));
+    map_walk_log("pt", pt_idx, cur);
     if cur & PTE_PRESENT != 0 {
         return Err(4);
     }

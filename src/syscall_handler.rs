@@ -322,7 +322,40 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
             ))
         })?;
         let cspace_root = s.scheduler.slab.get(current).cspace_root;
-        let target = lookup_cap(s, &cspace_root, args.a0)?;
+
+        // Phase 42 — log every Send/Call entry so we can see the
+        // failing invocation even when target lookup itself errors
+        // out (which short-circuits decode_invocation's own trace).
+        // Format: `<send call=B cptr=0xNN mi=0xNN>` then on failure
+        // `<send-err code=N>` plus the SysCall reply path below.
+        crate::invocation::handle_send_log_entry(args.a0, args.a1, call);
+
+        let target = match lookup_cap(s, &cspace_root, args.a0) {
+            Ok(c) => c,
+            Err(lf) => {
+                let e: KException = lf.into();
+                crate::invocation::handle_send_log_lookup_err(&e);
+                // For SysCall, also write a reply msginfo into rsi so
+                // userspace sees the error code rather than stale rsi
+                // from a prior successful invocation. LookupFault
+                // maps to seL4_FailedLookup (= 6). We still return
+                // Err so kernel-side specs that assert on Err continue
+                // to work; the syscall_entry dispatcher discards the
+                // Result, so userspace only sees what's in rsi.
+                if call {
+                    let label: u64 = match &e {
+                        KException::SyscallError(SyscallError { code }) => *code as u64,
+                        KException::LookupFault(_) => seL4_Error::seL4_FailedLookup as u64,
+                        _ => 0xFFFF,
+                    };
+                    let inv_tcb = s.scheduler.slab.get_mut(current);
+                    let mi = label << 12;
+                    inv_tcb.user_context.rsi = mi;
+                    inv_tcb.user_context.rdi = 0;
+                }
+                return Err(e);
+            }
+        };
 
         // Phase 36f — stage msg_regs + pending_extra_caps for ALL
         // SysSend / SysCall paths, not just the Endpoint branch.

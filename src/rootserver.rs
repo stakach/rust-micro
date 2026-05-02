@@ -345,14 +345,18 @@ pub unsafe fn launch_rootserver() -> ! {
     let s = KERNEL.get();
 
     // Build the rootserver's CNode (slot 2 of itself = `seL4_CapInitThreadCNode`).
-    // Phase 36e — radix bumped 5 → 6 (32 → 64 slots) to fit the
-    // canonical initial-cap layout + per-CPU SchedControl region +
-    // Untyped + room for tests.
+    // Phase 42 — the cap's `radix` MUST match the underlying CNode
+    // storage width (`CNODE_RADIX`). When sel4test allocates new
+    // children at high offsets via Untyped::Retype it then addresses
+    // them via cptr = node_offset; with radix=6 those high offsets
+    // are unreachable through the cap and `lookup_cap` short-circuits
+    // to slot 0. `guard_size` makes up the remaining bits to a
+    // full 64-bit cptr so userspace can pass small (low-bit) cptrs.
     let cnode_ptr = KernelState::cnode_ptr(ROOTSERVER_CNODE_IDX);
     let cnode_cap = Cap::CNode {
         ptr: cnode_ptr,
-        radix: 6,
-        guard_size: 58,
+        radix: crate::kernel::CNODE_RADIX,
+        guard_size: 64 - crate::kernel::CNODE_RADIX,
         guard: 0,
     };
     // Wipe the CNode in case prior specs left state.

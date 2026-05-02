@@ -25,6 +25,139 @@ use crate::syscalls::InvocationLabel;
 use crate::tcb::TcbId;
 use crate::types::{seL4_Error, seL4_Word as Word};
 
+/// Single-letter tag for the cap kind — used by `inv_log` so the
+/// trace fits on one line and is easy to grep for. Keep in sync
+/// with the `decode_invocation` match arms.
+fn inv_cap_tag(c: &Cap) -> &'static str {
+    match c {
+        Cap::Untyped { .. }       => "Ut",
+        Cap::CNode { .. }         => "Cn",
+        Cap::Thread { .. }        => "Tcb",
+        Cap::IrqControl           => "IrC",
+        Cap::IrqHandler { .. }    => "IrH",
+        Cap::Frame { .. }         => "Fr",
+        Cap::PageTable { .. }     => "PT",
+        Cap::PageDirectory { .. } => "PD",
+        Cap::Pdpt { .. }          => "PDPT",
+        Cap::PML4 { .. }          => "PML4",
+        Cap::AsidControl          => "AsC",
+        Cap::AsidPool { .. }      => "AsP",
+        Cap::SchedContext { .. }  => "SC",
+        Cap::SchedControl { .. }  => "SCtl",
+        Cap::Reply { .. }         => "Rep",
+        Cap::Endpoint { .. }      => "Ep",
+        Cap::Notification { .. }  => "Ntfn",
+        Cap::Null                 => "Null",
+        _                         => "??",
+    }
+}
+
+/// Print a small u64 in decimal via `crate::arch::log`. Avoids
+/// pulling in `format!` in #[no_std].
+fn log_dec(mut v: u64) {
+    if v == 0 { crate::arch::log("0"); return; }
+    let mut buf = [b'0'; 8];
+    let mut i = 8;
+    while v > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        crate::arch::log(s);
+    }
+}
+
+/// One-line trace for an invocation entry — emits e.g.
+/// `<inv cap=Ut label=1 xc=0>`. Disabled by default; flip the const
+/// to true to enable while diagnosing sel4test failures.
+const INV_TRACE: bool = false;
+
+fn inv_log_entry(target: &Cap, label_n: u64, xc: u8) {
+    if !INV_TRACE { return; }
+    crate::arch::log("<inv cap=");
+    crate::arch::log(inv_cap_tag(target));
+    crate::arch::log(" label=");
+    log_dec(label_n);
+    crate::arch::log(" xc=");
+    log_dec(xc as u64);
+    crate::arch::log(">\n");
+}
+
+fn inv_log_exit(result: &KResult<()>) {
+    if !INV_TRACE { return; }
+    match result {
+        Ok(()) => crate::arch::log("<inv ok>\n"),
+        Err(KException::SyscallError(SyscallError { code })) => {
+            crate::arch::log("<inv ERR=");
+            log_dec(*code as u64);
+            crate::arch::log(">\n");
+        }
+        Err(_) => crate::arch::log("<inv ERR=?>\n"),
+    }
+}
+
+/// Hook called from `handle_send` so SysSend/SysCall entries are
+/// visible even when target lookup fails (which short-circuits
+/// `decode_invocation`'s own tracing).
+pub fn handle_send_log_entry(cptr: u64, mi_word: u64, call: bool) {
+    if !INV_TRACE { return; }
+    crate::arch::log(if call { "<send call cptr=" } else { "<send cptr=" });
+    log_hex(cptr);
+    let info = crate::types::seL4_MessageInfo_t { words: [mi_word] };
+    crate::arch::log(" label=");
+    log_dec(info.label());
+    crate::arch::log(" len=");
+    log_dec(info.length() as u64);
+    crate::arch::log(" xc=");
+    log_dec(info.extra_caps() as u64);
+    crate::arch::log(">\n");
+}
+
+pub fn handle_send_log_lookup_err(e: &KException) {
+    if !INV_TRACE { return; }
+    match e {
+        KException::SyscallError(SyscallError { code }) => {
+            crate::arch::log("<send-lookup-ERR=");
+            log_dec(*code as u64);
+            crate::arch::log(">\n");
+        }
+        _ => crate::arch::log("<send-lookup-ERR=?>\n"),
+    }
+}
+
+fn log_hex(mut v: u64) {
+    crate::arch::log("0x");
+    if v == 0 { crate::arch::log("0"); return; }
+    let mut buf = [b'0'; 16];
+    let mut i = 16;
+    while v > 0 && i > 0 {
+        i -= 1;
+        let nib = (v & 0xF) as u8;
+        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+        v >>= 4;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        crate::arch::log(s);
+    }
+}
+
+/// Like `log_hex` but without the `0x` prefix — for inline use.
+pub fn log_hex_u64(mut v: u64) {
+    if v == 0 { crate::arch::log("0"); return; }
+    let mut buf = [b'0'; 16];
+    let mut i = 16;
+    while v > 0 && i > 0 {
+        i -= 1;
+        let nib = (v & 0xF) as u8;
+        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+        v >>= 4;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        crate::arch::log(s);
+    }
+}
+
 /// Decode an invocation against a non-Endpoint cap. Called from
 /// the IPC dispatcher when SysSend/SysCall targets a non-IPC cap.
 pub fn decode_invocation(
@@ -34,13 +167,22 @@ pub fn decode_invocation(
 ) -> KResult<()> {
     // Decode the invocation label from MessageInfo.
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-    let label = info.label();
-    let label = InvocationLabel::from_u64(label).ok_or_else(|| {
-        KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_InvalidArgument,
-        ))
-    })?;
-    match target {
+    let label_n = info.label();
+    let xc_count = unsafe {
+        KERNEL.get().scheduler.slab.get(invoker).pending_extra_caps_count
+    };
+    inv_log_entry(&target, label_n, xc_count);
+
+    let label = match InvocationLabel::from_u64(label_n) {
+        Some(l) => l,
+        None => {
+            let r = Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidArgument)));
+            inv_log_exit(&r);
+            return r;
+        }
+    };
+    let result = match target {
         Cap::Untyped { .. } => decode_untyped(target, label, args, invoker),
         Cap::CNode { .. } => decode_cnode(target, label, args, invoker),
         Cap::Thread { .. } => decode_tcb(target, label, args, invoker),
@@ -63,7 +205,9 @@ pub fn decode_invocation(
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
-    }
+    };
+    inv_log_exit(&result);
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,28 +1199,8 @@ fn decode_untyped_retype(
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
 
-    if upstream {
-        let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
-        crate::arch::log("[ut t=");
-        let mut buf = [b'0'; 2]; let v = args.a2 as u8;
-        buf[0] = b'0' + (v / 10); buf[1] = b'0' + (v % 10);
-        if let Ok(s) = core::str::from_utf8(&buf) { crate::arch::log(s); }
-        crate::arch::log(" sb=");
-        let mut buf = [b'0'; 2]; let v = args.a3 as u8;
-        buf[0] = b'0' + (v / 10); buf[1] = b'0' + (v % 10);
-        if let Ok(s) = core::str::from_utf8(&buf) { crate::arch::log(s); }
-        crate::arch::log(" off=");
-        let mut buf = [b'0'; 4]; let mut v = inv_tcb.msg_regs[4]; let mut i = 4;
-        if v == 0 { crate::arch::log("0"); }
-        while v > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
-        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
-        crate::arch::log(" n=");
-        let mut buf = [b'0'; 4]; let mut v = inv_tcb.msg_regs[5]; let mut i = 4;
-        if v == 0 { crate::arch::log("0"); }
-        while v > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
-        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
-        crate::arch::log("]\n");
-    }
+    // Per-call retype trace was useful while diagnosing the source-slot
+    // free_index bug. Re-enable by setting INV_TRACE = true above.
 
     let (object_type, size_bits, num_objects, dest_offset, dest_root_override) =
         if upstream {
@@ -1262,6 +1386,40 @@ fn decode_untyped_retype(
                     }
                     other => other,
                 };
+                // Phase 42 — seL4 zeroes the underlying memory of
+                // every newly-retyped object (other than Untyped, which
+                // doesn't expose its bytes). For paging structs this
+                // is load-bearing: a fresh PD whose bytes look like
+                // valid PTE_PRESENT entries makes the page-table walk
+                // descend into garbage and the leaf Map then returns
+                // DeleteFirst. Frames are zeroed for the usual
+                // security reason.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use crate::cap::FrameSize;
+                    let zero_range: Option<(u64, u64)> = match cap_to_store {
+                        Cap::PageTable { ptr, .. } => Some((ptr.addr(), 4096)),
+                        Cap::PageDirectory { ptr, .. } => Some((ptr.addr(), 4096)),
+                        Cap::Pdpt { ptr, .. } => Some((ptr.addr(), 4096)),
+                        Cap::Frame { ptr, size, .. } => {
+                            let n: u64 = match size {
+                                FrameSize::Small => 4096,
+                                FrameSize::Large => 2 * 1024 * 1024,
+                                FrameSize::Huge => 1024 * 1024 * 1024,
+                            };
+                            Some((ptr.addr(), n))
+                        }
+                        _ => None,
+                    };
+                    if let Some((paddr, len)) = zero_range {
+                        // BOOTBOOT identity-maps low memory at vaddr=paddr,
+                        // and our user-page region + rootserver UT pool
+                        // both live in that region — so paddr doubles
+                        // as a kernel-writable vaddr.
+                        let dst = paddr as *mut u8;
+                        core::ptr::write_bytes(dst, 0, len as usize);
+                    }
+                }
                 cnode_slots[emit_idx].set_cap(&cap_to_store);
                 cnode_slots[emit_idx].set_parent(Some(parent_id));
                 emit_idx += 1;
@@ -1269,19 +1427,21 @@ fn decode_untyped_retype(
         );
         result?;
 
-        // Commit the updated UntypedState back into the cap stored
-        // somewhere in the invoker's CSpace. We don't know exactly
-        // which slot the original cap lives in — for now we store
-        // the new cap in slot 0 of the invoker's cnode if slot 0
-        // happens to hold the matching untyped. Real seL4 locates
-        // the source slot via the in-flight `CapRegister` saved
-        // before lookup. Phase 16b adds that.
-        for slot in cnode_slots.iter_mut() {
-            if let Cap::Untyped { ptr, .. } = slot.cap() {
-                if ptr.addr() == state.base {
-                    slot.set_cap(&state.to_cap());
-                    break;
-                }
+        // Commit the updated UntypedState back into the SOURCE slot.
+        // Phase 42 — re-resolve the source cptr (args.a0) against the
+        // invoker's CSpace to find the exact slot. Walking the CNode
+        // looking for `ptr.addr() == state.base` is broken when the
+        // child untyped is the leftmost descendant of its parent —
+        // both share the same base paddr and the search hits the
+        // parent first, leaving the source slot's free_index stale
+        // and causing the next retype to re-allocate the same memory.
+        let source_resolved = crate::cspace::resolve_address_bits(
+            KERNEL.get(), &cspace_root, args.a0, crate::cspace::WORD_BITS);
+        if let Ok(res) = source_resolved {
+            if res.bits_remaining == 0 {
+                let src_idx = KernelState::cnode_index(res.slot_ptr);
+                let s2 = KERNEL.get();
+                s2.cnodes[src_idx].0[res.slot_index].set_cap(&state.to_cap());
             }
         }
     }
