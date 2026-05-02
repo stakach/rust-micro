@@ -43,6 +43,7 @@ pub fn test_main() {
     crate::interrupt::spec::test_interrupt();
     crate::vspace::spec::test_vspace();
     crate::boot::spec::test_boot();
+    crate::initrd::spec::test_initrd();
     crate::elf::spec::test_elf();
     #[cfg(target_arch = "x86_64")]
     crate::rootserver::spec::test_rootserver();

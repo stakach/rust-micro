@@ -37,7 +37,7 @@ use crate::cap::{
 use crate::cte::Cte;
 use crate::elf::{self, LoadSegment};
 use crate::kernel::{KernelState, KERNEL};
-use crate::rootserver_image::ROOTSERVER_ELF;
+use crate::rootserver_image::rootserver_elf;
 use crate::tcb::{Tcb, ThreadStateType};
 use crate::types::{
     seL4_BootInfo, seL4_SlotPos, seL4_SlotRegion, seL4_UntypedDesc,
@@ -167,7 +167,7 @@ pub enum LoadError {
 // ---------------------------------------------------------------------------
 
 pub unsafe fn load() -> Result<RootserverImage, LoadError> {
-    let img = elf::parse(ROOTSERVER_ELF).map_err(LoadError::Elf)?;
+    let img = elf::parse(rootserver_elf()).map_err(LoadError::Elf)?;
     let pml4 = make_user_pml4();
 
     // The linker may emit several PT_LOAD segments that share a
@@ -570,7 +570,7 @@ unsafe fn load_segment(
         let copy_end = seg_file_end.min(page_vaddr + 0x1000);
         if copy_end > copy_start {
             let file_off = seg.file_off + (copy_start - seg.vaddr);
-            let src = ROOTSERVER_ELF.as_ptr().add(file_off as usize);
+            let src = rootserver_elf().as_ptr().add(file_off as usize);
             let dst = (kva + (copy_start - page_vaddr)) as *mut u8;
             let len = (copy_end - copy_start) as usize;
             core::ptr::copy_nonoverlapping(src, dst, len);
@@ -619,7 +619,7 @@ pub mod spec {
 
             // Entry must equal the ELF's e_entry (sanity vs the
             // 29b spec).
-            let img = crate::elf::parse(super::ROOTSERVER_ELF).unwrap();
+            let img = crate::elf::parse(super::rootserver_elf()).unwrap();
             assert_eq!(result.entry, img.entry);
 
             // Stack-top is the documented constant.

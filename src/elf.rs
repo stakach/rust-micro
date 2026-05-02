@@ -285,7 +285,7 @@ pub mod spec {
 
     #[inline(never)]
     fn parses_embedded_rootserver() {
-        let img = parse(crate::rootserver_image::ROOTSERVER_ELF)
+        let img = parse(crate::rootserver_image::rootserver_elf())
             .expect("rootserver ELF parses");
         // The linker script pins the image at 0x100_0040_0000
         // (PML4[2] + 4 MiB). The exact `_start` offset within the
@@ -302,7 +302,7 @@ pub mod spec {
 
     #[inline(never)]
     fn rootserver_segments_have_known_shape() {
-        let img = parse(crate::rootserver_image::ROOTSERVER_ELF).unwrap();
+        let img = parse(crate::rootserver_image::rootserver_elf()).unwrap();
         let mut count = 0u32;
         let mut saw_text = false;
         for seg in img.load_segments() {

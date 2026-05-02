@@ -100,8 +100,14 @@ mod sched_context;
 // for the smp module to keep its tests scoped.
 mod smp;
 
-// Phase 29a — the seL4-style rootserver. Compiled as a separate
-// crate (rootserver/) and embedded here via `include_bytes!`.
+// Phase 39 — initrd (USTAR tar) walker. BOOTBOOT loads the archive
+// at `bootboot.initrd_ptr`; the kernel walks it at runtime to find
+// the rootserver ELF (and any other userspace artifacts).
+mod initrd;
+
+// Phase 29a / 39 — locator for the rootserver ELF inside the initrd.
+// Pre-39 this was an `include_bytes!` of a sibling crate's output;
+// now it's a runtime `initrd::find_file("boot/rootserver")`.
 mod rootserver_image;
 
 // Phase 29b — minimal ELF64 parser. Reads the embedded

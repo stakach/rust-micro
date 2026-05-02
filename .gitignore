@@ -10,3 +10,11 @@ disk.img
 # reference but never committed. The .bf and .xml inputs we depend on
 # are pinned under codegen/.
 /seL4/
+
+# libsel4-build outputs (generated headers, built archives, venv).
+# The build.sh + config + src under vendor/libsel4-build/ ARE tracked.
+/vendor/libsel4-build/out/
+/vendor/libsel4-build/.venv/
+
+# Local agent state from Claude Code.
+/.claude/

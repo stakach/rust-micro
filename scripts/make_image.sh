@@ -32,9 +32,14 @@ fi
 mkdir -p .tmp
 IMAGE=.tmp/disk.img
 KERNEL=target/mykernel-x86/release/mykernel-rust
+ROOTSERVER=.tmp/rootserver.elf
 
 if [ ! -f "$KERNEL" ]; then
   echo "error: kernel not built at $KERNEL — run scripts/build_kernel.sh first" >&2
+  exit 1
+fi
+if [ ! -f "$ROOTSERVER" ]; then
+  echo "error: rootserver not staged at $ROOTSERVER — run scripts/build_kernel.sh first" >&2
   exit 1
 fi
 
@@ -58,6 +63,26 @@ mmd -i "$IMAGE" ::efi
 mmd -i "$IMAGE" ::efi/boot
 mmd -i "$IMAGE" ::bootboot
 mcopy -i "$IMAGE" .tmp/bootboot.efi ::efi/boot/bootx64.efi
-mcopy -i "$IMAGE" "$KERNEL" ::bootboot/X86_64
+
+# Phase 39 — pack kernel + rootserver into a USTAR tar archive at
+# ::bootboot/INITRD. BOOTBOOT loads it into RAM, extracts sys/core
+# as the kernel, and exposes the whole archive's physical address
+# to the kernel via `bootboot.initrd_ptr` so userspace ELFs can be
+# located at runtime (see src/initrd.rs).
+INITRD_STAGE=.tmp/initrd
+rm -rf "$INITRD_STAGE"
+mkdir -p "$INITRD_STAGE/sys" "$INITRD_STAGE/boot"
+cp "$KERNEL"     "$INITRD_STAGE/sys/core"
+cp "$ROOTSERVER" "$INITRD_STAGE/boot/rootserver"
+
+# Use a deterministic mtime so reproducible builds produce
+# byte-identical archives. macOS bsdtar and GNU tar both support
+# --format=ustar.
+tar --format=ustar \
+    -C "$INITRD_STAGE" \
+    -cf .tmp/initrd.tar \
+    sys/core boot/rootserver
+
+mcopy -i "$IMAGE" .tmp/initrd.tar ::bootboot/INITRD
 
 echo "disk image ready: $IMAGE"
