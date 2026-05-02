@@ -69,8 +69,8 @@ between us and a system that could host a userspace driver:
     "send-then-callee-arrives" path (the queued-sender-Call
     path doesn't yet propagate `do_call` through the wait).
 
-- [x] 33d — Multi-VSpace rootserver demo. **DONE (setup
-       only — child dispatch is a follow-up)**
+- [x] 33d — Multi-VSpace rootserver demo. **DONE**
+  Follow-up child dispatch landed (see review below).
   * Extended `X86Page::Map` ABI with `args.a4 = vspace cap_ptr`
     (0 = current CR3 fallback for back-compat); paging-struct
     `Map` invocations (PT/PD/PDPT) similarly take vspace at
@@ -86,11 +86,25 @@ between us and a system that could host a userspace driver:
   * Rootserver demo retypes a fresh PML4 + PDPT + PD + PT +
     Frame, walks the hierarchy `Map` calls, and prints
     `[multi-vspace setup ok -- PML4/PDPT/PD/PT/Frame mapped]`.
-  * Out of scope (follow-up): actually dispatching a TCB into
-    the new VSpace. That needs either Frame-cap copies (so
-    the rootserver can write child code into a frame already
-    mapped in its own vspace, then map the same frame in the
-    child's vspace) or a kernel-side hand-off.
+  * Follow-up (now also done): the rootserver retypes two more
+    frames (code + stack), maps them in its own vspace at
+    unused PT slots inside the rootserver image PT (PD[2]),
+    copies hand-assembled child machine code into the code
+    frame, retypes a child TCB, `SetSpace`s it with the new
+    PML4 + shared CNode, `WriteRegisters` (rip = code vaddr,
+    rsp = stack top), `SetPriority(100)`, `Resume`. The child
+    executes the copied code in the new PML4 (different CR3
+    from rootserver's), issues a `SysSend` on the shared
+    endpoint at slot 12 carrying 0xBEEF; the rootserver
+    `SysRecv`s it and prints
+    `[vspace child sent 0xbeef via new PML4]`.
+  * The "isolation" here is partial — the new PML4 was
+    cloned from the live one so it shares PD[2]'s PT with
+    the rootserver's own vspace, which lets us re-use the
+    existing PT entries for the child's code/stack vaddrs.
+    Full isolation (independent user-half page tables) would
+    require either Frame-cap copies with independent
+    `mapped` state or a kernel-mediated frame-init path.
 
 ## Verification
 * Spec count rises by ~4–6.
