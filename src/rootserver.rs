@@ -224,6 +224,37 @@ pub static MCS_DEMO_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static MCS_H_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub static MCS_B_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Phase 34a — when the rootserver is built with `--features
+/// microtest`, the kernel's syscall_entry watches for the byte
+/// stream `[microtest done]\n` and qemu_exits as soon as it sees
+/// that suffix in `SysDebugPutChar` output. The harness prints
+/// per-test pass/fail lines first, then the sentinel.
+pub static MICROTEST_MATCH_POS: AtomicUsize = AtomicUsize::new(0);
+pub const MICROTEST_SENTINEL: &[u8] = b"[microtest done]\n";
+
+/// Feed one debug-put-char byte through the sentinel matcher.
+/// Returns true on the byte that completes `MICROTEST_SENTINEL`.
+pub fn microtest_check_byte(b: u8) -> bool {
+    let pos = MICROTEST_MATCH_POS.load(Ordering::Relaxed);
+    let expect = MICROTEST_SENTINEL[pos];
+    if b == expect {
+        let new_pos = pos + 1;
+        if new_pos == MICROTEST_SENTINEL.len() {
+            MICROTEST_MATCH_POS.store(0, Ordering::Relaxed);
+            return true;
+        }
+        MICROTEST_MATCH_POS.store(new_pos, Ordering::Relaxed);
+        false
+    } else {
+        // Restart, but credit a 1-char match if `b` is the start.
+        MICROTEST_MATCH_POS.store(
+            if b == MICROTEST_SENTINEL[0] { 1 } else { 0 },
+            Ordering::Relaxed,
+        );
+        false
+    }
+}
+
 /// Phase 29e — replace the AY demo. Loads the rootserver, builds
 /// its TCB + CSpace, writes the BootInfo page, demotes the boot
 /// thread, swaps CR3, and `sysretq`s into user mode. Never returns;

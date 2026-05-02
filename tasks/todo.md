@@ -1,3 +1,109 @@
+# Active phase plan — Phase 34: sel4test parity + microtest
+
+## Goal
+Implement the seL4 features `sel4test` exercises but our kernel
+doesn't yet have, and validate each one with a Rust-side
+conformance suite called **microtest**. Once microtest is green,
+official sel4test bring-up (Phase 35+) is mostly a build /
+glue-code job — the kernel-side gaps will already be closed.
+
+## Known kernel gaps (from the sel4test ABI audit)
+
+  * `seL4_TCB_Configure` — single-shot TCB setup. We split the
+    same fields across `SetSpace` + `WriteRegisters` +
+    `SetPriority` + `SchedContextBind`. Composite invocation,
+    no new mechanism.
+  * **IPC buffer for long messages**. Today we carry `msg_regs`
+    in 4 register slots; `seL4_MessageInfo.length` ≤ 4. seL4
+    overflows into the per-TCB IPC-buffer page. Tests using > 4
+    word messages need this.
+  * **Cap transfer over IPC** (`extraCaps`). Sender writes cap
+    descriptors into its IPC buffer; the kernel copies the
+    referenced caps into the receiver's CNode at the slots the
+    receiver names. Requires honouring `msginfo.extraCaps` in
+    transfer.
+  * **Reply caps as caps**. We stash `reply_to: TcbId` in the
+    callee's TCB. seL4 (under MCS) mints a `seL4_CapReply`
+    that the callee invokes with `seL4_Reply(replyCap)`. We
+    already have `Cap::Reply { ptr, can_grant }` typed; just
+    nothing routes through it.
+  * Smaller items the audit will surface: `Wait`/`Poll`
+    notification variants, `seL4_TCB_BindNotification` round-
+    trip, fuller `seL4_BootInfo`, etc.
+
+## Plan (incremental — one feature per slice, microtest case
+in the same commit)
+
+- [x] 34a — microtest skeleton. **DONE**
+  * Added `microtest` Cargo feature to both the rootserver crate
+    (drives `_start` into the harness) and the kernel crate
+    (`scripts/build_kernel.sh microtest` propagates to both).
+  * `rootserver/src/microtest.rs` registers test cases in a
+    `CASES: &[TestCase]` array; `run()` executes each, prints
+    `PASS name` / `FAIL name: reason`, then a summary line and
+    the `[microtest done]\n` sentinel.
+  * Kernel-side sentinel matcher in `rootserver.rs`
+    (`microtest_check_byte`) is wired into `syscall_entry`'s
+    `SysDebugPutChar` hook unconditionally; on match the kernel
+    qemu_exits.
+  * Initial tests: `syscall_round_trip`, `untyped_retype_tcb`.
+  * Legacy demos (29h/32g/33b/33d) continue to work with the
+    feature off.
+
+- [ ] 34b — `seL4_TCB_Configure`.
+  * New invocation; reads fault_ep + cspace + vspace + ipc-
+    buffer-frame + priority all from one message. Backward-
+    compatible; the existing per-field invocations stay.
+  * Microtest: configure a TCB end-to-end with one call,
+    dispatch it, verify it ran.
+
+- [ ] 34c — IPC buffer for long messages.
+  * Sender's `ipc_buffer_paddr` is already provided by the
+    rootserver bootstrap. Read words 4..length out of it on
+    `Send`/`Call`; write them into the receiver's IPC buffer
+    on transfer.
+  * Microtest: round-trip a 16-word message through an
+    endpoint.
+
+- [ ] 34d — Cap transfer over IPC (`extraCaps`).
+  * IPC buffer carries an `extraCaps[N]` (cptr) array and
+    `caps_received[N]` (dest slots). Kernel copies sender's
+    caps into receiver's CNode at the requested slots.
+  * Honour badge / rights mutate semantics.
+  * Microtest: caller mints an Endpoint cap, sends it to a
+    server which then uses it to talk to a third party.
+
+- [ ] 34e — Reply caps as caps.
+  * `Untyped::Retype(Reply)` allocates a `ReplyStorage` slot
+    (kernel pool, like SchedContext). Cap::Reply points at it.
+  * `seL4_Call`: kernel records the caller in the reply
+    object, transfers the reply cap into the receiver's
+    CSpace at a designated slot, blocks the caller.
+  * `seL4_Reply(replyCap)`: kernel uses the reply object's
+    bound TCB to wake the caller, clears the binding.
+  * Microtest: server saves the reply cap, replies later;
+    verify reply still works (the existing path can't do
+    saved replies because `reply_to` is a single field).
+
+## Out of scope (Phase 35+)
+* Real sel4test integration (libsel4 build, ELF loader for
+  CPIO-packaged tests, etc.). Once 34a–34e are green, the
+  kernel-side gap should be small enough that bring-up is
+  mostly tooling.
+* Domain scheduler.
+* PCID / INVPCID.
+
+## Verification
+* microtest harness runs N tests, reports M passed / N-M
+  failed, exits.
+* Spec count rises by ~5–8 (kernel-side specs for the new
+  invocations).
+* Existing rootserver demos (29h, 32g, 33b, 33d) still run
+  when microtest feature is off.
+
+## Review (filled on completion)
+
+
 # Phase 33: round out the kernel — DONE (33a–33d)
 
 ## Goal

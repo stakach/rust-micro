@@ -449,6 +449,18 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
     //   * In MCS phase, count 'H' and 'B' bytes; once we've seen
     //     enough of each to verify the budget split, log a summary
     //     and qemu_exit.
+    // Phase 34a — microtest sentinel watch. Built whether or not
+    // the rootserver is in microtest mode; the matcher is a noop
+    // outside that mode (the sentinel never appears in normal
+    // output).
+    if matches!(syscall, Syscall::SysDebugPutChar) {
+        let b = args.a0 as u8;
+        if crate::rootserver::microtest_check_byte(b) {
+            arch::log("[microtest sentinel matched -- exiting QEMU]\n");
+            crate::arch::qemu_exit(0);
+        }
+    }
+
     if crate::rootserver::ROOTSERVER_DEMO_ACTIVE.load(Ordering::Relaxed)
         && matches!(syscall, Syscall::SysDebugPutChar)
     {

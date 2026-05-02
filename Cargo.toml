@@ -26,3 +26,9 @@ fastpath = []
 fpu = []
 # Hardware-virtualisation extensions (VT-x). Phase 10e.
 vmx = []
+# Phase 34a — when set, the build script also builds the
+# rootserver crate with `--features microtest` so the embedded
+# rootserver runs the structured test harness instead of the
+# legacy demos. Kernel-side this is a no-op flag (the sentinel
+# matcher in syscall_entry runs unconditionally).
+microtest = []

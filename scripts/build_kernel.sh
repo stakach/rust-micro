@@ -37,6 +37,14 @@ fi
 # Phase 29a — the kernel embeds the rootserver ELF via
 # include_bytes!. Build the rootserver first so the ELF exists at
 # include_bytes! resolution time.
+#
+# Phase 34a — if the kernel build is asked for the `microtest`
+# feature, propagate it to the rootserver crate so its `_start`
+# runs the microtest harness instead of the legacy demos.
+ROOTSERVER_FEATURES=""
+if [[ ",${FEATURES}," == *",microtest,"* ]]; then
+  ROOTSERVER_FEATURES="microtest"
+fi
 (
   cd rootserver
   cargo +nightly build \
@@ -44,7 +52,8 @@ fi
     -Z unstable-options \
     -Z json-target-spec \
     --target triplet.json \
-    --release
+    --release \
+    ${ROOTSERVER_FEATURES:+--features "$ROOTSERVER_FEATURES"}
 )
 echo "rootserver built: rootserver/target/triplet/release/rootserver"
 

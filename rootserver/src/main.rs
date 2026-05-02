@@ -15,6 +15,9 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 
+#[cfg(feature = "microtest")]
+mod microtest;
+
 // ---------------------------------------------------------------------------
 // Syscall numbers — must stay in sync with `codegen/syscall.xml`
 // (mirrored in target/.../syscalls.rs after kernel build). Hand-listed
@@ -532,18 +535,32 @@ fn print_u64(mut n: u64) {
 #[no_mangle]
 #[link_section = ".text._start"]
 pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
-    let bi = &*bootinfo;
-    let n_untyped = bi.untyped.end - bi.untyped.start;
+    // Phase 34a — when built with `--features microtest`, replace
+    // the legacy demos with the structured test harness. The
+    // harness prints `[microtest done]\n` when finished; the
+    // kernel's exit hook in syscall_entry catches that sentinel
+    // and qemu_exits.
+    #[cfg(feature = "microtest")]
+    {
+        let _ = bootinfo;
+        microtest::run();
+        loop { yield_now(); }
+    }
 
-    print_str(b"[rootserver alive] node ");
-    print_u64(bi.node_id);
-    print_str(b"/");
-    print_u64(bi.num_nodes);
-    print_str(b", ");
-    print_u64(n_untyped);
-    print_str(b" untyped(s) of ");
-    print_u64(1u64 << bi.untyped_list[0].size_bits);
-    print_str(b" bytes\n");
+    #[cfg(not(feature = "microtest"))]
+    {
+        let bi = &*bootinfo;
+        let n_untyped = bi.untyped.end - bi.untyped.start;
+
+        print_str(b"[rootserver alive] node ");
+        print_u64(bi.node_id);
+        print_str(b"/");
+        print_u64(bi.num_nodes);
+        print_str(b", ");
+        print_u64(n_untyped);
+        print_str(b" untyped(s) of ");
+        print_u64(1u64 << bi.untyped_list[0].size_bits);
+        print_str(b" bytes\n");
 
     // Phase 29g — retype the Untyped into one Endpoint, written
     // into our CNode at slot FIRST_EMPTY_SLOT.
@@ -650,6 +667,7 @@ pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     loop {
         yield_now();
     }
+    } // end #[cfg(not(feature = "microtest"))]
 }
 
 unsafe fn irq_demo() {

@@ -3,6 +3,14 @@ name = "rootserver"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Phase 34a — replace the rootserver demos with the structured
+# microtest harness. Each test is one fn that prints `✓ name`
+# or `✗ name: reason`; the kernel's exit hook watches for
+# `[microtest done]` and qemu_exits.
+microtest = []
+
 [dependencies]
 
 [profile.release]
