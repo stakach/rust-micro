@@ -1,4 +1,4 @@
-# Active phase plan — Phase 32: MCS scheduler
+# Phase 32: MCS scheduler — DONE (32a–32g)
 
 ## Goal
 Replace the classic time-slice scheduler with seL4's MCS
@@ -47,13 +47,6 @@ What's already in place:
     via Phase 30 wiring.
   * Specs: round-trip + retype-into-SchedContext.
 
-
-- [ ] 32b — Bind a SchedContext to a TCB.
-  * `Tcb::sc: Option<SchedContextId>` (kernel-side index into
-    a small SchedContext pool, like Endpoints).
-  * `TCB::SetSchedContext` invocation: takes a SchedContext cap
-    (in invoker's CSpace) and binds it to the target TCB.
-  * Spec: SetSchedContext stores the binding.
 
 - [x] 32c — Bind SchedContext to TCB. **DONE**
   * `MAX_SCHED_CONTEXTS = 16` SchedContext pool in
