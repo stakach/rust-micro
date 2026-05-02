@@ -1107,10 +1107,80 @@ fn decode_irq_control(
             }
             Ok(())
         }
+        // Phase 42 — sel4test on x86 only uses the platform-specific
+        // IRQControl variants (the generic IRQIssueIRQHandler is for
+        // ARM/RISC-V). GetIOAPIC takes 7 message words plus the dest
+        // root cap as extraCap[0]:
+        //   msg_regs[0] = index (cptr to dest slot)
+        //   msg_regs[1] = depth (bits to resolve under root)
+        //   msg_regs[2] = ioapic id (ignored for now)
+        //   msg_regs[3] = pin       (ignored — we don't program IOAPIC
+        //                            redirection from this path yet;
+        //                            the kernel's existing PIT/PIC
+        //                            wiring delivers IRQs at fixed
+        //                            vectors)
+        //   msg_regs[4] = level     (ignored)
+        //   msg_regs[5] = polarity  (ignored)
+        //   msg_regs[6] = vector    — the IRQ number sel4test will
+        //                            ack/wait on; matches the kernel's
+        //                            internal `irq` numbering.
+        InvocationLabel::X86IRQIssueIRQHandlerIOAPIC => {
+            issue_x86_irq_handler(args, invoker, /* msi */ false)
+        }
+        InvocationLabel::X86IRQIssueIRQHandlerMSI => {
+            // MSI variant — same dest-cap wiring, ignore PCI fields.
+            // msg_regs[6] is also the vector here (MSI handler-vector
+            // semantics differ from IOAPIC routing but the cap is
+            // analogous).
+            issue_x86_irq_handler(args, invoker, /* msi */ true)
+        }
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
+}
+
+/// Common worker for `X86IRQIssueIRQHandlerIOAPIC` /
+/// `X86IRQIssueIRQHandlerMSI`. Resolves the destination slot via
+/// `extraCaps[0]` + `(index, depth)` and stamps a fresh
+/// `Cap::IrqHandler` at that slot.
+fn issue_x86_irq_handler(
+    args: &SyscallArgs,
+    invoker: TcbId,
+    _msi: bool,
+) -> KResult<()> {
+    unsafe {
+        let s = KERNEL.get();
+        let inv_tcb = s.scheduler.slab.get_mut(invoker);
+        let dest_cptr = inv_tcb.msg_regs[0];
+        let depth = inv_tcb.msg_regs[1] as u32;
+        let vector = inv_tcb.msg_regs[6];
+        let dest_root = if inv_tcb.pending_extra_caps_count > 0 {
+            inv_tcb.pending_extra_caps[0]
+        } else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        };
+        inv_tcb.pending_extra_caps_count = 0;
+
+        if !matches!(dest_root, Cap::CNode { .. }) {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        }
+        let res = crate::cspace::resolve_address_bits(s, &dest_root, dest_cptr, depth)?;
+        if res.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+        let cnode_idx = KernelState::cnode_index(res.slot_ptr);
+        let slot = &mut s.cnodes[cnode_idx].0[res.slot_index];
+        if !slot.cap().is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst)));
+        }
+        slot.set_cap(&Cap::IrqHandler { irq: vector as u16 });
+    }
+    Ok(())
 }
 
 fn decode_irq_handler(
@@ -1199,8 +1269,30 @@ fn decode_untyped_retype(
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
 
-    // Per-call retype trace was useful while diagnosing the source-slot
-    // free_index bug. Re-enable by setting INV_TRACE = true above.
+    if upstream && INV_TRACE {
+        let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
+        crate::arch::log("[ut t=");
+        log_dec(args.a2);
+        crate::arch::log(" sb=");
+        log_dec(args.a3);
+        crate::arch::log(" off=");
+        log_dec(inv_tcb.msg_regs[4]);
+        crate::arch::log(" n=");
+        log_dec(inv_tcb.msg_regs[5]);
+        crate::arch::log(" base=0x");
+        log_hex_u64(unsafe {
+            crate::untyped::UntypedState::from_cap(&target).map(|s| s.base).unwrap_or(0)
+        });
+        crate::arch::log(" fi=0x");
+        log_hex_u64(unsafe {
+            crate::untyped::UntypedState::from_cap(&target).map(|s| s.free_index_bytes).unwrap_or(0)
+        });
+        crate::arch::log(" bb=");
+        log_dec(unsafe {
+            crate::untyped::UntypedState::from_cap(&target).map(|s| s.block_bits as u64).unwrap_or(0)
+        });
+        crate::arch::log("]\n");
+    }
 
     let (object_type, size_bits, num_objects, dest_offset, dest_root_override) =
         if upstream {
@@ -1401,7 +1493,12 @@ fn decode_untyped_retype(
                         Cap::PageTable { ptr, .. } => Some((ptr.addr(), 4096)),
                         Cap::PageDirectory { ptr, .. } => Some((ptr.addr(), 4096)),
                         Cap::Pdpt { ptr, .. } => Some((ptr.addr(), 4096)),
-                        Cap::Frame { ptr, size, .. } => {
+                        // Phase 42 — only zero RAM-backed frames.
+                        // Device frames cover MMIO regions or ACPI/BIOS
+                        // tables; zeroing them would either trigger
+                        // side effects or destroy data the user just
+                        // wanted to read.
+                        Cap::Frame { ptr, size, is_device: false, .. } => {
                             let n: u64 = match size {
                                 FrameSize::Small => 4096,
                                 FrameSize::Large => 2 * 1024 * 1024,

@@ -117,10 +117,22 @@ pub fn retype(
     }
     let obj_bits = size_in_bits(obj_ty, user_size_bits)?;
 
-    // Device memory may only produce sub-untypeds (and, in a future
-    // phase, Frame caps that propagate the device flag).
-    if untyped.is_device && !matches!(obj_ty, ObjectType::Untyped) {
-        return Err(RetypeError::IllegalOperationDeviceMemory);
+    // Device memory may produce sub-untypeds and Frame caps (any
+    // size). The frame inherits `is_device=true` so Map sets the
+    // right caching attributes (TODO: not yet modelled — current
+    // Map sets only PRESENT/RW/USER). Other object types (CNode,
+    // TCB, Endpoint, ...) require kernel-tracked state that can't
+    // safely live in MMIO and stay rejected.
+    if untyped.is_device {
+        let allowed = matches!(obj_ty, ObjectType::Untyped)
+            || matches!(
+                obj_ty,
+                ObjectType::Arch(crate::object_type::X86_4K)
+                    | ObjectType::Arch(crate::object_type::X86_LARGE_PAGE)
+            );
+        if !allowed {
+            return Err(RetypeError::IllegalOperationDeviceMemory);
+        }
     }
 
     // Total bytes needed = num_objects * 2^obj_bits. Check both for

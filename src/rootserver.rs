@@ -485,6 +485,26 @@ pub unsafe fn launch_rootserver() -> ! {
         free_index: 0,
         is_device: false,
     });
+    // Phase 42 — device untypeds at slots 21..25, paralleling
+    // build_bootinfo's untypedList[1..5]. These cover the low 1 MiB
+    // (BIOS/ACPI/legacy) plus IOAPIC/HPET/LAPIC MMIO, so sel4test's
+    // platsupport can `vka_utspace_alloc_at` the right paddr and
+    // hand userspace a device Frame.
+    const DEVICE_UTS: &[(u64, u8)] = &[
+        (0x00000000, 20),
+        (0xFEC00000, 12),
+        (0xFED00000, 12),
+        (0xFEE00000, 12),
+    ];
+    for (i, &(paddr, sb)) in DEVICE_UTS.iter().enumerate() {
+        s.cnodes[ROOTSERVER_CNODE_IDX].0[untyped_slot + 1 + i] =
+            Cte::with_cap(&Cap::Untyped {
+                ptr: PPtr::<UntypedStorage>::new(paddr.max(1)).expect("dev ut paddr"),
+                block_bits: sb,
+                free_index: 0,
+                is_device: true,
+            });
+    }
 
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)
@@ -559,26 +579,62 @@ unsafe fn build_bootinfo(
 ) -> seL4_BootInfo {
     let mut empty_untypeds = [seL4_UntypedDesc::default();
         CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
-    // Phase 42 — single Untyped at slot 20 covering the boot-time-
-    // reserved chunk. sel4test's allocman carves all its TCBs /
-    // CNodes / frames / page tables out of this.
+    // Phase 42 — slot 20: the rootserver's RAM Untyped (allocman
+    // carves all TCBs / CNodes / frames / page tables out of this).
     empty_untypeds[0] = seL4_UntypedDesc {
         paddr: untyped_paddr,
         sizeBits: untyped_size_bits,
         isDevice: 0,
         padding: [0; 6],
     };
+    // Phase 42 — device untypeds for the regions sel4platsupport
+    // expects to be able to map_paddr into:
+    //   * Low 1 MiB (0x00000–0xFFFFF): BIOS data area, ACPI RSDP,
+    //     legacy interrupt vector table, VGA/BIOS ROM. sel4test's
+    //     bootstrap calls `vka_utspace_alloc_at(0xE0000, …)` for
+    //     ACPI table discovery; without this it bails early.
+    //   * 0xFEC00000 (4 KiB): IOAPIC MMIO.
+    //   * 0xFED00000 (4 KiB): HPET MMIO.
+    //   * 0xFEE00000 (4 KiB): LAPIC MMIO.
+    // Each is a separate, naturally-aligned device untyped so the
+    // user's allocator can bisect down to a 4 KiB device frame
+    // matching the requested paddr.
+    empty_untypeds[1] = seL4_UntypedDesc {
+        paddr: 0x00000000,
+        sizeBits: 20, // 1 MiB
+        isDevice: 1,
+        padding: [0; 6],
+    };
+    empty_untypeds[2] = seL4_UntypedDesc {
+        paddr: 0xFEC00000,
+        sizeBits: 12,
+        isDevice: 1,
+        padding: [0; 6],
+    };
+    empty_untypeds[3] = seL4_UntypedDesc {
+        paddr: 0xFED00000,
+        sizeBits: 12,
+        isDevice: 1,
+        padding: [0; 6],
+    };
+    empty_untypeds[4] = seL4_UntypedDesc {
+        paddr: 0xFEE00000,
+        sizeBits: 12,
+        isDevice: 1,
+        padding: [0; 6],
+    };
+    let untyped_count: Word = 5;
 
     let n_cores = crate::bootboot::get_num_cores() as Word;
     // Phase 36e / 42 — canonical slot layout under MCS:
     //   0..15  initial caps (some Null where unsupported)
     //   16..(16+n_cores)  per-CPU SchedControl
-    //   20     first Untyped
-    //   21..(1 << CNODE_RADIX)  empty (sel4test allocates here)
+    //   20..20+untyped_count  Untypeds (RAM at 20, device at 21..)
+    //   (rest)  empty (sel4test allocates here)
     let schedcontrol_start: Word = 16;
     let schedcontrol_end: Word = schedcontrol_start + n_cores.min(4);
     let untyped_start: Word = 20;
-    let untyped_end: Word = untyped_start + 1;
+    let untyped_end: Word = untyped_start + untyped_count;
     let cnode_slots: Word = 1u64 << crate::kernel::CNODE_RADIX;
     seL4_BootInfo {
         extraLen: 0,
