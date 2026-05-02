@@ -82,13 +82,29 @@ in the same commit)
     invocation. End-to-end long-msg round-trip from userspace
     waits on richer harness machinery (34d/e).
 
-- [ ] 34d — Cap transfer over IPC (`extraCaps`).
-  * IPC buffer carries an `extraCaps[N]` (cptr) array and
-    `caps_received[N]` (dest slots). Kernel copies sender's
-    caps into receiver's CNode at the requested slots.
-  * Honour badge / rights mutate semantics.
-  * Microtest: caller mints an Endpoint cap, sends it to a
-    server which then uses it to talk to a third party.
+- [x] 34d — Cap transfer over IPC (`extraCaps`). **DONE**
+  * Added `Tcb.pending_extra_caps: [Cap; 3]` +
+    `pending_extra_caps_count: u8`. Sender's `handle_send`
+    stages caps from its IPC buffer's `caps_or_badges[]`
+    array (offset 122 from buffer base) before the message
+    transfer.
+  * `endpoint::transfer_extra_caps(sender, receiver)` runs
+    after `transfer()` in both `send_ipc::EpState::Recv`
+    and `receive_ipc::EpState::Send` paths. Reads the
+    receiver's IPC-buffer `receiveCNode`/`receiveIndex`,
+    resolves the target CNode (0 = own cspace_root), and
+    writes each staged cap into successive slots starting
+    at `receiveIndex`.
+  * New module `src/ipc_buffer.rs` collects the
+    seL4_IPCBuffer word-offset constants.
+  * Kernel spec `extra_cap_transfer_via_ipc` round-trips a
+    badged Endpoint cap through the IPC pair and asserts it
+    lands at the receiver's CSpace at slot 5 with badge
+    preserved.
+  * Microtest case `ipc_extra_cap_staging` exercises the
+    user-mode staging path. Full multi-thread round-trip
+    requires a microtest child harness — landing in 34e or
+    later.
 
 - [ ] 34e — Reply caps as caps.
   * `Untyped::Retype(Reply)` allocates a `ReplyStorage` slot

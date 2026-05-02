@@ -269,6 +269,41 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                     snd.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
                 }
             }
+
+            snd.pending_extra_caps_count = 0;
+        }
+        // Phase 34d — stage caps the sender wants to transfer.
+        // seL4's IPC buffer layout: [tag, msg[120], userData,
+        // caps_or_badges[3], receiveCNode, receiveIndex,
+        // receiveDepth]. caps_or_badges starts at word 122 from
+        // the buffer base. Done in a separate scope so the
+        // `snd` mutable borrow doesn't conflict with lookup_cap.
+        let n_caps = info.extra_caps() as usize;
+        if n_caps > 0 {
+            let (buf_paddr, snd_cspace) = {
+                let snd = s.scheduler.slab.get(current);
+                (snd.ipc_buffer_paddr, snd.cspace_root)
+            };
+            if buf_paddr != 0 {
+                let buf = buf_paddr as *const u64;
+                let mut staged: [crate::cap::Cap; 3] =
+                    [crate::cap::Cap::Null; 3];
+                let mut count = 0u8;
+                let n = n_caps.min(staged.len());
+                for i in 0..n {
+                    let cptr = core::ptr::read_volatile(
+                        buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET + i));
+                    if let Ok(c) = crate::cspace::lookup_cap(s, &snd_cspace, cptr) {
+                        staged[i] = c;
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let snd = s.scheduler.slab.get_mut(current);
+                snd.pending_extra_caps = staged;
+                snd.pending_extra_caps_count = count;
+            }
         }
         let idx = crate::kernel::KernelState::endpoint_index(ep_ptr);
         let opts = SendOptions { blocking, do_call: call, badge };

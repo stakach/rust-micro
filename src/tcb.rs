@@ -209,6 +209,15 @@ pub struct Tcb {
     /// Cleared on `seL4_Reply` so the donated SC reverts to its
     /// owner.
     pub active_sc: Option<u16>,
+    /// Phase 34d — caps staged for transfer on the next IPC. Set
+    /// by `handle_send` when `msginfo.extraCaps > 0`: the kernel
+    /// reads `caps_or_badges[]` out of the sender's IPC buffer,
+    /// looks each cptr up in the sender's CSpace, and stores the
+    /// resulting cap here. Cleared by the IPC transfer step,
+    /// which copies them into the receiver's CNode at the slots
+    /// the receiver named in `receiveIndex`.
+    pub pending_extra_caps: [crate::cap::Cap; 3],
+    pub pending_extra_caps_count: u8,
 }
 
 impl Default for Tcb {
@@ -241,6 +250,8 @@ impl Default for Tcb {
             affinity: 0,
             sc: None,
             active_sc: None,
+            pending_extra_caps: [crate::cap::Cap::Null; 3],
+            pending_extra_caps_count: 0,
         }
     }
 }

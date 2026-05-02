@@ -164,6 +164,7 @@ pub fn send_ipc(
             let receiver = queue_pop_head(ep, sched)
                 .expect("Recv state must have at least one waiter");
             transfer(sched, sender, receiver, opts.badge);
+            transfer_extra_caps(sched, sender, receiver);
             if opts.do_call {
                 // Call: block sender BlockedOnReply, set the
                 // receiver's reply_to to the caller.
@@ -212,6 +213,7 @@ pub fn receive_ipc(
             // send call — re-use it instead of consulting the cap.
             let badge = sched.slab.get(sender).ipc_badge;
             transfer(sched, sender, receiver, badge);
+            transfer_extra_caps(sched, sender, receiver);
             sched.make_runnable(sender);
             if queue_is_empty(ep) {
                 ep.state = EpState::Idle;
@@ -290,6 +292,83 @@ fn transfer(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) 
     }
 }
 
+/// Phase 34d — copy any caps the sender staged on
+/// `pending_extra_caps` into the receiver's CSpace at the slots the
+/// receiver named in its IPC buffer (`receiveCNode` / `receiveIndex`).
+/// `receiveCNode == 0` means "use the receiver's own cspace_root".
+///
+/// `receiveDepth` is read but currently ignored — our flat-radix
+/// CNodes don't traverse hierarchies on the receive side.
+pub fn transfer_extra_caps(
+    sched: &mut crate::scheduler::Scheduler,
+    sender: TcbId,
+    receiver: TcbId,
+) {
+    let count = sched.slab.get(sender).pending_extra_caps_count as usize;
+    if count == 0 { return; }
+    let recv_buf_paddr = sched.slab.get(receiver).ipc_buffer_paddr;
+    if recv_buf_paddr == 0 {
+        // No buffer to consult — drop the staged caps.
+        sched.slab.get_mut(sender).pending_extra_caps_count = 0;
+        return;
+    }
+
+    // Read receive descriptor from receiver's IPC buffer.
+    let (recv_cnode_cptr, recv_index) = unsafe {
+        let buf = recv_buf_paddr as *const u64;
+        (
+            core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET)),
+            core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET))
+                as usize,
+        )
+    };
+
+    let recv_cspace = sched.slab.get(receiver).cspace_root;
+    let target_cnode_cap = if recv_cnode_cptr == 0 {
+        recv_cspace
+    } else {
+        match unsafe {
+            crate::cspace::lookup_cap(crate::kernel::KERNEL.get(),
+                &recv_cspace, recv_cnode_cptr)
+        } {
+            Ok(c) => c,
+            Err(_) => {
+                sched.slab.get_mut(sender).pending_extra_caps_count = 0;
+                return;
+            }
+        }
+    };
+    let cnode_ptr = match target_cnode_cap {
+        crate::cap::Cap::CNode { ptr, .. } => ptr,
+        _ => {
+            sched.slab.get_mut(sender).pending_extra_caps_count = 0;
+            return;
+        }
+    };
+    let cnode_idx = unsafe {
+        crate::kernel::KernelState::cnode_index(cnode_ptr)
+    };
+
+    unsafe {
+        let s = crate::kernel::KERNEL.get();
+        let staged = s.scheduler.slab.get(sender).pending_extra_caps;
+        let slots = &mut s.cnodes[cnode_idx].0;
+        for i in 0..count {
+            let dest_idx = recv_index + i;
+            if dest_idx >= slots.len() { break; }
+            // Don't clobber an existing cap.
+            if !slots[dest_idx].cap().is_null() { continue; }
+            slots[dest_idx].set_cap(&staged[i]);
+            // MDB: the new cap is derived from… we have no source
+            // CTE id (the cap was looked up by cptr through the
+            // sender's CSpace, not retyped). For now record None;
+            // proper provenance tracking is a follow-up.
+            slots[dest_idx].set_parent(None);
+        }
+    }
+    sched.slab.get_mut(sender).pending_extra_caps_count = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Specs
 // ---------------------------------------------------------------------------
@@ -317,8 +396,102 @@ pub mod spec {
         cancel_ipc_unblocks_thread();
         multiple_senders_queue_in_order();
         long_message_via_ipc_buffer();
+        extra_cap_transfer_via_ipc();
 
         arch::log("Endpoint IPC tests completed\n");
+    }
+
+    /// Phase 34d — staging an Endpoint cap on the sender and
+    /// arranging for a receive slot via the receiver's IPC buffer
+    /// should land the cap in the receiver's CSpace at the named
+    /// slot after the IPC transfer.
+    ///
+    /// Uses `KERNEL.get().scheduler` rather than a local
+    /// `Scheduler::new()` — `transfer_extra_caps` reaches into
+    /// `KERNEL.get().cnodes[]` via raw pointer to write the cap,
+    /// so the sender/receiver TCBs need to live in the same slab
+    /// that production code consults.
+    #[inline(never)]
+    fn extra_cap_transfer_via_ipc() {
+        use crate::cap::{Cap, Badge, EndpointObj, EndpointRights, PPtr};
+
+        #[repr(C, align(4096))]
+        struct IpcPage([u64; 512]);
+        static mut SENDER_BUF: IpcPage = IpcPage([0; 512]);
+        static mut RECEIVER_BUF: IpcPage = IpcPage([0; 512]);
+
+        let s = unsafe { crate::kernel::KERNEL.get() };
+        s.scheduler.reset_queues();
+        s.scheduler.set_current(None);
+
+        let mut ep = Endpoint::new();
+        let sender = s.scheduler.admit(runnable(50));
+        let receiver = s.scheduler.admit(runnable(50));
+
+        unsafe {
+            s.scheduler.slab.get_mut(sender).ipc_buffer_paddr =
+                (&raw mut SENDER_BUF) as u64;
+            s.scheduler.slab.get_mut(receiver).ipc_buffer_paddr =
+                (&raw mut RECEIVER_BUF) as u64;
+        }
+
+        // Receiver names slot 5 of its own CSpace as the receive
+        // target. `receiveCNode = 0` ⇒ "use cspace_root".
+        unsafe {
+            let buf = (&raw mut RECEIVER_BUF) as *mut u64;
+            core::ptr::write_volatile(
+                buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET), 0);
+            core::ptr::write_volatile(
+                buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET), 5);
+        }
+
+        // Sender stages a fake Endpoint cap. We don't go through
+        // CSpace lookup here — `transfer_extra_caps` reads from
+        // `pending_extra_caps[]` directly.
+        let to_transfer = Cap::Endpoint {
+            ptr: PPtr::<EndpointObj>::new(0x4000).unwrap(),
+            badge: Badge(0xBEEF),
+            rights: EndpointRights {
+                can_send: true, can_receive: true,
+                can_grant: false, can_grant_reply: false,
+            },
+        };
+        s.scheduler.slab.get_mut(sender).pending_extra_caps[0] = to_transfer;
+        s.scheduler.slab.get_mut(sender).pending_extra_caps_count = 1;
+
+        // Plant the receiver's cspace_root pointing at CNode 0 so
+        // `transfer_extra_caps` can resolve the receive CNode.
+        let cspace = Cap::CNode {
+            ptr: crate::kernel::KernelState::cnode_ptr(0),
+            radix: 5, guard_size: 59, guard: 0,
+        };
+        s.scheduler.slab.get_mut(receiver).cspace_root = cspace;
+        // Make sure slot 5 starts empty.
+        s.cnodes[0].0[5].set_cap(&Cap::Null);
+
+        receive_ipc(&mut ep, &mut s.scheduler, receiver, RecvOptions::blocking());
+        send_ipc(&mut ep, &mut s.scheduler, sender, SendOptions::blocking(0));
+
+        let landed = s.cnodes[0].0[5].cap();
+        match landed {
+            Cap::Endpoint { ptr, badge, .. } => {
+                assert_eq!(ptr.addr(), 0x4000);
+                assert_eq!(badge.0, 0xBEEF);
+            }
+            other => panic!(
+                "expected Endpoint at slot 5, got {:?}", other),
+        }
+        s.cnodes[0].0[5].set_cap(&Cap::Null);
+        assert_eq!(
+            s.scheduler.slab.get(sender).pending_extra_caps_count, 0,
+            "transfer should drain the staged caps");
+
+        // Cleanup.
+        s.scheduler.slab.free(sender);
+        s.scheduler.slab.free(receiver);
+        s.scheduler.reset_queues();
+        s.scheduler.set_current(None);
+        arch::log("  ✓ extra cap transfers through IPC into receiver's CNode\n");
     }
 
     /// Phase 34c — long-message IPC. With both TCBs sporting an
