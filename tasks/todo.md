@@ -1,3 +1,30 @@
+# Phase 36: ABI audit + parity fixes — DONE (36a–36g)
+
+Audit doc: `tasks/sel4test_abi_audit.md`. All six major gaps the
+audit enumerated are now closed:
+
+- 36a — sel4test ABI audit (read-only diff doc).
+- 36b — syscall codegen → api-mcs.
+- 36c — bi.schedcontrol slot region.
+- 36d — Reply caps wired through Call/Reply.
+- 36e — initial-cap slot layout (Untyped@20, ASIDControl@5,
+        per-CPU SchedControl@16+, CNode radix→6).
+- 36f — handle_send pre-match staging so non-Endpoint
+        invocations can read msg_regs / extraCaps.
+- 36g — full upstream-shape `seL4_TCB_WriteRegisters` (legacy
+        3-arg form retained for back-compat).
+
+Remaining as smaller follow-ups: `Cap::AsidPool` at slot 6,
+`Cap::SchedContext` for the initial thread at slot 14, the
+mechanical `cspace_data` / `ipc_buffer_frame` additions to
+TCBConfigure, and symmetric ReadRegisters. Next big step is
+building libsel4 standalone against our generated headers (the
+original Phase 34 follow-up).
+
+
+# Phase 35: microtest expansion — DONE (35a)
+
+
 # Phase 34: sel4test parity + microtest — DONE (34a–34e)
 
 ## Goal
