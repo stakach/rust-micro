@@ -109,14 +109,15 @@ pub const ROOTSERVER_BOOTINFO_VBASE: u64 = 0x0000_0100_0070_0000;
 /// rootserver's own CNode.
 pub const ROOTSERVER_CNODE_IDX: usize = 3;
 
-/// Backing memory for the rootserver's only Untyped cap. 16 KiB
-/// (block_bits=14) is enough to retype a child TCB + CNode +
-/// Endpoint in Phase 29g. Reserved as a static so the physical
-/// address is stable across runs.
+/// Backing memory for the rootserver's only Untyped cap. Phase 33d
+/// bumped this from 16 KiB to 64 KiB so the rootserver can carve a
+/// fresh PML4 + PDPT + PD + PT + Frame on top of the earlier 32g
+/// retypes. block_bits=16 → 65 536 bytes. Reserved as a static so
+/// the physical address is stable across runs.
 #[repr(C, align(4096))]
-struct UntypedPool([u8; 16 * 1024]);
-static mut ROOTSERVER_UNTYPED_POOL: UntypedPool = UntypedPool([0; 16 * 1024]);
-const ROOTSERVER_UNTYPED_BITS: u8 = 14;
+struct UntypedPool([u8; 64 * 1024]);
+static mut ROOTSERVER_UNTYPED_POOL: UntypedPool = UntypedPool([0; 64 * 1024]);
+const ROOTSERVER_UNTYPED_BITS: u8 = 16;
 
 // ---------------------------------------------------------------------------
 // Output of the loader.

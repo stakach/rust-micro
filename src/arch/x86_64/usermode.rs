@@ -573,6 +573,68 @@ pub unsafe fn install_user_table(level: u32, vaddr: u64, table_paddr: u64) -> bo
     install_user_table_in(pml4, level, vaddr, table_paddr)
 }
 
+/// Phase 33d — variant of `install_user_table` that targets an
+/// arbitrary PML4 (identified by paddr) rather than the live CR3.
+/// Used by `decode_pt_map` / `decode_pd_map` / `decode_pdpt_map`
+/// when the invoker passes a vspace cap_ptr in args.a3.
+///
+/// SAFETY: `pml4_paddr` must be a valid PML4 paddr and the
+/// rootserver pool memory must be reachable through the kernel's
+/// identity-mapped low memory (the BOOTBOOT 1 GiB identity map).
+pub unsafe fn install_user_table_in_paddr(
+    pml4_paddr: u64,
+    level: u32,
+    vaddr: u64,
+    table_paddr: u64,
+) -> bool {
+    // BOOTBOOT identity-maps low memory 1:1 in the kernel half, so a
+    // physical address < 1 GiB also names a kernel-virt address.
+    let pml4 = (pml4_paddr & 0xFFFF_F000) as *mut u64;
+    install_user_table_in(pml4, level, vaddr, table_paddr)
+}
+
+/// Phase 33d — map a 4 KiB frame into a foreign PML4. Walks the
+/// PML4 → PDPT → PD → PT chain (which the caller must have set up
+/// via the paging-struct `Map` invocations) and installs the leaf
+/// PTE. Returns `Err(())` if any intermediate level is missing.
+pub unsafe fn map_user_4k_into_foreign_pml4(
+    pml4_paddr: u64,
+    vaddr: u64,
+    frame_paddr: u64,
+    writable: bool,
+) -> Result<(), u32> {
+    let pml4 = (pml4_paddr & 0xFFFF_F000) as *mut u64;
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
+    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+    if pml4e & PTE_PRESENT == 0 || pml4e & super::paging::PTE_PS != 0 {
+        return Err(1);
+    }
+    let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+    if pdpte & PTE_PRESENT == 0 || pdpte & super::paging::PTE_PS != 0 {
+        return Err(2);
+    }
+    let pd = (pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pde = core::ptr::read_volatile(pd.add(pd_idx));
+    if pde & PTE_PRESENT == 0 || pde & super::paging::PTE_PS != 0 {
+        return Err(3);
+    }
+    let pt = (pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let cur = core::ptr::read_volatile(pt.add(pt_idx));
+    if cur & PTE_PRESENT != 0 {
+        return Err(4);
+    }
+    let mut flags = PTE_PRESENT | PTE_USER;
+    if writable {
+        flags |= PTE_RW;
+    }
+    core::ptr::write_volatile(pt.add(pt_idx), (frame_paddr & !0xFFF) | flags);
+    Ok(())
+}
+
 unsafe fn install_user_table_in(
     pml4: *mut u64,
     level: u32,

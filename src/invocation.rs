@@ -85,11 +85,14 @@ fn decode_frame(
     }
 }
 
-/// `X86Page::Map(vspace, vaddr, rights)` — install the frame at
-/// `vaddr` in the invoker's vspace. We only handle 4 KiB pages
-/// today; large/huge fall through with InvalidArgument.
+/// `X86Page::Map(vaddr, rights, [vspace_cptr])` — install the frame
+/// at `vaddr` in a vspace. We only handle 4 KiB pages today;
+/// large/huge fall through with InvalidArgument.
 ///
-/// ABI: a2 = vaddr, a3 = rights word (FrameRights encoding).
+/// ABI: a2 = vaddr, a3 = rights word (FrameRights encoding),
+/// a4 = vspace cap_ptr (0 = current CR3 — backward-compatible
+/// default; non-zero = invoker-owned PML4 cap to map the frame
+/// into, used by the Phase 33d multi-vspace path).
 fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     use crate::arch::x86_64::usermode;
     let (paddr, size, _device, current_mapped) = match target {
@@ -109,6 +112,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     let vaddr = args.a2;
     let rights = crate::cap::FrameRights::from_word(args.a3);
     let writable = matches!(rights, crate::cap::FrameRights::ReadWrite);
+    let vspace_cptr = args.a4;
 
     if vaddr & 0xFFF != 0 {
         return Err(KException::SyscallError(SyscallError::new(
@@ -116,11 +120,25 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         )));
     }
 
-    // Install via the same low-level page-table helper userspace
-    // pages use. We don't have per-thread CR3 yet so this maps
-    // into the shared kernel page tables — fine for the demo.
+    // Phase 33d — if a vspace cap is provided, look up the target
+    // PML4 paddr and install into THAT vspace's tables. Otherwise
+    // install into the live CR3 (backward-compat path used by all
+    // pre-33d invocations).
     unsafe {
-        usermode::map_user_4k_public(vaddr, paddr, writable);
+        if vspace_cptr != 0 {
+            let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
+            let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, vspace_cptr)?;
+            let pml4_paddr = match pml4_cap {
+                Cap::PML4 { ptr, .. } => ptr.addr(),
+                _ => return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability))),
+            };
+            usermode::map_user_4k_into_foreign_pml4(pml4_paddr, vaddr, paddr, writable)
+                .map_err(|_| KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_FailedLookup)))?;
+        } else {
+            usermode::map_user_4k_public(vaddr, paddr, writable);
+        }
     }
 
     // Update the cap to reflect the mapping. We need to find the
@@ -286,6 +304,10 @@ fn decode_pdpt(
 /// Common shape: write a paging-structure cap into the parent table
 /// at the appropriate level, then update the source slot's cap to
 /// record the mapped vaddr.
+///
+/// ABI: a2 = vaddr, a3 = vspace cap_ptr (0 = current CR3 —
+/// backward-compatible default; non-zero = invoker-owned PML4 cap
+/// added by Phase 33d for multi-vspace setup).
 fn map_paging_struct(
     target: Cap,
     args: &SyscallArgs,
@@ -305,21 +327,37 @@ fn map_paging_struct(
             seL4_Error::seL4_AlignmentError,
         )));
     }
+    let vspace_cptr = args.a3;
 
-    // Outside spec mode, install the entry into the live PML4.
-    // Spec mode runs without a real page-table tree, so we skip
-    // the hardware install and only update the cap shadow.
-    #[cfg(not(feature = "spec"))]
-    {
-        let installed = unsafe { usermode::install_user_table(level, vaddr, paddr) };
-        if !installed {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup,
-            )));
+    // Install the entry into the target PML4. The foreign-vspace
+    // path (vspace_cptr != 0) always runs the hardware install
+    // since it requires a real PML4 backing the new vspace; the
+    // legacy "current CR3" path is gated under !spec because some
+    // unit specs construct synthetic paging-struct caps that don't
+    // back real tables.
+    let installed = unsafe {
+        if vspace_cptr != 0 {
+            let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
+            let pml4_cap = crate::cspace::lookup_cap(
+                KERNEL.get(), &cspace_root, vspace_cptr)?;
+            let pml4_paddr = match pml4_cap {
+                Cap::PML4 { ptr, .. } => ptr.addr(),
+                _ => return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability))),
+            };
+            usermode::install_user_table_in_paddr(pml4_paddr, level, vaddr, paddr)
+        } else {
+            #[cfg(not(feature = "spec"))]
+            { usermode::install_user_table(level, vaddr, paddr) }
+            #[cfg(feature = "spec")]
+            { let _ = (level, usermode::install_user_table); true }
         }
+    };
+    if !installed {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_FailedLookup,
+        )));
     }
-    #[cfg(feature = "spec")]
-    let _ = (level, usermode::install_user_table); // silence unused-function warning under spec
 
     rewrite_paging_cap_in_cspace(invoker, &target, Some(vaddr));
     Ok(())
@@ -947,6 +985,19 @@ fn decode_untyped_retype(
                             ptr: KernelState::sched_context_ptr(i),
                             size_bits,
                         }
+                    }
+                    // Phase 33d — when the rootserver retypes a fresh
+                    // PML4, copy the live PML4's entries into it so
+                    // the new vspace has the kernel half mapped. Any
+                    // thread we later dispatch with this PML4 needs
+                    // those entries to enter the kernel from SYSCALL
+                    // (gs:-relative loads of PER_CPU_SYSCALL hit the
+                    // kernel half) and to take page faults.
+                    #[cfg(target_arch = "x86_64")]
+                    Cap::PML4 { ptr, mapped, asid } => {
+                        let new_paddr = ptr.addr();
+                        crate::arch::x86_64::paging::clone_live_pml4_to_paddr(new_paddr);
+                        Cap::PML4 { ptr, mapped, asid }
                     }
                     other => other,
                 };

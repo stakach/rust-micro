@@ -91,6 +91,25 @@ pub unsafe fn make_user_pml4() -> u64 {
     kernel_virt_to_phys(new_va as u64)
 }
 
+/// Phase 33d — clone the live CR3's PML4 into `target_paddr`, used
+/// when a fresh PML4 is carved out of an Untyped via
+/// `Untyped::Retype`. The kernel half (and BOOTBOOT identity map)
+/// must be present in any user PML4 we later dispatch a thread on,
+/// otherwise SYSCALL entries land in unmapped memory.
+///
+/// Relies on the BOOTBOOT 1 GiB identity map: low-memory paddrs
+/// (where rootserver Untyped pools live) double as kernel-virt
+/// addresses. If we ever move the Untyped pool out of low memory
+/// this routine will need a real phys->virt translation.
+pub unsafe fn clone_live_pml4_to_paddr(target_paddr: u64) {
+    let live = (read_cr3() & 0xFFFF_F000) as *const u64;
+    let target = (target_paddr & 0xFFFF_F000) as *mut u64;
+    for i in 0..512 {
+        let entry = ptr::read_volatile(live.add(i));
+        ptr::write_volatile(target.add(i), entry);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PTE flag constants. Same encoding as `vspace::make_pte` but
 // without the bitfield wrapper — we want raw u64 entries for the

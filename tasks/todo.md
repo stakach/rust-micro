@@ -69,17 +69,28 @@ between us and a system that could host a userspace driver:
     "send-then-callee-arrives" path (the queued-sender-Call
     path doesn't yet propagate `do_call` through the wait).
 
-- [ ] 33d — Multi-VSpace rootserver demo.
-  * Rootserver retypes PML4 + PDPT + PD + PT objects out of
-    its Untyped, plus one Frame for the child's code page.
-  * Maps the frame at a known vaddr in the new VSpace using
-    the existing `X86Page::Map` / `X86PageTable::Map` /
-    `X86PageDirectory::Map` / `X86PDPT::Map` invocations.
-  * Copies a tiny inline child function (`ep_send + loop
-    yield`) into the frame.
-  * Retypes a TCB, `SetSpace` with the new PML4 cap,
-    `WriteRegisters`, `Resume`. Child IPCs back over a
-    shared endpoint.
+- [x] 33d — Multi-VSpace rootserver demo. **DONE (setup
+       only — child dispatch is a follow-up)**
+  * Extended `X86Page::Map` ABI with `args.a4 = vspace cap_ptr`
+    (0 = current CR3 fallback for back-compat); paging-struct
+    `Map` invocations (PT/PD/PDPT) similarly take vspace at
+    `args.a3`. `usermode::install_user_table_in_paddr` and
+    `map_user_4k_into_foreign_pml4` install into a foreign
+    PML4 walked by paddr.
+  * `Untyped::Retype(X86_PML4)` now clones the live PML4 into
+    the new one via `clone_live_pml4_to_paddr`, so any later
+    dispatch into the new vspace lands on a PML4 with the
+    kernel half + BOOTBOOT identity map already wired.
+  * Rootserver Untyped pool bumped 16 KiB → 64 KiB to fit the
+    new paging structures alongside the 32g/33b retypes.
+  * Rootserver demo retypes a fresh PML4 + PDPT + PD + PT +
+    Frame, walks the hierarchy `Map` calls, and prints
+    `[multi-vspace setup ok -- PML4/PDPT/PD/PT/Frame mapped]`.
+  * Out of scope (follow-up): actually dispatching a TCB into
+    the new VSpace. That needs either Frame-cap copies (so
+    the rootserver can write child code into a frame already
+    mapped in its own vspace, then map the same frame in the
+    child's vspace) or a kernel-side hand-off.
 
 ## Verification
 * Spec count rises by ~4–6.

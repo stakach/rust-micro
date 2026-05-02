@@ -41,6 +41,14 @@ const LBL_TCB_SET_PRIORITY: u64 = 6;
 /// Phase 33b — IRQ-handler invocations.
 const LBL_IRQ_ISSUE_IRQ_HANDLER: u64 = 26;
 const LBL_IRQ_SET_IRQ_HANDLER: u64 = 28;
+/// Phase 33d — X86 paging map invocations. Each `Map` invocation
+/// installs a paging structure or frame at a vaddr in a vspace
+/// (passed via args.a3 / a4 — see `decode_pt_map` &c. in the
+/// kernel).
+const LBL_X86_PDPT_MAP: u64 = 39;
+const LBL_X86_PAGE_DIRECTORY_MAP: u64 = 41;
+const LBL_X86_PAGE_TABLE_MAP: u64 = 43;
+const LBL_X86_PAGE_MAP: u64 = 45;
 
 /// `seL4_ObjectType` values we use here.
 const OBJ_TCB: u64 = 1;
@@ -51,6 +59,15 @@ const OBJ_NOTIFICATION: u64 = 3;
 /// struct's footprint.
 const OBJ_SCHED_CONTEXT: u64 = 5;
 const SCHED_CONTEXT_BITS: u32 = 8;
+/// Phase 33d — x86 paging-structure object types. Numeric tags
+/// match `object_type::X86_*`. The kernel's `untyped::create_object`
+/// expects size_bits=12 (one 4 KiB page) for each paging level.
+const OBJ_X86_4K_PAGE: u64 = 7;
+const OBJ_X86_PAGE_TABLE: u64 = 10;
+const OBJ_X86_PAGE_DIRECTORY: u64 = 11;
+const OBJ_X86_PDPT: u64 = 12;
+const OBJ_X86_PML4: u64 = 13;
+const PAGING_BITS: u32 = 12;
 
 /// Initial CNode slots (mirrors the kernel's `seL4_RootCNodeCapSlots`).
 const CAP_INIT_THREAD_CNODE: u64 = 2;
@@ -77,6 +94,19 @@ const SLOT_IRQ_NTFN: u64 = 19;
 const SLOT_IRQ_HANDLER: u64 = 20;
 /// IRQ used in the demo (PIC1 line 1 → IDT vector 0x21).
 const DEMO_IRQ: u64 = 1;
+/// Phase 33d — multi-VSpace demo slots. Lay out the paging
+/// hierarchy + a frame, all carved from the rootserver's
+/// Untyped at slot 11.
+const SLOT_NEW_PML4: u64 = 21;
+const SLOT_NEW_PDPT: u64 = 22;
+const SLOT_NEW_PD:   u64 = 23;
+const SLOT_NEW_PT:   u64 = 24;
+const SLOT_NEW_FRAME: u64 = 25;
+/// Vaddr inside the new vspace where we'll map the test frame.
+/// Picked at PML4[1] (well above the rootserver's own image at
+/// PML4[2]) so it doesn't collide with anything cloned from the
+/// live PML4 by the kernel-half copy.
+const NEW_VSPACE_FRAME_VADDR: u64 = 0x0000_0080_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Syscall stubs. The x86_64 SYSCALL ABI puts the syscall number in
@@ -237,6 +267,23 @@ fn irq_control_issue_handler(irq_control: u64, irq: u64, dest_slot: u64) -> u64 
 fn irq_handler_set_notification(irq_handler: u64, notification_cap: u64) -> u64 {
     let msg_info = LBL_IRQ_SET_IRQ_HANDLER << 12;
     unsafe { syscall5(SYS_SEND, irq_handler, msg_info, notification_cap, 0, 0) }
+}
+
+/// `X86Pdpt/PageDirectory/PageTable::Map(vaddr, vspace_cptr)`.
+/// Installs the paging structure at `vaddr` in `vspace_cptr`'s
+/// PML4 chain (when `vspace_cptr == 0` the kernel falls back to
+/// the live CR3, which is the pre-Phase-33d behaviour).
+#[inline(always)]
+fn paging_struct_map(struct_cptr: u64, label: u64, vaddr: u64, vspace_cptr: u64) -> u64 {
+    let msg_info = label << 12;
+    unsafe { syscall5(SYS_SEND, struct_cptr, msg_info, vaddr, vspace_cptr, 0) }
+}
+
+/// `X86Page::Map(vaddr, rights, vspace_cptr)`.
+#[inline(always)]
+fn page_map(frame_cptr: u64, vaddr: u64, rights: u64, vspace_cptr: u64) -> u64 {
+    let msg_info = LBL_X86_PAGE_MAP << 12;
+    unsafe { syscall5(SYS_SEND, frame_cptr, msg_info, vaddr, rights, vspace_cptr) }
 }
 
 /// IPC `Send` on an Endpoint cap. `length` words are taken from
@@ -514,6 +561,15 @@ pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     irq_demo();
 
     // -----------------------------------------------------------------
+    // Phase 33d — multi-VSpace setup. Retype a fresh PML4 + PDPT +
+    // PD + PT + Frame, install them in the hierarchy, then map the
+    // frame at a chosen vaddr. Proves the userspace VSpace-build
+    // path works end-to-end; child dispatch into the new VSpace is
+    // a follow-up.
+    // -----------------------------------------------------------------
+    multi_vspace_demo();
+
+    // -----------------------------------------------------------------
     // Phase 32g — mixed-criticality demo. The kernel's exit hook
     // counts H/B prints from the children to verify MCS budget
     // enforcement.
@@ -553,6 +609,47 @@ unsafe fn irq_demo() {
         return;
     }
     print_str(b"[rootserver got irq signal -- IRQ -> Notification path live]\n");
+}
+
+unsafe fn multi_vspace_demo() {
+    // 1. Retype the four paging structures + a frame, all 4 KiB
+    //    each. They're carved sequentially out of the same
+    //    Untyped — the kernel handles alignment.
+    let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4,
+                           PAGING_BITS, 1, SLOT_NEW_PML4);
+    if r != 0 { print_str(b"[mvs retype PML4 FAILED]\n"); return; }
+    let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT,
+                           PAGING_BITS, 1, SLOT_NEW_PDPT);
+    if r != 0 { print_str(b"[mvs retype PDPT FAILED]\n"); return; }
+    let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY,
+                           PAGING_BITS, 1, SLOT_NEW_PD);
+    if r != 0 { print_str(b"[mvs retype PD FAILED]\n"); return; }
+    let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE,
+                           PAGING_BITS, 1, SLOT_NEW_PT);
+    if r != 0 { print_str(b"[mvs retype PT FAILED]\n"); return; }
+    let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE,
+                           PAGING_BITS, 1, SLOT_NEW_FRAME);
+    if r != 0 { print_str(b"[mvs retype Frame FAILED]\n"); return; }
+
+    // 2. Install the paging hierarchy in the new PML4. Each level
+    //    walks down to the leaf vaddr `NEW_VSPACE_FRAME_VADDR`.
+    let r = paging_struct_map(SLOT_NEW_PDPT, LBL_X86_PDPT_MAP,
+                              NEW_VSPACE_FRAME_VADDR, SLOT_NEW_PML4);
+    if r != 0 { print_str(b"[mvs PDPT::Map FAILED]\n"); return; }
+    let r = paging_struct_map(SLOT_NEW_PD, LBL_X86_PAGE_DIRECTORY_MAP,
+                              NEW_VSPACE_FRAME_VADDR, SLOT_NEW_PML4);
+    if r != 0 { print_str(b"[mvs PD::Map FAILED]\n"); return; }
+    let r = paging_struct_map(SLOT_NEW_PT, LBL_X86_PAGE_TABLE_MAP,
+                              NEW_VSPACE_FRAME_VADDR, SLOT_NEW_PML4);
+    if r != 0 { print_str(b"[mvs PT::Map FAILED]\n"); return; }
+
+    // 3. Map the leaf frame. Rights word = ReadWrite (FrameRights
+    //    encoding mirrors `cap.rs`: ReadWrite = 3).
+    let r = page_map(SLOT_NEW_FRAME, NEW_VSPACE_FRAME_VADDR,
+                     /* rights ReadWrite */ 3, SLOT_NEW_PML4);
+    if r != 0 { print_str(b"[mvs Page::Map FAILED]\n"); return; }
+
+    print_str(b"[multi-vspace setup ok -- PML4/PDPT/PD/PT/Frame mapped]\n");
 }
 
 unsafe fn spawn_mcs_children() {
