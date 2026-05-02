@@ -35,6 +35,9 @@ pub const MAX_NTFNS: usize = 16;
 /// Maximum SchedContexts in the in-kernel pool (Phase 32c).
 pub const MAX_SCHED_CONTEXTS: usize = 16;
 
+/// Maximum Reply objects in the in-kernel pool (Phase 34e).
+pub const MAX_REPLIES: usize = 16;
+
 /// CTEs per pre-allocated CNode in the in-kernel pool.
 pub const CNODE_RADIX: u8 = 5;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
@@ -63,6 +66,11 @@ pub struct KernelState {
     /// PPtrs encode `pool_index + 1`, same convention as endpoints.
     pub sched_contexts: [crate::sched_context::SchedContext;
                          MAX_SCHED_CONTEXTS],
+    /// Phase 34e — in-kernel Reply object pool. Same +1 PPtr
+    /// convention. `Untyped::Retype(Reply)` allocates a slot and
+    /// emits a `Cap::Reply { ptr, can_grant: true }` referencing
+    /// it.
+    pub replies: [crate::reply::Reply; MAX_REPLIES],
     /// Pre-allocated CNode pool. Same 1-based indexing convention
     /// for `Cap::CNode { ptr, .. }`.
     pub cnodes: [CNodePage; MAX_CNODES],
@@ -80,6 +88,7 @@ pub struct KernelState {
     pub next_notification: usize,
     pub next_cnode: usize,
     pub next_sched_context: usize,
+    pub next_reply: usize,
 }
 
 impl KernelState {
@@ -89,12 +98,14 @@ impl KernelState {
         const EMPTY_CN: CNodePage = CNodePage([Cte::null(); CNODE_SLOTS]);
         const EMPTY_SC: crate::sched_context::SchedContext =
             crate::sched_context::SchedContext::new(0, 0);
+        const EMPTY_REPLY: crate::reply::Reply = crate::reply::Reply::new();
         Self {
             scheduler: Scheduler::new(),
             endpoints: [EMPTY_EP; MAX_ENDPOINTS],
             notifications: [EMPTY_NT; MAX_NTFNS],
             cnodes: [EMPTY_CN; MAX_CNODES],
             sched_contexts: [EMPTY_SC; MAX_SCHED_CONTEXTS],
+            replies: [EMPTY_REPLY; MAX_REPLIES],
             irqs: IrqTable::new(),
             // Reserve indices < these for kernel-internal use
             // (boot CNode = 0, AY-demo CNodes = 1, 2, rootserver
@@ -104,6 +115,7 @@ impl KernelState {
             next_notification: 0,
             next_cnode: 4,
             next_sched_context: 0,
+            next_reply: 0,
         }
     }
 
@@ -173,6 +185,24 @@ impl KernelState {
     pub fn sched_context_index(
         p: PPtr<crate::cap::SchedContextStorage>,
     ) -> usize {
+        (p.addr() - 1) as usize
+    }
+
+    /// Phase 34e — allocate the next free Reply slot.
+    pub fn alloc_reply(&mut self) -> Option<usize> {
+        if self.next_reply >= MAX_REPLIES {
+            return None;
+        }
+        let i = self.next_reply;
+        self.next_reply += 1;
+        self.replies[i] = crate::reply::Reply::new();
+        Some(i)
+    }
+
+    pub fn reply_ptr(i: usize) -> PPtr<crate::cap::ReplyStorage> {
+        PPtr::<crate::cap::ReplyStorage>::new(i as u64 + 1).expect("non-zero")
+    }
+    pub fn reply_index(p: PPtr<crate::cap::ReplyStorage>) -> usize {
         (p.addr() - 1) as usize
     }
 

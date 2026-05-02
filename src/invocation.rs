@@ -986,6 +986,14 @@ fn decode_untyped_retype(
                             size_bits,
                         }
                     }
+                    Cap::Reply { can_grant, .. } => {
+                        let i = (*s_ptr).alloc_reply()
+                            .expect("reply pool exhausted");
+                        Cap::Reply {
+                            ptr: KernelState::reply_ptr(i),
+                            can_grant,
+                        }
+                    }
                     // Phase 33d — when the rootserver retypes a fresh
                     // PML4, copy the live PML4's entries into it so
                     // the new vspace has the kernel half mapped. Any

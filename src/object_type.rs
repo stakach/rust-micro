@@ -32,6 +32,9 @@ pub const ENDPOINT_SIZE_BITS: u32 = 4;
 /// log2(bytes) of a Notification (non-MCS).
 pub const NOTIFICATION_SIZE_BITS: u32 = 5;
 
+/// log2(bytes) of a Reply object (Phase 34e).
+pub const REPLY_SIZE_BITS: u32 = 5;
+
 /// log2(bytes) of one CTE.
 pub const CTE_SIZE_BITS: u32 = 5;
 
@@ -163,7 +166,7 @@ pub fn size_in_bits(ty: ObjectType, user_size_bits: u32) -> Result<u32, SizeErro
         ObjectType::SchedContext => {
             bounds_check(user_size_bits, MIN_SCHED_CONTEXT_BITS, MAX_SCHED_CONTEXT_BITS)
         }
-        ObjectType::Reply => Err(SizeError::Unsupported),
+        ObjectType::Reply => Ok(REPLY_SIZE_BITS),
         ObjectType::Arch(t) => match t {
             X86_4K => Ok(12),
             X86_2M => Ok(21),
@@ -243,11 +246,11 @@ pub mod spec {
             size_in_bits(ObjectType::SchedContext, MIN_SCHED_CONTEXT_BITS),
             Ok(MIN_SCHED_CONTEXT_BITS)
         );
-        // Reply still has no Untyped::Retype path (kernel allocates).
-        assert!(matches!(
+        // Phase 34e — Reply now has a 32-byte object size.
+        assert_eq!(
             size_in_bits(ObjectType::Reply, 0),
-            Err(SizeError::Unsupported)
-        ));
+            Ok(REPLY_SIZE_BITS)
+        );
         arch::log("  ✓ size_in_bits rejects out-of-range and unsupported\n");
     }
 }

@@ -106,17 +106,25 @@ in the same commit)
     requires a microtest child harness — landing in 34e or
     later.
 
-- [ ] 34e — Reply caps as caps.
-  * `Untyped::Retype(Reply)` allocates a `ReplyStorage` slot
-    (kernel pool, like SchedContext). Cap::Reply points at it.
-  * `seL4_Call`: kernel records the caller in the reply
-    object, transfers the reply cap into the receiver's
-    CSpace at a designated slot, blocks the caller.
-  * `seL4_Reply(replyCap)`: kernel uses the reply object's
-    bound TCB to wake the caller, clears the binding.
-  * Microtest: server saves the reply cap, replies later;
-    verify reply still works (the existing path can't do
-    saved replies because `reply_to` is a single field).
+- [x] 34e — Reply caps as proper caps. **DONE (data layer
+       only; IPC integration is a follow-up)**
+  * New `src/reply.rs` module with `Reply { bound_tcb }`.
+  * `KernelState.replies: [Reply; MAX_REPLIES]` pool with
+    `alloc_reply` / `reply_ptr` / `reply_index` helpers
+    (same +1 PPtr convention as Endpoint / SchedContext).
+  * `ObjectType::Reply` is now a fixed 32-byte object
+    (`REPLY_SIZE_BITS = 5`); `Untyped::Retype(Reply)` carves
+    it and the emit closure swaps the carved cap for one
+    keyed off the kernel pool slot. `Cap::Reply { ptr,
+    can_grant: true }` results.
+  * Kernel spec `retype_into_reply` covers the carve.
+  * Microtest case `untyped_retype_reply` covers the
+    user-facing retype invocation.
+  * **Follow-up**: replacing `Tcb.reply_to: Option<TcbId>`
+    with cap-based reply routing through `seL4_Call` /
+    `seL4_Reply`. That changes every reply-using spec and
+    requires designating a receiver-side reply slot — same
+    scope as 34d itself, so it gets its own phase.
 
 ## Out of scope (Phase 35+)
 * Real sel4test integration (libsel4 build, ELF loader for

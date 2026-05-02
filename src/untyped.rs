@@ -230,7 +230,18 @@ fn make_object_cap(
                 .ok_or(RetypeError::InvalidArgument)?;
             Ok(Cap::SchedContext { ptr, size_bits: user_size_bits as u8 })
         }
-        ObjectType::Reply => Err(RetypeError::InvalidArgument),
+        ObjectType::Reply => {
+            // Phase 34e — fixed-size kernel object (32 bytes).
+            // The actual `Reply` struct lives in `KernelState.replies`;
+            // here we just emit the typed cap. The retype emit
+            // closure in `decode_untyped_retype` swaps the carved
+            // PPtr for one keyed off the kernel pool slot, same
+            // pattern as Endpoint / SchedContext.
+            use crate::cap::ReplyStorage;
+            let ptr = PPtr::<ReplyStorage>::new(obj_addr)
+                .ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::Reply { ptr, can_grant: true })
+        }
         ObjectType::Arch(t) => {
             // x86_64 frame types — see object_type::X86_* constants.
             use crate::cap::{
@@ -322,8 +333,32 @@ pub mod spec {
         zero_objects_rejected();
         retype_into_paging_structs();
         retype_into_sched_context();
+        retype_into_reply();
 
         arch::log("Untyped retype tests completed\n");
+    }
+
+    /// Phase 34e — Untyped → Reply. Fixed-size 32-byte object;
+    /// the resulting cap defaults to `can_grant: true`.
+    fn retype_into_reply() {
+        use crate::cap::ReplyStorage;
+        let base = 0x0090_0000;
+        let mut ut = UntypedState::new(base, 14, false);
+
+        let mut produced = Cap::Null;
+        retype(&mut ut, ObjectType::Reply, 0, 1, |c| produced = c)
+            .expect("retype Reply");
+        match produced {
+            Cap::Reply { ptr, can_grant } => {
+                let _: PPtr<ReplyStorage> = ptr;
+                assert_eq!(ptr.addr(), base);
+                assert!(can_grant, "freshly retyped Reply has can_grant=true");
+            }
+            other => panic!("expected Cap::Reply, got {:?}", other),
+        }
+        // Untyped advanced by exactly 1 << 5 = 32 bytes.
+        assert_eq!(ut.free_index_bytes, 32);
+        arch::log("  ✓ Untyped::Retype produces a typed Reply cap\n");
     }
 
     /// Phase 32b — Untyped → SchedContext. Variable-sized, so we

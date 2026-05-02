@@ -77,6 +77,9 @@ mod notification;
 // IRQ → notification dispatch.
 mod interrupt;
 
+// Phase 34e — Reply objects + kernel-side pool.
+mod reply;
+
 // x86_64 virtual-address-space helpers — re-exported from
 // arch::x86_64::vspace so callers can stay arch-neutral. ARM and
 // RISC-V will land sibling modules with their own paging layouts.

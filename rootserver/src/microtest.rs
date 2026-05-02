@@ -30,6 +30,7 @@ const CASES: &[TestCase] = &[
     TestCase { name: "tcb_configure",        body: tests::tcb_configure },
     TestCase { name: "tcb_set_ipc_buffer",   body: tests::tcb_set_ipc_buffer },
     TestCase { name: "ipc_extra_cap_staging", body: tests::ipc_extra_cap_staging },
+    TestCase { name: "untyped_retype_reply", body: tests::untyped_retype_reply },
 ];
 
 /// Entry point invoked from `_start` when `--features microtest`
@@ -95,6 +96,25 @@ mod tests {
         if r != 0 {
             return Err("retype failed");
         }
+        Ok(())
+    }
+
+    /// Phase 34e — `Untyped::Retype(Reply)` should land a typed
+    /// reply cap in the destination slot. The kernel's pool slot
+    /// is ours to inspect via the cap layer; from userspace we
+    /// just assert retype succeeded.
+    pub(super) fn untyped_retype_reply() -> TestResult {
+        // Slot 14 is reserved by the kernel for the rootserver's
+        // SchedControl cap; use the next free slot.
+        let dest_slot: u64 = 15;
+        let r = untyped_retype(
+            CAP_INIT_UNTYPED,
+            OBJ_REPLY,
+            /* user_size_bits */ 0,
+            /* num_objects */ 1,
+            dest_slot,
+        );
+        if r != 0 { return Err("retype Reply failed"); }
         Ok(())
     }
 
@@ -196,6 +216,8 @@ mod tests {
 const LBL_TCB_CONFIGURE: u64 = 5;
 const LBL_TCB_SET_IPC_BUFFER: u64 = 10;
 const SYS_NB_SEND: i64 = -4;
+/// `seL4_ObjectType::Reply` numeric tag (mirrors `object_type.rs`).
+const OBJ_REPLY: u64 = 6;
 /// Bit position of `extraCaps` in `seL4_MessageInfo` (sits just above
 /// the 7-bit length field).
 const MSG_EXTRA_CAPS_SHIFT: u64 = 7;
