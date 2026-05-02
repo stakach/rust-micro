@@ -167,6 +167,12 @@ fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             ThreadStateType::BlockedOnReply,
             "caller should be parked on Reply"
         );
+        // Phase 33c — return the donated SchedContext to the
+        // caller. While the call was in progress, `current` (the
+        // server) ran on `current.active_sc = caller.sc`; clearing
+        // it here means future `mcs_tick` charges fall back to the
+        // server's own bound SC (or no SC if it has none).
+        s.scheduler.slab.get_mut(current).active_sc = None;
         s.scheduler.make_runnable(caller);
         Ok(())
     }

@@ -212,12 +212,16 @@ pub fn mcs_tick(delta_ticks: Ticks) {
             }
         }
 
-        // Then charge the current thread's SC (if any).
+        // Then charge the current thread's SC (if any). Phase 33c —
+        // prefer `active_sc` (set during a call when the caller
+        // donated their SC) so the callee burns the caller's
+        // budget, not its own (or none).
         let cur = match s.scheduler.current() {
             Some(c) => c,
             None => return,
         };
-        let sc_idx = match s.scheduler.slab.get(cur).sc {
+        let cur_tcb = s.scheduler.slab.get(cur);
+        let sc_idx = match cur_tcb.active_sc.or(cur_tcb.sc) {
             Some(i) => i as usize,
             None => return,
         };
@@ -284,7 +288,82 @@ pub mod spec {
         ring_full_returns_error();
         mcs_tick_blocks_on_exhaustion();
         mcs_tick_wakes_on_matured_refill();
+        sc_donation_across_call_charges_callee_on_caller_sc();
         arch::log("MCS sched_context tests completed\n");
+    }
+
+    /// Phase 33c — `seL4_Call` donates the caller's bound SC to
+    /// the callee for the duration of the call. While the call is
+    /// in flight, `mcs_tick` charges the donated SC (caller's), not
+    /// the callee's own. Reply restores the callee's `active_sc`
+    /// to None.
+    #[inline(never)]
+    fn sc_donation_across_call_charges_callee_on_caller_sc() {
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
+            super::set_test_time(Some(0));
+
+            // Caller has a 5-tick budget bound SC.
+            let mut caller = crate::tcb::Tcb::default();
+            caller.priority = 50;
+            caller.state = crate::tcb::ThreadStateType::Running;
+            let caller_id = s.scheduler.admit(caller);
+            let sc_caller = s.alloc_sched_context().expect("sc pool");
+            s.sched_contexts[sc_caller] =
+                SchedContext::new(/* period */ 100, /* budget */ 5);
+            s.sched_contexts[sc_caller].push(
+                Refill { release_time: 0, amount: 5 }).unwrap();
+            s.sched_contexts[sc_caller].bound_tcb = Some(caller_id);
+            s.scheduler.slab.get_mut(caller_id).sc = Some(sc_caller as u16);
+
+            // Server has no bound SC — without donation, mcs_tick
+            // would early-out when the server is `current`.
+            let mut server = crate::tcb::Tcb::default();
+            server.priority = 50;
+            server.state = crate::tcb::ThreadStateType::Running;
+            let server_id = s.scheduler.admit(server);
+
+            // Simulate post-Call state: caller blocked on Reply,
+            // server is current and running on caller's SC. The
+            // production path runs through `endpoint::send_ipc`
+            // with `do_call`; here we set the same fields directly
+            // so the spec doesn't have to construct an endpoint.
+            s.scheduler.block(caller_id,
+                crate::tcb::ThreadStateType::BlockedOnReply);
+            s.scheduler.slab.get_mut(server_id).reply_to = Some(caller_id);
+            s.scheduler.slab.get_mut(server_id).active_sc = Some(sc_caller as u16);
+            s.scheduler.set_current(Some(server_id));
+
+            // Tick — the server's `active_sc` (= caller's SC) is
+            // charged, even though `server.sc` is None.
+            crate::sched_context::mcs_tick(1);
+            assert_eq!(s.sched_contexts[sc_caller].refills[0].amount, 4,
+                "caller's SC should have been debited via the server");
+
+            // Reply: clear donation. Production path is
+            // `handle_reply`; spec mirrors the active_sc clear.
+            s.scheduler.slab.get_mut(server_id).active_sc = None;
+            s.scheduler.make_runnable(caller_id);
+
+            // After reply, server has no SC of its own and no
+            // donation; mcs_tick should early-out without charging.
+            s.scheduler.set_current(Some(server_id));
+            crate::sched_context::mcs_tick(1);
+            assert_eq!(s.sched_contexts[sc_caller].refills[0].amount, 4,
+                "caller's SC must NOT be charged once donation is cleared");
+
+            // Cleanup.
+            super::set_test_time(None);
+            s.scheduler.set_current(None);
+            s.scheduler.slab.free(caller_id);
+            s.scheduler.slab.free(server_id);
+            s.sched_contexts[sc_caller].bound_tcb = None;
+            s.scheduler.reset_queues();
+        }
+        arch::log(
+            "  ✓ Call donates caller's SC; mcs_tick charges callee on it; reply releases\n");
     }
 
     /// Phase 32f — exhausting the budget should both:

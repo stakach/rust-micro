@@ -51,16 +51,23 @@ between us and a system that could host a userspace driver:
     prints `[rootserver got irq signal -- IRQ -> Notification
     path live]`.
 
-- [ ] 33c — SC donation across IPC.
-  * On `seL4_Call` (with the caller bound to an SC), record
-    the caller's SC onto the callee TCB; the callee runs on
-    that SC's budget.
-  * On `seL4_ReplyRecv` (or `Reply`), return the SC to the
-    caller.
-  * If the donated SC's budget exhausts during the call,
-    *both* threads block until refill.
-  * Specs: donate-on-call, return-on-reply, exhaust-during-
-    call blocks both.
+- [x] 33c — SC donation across IPC. **DONE**
+  * Added `Tcb.active_sc: Option<u16>` (mirrors seL4's
+    `tcbActiveSchedContext`). `mcs_tick` now charges
+    `active_sc.or(sc)` so a callee with no bound SC still
+    burns budget while running on a donated one.
+  * `endpoint::send_ipc`'s call-with-waiting-receiver branch
+    sets `receiver.active_sc = sender.sc` when `do_call`.
+    `handle_reply` clears `current.active_sc` so the donation
+    reverts to the caller (which is woken on the same call).
+  * Spec `sc_donation_across_call_charges_callee_on_caller_sc`
+    verifies a caller's SC is debited via a callee that has
+    no bound SC of its own, and that the debit stops once
+    Reply clears the donation.
+  * Out of scope for this slice (follow-up): exhaustion
+    during the call blocking both caller and callee, and the
+    "send-then-callee-arrives" path (the queued-sender-Call
+    path doesn't yet propagate `do_call` through the wait).
 
 - [ ] 33d — Multi-VSpace rootserver demo.
   * Rootserver retypes PML4 + PDPT + PD + PT objects out of

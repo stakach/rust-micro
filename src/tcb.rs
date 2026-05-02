@@ -195,6 +195,12 @@ pub struct Tcb {
     /// MCS integration lands (Phase 32d/e), the per-tick refill
     /// charge debits this SC instead of `time_slice`.
     pub sc: Option<u16>,
+    /// Phase 33c — currently-charged SchedContext. While set, the
+    /// thread runs on this SC's budget instead of `sc` (donation
+    /// across `seL4_Call`). seL4 calls this `tcbActiveSchedContext`.
+    /// Cleared on `seL4_Reply` so the donated SC reverts to its
+    /// owner.
+    pub active_sc: Option<u16>,
 }
 
 impl Default for Tcb {
@@ -225,6 +231,7 @@ impl Default for Tcb {
             bound_notification: None,
             affinity: 0,
             sc: None,
+            active_sc: None,
         }
     }
 }

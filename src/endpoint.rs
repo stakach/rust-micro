@@ -169,6 +169,14 @@ pub fn send_ipc(
                 // receiver's reply_to to the caller.
                 sched.block(sender, ThreadStateType::BlockedOnReply);
                 sched.slab.get_mut(receiver).reply_to = Some(sender);
+                // Phase 33c — donate the caller's SchedContext to
+                // the callee for the duration of the call. The
+                // callee runs on the caller's budget; the receiver
+                // restores its own SC on `seL4_Reply`.
+                let donated = sched.slab.get(sender).sc;
+                if donated.is_some() {
+                    sched.slab.get_mut(receiver).active_sc = donated;
+                }
             }
             sched.make_runnable(receiver);
             if queue_is_empty(ep) {
