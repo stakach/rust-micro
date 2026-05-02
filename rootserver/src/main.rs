@@ -67,11 +67,15 @@ const SCHED_CONTEXT_BITS: u32 = 8;
 /// Phase 33d — x86 paging-structure object types. Numeric tags
 /// match `object_type::X86_*`. The kernel's `untyped::create_object`
 /// expects size_bits=12 (one 4 KiB page) for each paging level.
-const OBJ_X86_4K_PAGE: u64 = 7;
-const OBJ_X86_PAGE_TABLE: u64 = 10;
-const OBJ_X86_PAGE_DIRECTORY: u64 = 11;
-const OBJ_X86_PDPT: u64 = 12;
-const OBJ_X86_PML4: u64 = 13;
+// Phase 42 — must match upstream libsel4's seL4_X86_*Object enum
+// values for compatibility with sel4test-built userland (which uses
+// the same numbers). With NonArchObjectTypeCount = 7 (MCS) and
+// ModeObjectTypeCount = 9 (no HUGE_PAGE on x86_64).
+const OBJ_X86_PDPT: u64 = 7;
+const OBJ_X86_PML4: u64 = 8;
+const OBJ_X86_4K_PAGE: u64 = 9;
+const OBJ_X86_PAGE_TABLE: u64 = 11;
+const OBJ_X86_PAGE_DIRECTORY: u64 = 12;
 const PAGING_BITS: u32 = 12;
 
 /// Initial CNode slots (mirrors the kernel's `seL4_RootCNodeCapSlots`).

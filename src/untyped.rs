@@ -249,15 +249,14 @@ fn make_object_cap(
                 PageTableStorage, PdptStorage, Pml4Storage,
             };
             use crate::object_type::{
-                X86_1G, X86_2M, X86_4K, X86_PAGE_DIRECTORY, X86_PAGE_TABLE,
+                X86_4K, X86_LARGE_PAGE, X86_PAGE_DIRECTORY, X86_PAGE_TABLE,
                 X86_PDPT, X86_PML4,
             };
             match t {
-                X86_4K | X86_2M | X86_1G => {
+                X86_4K | X86_LARGE_PAGE => {
                     let size = match t {
                         X86_4K => FrameSize::Small,
-                        X86_2M => FrameSize::Large,
-                        X86_1G => FrameSize::Huge,
+                        X86_LARGE_PAGE => FrameSize::Large,
                         _ => unreachable!(),
                     };
                     let ptr = PPtr::<FrameStorage>::new(obj_addr)

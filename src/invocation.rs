@@ -113,7 +113,15 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     let vaddr = args.a2;
     let rights = crate::cap::FrameRights::from_word(args.a3);
     let writable = matches!(rights, crate::cap::FrameRights::ReadWrite);
-    let vspace_cptr = args.a4;
+
+    // Two wire formats coexist:
+    //   * Phase 33d (compressed, microtest): args.a4 = vspace_cptr.
+    //     extra_caps == 0.
+    //   * Phase 42 upstream (sel4test): vspace passed as extraCaps[0],
+    //     args.a4 = attr (we ignore — caching not yet modelled).
+    //     Distinguished by msginfo.extra_caps() > 0.
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() > 0;
 
     if vaddr & 0xFFF != 0 {
         return Err(KException::SyscallError(SyscallError::new(
@@ -121,19 +129,34 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         )));
     }
 
-    // Phase 33d — if a vspace cap is provided, look up the target
-    // PML4 paddr and install into THAT vspace's tables. Otherwise
-    // install into the live CR3 (backward-compat path used by all
-    // pre-33d invocations).
     unsafe {
-        if vspace_cptr != 0 {
-            let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
-            let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, vspace_cptr)?;
-            let pml4_paddr = match pml4_cap {
-                Cap::PML4 { ptr, .. } => ptr.addr(),
+        let pml4_paddr_opt: Option<u64> = if upstream {
+            let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+            let count = inv_tcb.pending_extra_caps_count as usize;
+            let cap = if count > 0 {
+                Some(inv_tcb.pending_extra_caps[0])
+            } else {
+                None
+            };
+            inv_tcb.pending_extra_caps_count = 0;
+            match cap {
+                Some(Cap::PML4 { ptr, .. }) => Some(ptr.addr()),
                 _ => return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_InvalidCapability))),
-            };
+            }
+        } else if args.a4 != 0 {
+            let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
+            let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a4)?;
+            match pml4_cap {
+                Cap::PML4 { ptr, .. } => Some(ptr.addr()),
+                _ => return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability))),
+            }
+        } else {
+            None
+        };
+
+        if let Some(pml4_paddr) = pml4_paddr_opt {
             usermode::map_user_4k_into_foreign_pml4(pml4_paddr, vaddr, paddr, writable)
                 .map_err(|_| KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_FailedLookup)))?;
@@ -328,24 +351,44 @@ fn map_paging_struct(
             seL4_Error::seL4_AlignmentError,
         )));
     }
-    let vspace_cptr = args.a3;
 
-    // Install the entry into the target PML4. The foreign-vspace
-    // path (vspace_cptr != 0) always runs the hardware install
-    // since it requires a real PML4 backing the new vspace; the
-    // legacy "current CR3" path is gated under !spec because some
-    // unit specs construct synthetic paging-struct caps that don't
-    // back real tables.
+    // Two wire formats coexist:
+    //   * Phase 33d compressed (microtest): args.a3 = vspace_cptr,
+    //     extra_caps == 0.
+    //   * Phase 42 upstream (sel4test): vspace via extraCaps[0],
+    //     args.a3 = attrs (ignored — caching not yet modelled).
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() > 0;
+
     let installed = unsafe {
-        if vspace_cptr != 0 {
-            let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
-            let pml4_cap = crate::cspace::lookup_cap(
-                KERNEL.get(), &cspace_root, vspace_cptr)?;
-            let pml4_paddr = match pml4_cap {
-                Cap::PML4 { ptr, .. } => ptr.addr(),
+        let pml4_paddr_opt: Option<u64> = if upstream {
+            let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+            let count = inv_tcb.pending_extra_caps_count as usize;
+            let cap = if count > 0 {
+                Some(inv_tcb.pending_extra_caps[0])
+            } else {
+                None
+            };
+            inv_tcb.pending_extra_caps_count = 0;
+            match cap {
+                Some(Cap::PML4 { ptr, .. }) => Some(ptr.addr()),
                 _ => return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_InvalidCapability))),
-            };
+            }
+        } else if args.a3 != 0 {
+            let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
+            let pml4_cap = crate::cspace::lookup_cap(
+                KERNEL.get(), &cspace_root, args.a3)?;
+            match pml4_cap {
+                Cap::PML4 { ptr, .. } => Some(ptr.addr()),
+                _ => return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability))),
+            }
+        } else {
+            None
+        };
+
+        if let Some(pml4_paddr) = pml4_paddr_opt {
             usermode::install_user_table_in_paddr(pml4_paddr, level, vaddr, paddr)
         } else {
             #[cfg(not(feature = "spec"))]

@@ -59,20 +59,22 @@ pub const MIN_SCHED_CONTEXT_BITS: u32 = 8;
 /// (`capSCSizeBits`, 6 bits) addressable.
 pub const MAX_SCHED_CONTEXT_BITS: u32 = 16;
 
-// x86_64 arch object types — these sit above
-// `seL4_NonArchObjectTypeCount` in libsel4. Numbered to match
-// seL4's `seL4_X86_*Object` ordering.
-pub const X86_4K: u64 = 7;
-pub const X86_2M: u64 = 8;
-pub const X86_1G: u64 = 9;
+// x86_64 arch object types — must match upstream libsel4's numeric
+// values exactly (seL4_NonArchObjectTypeCount = 7 with MCS,
+// seL4_ModeObjectTypeCount = 9 on x86_64 without HUGE_PAGE).
+// Our previous numbering had X86_4K = 7 etc. which collided with
+// upstream's X86_PDPT — sel4test's allocman sent type=10 expecting
+// LargePage and we retyped a PageTable; the cap-type mismatch
+// surfaced later as IllegalOperation on Frame::Map.
+pub const X86_PDPT: u64 = 7;
+pub const X86_PML4: u64 = 8;
+pub const X86_4K: u64 = 9;
+/// 2 MiB large page — modelled but currently rejected at retype.
+pub const X86_LARGE_PAGE: u64 = 10;
 /// 4 KiB page table — backs `Cap::PageTable` (PT, 512 PTEs).
-pub const X86_PAGE_TABLE: u64 = 10;
+pub const X86_PAGE_TABLE: u64 = 11;
 /// 4 KiB page directory — backs `Cap::PageDirectory` (PD, 512 PDEs).
-pub const X86_PAGE_DIRECTORY: u64 = 11;
-/// 4 KiB page-directory-pointer table — backs `Cap::Pdpt`.
-pub const X86_PDPT: u64 = 12;
-/// 4 KiB page-map-level-4 — backs `Cap::PML4` (vspace root).
-pub const X86_PML4: u64 = 13;
+pub const X86_PAGE_DIRECTORY: u64 = 12;
 
 // ---------------------------------------------------------------------------
 // ObjectType enum.
@@ -169,8 +171,7 @@ pub fn size_in_bits(ty: ObjectType, user_size_bits: u32) -> Result<u32, SizeErro
         ObjectType::Reply => Ok(REPLY_SIZE_BITS),
         ObjectType::Arch(t) => match t {
             X86_4K => Ok(12),
-            X86_2M => Ok(21),
-            X86_1G => Ok(30),
+            X86_LARGE_PAGE => Ok(21),
             // PT/PD/PDPT/PML4 are each one 4 KiB page of bitfield entries.
             X86_PAGE_TABLE | X86_PAGE_DIRECTORY | X86_PDPT | X86_PML4 => Ok(12),
             _ => Err(SizeError::Unsupported),
