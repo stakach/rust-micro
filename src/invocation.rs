@@ -1300,6 +1300,54 @@ fn decode_tcb(
                 s.scheduler.make_runnable(id);
                 Ok(())
             }
+            // Phase 34b — `seL4_TCB_Configure`. One-shot setup that
+            // composes the equivalent of `SetSpace` + `SetPriority`.
+            // ABI:
+            //   a2 = fault_ep cptr (0 = none)
+            //   a3 = cspace_root cptr
+            //   a4 = vspace_root cptr
+            //   a5 = priority (low byte) | (mcp << 8)
+            //
+            // IPC-buffer fields (and the frame cap that backs them)
+            // are handled by `SetIPCBuffer` once the IPC-buffer
+            // long-message path lands in Phase 34c. Until then the
+            // caller is expected to set the buffer separately.
+            InvocationLabel::TCBConfigure => {
+                let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                let cnode_cap = if args.a3 != 0 {
+                    Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
+                } else { None };
+                let vspace_cap = if args.a4 != 0 {
+                    Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
+                } else { None };
+                let t = s.scheduler.slab.get_mut(id);
+                t.fault_handler = args.a2;
+                if let Some(c) = cnode_cap {
+                    if !matches!(c, Cap::CNode { .. }) {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    t.cspace_root = c;
+                }
+                if let Some(c) = vspace_cap {
+                    match c {
+                        Cap::PML4 { ptr, .. } => {
+                            t.cpu_context.cr3 = ptr.addr();
+                        }
+                        Cap::Null => {}
+                        _ => return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability))),
+                    }
+                    t.vspace_root = c;
+                }
+                let prio = args.a5 as u8;
+                let mcp = (args.a5 >> 8) as u8;
+                t.priority = prio;
+                if mcp != 0 {
+                    t.mcp = mcp;
+                }
+                Ok(())
+            }
             InvocationLabel::TCBSetPriority => {
                 let prio = args.a2 as u8;
                 s.scheduler.slab.get_mut(id).priority = prio;
@@ -1430,6 +1478,7 @@ pub mod spec {
         tcb_write_read_registers();
         tcb_set_space_and_bind_notification();
         tcb_set_space_pml4_pins_cr3();
+        tcb_configure_one_shot_setup();
         asid_control_make_pool_then_assign();
         sched_context_bind_unbind();
         sched_control_configure_sets_period_budget();
@@ -2275,6 +2324,57 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ TCB::SetSpace pins CR3 from a Cap::PML4\n");
+    }
+
+    /// Phase 34b — `seL4_TCB_Configure` packs SetSpace + priority
+    /// into one invocation. Verify all fields land on the target.
+    #[inline(never)]
+    fn tcb_configure_one_shot_setup() {
+        use crate::cap::Pml4Storage;
+        let invoker = setup_invoker(0);
+        let target = unsafe {
+            let t = crate::tcb::Tcb::default();
+            KERNEL.get().scheduler.admit(t)
+        };
+        let target_cap = Cap::Thread {
+            tcb: PPtr::<crate::cap::Tcb>::new(target.0 as u64).unwrap(),
+        };
+        // Plant a CNode at slot 4 and a PML4 at slot 5 in the invoker.
+        let cnode_cap = Cap::CNode {
+            ptr: KernelState::cnode_ptr(2),
+            radix: 5, guard_size: 59, guard: 0,
+        };
+        let pml4_paddr = 0x0000_0000_00DD_0000u64;
+        let pml4_cap = Cap::PML4 {
+            ptr: PPtr::<Pml4Storage>::new(pml4_paddr).unwrap(),
+            mapped: true, asid: 0,
+        };
+        unsafe {
+            KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&cnode_cap);
+            KERNEL.get().cnodes[0].0[5] = Cte::with_cap(&pml4_cap);
+        }
+        // Configure(target, fault_ep=0xCAFE, cspace=4, vspace=5,
+        //           a5=prio 75 | mcp 200 << 8).
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBConfigure as u64) << 12,
+            a2: 0xCAFE,
+            a3: 4,
+            a4: 5,
+            a5: 75 | (200u64 << 8),
+            ..Default::default()
+        };
+        decode_invocation(target_cap, &args, invoker).expect("Configure");
+        unsafe {
+            let t = KERNEL.get().scheduler.slab.get(target);
+            assert_eq!(t.fault_handler, 0xCAFE);
+            assert!(matches!(t.cspace_root, Cap::CNode { .. }));
+            assert_eq!(t.cpu_context.cr3, pml4_paddr);
+            assert_eq!(t.priority, 75);
+            assert_eq!(t.mcp, 200);
+            KERNEL.get().scheduler.slab.free(target);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ TCB::Configure sets fault_ep + cspace + vspace + prio in one call\n");
     }
 
     /// Phase 32c — bind a SchedContext to a TCB.

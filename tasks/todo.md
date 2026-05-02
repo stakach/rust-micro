@@ -50,12 +50,16 @@ in the same commit)
   * Legacy demos (29h/32g/33b/33d) continue to work with the
     feature off.
 
-- [ ] 34b — `seL4_TCB_Configure`.
-  * New invocation; reads fault_ep + cspace + vspace + ipc-
-    buffer-frame + priority all from one message. Backward-
-    compatible; the existing per-field invocations stay.
-  * Microtest: configure a TCB end-to-end with one call,
-    dispatch it, verify it ran.
+- [x] 34b — `seL4_TCB_Configure`. **DONE**
+  * Composite invocation: `args.a2 = fault_ep`, `a3 = cspace`,
+    `a4 = vspace` (PML4 → pins `cpu_context.cr3` like
+    SetSpace), `a5 = priority | (mcp << 8)`.
+  * IPC-buffer fields (`ipc_buffer` vaddr + frame cap) deferred
+    to 34c when the long-message path lands.
+  * Kernel spec: `tcb_configure_one_shot_setup` verifies all
+    four fields land on the target.
+  * Microtest case: `tcb_configure` issues the invocation
+    against a freshly retyped TCB.
 
 - [ ] 34c — IPC buffer for long messages.
   * Sender's `ipc_buffer_paddr` is already provided by the

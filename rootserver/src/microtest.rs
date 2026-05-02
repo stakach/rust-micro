@@ -27,6 +27,7 @@ struct TestCase {
 const CASES: &[TestCase] = &[
     TestCase { name: "syscall_round_trip",   body: tests::syscall_round_trip },
     TestCase { name: "untyped_retype_tcb",   body: tests::untyped_retype_tcb },
+    TestCase { name: "tcb_configure",        body: tests::tcb_configure },
 ];
 
 /// Entry point invoked from `_start` when `--features microtest`
@@ -94,4 +95,62 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Phase 34b — `seL4_TCB_Configure` should accept the same
+    /// fault_ep / cspace / vspace fields as the per-field
+    /// invocations in one shot, plus the priority. The TCB we
+    /// retyped in `untyped_retype_tcb` (slot 12) is reused here.
+    pub(super) fn tcb_configure() -> TestResult {
+        // a2 = fault_ep, a3 = cspace, a4 = vspace, a5 = prio.
+        let target = FIRST_EMPTY_SLOT;
+        let prio = 50u64;
+        let msg_info = LBL_TCB_CONFIGURE << 12;
+        let r = unsafe {
+            syscall5(
+                SYS_SEND, target, msg_info,
+                /* fault_ep */ 0,
+                /* cspace */ CAP_INIT_THREAD_CNODE,
+                /* vspace */ CAP_INIT_THREAD_VSPACE,
+            )
+        };
+        if r != 0 { return Err("Configure(stage 1) failed"); }
+        // The Configure ABI also wants `priority` in args.a5,
+        // which `syscall5` doesn't expose (only 4 args after the
+        // cap). Issue a 6-arg variant via inline asm.
+        let r = unsafe { syscall_configure_with_prio(target, msg_info,
+            /* fault_ep */ 0,
+            CAP_INIT_THREAD_CNODE,
+            CAP_INIT_THREAD_VSPACE,
+            prio) };
+        if r != 0 { return Err("Configure(stage 2) failed"); }
+        Ok(())
+    }
+}
+
+const LBL_TCB_CONFIGURE: u64 = 5;
+
+/// 6-register SYSCALL — like `syscall5` but exposes the sixth arg
+/// (r9 / `args.a5`). Used by tests that need to set the priority
+/// field of `TCB::Configure`, which lives at a5.
+#[inline(always)]
+unsafe fn syscall_configure_with_prio(
+    target: u64, msg_info: u64,
+    fault_ep: u64, cspace: u64, vspace: u64, prio: u64,
+) -> u64 {
+    let mut ret: u64;
+    asm!(
+        "syscall",
+        in("rax") SYS_SEND as u64,
+        in("rdi") target,
+        in("rsi") msg_info,
+        in("rdx") fault_ep,
+        in("r10") cspace,
+        in("r8")  vspace,
+        in("r9")  prio,
+        lateout("rax") ret,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack, preserves_flags),
+    );
+    ret
 }
