@@ -1,4 +1,4 @@
-# Active phase plan — Phase 34: sel4test parity + microtest
+# Phase 34: sel4test parity + microtest — DONE (34a–34e)
 
 ## Goal
 Implement the seL4 features `sel4test` exercises but our kernel
