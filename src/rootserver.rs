@@ -268,11 +268,14 @@ pub unsafe fn launch_rootserver() -> ! {
     let s = KERNEL.get();
 
     // Build the rootserver's CNode (slot 2 of itself = `seL4_CapInitThreadCNode`).
+    // Phase 36e — radix bumped 5 → 6 (32 → 64 slots) to fit the
+    // canonical initial-cap layout + per-CPU SchedControl region +
+    // Untyped + room for tests.
     let cnode_ptr = KernelState::cnode_ptr(ROOTSERVER_CNODE_IDX);
     let cnode_cap = Cap::CNode {
         ptr: cnode_ptr,
-        radix: 5,
-        guard_size: 59,
+        radix: 6,
+        guard_size: 58,
         guard: 0,
     };
     // Wipe the CNode in case prior specs left state.
@@ -336,24 +339,34 @@ pub unsafe fn launch_rootserver() -> ! {
         asid: 0,
         is_device: false,
     });
-    // First Untyped at slot 11. 16 KiB, in BSS-backed memory.
+    // Phase 33b / 36e — IRQControl at canonical slot 4.
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[4] = Cte::with_cap(&Cap::IrqControl);
+    // Phase 36e — ASIDControl at canonical slot 5. The matching
+    // initial AsidPool at slot 6 is left as a follow-up (we don't
+    // pre-allocate one for the rootserver yet).
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[5] = Cte::with_cap(&Cap::AsidControl);
+    // Slots 6, 7, 8, 11, 12, 13, 15: empty (no AsidPool / IO / Domain
+    // / SMMU / SMC support).
+    // Phase 36e — per-CPU SchedControl caps in the schedcontrol
+    // region [16, 16+ncores). bi.schedcontrol points at this range.
+    let n_cores = crate::bootboot::get_num_cores() as usize;
+    let schedcontrol_start: usize = 16;
+    for core in 0..n_cores.min(4) {
+        s.cnodes[ROOTSERVER_CNODE_IDX].0[schedcontrol_start + core] =
+            Cte::with_cap(&Cap::SchedControl { core: core as u32 });
+    }
+    // Phase 36e — Untyped at slot 20 (after the schedcontrol region).
+    // bi.untyped points here.
     let untyped_pool_va = (&raw const ROOTSERVER_UNTYPED_POOL) as u64;
     let untyped_pool_pa =
         crate::arch::x86_64::paging::kernel_virt_to_phys(untyped_pool_va);
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[11] = Cte::with_cap(&Cap::Untyped {
+    let untyped_slot: usize = 20;
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[untyped_slot] = Cte::with_cap(&Cap::Untyped {
         ptr: PPtr::<UntypedStorage>::new(untyped_pool_pa).expect("ut paddr"),
         block_bits: ROOTSERVER_UNTYPED_BITS,
         free_index: 0,
         is_device: false,
     });
-    // Phase 32g — give the rootserver a SchedControl cap so it can
-    // `SchedControl::Configure` SCs it retypes from its Untyped.
-    // Pinned at slot 14 by convention (kernel + rootserver agree).
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[14] =
-        Cte::with_cap(&Cap::SchedControl { core: 0 });
-    // Phase 33b — give the rootserver an IRQControl cap so it can
-    // `IRQControl::IssueIRQHandler` for the userspace-driver demo.
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[4] = Cte::with_cap(&Cap::IrqControl);
 
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)
@@ -425,27 +438,35 @@ unsafe fn build_bootinfo(ipc_buffer_paddr: u64, _untyped_paddr: u64) -> seL4_Boo
         padding: [0; 6],
     };
 
+    let n_cores = crate::bootboot::get_num_cores() as Word;
+    // Phase 36e — canonical slot layout under MCS:
+    //   0..15  initial caps (some Null where unsupported)
+    //   16..(16+n_cores)  per-CPU SchedControl
+    //   20     first Untyped
+    //   21..64 empty
+    let schedcontrol_start: Word = 16;
+    let schedcontrol_end: Word = schedcontrol_start + n_cores.min(4);
+    let untyped_start: Word = 20;
+    let untyped_end: Word = untyped_start + 1;
     seL4_BootInfo {
         extraLen: 0,
         nodeID: 0,
-        numNodes: crate::bootboot::get_num_cores() as Word,
+        numNodes: n_cores,
         numIOPTLevels: 0,
         ipcBuffer: ROOTSERVER_IPCBUF_VBASE as *mut crate::types::seL4_IPCBuffer,
-        // Empty cap slots = 12..32 (CNode is radix=5 → 32 slots,
-        // and we populated 0/1/2/3/9/10/11).
-        empty: seL4_SlotRegion { start: 12, end: 32 },
+        empty: seL4_SlotRegion { start: untyped_end, end: 64 },
         sharedFrames: seL4_SlotRegion { start: 0, end: 0 },
         userImageFrames: seL4_SlotRegion { start: 0, end: 0 },
         userImagePaging: seL4_SlotRegion { start: 0, end: 0 },
         ioSpaceCaps: seL4_SlotRegion { start: 0, end: 0 },
         extraBIPages: seL4_SlotRegion { start: 0, end: 0 },
-        initThreadCNodeSizeBits: 5,
+        initThreadCNodeSizeBits: 6,
         initThreadDomain: 0,
-        // Phase 36c — empty schedcontrol region. Once we install
-        // per-core SchedControl caps in the rootserver's CNode
-        // (audit follow-up), this becomes [start, start + ncores).
-        schedcontrol: seL4_SlotRegion { start: 0, end: 0 },
-        untyped: seL4_SlotRegion { start: 11, end: 12 },
+        schedcontrol: seL4_SlotRegion {
+            start: schedcontrol_start,
+            end: schedcontrol_end,
+        },
+        untyped: seL4_SlotRegion { start: untyped_start, end: untyped_end },
         untypedList: empty_untypeds,
     }
 }

@@ -111,26 +111,26 @@ Upstream `seL4_RootCNodeCapSlots` (libsel4 `bootinfo_types.h`):
 | 16 | NumInitialCaps | — |
 | 16+ | (untyped here) | (we put untyped at slot 11) |
 
-**Status: GAP, several issues:**
-1. **Untyped at slot 11**, not slot 12+. `bi.untyped.start` is 11
-   for us, but sel4test reads it from BootInfo so this only
-   collides with the Domain cap at slot 11. We currently leave
-   slot 11 = Untyped (no Domain cap). sel4test invokes Domain at
-   slot 11 → InvalidCapability.
-2. **No Cap::AsidControl at slot 5.** We have the typed cap (32a)
-   but the rootserver bootstrap doesn't install one. sel4test's
-   ASID tests would fail.
-3. **No Cap::AsidPool at slot 6.** Same issue — we have the typed
-   cap but no install.
-4. **Slot 14 holds SchedControl, should hold InitThreadSC.** Under
-   MCS, slot 14 is the *initial thread's* SchedContext. SchedControl
-   is per-CPU and lives in `bi.schedcontrol` (a slot region), not in
-   the CNode at a fixed slot.
+**Status: ~~GAP~~ → mostly FIXED in Phase 36e:**
 
-**Fix:** rework `launch_rootserver` to install the canonical
-slot 0..14 layout, allocate one SchedContext for the initial
-thread, and surface SchedControl caps via the (still-to-add)
-`bi.schedcontrol` slot region.
+  * Untyped moved 11 → **20**, past the canonical initial-cap
+    range. `bi.untyped = {20, 21}`.
+  * `Cap::AsidControl` installed at slot **5**.
+  * Per-CPU `Cap::SchedControl` caps installed at slots **16..(16
+    + ncores)**. `bi.schedcontrol` points at this range.
+  * Slots 6 / 7 / 8 / 11 / 12 / 13 / 14 / 15 are left Null —
+    Cap::AsidPool, IO, Domain, SMMU, InitThreadSC, SMC are not
+    yet wired (still GAPs but smaller; sel4test cases that don't
+    touch them work).
+  * CNode radix bumped 5 → **6** (32 → 64 slots) to fit the new
+    layout + leave headroom for tests.
+  * `bi.empty = {21, 64}`.
+  * `bi.initThreadCNodeSizeBits = 6`.
+
+  Still missing (smaller follow-ups):
+    - `Cap::AsidPool` at slot 6 (need to retype one for the
+      rootserver).
+    - `Cap::SchedContext` for the initial thread at slot 14.
 
 ## TCB invocation surface
 

@@ -75,38 +75,39 @@ const OBJ_X86_PML4: u64 = 13;
 const PAGING_BITS: u32 = 12;
 
 /// Initial CNode slots (mirrors the kernel's `seL4_RootCNodeCapSlots`).
+/// Phase 36e — moved to upstream-canonical layout. Slots 0..15
+/// are the canonical initial caps; 16..19 hold per-CPU
+/// SchedControl caps; 20 holds the boot Untyped; 21+ is empty.
 const CAP_INIT_THREAD_CNODE: u64 = 2;
 const CAP_INIT_THREAD_VSPACE: u64 = 3;
-const CAP_INIT_UNTYPED: u64 = 11;
-/// First empty slot — see BootInfo `empty.start`.
-const FIRST_EMPTY_SLOT: u64 = 12;
-/// Slot we'll write the new Endpoint into.
-const SLOT_ENDPOINT: u64 = 12;
-/// Slot we'll write the new child TCB into.
-const SLOT_CHILD_TCB: u64 = 13;
-/// Phase 32g — slot the kernel installs a `Cap::SchedControl` into
-/// (see `rootserver.rs::launch_rootserver`).
-const SLOT_SCHED_CONTROL: u64 = 14;
-/// Slots for the two MCS children's SchedContext + TCB caps.
-const SLOT_SC_HIGH: u64 = 15;
-const SLOT_SC_LOW: u64 = 16;
-const SLOT_TCB_HIGH: u64 = 17;
-const SLOT_TCB_LOW: u64 = 18;
 /// Phase 33b — slot the kernel installs a `Cap::IrqControl` into.
 const SLOT_IRQ_CONTROL: u64 = 4;
+const CAP_INIT_UNTYPED: u64 = 20;
+/// First empty slot — see BootInfo `empty.start`.
+const FIRST_EMPTY_SLOT: u64 = 21;
+/// Slot we'll write the new Endpoint into.
+const SLOT_ENDPOINT: u64 = 21;
+/// Slot we'll write the new child TCB into.
+const SLOT_CHILD_TCB: u64 = 22;
+/// Phase 32g — first per-CPU SchedControl cap (core 0). Phase 36e
+/// moved this from a single slot at 14 to a region at 16+.
+const SLOT_SCHED_CONTROL: u64 = 16;
+/// Slots for the two MCS children's SchedContext + TCB caps.
+const SLOT_SC_HIGH: u64 = 23;
+const SLOT_SC_LOW: u64 = 24;
+const SLOT_TCB_HIGH: u64 = 25;
+const SLOT_TCB_LOW: u64 = 26;
 /// IRQ demo slots.
-const SLOT_IRQ_NTFN: u64 = 19;
-const SLOT_IRQ_HANDLER: u64 = 20;
+const SLOT_IRQ_NTFN: u64 = 27;
+const SLOT_IRQ_HANDLER: u64 = 28;
 /// IRQ used in the demo (PIC1 line 1 → IDT vector 0x21).
 const DEMO_IRQ: u64 = 1;
-/// Phase 33d — multi-VSpace demo slots. Lay out the paging
-/// hierarchy + a frame, all carved from the rootserver's
-/// Untyped at slot 11.
-const SLOT_NEW_PML4: u64 = 21;
-const SLOT_NEW_PDPT: u64 = 22;
-const SLOT_NEW_PD:   u64 = 23;
-const SLOT_NEW_PT:   u64 = 24;
-const SLOT_NEW_FRAME: u64 = 25;
+/// Phase 33d — multi-VSpace demo slots.
+const SLOT_NEW_PML4: u64 = 29;
+const SLOT_NEW_PDPT: u64 = 30;
+const SLOT_NEW_PD:   u64 = 31;
+const SLOT_NEW_PT:   u64 = 32;
+const SLOT_NEW_FRAME: u64 = 33;
 /// Vaddr inside the new vspace where we'll map the test frame.
 /// Picked at PML4[1] (well above the rootserver's own image at
 /// PML4[2]) so it doesn't collide with anything cloned from the
@@ -128,10 +129,10 @@ const NEW_VSPACE_FRAME_VADDR: u64 = 0x0000_0080_0000_0000;
 /// the rootserver's PD. After memcpy, `X86PageUnmap` clears the
 /// cap's `mapped` flag so we can re-map the same Frame in the
 /// new vspace.
-const SLOT_OWN_SCRATCH_PT: u64 = 26;
-const SLOT_VSPACE_CODE_FRAME: u64 = 27;
-const SLOT_VSPACE_STACK_FRAME: u64 = 28;
-const SLOT_VSPACE_CHILD_TCB: u64 = 29;
+const SLOT_OWN_SCRATCH_PT: u64 = 34;
+const SLOT_VSPACE_CODE_FRAME: u64 = 35;
+const SLOT_VSPACE_STACK_FRAME: u64 = 36;
+const SLOT_VSPACE_CHILD_TCB: u64 = 37;
 /// Vaddr inside the rootserver's own vspace where we temporarily
 /// stage the child's code page for memcpy. PD[4] is empty in the
 /// rootserver's PD (PD[2] is the image PT), so we can install a
@@ -146,21 +147,24 @@ const VSPACE_CODE_VADDR: u64 = NEW_VSPACE_FRAME_VADDR + 16 * 0x1000;
 const VSPACE_STACK_VADDR: u64 = NEW_VSPACE_FRAME_VADDR + 32 * 0x1000;
 
 /// Hand-assembled child code: send IPC carrying 0xBEEF over the
-/// endpoint at slot 12, then yield-loop forever.
+/// endpoint at SLOT_ENDPOINT, then yield-loop forever.
 ///
 /// Phase 36b: syscall numbers shifted to the MCS layout.
-///   mov rax, -5       ; SYS_SEND   (was -3 pre-MCS)
-///   mov rdi, 12       ; endpoint cap_ptr
+/// Phase 36e: SLOT_ENDPOINT moved 12 → 21 (canonical initial-cap
+/// layout pushed Untyped + first-empty past the upstream slot
+/// reservations).
+///   mov rax, -5       ; SYS_SEND
+///   mov rdi, 21       ; endpoint cap_ptr (= SLOT_ENDPOINT)
 ///   mov rsi, 1        ; MessageInfo: length=1, label=0
 ///   mov rdx, 0xBEEF   ; payload
 ///   syscall
 /// .loop:
-///   mov rax, -11      ; SYS_YIELD  (was -7 pre-MCS)
+///   mov rax, -11      ; SYS_YIELD
 ///   syscall
 ///   jmp .loop
 static VSPACE_CHILD_CODE: [u8; 41] = [
     0x48, 0xC7, 0xC0, 0xFB, 0xFF, 0xFF, 0xFF, // mov rax, -5
-    0x48, 0xC7, 0xC7, 0x0C, 0x00, 0x00, 0x00, // mov rdi, 12
+    0x48, 0xC7, 0xC7, 0x15, 0x00, 0x00, 0x00, // mov rdi, 21
     0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00, // mov rsi, 1
     0x48, 0xC7, 0xC2, 0xEF, 0xBE, 0x00, 0x00, // mov rdx, 0xBEEF
     0x0F, 0x05,                               // syscall
@@ -227,7 +231,7 @@ unsafe fn syscall5(nr: i64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 
 }
 
 #[inline(always)]
-fn debug_put_char(c: u8) {
+pub(crate) fn debug_put_char(c: u8) {
     unsafe { syscall1(SYS_DEBUG_PUT_CHAR, c as u64); }
 }
 

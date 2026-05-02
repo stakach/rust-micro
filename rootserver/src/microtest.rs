@@ -86,13 +86,13 @@ pub unsafe fn run() {
 
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-/// First slot the harness will hand out. Slots 0..11 are reserved
-/// for the canonical initial-cap layout (TCB, CNode, PML4,
-/// IRQControl, BootInfo Frame, IPC Frame, Untyped); slot 14 is
-/// SchedControl. Slots 12-13 are consumed by the `untyped_retype_tcb`
-/// + `tcb_set_ipc_buffer` cases, slot 15 by `untyped_retype_reply`,
-/// so we begin handing out from 16.
-static NEXT_SLOT: AtomicU64 = AtomicU64::new(16);
+/// First slot the harness will hand out. Phase 36e moved the
+/// canonical initial caps + Untyped to slots 0..20, so the first
+/// empty slot is 21. The `untyped_retype_tcb` test uses
+/// FIRST_EMPTY_SLOT (= 21), `tcb_set_ipc_buffer` uses 22, and
+/// `untyped_retype_reply` uses 23. The general-purpose
+/// allocator starts after them at 24.
+static NEXT_SLOT: AtomicU64 = AtomicU64::new(24);
 
 #[allow(dead_code)]
 fn alloc_slot() -> u64 {
@@ -303,7 +303,7 @@ mod tests {
     pub(super) fn untyped_retype_reply() -> TestResult {
         // Slot 14 is reserved by the kernel for the rootserver's
         // SchedControl cap; use the next free slot.
-        let dest_slot: u64 = 15;
+        let dest_slot: u64 = 23; // Phase 36e shifted: was 15
         let r = untyped_retype(
             CAP_INIT_UNTYPED,
             OBJ_REPLY,
@@ -362,7 +362,7 @@ mod tests {
     /// the invocation; the kernel-side spec covers actual long-
     /// message round-trips.
     pub(super) fn tcb_set_ipc_buffer() -> TestResult {
-        let frame_slot: u64 = 13;
+        let frame_slot: u64 = 22; // Phase 36e shifted: was 13
         let r = untyped_retype(
             CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE,
             PAGING_BITS, 1, frame_slot,
