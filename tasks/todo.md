@@ -1,3 +1,82 @@
+# Active phase plan — Phase 33: round out the kernel
+
+## Goal
+After Phase 32 the MCS scheduler runs but four gaps stand
+between us and a system that could host a userspace driver:
+  * 33a — PIT IRQ doesn't context-switch when `mcs_tick` parks
+    the running thread; the thread keeps spinning until its
+    next syscall, smearing the budget split. Fix: switch out
+    of the IRQ entry the same way `enter_user_via_sysret`
+    does.
+  * 33b — `handle_interrupt` is wired at the cap level, but
+    no hardware vectors route through it; only the PIT and
+    IPI vectors have real handlers today. Generic IRQ entries
+    + an IRQHandler-driven demo close the loop.
+  * 33c — seL4 `Call` donates the caller's SchedContext to
+    the callee. We don't model donation yet; servers run on
+    their own SC, so a fast caller can't push budget into a
+    slow handler.
+  * 33d — The rootserver runs everything in its own VSpace.
+    A real init would load a child ELF into a *fresh* VSpace.
+    All paging caps exist; the demo just hasn't exercised
+    them from userspace.
+
+## Plan (incremental — one slice per session)
+
+- [x] 33a — IRQ-driven preemption. **DONE**
+  * `pit_irq_entry` now pushes all 15 GPRs, hands the kernel
+    stack down as `&mut IretqContext`, and the Rust dispatcher
+    (`pit_irq_dispatch`) rewrites the entire context — iretq
+    frame's RIP/RFLAGS/RSP plus all GPRs — when `mcs_tick`
+    parked the running thread.
+  * 32g H:B ratio tightened from 2.4:1 to 3.08:1
+    (`15102H 4898B`). The remaining slack is cooperative
+    `yield` between PIT ticks — the children themselves yield
+    after each char.
+
+- [ ] 33b — IRQ → Notification end-to-end.
+  * Install `IDT[vec]` for the master/slave PIC IRQ range so
+    every hardware IRQ funnels through a single dispatch
+    that calls `interrupt::handle_interrupt`.
+  * Add an IRQ-driven demo: rootserver retypes a Notification,
+    issues `IRQControl::IssueIRQHandler` for some IRQ, binds
+    the notification, waits on it. Trigger the IRQ (e.g.
+    arm the PIT and let it fire on a vector other than 0).
+  * Spec: signal arrives via the IRQ path, waiter unblocks.
+
+- [ ] 33c — SC donation across IPC.
+  * On `seL4_Call` (with the caller bound to an SC), record
+    the caller's SC onto the callee TCB; the callee runs on
+    that SC's budget.
+  * On `seL4_ReplyRecv` (or `Reply`), return the SC to the
+    caller.
+  * If the donated SC's budget exhausts during the call,
+    *both* threads block until refill.
+  * Specs: donate-on-call, return-on-reply, exhaust-during-
+    call blocks both.
+
+- [ ] 33d — Multi-VSpace rootserver demo.
+  * Rootserver retypes PML4 + PDPT + PD + PT objects out of
+    its Untyped, plus one Frame for the child's code page.
+  * Maps the frame at a known vaddr in the new VSpace using
+    the existing `X86Page::Map` / `X86PageTable::Map` /
+    `X86PageDirectory::Map` / `X86PDPT::Map` invocations.
+  * Copies a tiny inline child function (`ep_send + loop
+    yield`) into the frame.
+  * Retypes a TCB, `SetSpace` with the new PML4 cap,
+    `WriteRegisters`, `Resume`. Child IPCs back over a
+    shared endpoint.
+
+## Verification
+* Spec count rises by ~4–6.
+* MCS demo budget ratio tightens toward 4:1 (33a).
+* New IRQ demo logs notification delivery (33b).
+* New SC-donation specs pass (33c).
+* Multi-VSpace child IPC banner prints (33d).
+
+## Review (filled on completion)
+
+
 # Phase 32: MCS scheduler — DONE (32a–32g)
 
 ## Goal
