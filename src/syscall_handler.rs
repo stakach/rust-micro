@@ -289,6 +289,35 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             r.ipc_badge = 0; // reply has no badge
             let n = (length as usize).min(r.msg_regs.len());
             r.msg_regs[..n].copy_from_slice(&regs[..n]);
+            // Phase 43 — fan the reply payload into the caller's
+            // saved user_context so its blocked SysCall returns with
+            // the right register values. Without this, the caller
+            // wakes up but its r10/r8/r9/r15 still hold whatever it
+            // had at SysCall entry, so user-mode `seL4_GetMR(0)`
+            // reads stale data and tests like
+            // CANCEL_BADGED_SENDS_0001 fail with "GetMR(0) == ~msg".
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mi = (label << 12) | (length as Word & 0x7F);
+                r.user_context.rsi = mi;
+                r.user_context.rdi = 0; // reply has no badge
+                r.user_context.r10 = r.msg_regs[0];
+                r.user_context.r8  = r.msg_regs[1];
+                r.user_context.r9  = r.msg_regs[2];
+                r.user_context.r15 = r.msg_regs[3];
+            }
+            // Mirror words 4..length into the caller's IPC buffer.
+            if length > 4 && r.ipc_buffer_paddr != 0 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    let buf = (crate::arch::x86_64::paging::phys_to_lin(
+                        r.ipc_buffer_paddr) as *mut u64).wrapping_add(1);
+                    let max = (length as usize).min(regs.len());
+                    for i in 4..max {
+                        core::ptr::write_volatile(buf.add(i), regs[i]);
+                    }
+                }
+            }
         }
         // Wake the caller from BlockedOnReply.
         debug_assert_eq!(
