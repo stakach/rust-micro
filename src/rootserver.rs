@@ -462,7 +462,13 @@ pub unsafe fn launch_rootserver() -> ! {
             .expect("asid pool paddr"),
         asid_base: 0,
     });
-    // Slots 7, 8, 11, 12, 13, 15: empty (no IO / Domain / SMMU /
+    // Phase 42 — IOPortControl at canonical slot 7
+    // (`seL4_CapIOPortControl`). sel4test's pc99 timer driver
+    // calls `seL4_X86_IOPortControl_Issue` here when it falls back
+    // to PIT (which it does whenever ACPI/HPET discovery fails),
+    // so without this cap the timer driver silently bails.
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[7] = Cte::with_cap(&Cap::IOPortControl);
+    // Slots 8, 11, 12, 13, 15: empty (no IO / Domain / SMMU /
     // SMC support).
     // Phase 37b — InitThreadSC at canonical slot 14. The
     // SchedContext object was allocated above and bound to the

@@ -47,6 +47,8 @@ fn inv_cap_tag(c: &Cap) -> &'static str {
         Cap::Reply { .. }         => "Rep",
         Cap::Endpoint { .. }      => "Ep",
         Cap::Notification { .. }  => "Ntfn",
+        Cap::IOPort { .. }        => "IoP",
+        Cap::IOPortControl        => "IoPC",
         Cap::Null                 => "Null",
         _                         => "??",
     }
@@ -197,6 +199,10 @@ pub fn decode_invocation(
         Cap::SchedContext { .. } => decode_sched_context(target, label, args, invoker),
         Cap::SchedControl { .. } => decode_sched_control(label, args, invoker),
         Cap::Reply { .. } => decode_reply(target, args, invoker),
+        Cap::IOPort { first_port, last_port } => {
+            decode_io_port(first_port, last_port, label, args, invoker)
+        }
+        Cap::IOPortControl => decode_io_port_control(label, args, invoker),
         Cap::Null => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidCapability,
         ))),
@@ -1219,6 +1225,176 @@ fn issue_x86_irq_handler(
             );
         }
         let _ = (pin, level, polarity);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// X86 I/O port invocations.
+//
+// Each `Cap::IOPort` carries an inclusive `[first, last]` port window.
+// In*/Out* invocations check the requested port against that window
+// and then issue the actual `in`/`out` instruction in kernel mode.
+// `seL4_X86_IOPortControl_Issue` mints a fresh `Cap::IOPort` with
+// caller-supplied `(first, last)` from the singleton control cap.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn io_in8(port: u16) -> u8 {
+    let v: u8;
+    core::arch::asm!("in al, dx", in("dx") port, out("al") v,
+        options(nomem, nostack, preserves_flags));
+    v
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn io_in16(port: u16) -> u16 {
+    let v: u16;
+    core::arch::asm!("in ax, dx", in("dx") port, out("ax") v,
+        options(nomem, nostack, preserves_flags));
+    v
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn io_in32(port: u16) -> u32 {
+    let v: u32;
+    core::arch::asm!("in eax, dx", in("dx") port, out("eax") v,
+        options(nomem, nostack, preserves_flags));
+    v
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn io_out8(port: u16, v: u8) {
+    core::arch::asm!("out dx, al", in("dx") port, in("al") v,
+        options(nomem, nostack, preserves_flags));
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn io_out16(port: u16, v: u16) {
+    core::arch::asm!("out dx, ax", in("dx") port, in("ax") v,
+        options(nomem, nostack, preserves_flags));
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn io_out32(port: u16, v: u32) {
+    core::arch::asm!("out dx, eax", in("dx") port, in("eax") v,
+        options(nomem, nostack, preserves_flags));
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn io_in8(_p: u16) -> u8 { 0 }
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn io_in16(_p: u16) -> u16 { 0 }
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn io_in32(_p: u16) -> u32 { 0 }
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn io_out8(_p: u16, _v: u8) {}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn io_out16(_p: u16, _v: u16) {}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn io_out32(_p: u16, _v: u32) {}
+
+fn decode_io_port(
+    first_port: u16,
+    last_port: u16,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    // ABI for In/Out:
+    //   a2 (mr0) = port number (low 16 bits)
+    //   a3 (mr1) = value to write (Out only)
+    // In ops return the read value via msg_regs[0] (and the SysCall
+    // reply path in handle_send fans it back into r10 + IPC buffer).
+    let port = (args.a2 & 0xFFFF) as u16;
+    if port < first_port || port > last_port {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_RangeError)));
+    }
+    unsafe {
+        let s = KERNEL.get();
+        match label {
+            InvocationLabel::X86IOPortIn8 => {
+                let v = io_in8(port) as u64;
+                let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                inv_tcb.msg_regs[0] = v;
+                inv_tcb.ipc_length = 1;
+            }
+            InvocationLabel::X86IOPortIn16 => {
+                let v = io_in16(port) as u64;
+                let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                inv_tcb.msg_regs[0] = v;
+                inv_tcb.ipc_length = 1;
+            }
+            InvocationLabel::X86IOPortIn32 => {
+                let v = io_in32(port) as u64;
+                let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                inv_tcb.msg_regs[0] = v;
+                inv_tcb.ipc_length = 1;
+            }
+            InvocationLabel::X86IOPortOut8 => {
+                io_out8(port, args.a3 as u8);
+            }
+            InvocationLabel::X86IOPortOut16 => {
+                io_out16(port, args.a3 as u16);
+            }
+            InvocationLabel::X86IOPortOut32 => {
+                io_out32(port, args.a3 as u32);
+            }
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_IllegalOperation)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_io_port_control(
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    if !matches!(label, InvocationLabel::X86IOPortControlIssue) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation)));
+    }
+    // Upstream `seL4_X86_IOPortControl_Issue` ABI:
+    //   a2 (mr0) = first_port
+    //   a3 (mr1) = last_port
+    //   extraCaps[0] = dest root cap (CNode under which the issued
+    //                  IOPort cap lands)
+    //   mr2 = dest_index, mr3 = dest_depth
+    let first = (args.a2 & 0xFFFF) as u16;
+    let last = (args.a3 & 0xFFFF) as u16;
+    if first > last {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument)));
+    }
+    unsafe {
+        let s = KERNEL.get();
+        let inv_tcb = s.scheduler.slab.get_mut(invoker);
+        let dest_index = inv_tcb.msg_regs[2];
+        let depth = inv_tcb.msg_regs[3] as u32;
+        let dest_root = if inv_tcb.pending_extra_caps_count > 0 {
+            let c = inv_tcb.pending_extra_caps[0];
+            inv_tcb.pending_extra_caps_count = 0;
+            c
+        } else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        };
+        if !matches!(dest_root, Cap::CNode { .. }) {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        }
+        let res = crate::cspace::resolve_address_bits(s, &dest_root, dest_index, depth)?;
+        if res.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+        let cnode_idx = KernelState::cnode_index(res.slot_ptr);
+        let slot = &mut s.cnodes[cnode_idx].0[res.slot_index];
+        if !slot.cap().is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst)));
+        }
+        slot.set_cap(&Cap::IOPort { first_port: first, last_port: last });
     }
     Ok(())
 }
@@ -2420,9 +2596,26 @@ fn decode_tcb(
                 Ok(())
             }
             InvocationLabel::TCBBindNotification => {
-                // a2 = ntfn_cptr.
-                let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let ntfn_cap = crate::cspace::lookup_cap(s, &inv_cspace, args.a2)?;
+                // Two ABI shapes:
+                //   * legacy (microtest): a2 = ntfn_cptr in invoker's
+                //     CSpace.
+                //   * upstream (sel4test): notification passed as
+                //     extraCaps[0]; no message words.
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                let upstream = info.extra_caps() > 0;
+                let inv_tcb_mut = s.scheduler.slab.get_mut(invoker);
+                let ntfn_cap = if upstream {
+                    if inv_tcb_mut.pending_extra_caps_count == 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    let c = inv_tcb_mut.pending_extra_caps[0];
+                    inv_tcb_mut.pending_extra_caps_count = 0;
+                    c
+                } else {
+                    let cspace_root = inv_tcb_mut.cspace_root;
+                    crate::cspace::lookup_cap(s, &cspace_root, args.a2)?
+                };
                 let ntfn_idx = match ntfn_cap {
                     Cap::Notification { ptr, .. } => {
                         KernelState::ntfn_index(ptr) as u16

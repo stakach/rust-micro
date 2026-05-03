@@ -19,8 +19,8 @@
 
 use crate::structures::*;
 use crate::structures::arch::{
-    AsidControlCap, AsidPoolCap, FrameCap, PageDirectoryCap, PageTableCap, PdptCap,
-    Pml4Cap,
+    AsidControlCap, AsidPoolCap, FrameCap, IoPortCap, IoPortControlCap,
+    PageDirectoryCap, PageTableCap, PdptCap, Pml4Cap,
 };
 use crate::structures::{SchedContextCap, SchedControlCap};
 use crate::types::seL4_Word as Word;
@@ -62,6 +62,8 @@ pub mod tag {
     pub const PML4: u64 = 9;
     pub const ASID_CONTROL: u64 = 11;
     pub const ASID_POOL: u64 = 13;
+    pub const IO_PORT: u64 = 19;
+    pub const IO_PORT_CONTROL: u64 = 31;
 
     /// Returns true for all arch-specific cap tags. Mirrors
     /// `isArchCap` in seL4: arch caps occupy odd tag values.
@@ -366,6 +368,21 @@ pub enum Cap {
     SchedControl {
         core: u32,
     },
+    /// Phase 42 — x86 I/O port range cap (tag 19). Permits
+    /// `seL4_X86_IOPort_In*` and `Out*` invocations on the `[first,
+    /// last]` (inclusive) port range. The kernel's decoder ranges-
+    /// checks every in/out against the cap's window before issuing
+    /// the actual `in`/`out` instruction.
+    IOPort {
+        first_port: u16,
+        last_port: u16,
+    },
+    /// Phase 42 — singleton "I/O port control" cap (tag 31).
+    /// Holding it permits `seL4_X86_IOPortControl_Issue` to mint a
+    /// fresh `Cap::IOPort` covering an arbitrary port window. The
+    /// rootserver gets one in slot 14 (`seL4_CapIOPortControl`)
+    /// of its CNode at boot.
+    IOPortControl,
     /// Any other arch-tagged cap (page tables, ASID pool, etc.).
     /// Stored as the raw two-word encoding; full decoding for the
     /// remaining cap types lands in later phases.
@@ -586,6 +603,14 @@ pub fn from_words(words: [Word; 2]) -> Cap {
             let c = SchedControlCap { words };
             Cap::SchedControl { core: c.core() as u32 }
         }
+        tag::IO_PORT => {
+            let c = IoPortCap { words };
+            Cap::IOPort {
+                first_port: c.capIOPortFirstPort() as u16,
+                last_port: c.capIOPortLastPort() as u16,
+            }
+        }
+        tag::IO_PORT_CONTROL => Cap::IOPortControl,
         t if tag::is_arch(t) => Cap::Arch { cap_type: t, words },
         _ => Cap::Null,
     }
@@ -736,6 +761,18 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
         }
         Cap::SchedControl { core } => {
             SchedControlCap::new(*core as u64, tag::SCHED_CONTROL).words
+        }
+        Cap::IOPort { first_port, last_port } => {
+            let mut c = IoPortCap::zeroed();
+            c = c.with_capType(tag::IO_PORT);
+            c = c.with_capIOPortFirstPort(*first_port as u64);
+            c = c.with_capIOPortLastPort(*last_port as u64);
+            c.words
+        }
+        Cap::IOPortControl => {
+            let mut c = IoPortControlCap::zeroed();
+            c = c.with_capType(tag::IO_PORT_CONTROL);
+            c.words
         }
         Cap::Frame { ptr, size, rights, mapped, asid, is_device } => {
             // Visible field order (no explicit_params on frame_cap):
