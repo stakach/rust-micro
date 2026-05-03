@@ -183,6 +183,11 @@ pub struct RootserverImage {
     pub ipc_buffer_paddr: u64,
     /// Physical address of the BootInfo page; slot 9.
     pub bootinfo_paddr: u64,
+    /// User vaddr of the extended BootInfo page (sized chunks of
+    /// optional info — the TSC frequency lives here today).
+    pub extra_bi_vaddr: u64,
+    /// Physical address of the extended BootInfo page.
+    pub extra_bi_paddr: u64,
 }
 
 /// Errors the loader can surface.
@@ -269,6 +274,17 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     map_user_4k_into_pml4(pml4, bootinfo_vaddr, bi_phys, false);
     record_image_page(seen, &mut n_seen, bootinfo_vaddr, bi_phys, false)?;
 
+    // Phase 42 — extended BootInfo page. sel4test's
+    // `x86_get_tsc_freq_from_simple` looks here for a
+    // `SEL4_BOOTINFO_HEADER_X86_TSC_FREQ` chunk; without it
+    // `plat_init` aborts after `init_timer` succeeds. Mapping a
+    // single page right after `bootinfo_vaddr` is enough for the
+    // headers we currently emit.
+    let extra_bi_vaddr = bootinfo_vaddr + page;
+    let extra_bi_phys = alloc_page();
+    map_user_4k_into_pml4(pml4, extra_bi_vaddr, extra_bi_phys, false);
+    record_image_page(seen, &mut n_seen, extra_bi_vaddr, extra_bi_phys, false)?;
+
     // Publish the count for the BootInfo builder.
     IMAGE_PAGE_COUNT = n_seen;
 
@@ -280,6 +296,8 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
         bootinfo_vaddr,
         ipc_buffer_paddr: ipcbuf_phys,
         bootinfo_paddr: bi_phys,
+        extra_bi_vaddr,
+        extra_bi_paddr: extra_bi_phys,
     })
 }
 
@@ -547,6 +565,32 @@ pub unsafe fn launch_rootserver() -> ! {
     }
     let user_image_end: Word = user_image_start + n_image_pages as Word;
 
+    // Phase 42 — populate the extended BootInfo page with the
+    // TSC-frequency chunk sel4test's `x86_get_tsc_freq_from_simple`
+    // looks up. The header is `{ id: u64, len: u64 }` followed by
+    // a 4-byte TSC freq in MHz. We hardcode 1000 MHz (1 GHz) — the
+    // QEMU default for `-cpu host` is in this ballpark, and sel4test
+    // uses the value only for relative timing; off-by-a-factor is
+    // acceptable for getting the test suite running.
+    const SEL4_BI_HEADER_SIZE: usize = 16; // u64 id + u64 len
+    const TSC_FREQ_HEADER_ID: u64 = 5; // SEL4_BOOTINFO_HEADER_X86_TSC_FREQ
+    const TSC_FREQ_MHZ: u32 = 1000;
+    let extra_bi_kvaddr = phys_to_kernel_virt(img.extra_bi_paddr);
+    let extra_bi_ptr = extra_bi_kvaddr as *mut u8;
+    // Header.id
+    core::ptr::write_volatile(extra_bi_ptr as *mut u64, TSC_FREQ_HEADER_ID);
+    // Header.len (header + payload)
+    core::ptr::write_volatile(
+        (extra_bi_ptr as *mut u64).add(1),
+        (SEL4_BI_HEADER_SIZE + 4) as u64,
+    );
+    // Payload: TSC freq in MHz (u32).
+    core::ptr::write_volatile(
+        extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut u32,
+        TSC_FREQ_MHZ,
+    );
+    let extra_bi_total_len: Word = (SEL4_BI_HEADER_SIZE + 4) as Word;
+
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)
     // before the CR3 swap; the rootserver reads it through its
@@ -558,6 +602,7 @@ pub unsafe fn launch_rootserver() -> ! {
         ut_size_bits,
         user_image_start,
         user_image_end,
+        extra_bi_total_len,
     );
     core::ptr::write(bi_ptr, bi);
 
@@ -616,6 +661,7 @@ unsafe fn build_bootinfo(
     untyped_size_bits: u8,
     user_image_start: Word,
     user_image_end: Word,
+    extra_bi_size: Word,
 ) -> seL4_BootInfo {
     let mut empty_untypeds = [seL4_UntypedDesc::default();
         CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
@@ -682,7 +728,7 @@ unsafe fn build_bootinfo(
     let untyped_end: Word = untyped_start + untyped_count;
     let cnode_slots: Word = 1u64 << crate::kernel::CNODE_RADIX;
     seL4_BootInfo {
-        extraLen: 0,
+        extraLen: extra_bi_size,
         nodeID: 0,
         numNodes: n_cores,
         numIOPTLevels: 0,
