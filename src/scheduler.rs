@@ -277,7 +277,8 @@ impl Scheduler {
     /// Set this CPU's `current` thread.
     #[inline]
     pub fn set_current(&mut self, val: Option<TcbId>) {
-        self.nodes[crate::arch::get_cpu_id() as usize].current = val;
+        let cpu = crate::arch::get_cpu_id() as usize;
+        self.nodes[cpu].current = val;
     }
 
     /// Read another CPU's `current` thread (used by IPI handlers

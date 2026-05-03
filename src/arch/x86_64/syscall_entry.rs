@@ -315,9 +315,14 @@ pub unsafe extern "C" fn syscall_entry() {
         // Call the Rust dispatcher. ABI:
         //   rdi = syscall number (upstream seL4 ABI puts it in rdx;
         //         our save area at offset 24 holds the saved rdx)
+        //   rsi = from_user marker (1 — the no-runnable-thread tail
+        //         enters HLT instead of sysret'ing back to a blocked
+        //         caller; specs that invoke the dispatcher directly
+        //         pass 0 to keep their drive-by call returning).
         // The dispatcher recovers its UserContext via
         // `arch::get_cpu_id()` indexing into `PER_CPU_SYSCALL`.
         "mov rdi, gs:[16 + 24]",
+        "mov rsi, 1",
         "call {handler}",
 
         // Restore user GPRs (rcx and r11 carry the SYSRET targets).
@@ -353,7 +358,7 @@ pub unsafe extern "C" fn syscall_entry() {
 /// Public so specs (and a future user-mode integration test) can
 /// invoke the same path the trap entry calls.
 #[no_mangle]
-pub extern "C" fn rust_syscall_dispatch(number: u64) {
+pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     use crate::arch;
     use crate::syscall_handler::{handle_syscall, DebugSink, SyscallArgs};
     use crate::syscalls::Syscall;
@@ -628,10 +633,63 @@ pub extern "C" fn rust_syscall_dispatch(number: u64) {
             // the next entry sees them too (idempotent).
             s.scheduler.slab.get_mut(next).user_context = new_ctx;
             *ctx = new_ctx;
-        } else {
-            // No next-thread to dispatch; current ctx is preserved.
-            // rax is left as the user wrote it (upstream ABI).
+        } else if from_user != 0 {
+            // No runnable thread on this CPU. The asm restore tail
+            // would otherwise sysretq back to the original caller's
+            // context (PER_CPU_SYSCALL[cpu].user_ctx, which the
+            // entry stub populated with caller's GPRs). But the
+            // caller is the one we just blocked — sysret'ing to it
+            // would have it run user code as if the syscall returned
+            // normally, retry the operation, eventually corrupt its
+            // own stack and #PF at RIP=0. Halt this CPU in kernel
+            // mode until an IRQ arrives instead. Release the BKL
+            // first so peer CPUs can keep making progress.
+            //
+            // sti+hlt is the canonical "enable interrupts and wait
+            // for one" sequence on x86; the next IRQ pops us out
+            // and we re-enter the dispatcher to look for runnable
+            // work.
+            //
+            // The `from_user` gate keeps spec tests that invoke
+            // the dispatcher directly from kernel context falling
+            // through and returning, since they have no scheduler
+            // state and shouldn't sit in a wait-for-IRQ loop.
             let _ = result;
+            crate::smp::bkl_release();
+            loop {
+                core::arch::asm!("sti", "hlt",
+                    options(nostack, preserves_flags));
+                // After waking, re-evaluate. If something is now
+                // runnable, dispatch it via enter_user_via_sysret.
+                let s = KERNEL.get();
+                crate::smp::bkl_acquire();
+                let next = match s.scheduler.current() {
+                    Some(t) => Some(t),
+                    None => s.scheduler.choose_thread(),
+                };
+                if let Some(next_id) = next {
+                    s.scheduler.set_current(Some(next_id));
+                    let tcb = s.scheduler.slab.get(next_id);
+                    let next_cr3 = tcb.cpu_context.cr3;
+                    let next_ctx = tcb.user_context;
+                    if next_cr3 != 0 {
+                        let cur_cr3: u64;
+                        core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+                            options(nomem, nostack, preserves_flags));
+                        if next_cr3 != cur_cr3 {
+                            core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
+                                options(nostack, preserves_flags));
+                        }
+                    }
+                    let pcc = current_cpu_user_ctx_mut();
+                    *pcc = next_ctx;
+                    crate::smp::bkl_release();
+                    enter_user_via_sysret(pcc as *const _);
+                    // unreachable
+                }
+                crate::smp::bkl_release();
+                // Spurious wake (e.g. IPI to peer) — go back to HLT.
+            }
         }
     }
 }
@@ -741,7 +799,7 @@ pub mod spec {
         ctx.rdi = b'!' as u64;
         ctx.rax = 0xDEAD_BEEF;
 
-        super::rust_syscall_dispatch(-12i64 as u64);
+        super::rust_syscall_dispatch(-12i64 as u64, 0);
 
         let ctx = super::current_cpu_user_ctx_mut();
         assert_eq!(ctx.rax, 0xDEAD_BEEF,
@@ -759,7 +817,7 @@ pub mod spec {
         let ctx = super::current_cpu_user_ctx_mut();
         *ctx = UserContext::default();
         ctx.rax = 0xFEED_CAFE;
-        super::rust_syscall_dispatch(99u64);
+        super::rust_syscall_dispatch(99u64, 0);
         let ctx = super::current_cpu_user_ctx_mut();
         assert_eq!(ctx.rax, 0xFEED_CAFE,
                    "kernel preserves rax even on unknown-syscall exit");
