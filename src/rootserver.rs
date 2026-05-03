@@ -391,7 +391,13 @@ pub unsafe fn launch_rootserver() -> ! {
     // Build the TCB. cspace_root points at the new CNode; the
     // dispatcher consults this for cap lookups.
     let mut t = Tcb::default();
-    t.priority = 100;
+    // Rootserver runs at seL4_MaxPrio (255). sel4test's driver
+    // assumes it is strictly higher priority than every test process
+    // it spawns (env->init->priority is always seL4_MaxPrio - 1) so
+    // that result-send IPCs immediately preempt the test process and
+    // the driver's tear_down runs before the test process resumes.
+    t.priority = 255;
+    t.mcp = 255;
     t.state = ThreadStateType::Running;
     t.affinity = 0;
     t.user_context = UserContext::for_entry(
