@@ -73,7 +73,7 @@ fn log_dec(mut v: u64) {
 /// One-line trace for an invocation entry — emits e.g.
 /// `<inv cap=Ut label=1 xc=0>`. Disabled by default; flip the const
 /// to true to enable while diagnosing sel4test failures.
-const INV_TRACE: bool = false;
+const INV_TRACE: bool = true;
 
 fn inv_log_entry(target: &Cap, label_n: u64, xc: u8) {
     if !INV_TRACE { return; }
@@ -2720,7 +2720,35 @@ fn decode_tcb(
                         return Err(KException::SyscallError(SyscallError::new(
                             seL4_Error::seL4_InvalidCapability)));
                     }
-                    t.cspace_root = c;
+                    // Apply cspace_root_data (mr0 in upstream MCS layout
+                    // = args.a2, mr1 in upstream non-MCS = args.a3,
+                    // none in legacy). Encoding mirrors libsel4's
+                    // `seL4_CNode_CapData`:
+                    //   bits 0..6  = guardSize
+                    //   bits 6..64 = guard
+                    // Mirrors upstream `updateCapData` for cnode caps.
+                    let cdata = if upstream { args.a2 } else { 0 };
+                    let final_cnode = if cdata != 0 {
+                        let new_guard_size = (cdata & 0x3F) as u8;
+                        let new_guard = cdata >> 6;
+                        if let Cap::CNode { ptr, radix, .. } = c {
+                            if (new_guard_size as u32) + (radix as u32) > 64 {
+                                return Err(KException::SyscallError(SyscallError::new(
+                                    seL4_Error::seL4_RangeError)));
+                            }
+                            Cap::CNode {
+                                ptr,
+                                radix,
+                                guard_size: new_guard_size,
+                                guard: new_guard & ((1u64 << new_guard_size) - 1),
+                            }
+                        } else {
+                            c
+                        }
+                    } else {
+                        c
+                    };
+                    t.cspace_root = final_cnode;
                 }
                 if let Some(c) = vspace_cap {
                     // Phase 27: a typed PML4 cap pins the target's
