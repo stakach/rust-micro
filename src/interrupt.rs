@@ -40,6 +40,11 @@ pub struct IrqEntry {
     pub state: IrqState,
     /// Notification slab index, or `None` if no binding.
     pub notification: Option<u16>,
+    /// Badge from the badged notification cap that was bound to this
+    /// IRQ via IRQHandler::SetNotification. Signal() uses this value
+    /// instead of 0 so userspace can route the IRQ to the right
+    /// timer slot via CTZL(badge) (sel4test convention).
+    pub badge: u64,
     /// True while a delivered IRQ has not yet been ack'd. seL4 masks
     /// the line at the controller; we just track the flag.
     pub pending: bool,
@@ -56,7 +61,7 @@ impl Default for IrqTable {
 
 impl IrqTable {
     pub const fn new() -> Self {
-        Self { entries: [IrqEntry { state: IrqState::Inactive, notification: None, pending: false }; MAX_IRQ] }
+        Self { entries: [IrqEntry { state: IrqState::Inactive, notification: None, badge: 0, pending: false }; MAX_IRQ] }
     }
     pub fn get(&self, irq: u16) -> Option<&IrqEntry> {
         self.entries.get(irq as usize)
@@ -83,6 +88,7 @@ pub fn set_notification(
     table: &mut IrqTable,
     irq: u16,
     notification_index: u16,
+    badge: u64,
 ) -> Result<(), IrqError> {
     let entry = table.get_mut(irq).ok_or(IrqError::Range)?;
     if entry.state != IrqState::Inactive {
@@ -90,6 +96,7 @@ pub fn set_notification(
     }
     entry.state = IrqState::Signal;
     entry.notification = Some(notification_index);
+    entry.badge = badge;
     Ok(())
 }
 
@@ -133,11 +140,17 @@ pub fn handle_interrupt(
     match entry.state {
         IrqState::Signal => {
             let idx = entry.notification?;
+            let badge = entry.badge;
             let ntfn = notifications.get_mut(idx as usize)?;
-            // seL4 always signals with badge 0 from the IRQ path —
-            // userspace identifies the source via the IRQHandler
-            // cap, not the badge.
-            signal(ntfn, sched, 0)
+            // Use the badge stored at SetNotification time. sel4test
+            // mints a badged notification cap (BIT(N)) per timer IRQ
+            // and binds it via IRQHandler::SetNotification; on signal
+            // it expects to read that badge in rdi so its
+            // handle_timer_interrupts() can `CTZL(badge)` to pick
+            // the right per-timer callback. Signalling with badge=0
+            // would route the wake into the "no-badge" branch and
+            // skip the per-timer dispatch entirely.
+            signal(ntfn, sched, badge)
         }
         IrqState::Inactive | IrqState::Reserved => None,
     }
@@ -178,7 +191,7 @@ pub mod spec {
         let t = sched.admit(runnable(50));
 
         // Bind IRQ 7 to notification 1, then have `t` wait on it.
-        set_notification(&mut table, 7, 1).unwrap();
+        set_notification(&mut table, 7, 1, 0).unwrap();
         wait(&mut ntfns[1], &mut sched, t);
         assert_eq!(sched.slab.get(t).state, ThreadStateType::BlockedOnNotification);
 
@@ -195,16 +208,16 @@ pub mod spec {
     #[inline(never)]
     fn bind_unbind_rebind() {
         let mut table = IrqTable::new();
-        set_notification(&mut table, 3, 0).unwrap();
+        set_notification(&mut table, 3, 0, 0).unwrap();
         // Double-bind rejected.
         assert_eq!(
-            set_notification(&mut table, 3, 1),
+            set_notification(&mut table, 3, 1, 0),
             Err(IrqError::AlreadyBound),
         );
         // Clear, then re-bind.
         clear_handler(&mut table, 3).unwrap();
         assert_eq!(table.get(3).unwrap().state, IrqState::Inactive);
-        set_notification(&mut table, 3, 1).unwrap();
+        set_notification(&mut table, 3, 1, 0).unwrap();
         assert_eq!(table.get(3).unwrap().notification, Some(1));
         arch::log("  ✓ bind/unbind/rebind transitions\n");
     }
@@ -214,7 +227,7 @@ pub mod spec {
         let mut table = IrqTable::new();
         let mut ntfns = [Notification::new()];
         let mut sched = Scheduler::new();
-        set_notification(&mut table, 5, 0).unwrap();
+        set_notification(&mut table, 5, 0, 0).unwrap();
         handle_interrupt(&mut table, &mut ntfns, &mut sched, 5);
         assert!(table.get(5).unwrap().pending);
         ack_irq(&mut table, 5).unwrap();
@@ -228,7 +241,7 @@ pub mod spec {
     #[inline(never)]
     fn out_of_range_irq_rejected() {
         let mut table = IrqTable::new();
-        assert_eq!(set_notification(&mut table, 9999, 0), Err(IrqError::Range));
+        assert_eq!(set_notification(&mut table, 9999, 0, 0), Err(IrqError::Range));
         assert_eq!(clear_handler(&mut table, 9999), Err(IrqError::Range));
         assert_eq!(ack_irq(&mut table, 9999), Err(IrqError::Range));
         arch::log("  ✓ out-of-range IRQ rejected\n");

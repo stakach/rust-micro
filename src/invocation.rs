@@ -1451,16 +1451,18 @@ fn decode_irq_handler(
                     let cspace_root = inv_tcb.cspace_root;
                     crate::cspace::lookup_cap(s, &cspace_root, args.a2)?
                 };
-                let ntfn_ptr = match ntfn_cap {
-                    Cap::Notification { ptr, .. } => ptr,
+                let (ntfn_ptr, ntfn_badge) = match ntfn_cap {
+                    Cap::Notification { ptr, badge, .. } => (ptr, badge.0),
                     _ => return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability))),
                 };
                 let ntfn_idx = KernelState::ntfn_index(ntfn_ptr) as u16;
                 // Replace any existing handler binding and install
-                // the new one.
+                // the new one. The badge from the badged cap is
+                // recorded on the IRQ entry so handle_interrupt can
+                // signal with it (sel4test minted BIT(N) per timer).
                 let _ = crate::interrupt::clear_handler(&mut s.irqs, irq);
-                crate::interrupt::set_notification(&mut s.irqs, irq, ntfn_idx)
+                crate::interrupt::set_notification(&mut s.irqs, irq, ntfn_idx, ntfn_badge)
                     .map_err(|_| KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability)))
             }

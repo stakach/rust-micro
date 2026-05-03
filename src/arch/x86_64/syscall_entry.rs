@@ -219,20 +219,26 @@ const OFF_KSP: usize = 0;
 /// Offset of `user_ctx` within `PerCpuSyscallArea` (gs-relative).
 const OFF_CTX: usize = 16;
 
-/// Set the calling CPU's `IA32_KERNEL_GS_BASE` to its per-CPU slot.
-/// `swapgs` after SYSCALL entry then makes `gs:[0]` resolve to the
-/// kernel slot; on `swapgs` before sysretq the kernel value moves
-/// back into KERNEL_GS_BASE and `gs:` reverts to whatever the user
-/// had (we leave that 0).
+/// Set the calling CPU's `IA32_KERNEL_GS_BASE` AND active GS_BASE to
+/// its per-CPU slot. The kernel relies on the invariant that
+/// "kernel-mode active GS_BASE = per-CPU slot": SYSCALL entry's
+/// `swapgs` swaps active and KERNEL, so as long as both start equal
+/// to the per-CPU slot, every entry/exit pair leaves them unchanged.
+/// All exit paths (the SYSCALL stub's tail and `enter_user_via_sysret`)
+/// likewise `swapgs` so the round-trip preserves the invariant.
+///
+/// Setting both at init also covers the very first user dispatch:
+/// the rootserver-launch path calls `enter_user_via_sysret` from
+/// fresh kernel mode (no prior SYSCALL entry), so without seeding
+/// the active register the post-swapgs value would be the boot
+/// default of 0 and the next SYSCALL would land in the kernel with
+/// gs pointing at virtual address 0.
 pub fn init_per_cpu_gs() {
     unsafe {
         let cpu = crate::arch::get_cpu_id() as usize;
         let base = (&raw mut PER_CPU_SYSCALL[cpu]) as u64;
         wrmsr(IA32_KERNEL_GS_BASE, base);
-        // We never set the *active* GS_BASE — it stays 0 (or
-        // whatever user sets). swapgs swaps the two; SYSCALL entry
-        // does the swap so the kernel side runs with `gs` pointing
-        // at the per-CPU slot.
+        wrmsr(IA32_GS_BASE, base);
     }
 }
 
@@ -265,6 +271,16 @@ pub unsafe extern "C" fn enter_user_via_sysret(ctx: *const UserContext) -> ! {
         // rdi was the ctx pointer we needed; restore its user value
         // last, after we've used it for everything else.
         "mov rdi, [rdi + 40]",
+        // Mirror the syscall-entry's swapgs round-trip so the
+        // active/KERNEL_GS_BASE pair stays balanced. Without this,
+        // every dispatch through this path rotates KERNEL_GS_BASE
+        // by one (active and KERNEL drift apart), and after a few
+        // round-trips KERNEL_GS_BASE = 0 → the next SYSCALL entry's
+        // swapgs makes the kernel access gs:[0x10] = address 0x10,
+        // crashing the kernel before any GPR is saved. init_per_cpu_gs
+        // seeds active=KERNEL=per-CPU at boot so the initial dispatch
+        // (no prior SYSCALL entry) starts the invariant correctly.
+        "swapgs",
         "sysretq",
     );
 }
@@ -599,7 +615,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             let mut new_ctx = tcb.user_context;
             let was_recv_path = matches!(
                 syscall,
-                Syscall::SysRecv | Syscall::SysNBRecv | Syscall::SysReplyRecv,
+                Syscall::SysRecv
+                | Syscall::SysNBRecv
+                | Syscall::SysReplyRecv
+                | Syscall::SysWait
+                | Syscall::SysNBWait,
             ) && Some(next) == s.scheduler.current();
             // The "matches" above guards against the sender side:
             // when a blocked sender wakes up, we don't want to

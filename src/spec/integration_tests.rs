@@ -146,7 +146,7 @@ fn irq_drives_thread_unblock() {
     let driver = sched.admit(running(100));
 
     // Bind IRQ 12 to notification slot 2.
-    set_notification(&mut irqs, 12, 2).unwrap();
+    set_notification(&mut irqs, 12, 2, 0).unwrap();
     // Driver waits on the notification — blocks.
     wait(&mut ntfns[2], &mut sched, driver);
     assert_eq!(sched.slab.get(driver).state, ThreadStateType::BlockedOnNotification);

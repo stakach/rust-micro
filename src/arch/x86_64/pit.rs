@@ -226,6 +226,18 @@ extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
     crate::sched_context::mcs_tick(/* delta_ticks */ 1);
     super::pic::eoi(0);
 
+    // Phase 42 — fan to user IRQ 2 (PIT-via-IOAPIC GSI 2 binding)
+    unsafe {
+        let s = crate::kernel::KERNEL.get();
+        let s_ptr: *mut crate::kernel::KernelState = s;
+        let _ = crate::interrupt::handle_interrupt(
+            &mut (*s_ptr).irqs,
+            &mut (*s_ptr).notifications,
+            &mut (*s_ptr).scheduler,
+            2,
+        );
+    }
+
     // Phase 33a — IRQ-driven preemption. If `mcs_tick` (or any
     // other tick handler) cleared `current`, switch contexts here
     // rather than `iretq`-ing back to the now-blocked thread.

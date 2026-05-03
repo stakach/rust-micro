@@ -140,10 +140,31 @@ pub fn signal(
         NtfnState::Waiting => {
             let t = queue_pop_head(ntfn, sched)
                 .expect("Waiting state must have at least one waiter");
-            // Hand the badge directly to the woken thread via the
-            // `ipc_badge` register — same convention as endpoint
-            // transfer.
-            sched.slab.get_mut(t).ipc_badge = badge;
+            // Hand the badge directly to the woken thread. Write it
+            // into both `ipc_badge` (for the syscall_entry tail's
+            // was_recv_path fan-out, when the wake happens during
+            // the same SYSCALL that called Wait) AND directly into
+            // `user_context.rdi` (the upstream Wait/Recv ABI return
+            // register) so dispatch paths that bypass the fan-out —
+            // notably the syscall HLT loop's `enter_user_via_sysret`
+            // when the Wait blocked, the kernel HLT'd, and an IRQ
+            // ISR signalled the wake — still deliver the badge to
+            // userspace. Without this rdi update, sel4test's Wait
+            // returns with rdi == the original `src` cptr (preserved
+            // from the SYSCALL entry args), userspace treats it as
+            // the badge, runs `CTZL(cptr)` to index its per-IRQ
+            // callback table, and calls a NULL function pointer.
+            {
+                let tcb = sched.slab.get_mut(t);
+                tcb.ipc_badge = badge;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    tcb.user_context.rdi = badge;
+                    // rsi (msginfo) — Wait returns an empty msginfo
+                    // (no message words from notifications).
+                    tcb.user_context.rsi = 0;
+                }
+            }
             sched.make_runnable(t);
             if ntfn.head.is_none() {
                 ntfn.state = NtfnState::Idle;
