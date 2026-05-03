@@ -2888,7 +2888,38 @@ fn decode_tcb(
             }
             InvocationLabel::TCBSetPriority => {
                 let prio = args.a2 as u8;
+                // Phase 43 — properly migrate the thread between
+                // priority queues. Without this, a TCB's priority
+                // field is updated but it stays in its OLD priority
+                // bucket — choose_thread keeps picking it as if it
+                // were still high-priority, blocking lower-priority
+                // wakes. sel4test's BIND005/006 lower the driver
+                // from 255 to 9 expecting the helper at 10 to run;
+                // without re-queue, the driver stays in the 255
+                // bucket and the helper is starved.
+                let cpu = s.scheduler.slab.get(id).affinity as usize;
+                let was_runnable = s.scheduler.slab.get(id).is_runnable();
+                if was_runnable {
+                    s.scheduler.nodes[cpu].queues
+                        .dequeue(&mut s.scheduler.slab, id);
+                }
                 s.scheduler.slab.get_mut(id).priority = prio;
+                if was_runnable {
+                    s.scheduler.nodes[cpu].queues
+                        .enqueue(&mut s.scheduler.slab, id);
+                    // If we just demoted the current thread on this
+                    // CPU and a higher-priority thread is waiting,
+                    // force a reschedule.
+                    if s.scheduler.nodes[cpu].current == Some(id) {
+                        if let Some(top) = s.scheduler.nodes[cpu]
+                            .queues.peek_highest()
+                        {
+                            if top > prio {
+                                s.scheduler.nodes[cpu].current = None;
+                            }
+                        }
+                    }
+                }
                 Ok(())
             }
             InvocationLabel::TCBWriteRegisters => {
