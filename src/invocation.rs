@@ -1213,16 +1213,33 @@ fn issue_x86_irq_handler(
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst)));
         }
+        // Phase 42 — store the user-visible "vector" as the IRQ
+        // table index in the cap. seL4_IRQHandler_Ack /
+        // SetNotification will resolve the same index against
+        // KernelState.irqs, and our generic IRQ ISR (irq{N}_entry →
+        // irq_dispatch) calls handle_interrupt with this index.
         slot.set_cap(&Cap::IrqHandler { irq: vector as u16 });
 
         // Program the hardware so the line actually fires.
-        // MSI variant goes through PCI config space — TODO; for
-        // IOAPIC we drive the redirection table directly.
+        //
+        // Upstream seL4 maps the user-visible vector to a CPU IDT
+        // vector via `cpu_vec = irq + IRQ_INT_OFFSET`; we mirror
+        // that with `cpu_vec = vector + PIC1_VECTOR_BASE` so the
+        // IOAPIC delivers to one of our `irq{N}_entry` stubs at
+        // IDT[0x20 + N], which routes through `irq_dispatch(_, N)`.
+        // Without this translation we'd write the raw user value
+        // (e.g. 2 for the PIT-via-IOAPIC pin 2) into the redirection
+        // table and the CPU would receive vector 2 (NMI).
+        // MSI variant goes through PCI config space — TODO.
         if !msi {
             #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::ioapic::program_redirection(
-                pin as u32, vector as u32, level as u32, polarity as u32,
-            );
+            {
+                let cpu_vec = (vector as u32)
+                    + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
+                crate::arch::x86_64::ioapic::program_redirection(
+                    pin as u32, cpu_vec, level as u32, polarity as u32,
+                );
+            }
         }
         let _ = (pin, level, polarity);
     }
