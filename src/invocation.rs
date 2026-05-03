@@ -73,7 +73,7 @@ fn log_dec(mut v: u64) {
 /// One-line trace for an invocation entry — emits e.g.
 /// `<inv cap=Ut label=1 xc=0>`. Disabled by default; flip the const
 /// to true to enable while diagnosing sel4test failures.
-const INV_TRACE: bool = true;
+const INV_TRACE: bool = false;
 
 fn inv_log_entry(target: &Cap, label_n: u64, xc: u8) {
     if !INV_TRACE { return; }
@@ -2143,15 +2143,39 @@ fn cnode_copy_or_mint(
             _ => {}
         }
         if mint {
-            // Mint can re-badge an Endpoint/Notification cap. The
-            // badge lives in mr5 per the upstream layout above; the
-            // legacy 4-arg form put it in `args.a4`.
+            // Mirrors upstream `updateCapData(false, badge, cap)`:
+            // for Endpoint/Notification, `badge` is the badge value;
+            // for CNode caps, `badge` is the seL4_CNode_CapData
+            // encoding of (guard, guardSize) which the kernel applies
+            // to the derived cap so it walks the new CSpace at the
+            // expected depth. Without this, sel4test's
+            // create_cspace mints the new CNode cap into its own
+            // slot 1 expecting guard_size=47 (skipping the high
+            // 47 bits of any cptr lookup) and our resolve falls 47
+            // bits short → FailedLookup on every cnode_move/mint
+            // through that cap.
             match &mut copy {
                 Cap::Endpoint { badge: b, .. } => {
                     *b = crate::cap::Badge(badge);
                 }
                 Cap::Notification { badge: b, .. } => {
                     *b = crate::cap::Badge(badge);
+                }
+                Cap::CNode { ptr, radix, guard_size, guard } => {
+                    if badge != 0 {
+                        let new_guard_size = (badge & 0x3F) as u8;
+                        let new_guard_raw = badge >> 6;
+                        if (new_guard_size as u32) + (*radix as u32) <= 64 {
+                            let mask = if new_guard_size == 0 {
+                                0
+                            } else {
+                                (1u64 << new_guard_size) - 1
+                            };
+                            *guard_size = new_guard_size;
+                            *guard = new_guard_raw & mask;
+                        }
+                        let _ = ptr;
+                    }
                 }
                 _ => {}
             }
