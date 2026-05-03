@@ -182,11 +182,17 @@ extern "C" fn handle_page_fault_typed(
     saved_cs: u64,
     saved_rip: u64,
 ) {
-    // Phase 28b — BKL across the fault handler. Fault delivery
+    // Phase 28b / 42 — BKL across the fault handler. Fault delivery
     // touches the kernel scheduler + fault EP cap chain, all of
     // which are shared kernel state.
+    //
+    // We DON'T use BklGuard here. The handler has multiple exit
+    // paths that don't return through this function (sysret into
+    // a freshly-dispatched thread, infinite hlt loop), and the
+    // RAII guard's Drop never fires on those — leaving the BKL
+    // held forever and deadlocking peer CPUs in `bkl_acquire`.
+    // Each early-exit path calls `bkl_release()` explicitly below.
     crate::smp::bkl_acquire();
-    let _bkl = BklGuard;
 
     let user_mode = (saved_cs & 3) == 3;
     if !user_mode {
@@ -197,6 +203,7 @@ extern "C" fn handle_page_fault_typed(
         crate::arch::log(", err=0x");
         log_hex64(error_code);
         crate::arch::log("\nfatal — halting\n");
+        crate::smp::bkl_release();
         #[cfg(feature = "spec")]
         crate::arch::qemu_exit(255);
         #[cfg(not(feature = "spec"))]
@@ -236,10 +243,35 @@ extern "C" fn handle_page_fault_typed(
                 let pcc = crate::arch::x86_64::syscall_entry
                     ::current_cpu_user_ctx_mut();
                 *pcc = next_ctx;
+                crate::smp::bkl_release();
                 crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
                     pcc as *const _);
                 // unreachable
             }
+        }
+        // Dump per-CPU highest-priority hint to confirm whether
+        // other CPUs have work to steal.
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            crate::arch::log("[peek per-CPU:");
+            for (cpu_i, node) in s.scheduler.nodes.iter().enumerate() {
+                crate::arch::log(" cpu");
+                let mut buf = [b'0'; 4]; let mut v = cpu_i as u64; let mut i = 4;
+                if v == 0 { crate::arch::log("0"); }
+                while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+                if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
+                crate::arch::log("=");
+                match node.queues.peek_highest() {
+                    None => crate::arch::log("-"),
+                    Some(p) => {
+                        let mut buf = [b'0'; 4]; let mut v = p as u64; let mut i = 4;
+                        if v == 0 { crate::arch::log("0"); }
+                        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+                        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
+                    }
+                }
+            }
+            crate::arch::log("]\n");
         }
         crate::arch::log("[USER #PF no current, no runnable cs=0x");
         log_hex64(saved_cs);
@@ -247,13 +279,14 @@ extern "C" fn handle_page_fault_typed(
         log_hex64(saved_rip);
         crate::arch::log(" cr2=0x");
         log_hex64(cr2);
-        crate::arch::log(" — halt cpu=");
+        crate::arch::log(" — idle cpu=");
         let cpu = crate::arch::get_cpu_id();
         let mut buf = [b'0'; 4]; let mut v = cpu as u64; let mut i = 4;
         if v == 0 { crate::arch::log("0"); }
         while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
         if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
         crate::arch::log("]\n");
+        crate::smp::bkl_release();
         loop { unsafe { core::arch::asm!("sti", "hlt"); } }
     }
     let faulter = current.unwrap();
@@ -314,13 +347,16 @@ extern "C" fn handle_page_fault_typed(
                 let pcc = crate::arch::x86_64::syscall_entry
                     ::current_cpu_user_ctx_mut();
                 *pcc = next_ctx;
+                crate::smp::bkl_release();
                 crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
                     pcc as *const _);
                 // unreachable
             }
             // No runnable thread on this CPU: stall in HLT until
-            // an IRQ wakes us. Don't iretq.
-            crate::arch::log("[user #PF: no next thread, halting CPU]\n");
+            // an IRQ wakes us. Don't iretq. Release the BKL first
+            // so other CPUs can keep making progress.
+            crate::arch::log("[user #PF: no next thread, idling CPU]\n");
+            crate::smp::bkl_release();
             loop { core::arch::asm!("sti", "hlt"); }
         }
     }

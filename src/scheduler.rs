@@ -52,6 +52,10 @@ impl PrioBitmap {
         let p = prio as usize;
         self.words[p / 64] &= !(1u64 << (p % 64));
     }
+    pub fn bit_set(&self, prio: u8) -> bool {
+        let p = prio as usize;
+        (self.words[p / 64] & (1u64 << (p % 64))) != 0
+    }
     pub fn highest(&self) -> Option<u8> {
         // Walk from the high word down so we find the topmost set bit.
         for i in (0..BITMAP_WORDS).rev() {
@@ -158,6 +162,47 @@ impl ReadyQueues {
     /// thread can keep running.
     pub fn peek_highest(&self) -> Option<u8> {
         self.bitmap.highest()
+    }
+
+    /// Walk this queue from highest priority down looking for the
+    /// first thread whose `affinity == want_affinity`. Returns its
+    /// `TcbId` (without removing it from the queue) so the caller
+    /// can dequeue + re-enqueue elsewhere. Used by cross-CPU
+    /// migration in `Scheduler::choose_thread`.
+    pub fn peek_top_with_affinity(
+        &self,
+        slab: &TcbSlab,
+        want_affinity: u32,
+    ) -> Option<TcbId> {
+        let mut prio_opt = self.bitmap.highest();
+        while let Some(prio) = prio_opt {
+            let mut cur = self.heads[prio as usize];
+            while let Some(id) = cur {
+                if slab.get(id).affinity == want_affinity {
+                    return Some(id);
+                }
+                cur = slab.get(id).sched_next;
+            }
+            // Couldn't find a match at this priority; try the next
+            // lower one. The bitmap doesn't have a "next-below"
+            // accessor so just decrement until we hit zero or find
+            // another set bit.
+            if prio == 0 {
+                return None;
+            }
+            let mut p = prio - 1;
+            loop {
+                if self.bitmap.bit_set(p) {
+                    prio_opt = Some(p);
+                    break;
+                }
+                if p == 0 {
+                    return None;
+                }
+                p -= 1;
+            }
+        }
+        None
     }
 
     /// Test helper: count how many threads sit in `prio`'s queue.
@@ -298,6 +343,20 @@ impl Scheduler {
         self.slab.get_mut(id).state = ThreadStateType::Running;
         if !was_runnable {
             self.nodes[cpu].queues.enqueue(&mut self.slab, id);
+            // Phase 42 — if the woken thread's affinity is a peer
+            // CPU and that CPU is currently idle (current = None),
+            // send a Reschedule IPI so it picks up the work
+            // instead of staying parked in HLT. Without this,
+            // sel4test deadlocks the moment a per-CPU timer
+            // notification wakes a thread on AP1 while AP1 is
+            // sleeping.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let my_cpu = crate::arch::get_cpu_id() as usize;
+                if cpu != my_cpu && self.nodes[cpu].current.is_none() {
+                    crate::smp::kick_cpu(cpu as u32);
+                }
+            }
         }
     }
 
@@ -324,17 +383,38 @@ impl Scheduler {
 
     /// Pick the thread that should run next on the calling CPU.
     /// Mirrors seL4's `scheduleChooseNewThread` for the single-domain
-    /// non-MCS case but per-CPU.
+    /// non-MCS case but per-CPU. If the local queue is empty, peek
+    /// at peer CPUs and only steal a thread whose explicit affinity
+    /// matches this CPU — i.e. a thread that "belongs here" but
+    /// was racily enqueued elsewhere by some wakeup path. Threads
+    /// with intentional affinity to a different CPU stay where the
+    /// user pinned them so e.g. sel4test's per-CPU timer threads
+    /// don't migrate mid-test.
     pub fn choose_thread(&mut self) -> Option<TcbId> {
         let cpu = crate::arch::get_cpu_id() as usize;
         if let Some(id) = self.nodes[cpu].queues.pop_highest(&mut self.slab) {
             // Re-enqueue at the tail so equal-priority threads
             // round-robin.
             self.nodes[cpu].queues.enqueue(&mut self.slab, id);
-            Some(id)
-        } else {
-            self.nodes[cpu].idle
+            return Some(id);
         }
+
+        // Local queue empty — look for an affinity-mismatched
+        // thread on a peer queue (i.e. a thread pinned to *us* that
+        // somehow ended up over there). We do NOT migrate threads
+        // whose affinity already matches their queue's CPU.
+        for i in 0..self.nodes.len() {
+            if i == cpu { continue; }
+            if let Some(id) = self.nodes[i].queues.peek_top_with_affinity(
+                &self.slab, cpu as u32)
+            {
+                self.nodes[i].queues.dequeue(&mut self.slab, id);
+                self.nodes[cpu].queues.enqueue(&mut self.slab, id);
+                return Some(id);
+            }
+        }
+
+        self.nodes[cpu].idle
     }
 
     /// Decide whether the current thread on this CPU should yield.
