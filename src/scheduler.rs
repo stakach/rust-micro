@@ -178,15 +178,19 @@ impl ReadyQueues {
         while let Some(prio) = prio_opt {
             let mut cur = self.heads[prio as usize];
             while let Some(id) = cur {
-                if slab.get(id).affinity == want_affinity {
+                // Spec teardown can leave stale TCB IDs in the
+                // queue (the spec admits a TCB, runs, doesn't
+                // dequeue before the next test resets the slab);
+                // skip them so the walk doesn't panic.
+                let Some(tcb) = slab.try_get(id) else {
+                    cur = None;
+                    break;
+                };
+                if tcb.affinity == want_affinity {
                     return Some(id);
                 }
-                cur = slab.get(id).sched_next;
+                cur = tcb.sched_next;
             }
-            // Couldn't find a match at this priority; try the next
-            // lower one. The bitmap doesn't have a "next-below"
-            // accessor so just decrement until we hit zero or find
-            // another set bit.
             if prio == 0 {
                 return None;
             }

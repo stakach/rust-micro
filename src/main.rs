@@ -318,9 +318,25 @@ fn ap_scheduler_loop() -> ! {
         #[cfg(target_arch = "x86_64")]
         {
             let my_cpu = arch::get_cpu_id();
+            // Phase 42 — fall through to choose_thread() when
+            // `current` is None so an AP that's been HLT'd can
+            // pick up newly-runnable threads enqueued by an IRQ-
+            // driven make_runnable on this CPU. Without this, AP1
+            // stays parked forever once `current` is cleared,
+            // even if its queue has work — strands sel4test's
+            // per-CPU timer threads.
             let next = unsafe {
-                crate::kernel::KERNEL.get()
-                    .scheduler.current_for_cpu(my_cpu)
+                let s = crate::kernel::KERNEL.get();
+                match s.scheduler.current_for_cpu(my_cpu) {
+                    Some(t) => Some(t),
+                    None => {
+                        let picked = s.scheduler.choose_thread();
+                        if let Some(id) = picked {
+                            s.scheduler.set_current(Some(id));
+                        }
+                        picked
+                    }
+                }
             };
             if let Some(tcb_id) = next {
                 // Only dispatch threads that have a real vspace

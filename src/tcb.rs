@@ -313,6 +313,14 @@ impl TcbSlab {
             .expect("TcbSlab::get on empty slot")
     }
 
+    /// Defensive read for paths that may walk stale TCB IDs left
+    /// behind in scheduler queues by spec teardown (or in production
+    /// by a path that frees a TCB without dequeueing it first). Used
+    /// by queue traversal helpers like `peek_top_with_affinity`.
+    pub fn try_get(&self, id: TcbId) -> Option<&Tcb> {
+        self.entries.get(id.0 as usize).and_then(|e| e.as_ref())
+    }
+
     pub fn get_mut(&mut self, id: TcbId) -> &mut Tcb {
         self.entries[id.0 as usize]
             .as_mut()
