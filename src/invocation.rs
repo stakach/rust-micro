@@ -2391,6 +2391,19 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         s.cnodes[cnode_idx].0[res.slot_index].set_cap(&Cap::Null);
         s.cnodes[cnode_idx].0[res.slot_index].set_parent(None);
 
+        // Phase 43 — deleting the LAST cap to a TCB triggers thread
+        // destruction in upstream seL4. We approximate by suspending
+        // the TCB on every Thread cap delete (cheap if already
+        // Inactive). Without this, sel4utils_destroy_process leaves
+        // BIND0001's test-process TCB in `Running` state in our slab,
+        // and it competes with the driver for CPU during BIND0002
+        // setup — turning the apparent BIND0002 hang into ~3s/sec
+        // wall-clock progress.
+        if let Cap::Thread { tcb } = deleted_cap {
+            let id = crate::tcb::TcbId(tcb.addr() as u16);
+            s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
+        }
+
         // Phase 42 — Untyped reclaim. allocman's split allocator
         // calls CNode_Delete on bisect-ladder children and expects
         // the parent Untyped's `free_index` to roll back so the
