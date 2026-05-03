@@ -2410,12 +2410,20 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
             return;
         }
         let cap = s.cnodes[pcn].0[psl].cap();
-        let (parent_base, parent_block_bits) = match cap {
-            Cap::Untyped { ptr, block_bits, .. } => (ptr.addr(), block_bits as u32),
+        let (parent_base, parent_block_bits, parent_free_index) = match cap {
+            Cap::Untyped { ptr, block_bits, free_index, .. } => {
+                (ptr.addr(), block_bits as u32, free_index)
+            }
             _ => return,
         };
         let parent_total = 1u64 << parent_block_bits;
         let parent_end = parent_base + parent_total;
+        // If parent already has free_index = 0, no work to do here
+        // and no reason to walk the parent chain — the chain only
+        // shrinks above us when this level shrank.
+        if parent_free_index == 0 {
+            return;
+        }
 
         // Find the highest end-paddr among surviving children of pid.
         // Count ALL child cap types (not just Untyped) — Untyped::Retype
