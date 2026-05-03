@@ -51,6 +51,11 @@ pub struct Notification {
     /// it directly. We track the cap but don't yet implement the
     /// shortcut — the slowpath subsumes it.
     pub bound_tcb: Option<TcbId>,
+    /// Phase 43 — passive-server SchedContext binding. When a TCB is
+    /// bound to this notification AND its SC has been unbound (sc =
+    /// None), signalling the notification donates this SC's budget
+    /// so the bound TCB can run. sel4test's BIND005/006 exercise this.
+    pub bound_sc: Option<u16>,
 }
 
 impl Notification {
@@ -61,6 +66,7 @@ impl Notification {
             head: None,
             tail: None,
             bound_tcb: None,
+            bound_sc: None,
         }
     }
 }
@@ -140,6 +146,15 @@ pub fn signal(
             // never wakes for a notification while it's blocked
             // on an endpoint.
             if let Some(bt) = ntfn.bound_tcb {
+                // Phase 43 — passive-server SC donation. If the
+                // bound TCB has no SC of its own (it was unbound) but
+                // the notification carries a bound_sc, donate it so
+                // the wake actually schedules. BIND006 needs this.
+                if sched.slab.get(bt).sc.is_none() {
+                    if let Some(sc_idx) = ntfn.bound_sc {
+                        sched.slab.get_mut(bt).sc = Some(sc_idx);
+                    }
+                }
                 let state = sched.slab.get(bt).state;
                 if matches!(state, ThreadStateType::BlockedOnReceive) {
                     // Walk all endpoints to find which queue holds

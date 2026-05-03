@@ -1090,22 +1090,49 @@ fn decode_sched_context(
                     let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
                     crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?
                 };
-                let tcb_id = match tcb_cap {
-                    Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
+                // Phase 43 — also accept Notification cap (passive
+                // server pattern). Binding an SC to a notification
+                // means: when the notification is signalled, the SC
+                // donates its budget to the bound TCB so it can run.
+                // BIND005 / BIND006 exercise this. We model it by
+                // recording the SC on the notification, and on signal
+                // we ensure the bound TCB has the SC.
+                match tcb_cap {
+                    Cap::Thread { tcb } => {
+                        let tcb_id = crate::tcb::TcbId(tcb.addr() as u16);
+                        if s.scheduler.slab.get(tcb_id).sc.is_some() {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_DeleteFirst)));
+                        }
+                        if s.sched_contexts[sc_id as usize].bound_tcb.is_some() {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_DeleteFirst)));
+                        }
+                        s.scheduler.slab.get_mut(tcb_id).sc = Some(sc_id);
+                        s.sched_contexts[sc_id as usize].bound_tcb = Some(tcb_id);
+                    }
+                    Cap::Notification { ptr, .. } => {
+                        let ntfn_idx = KernelState::ntfn_index(ptr);
+                        let ntfn = &mut s.notifications[ntfn_idx];
+                        // Bind SC to this notification so future
+                        // signal()s donate budget to the bound TCB.
+                        // Record the SC on the notification AND on the
+                        // bound TCB so signal() can find both.
+                        if let Some(bt) = ntfn.bound_tcb {
+                            let tcb = s.scheduler.slab.get_mut(bt);
+                            if tcb.sc.is_none() {
+                                tcb.sc = Some(sc_id);
+                                s.sched_contexts[sc_id as usize]
+                                    .bound_tcb = Some(bt);
+                            }
+                        }
+                        // Mark the SC as bound to the notification so
+                        // unbind can find it.
+                        ntfn.bound_sc = Some(sc_id);
+                    }
                     _ => return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability))),
-                };
-                // Refuse double-bind in either direction.
-                if s.scheduler.slab.get(tcb_id).sc.is_some() {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst)));
                 }
-                if s.sched_contexts[sc_id as usize].bound_tcb.is_some() {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst)));
-                }
-                s.scheduler.slab.get_mut(tcb_id).sc = Some(sc_id);
-                s.sched_contexts[sc_id as usize].bound_tcb = Some(tcb_id);
             }
             Ok(())
         }
@@ -1115,6 +1142,13 @@ fn decode_sched_context(
                 if let Some(tcb_id) = s.sched_contexts[sc_id as usize].bound_tcb {
                     s.scheduler.slab.get_mut(tcb_id).sc = None;
                     s.sched_contexts[sc_id as usize].bound_tcb = None;
+                }
+                // Phase 43 — also clear notification binding if any
+                // notification holds this SC for passive-server use.
+                for ntfn in s.notifications.iter_mut() {
+                    if ntfn.bound_sc == Some(sc_id) {
+                        ntfn.bound_sc = None;
+                    }
                 }
             }
             Ok(())
