@@ -207,13 +207,56 @@ extern "C" fn handle_page_fault_typed(
     // fault handler. If delivery fails (no handler / bad cap),
     // we kill the thread by parking it Inactive.
     let current = crate::kernel::current_thread();
-    let Some(faulter) = current else {
-        crate::arch::log("USER #PF with no current TCB — fatal\n");
-        #[cfg(feature = "spec")]
-        crate::arch::qemu_exit(255);
-        #[cfg(not(feature = "spec"))]
-        loop { unsafe { asm!("hlt"); } }
-    };
+    if current.is_none() {
+        // We took a user-mode #PF on a CPU whose `current` is
+        // None. Most common cause: another CPU blocked the thread
+        // we were running (e.g. as the receiver in a Call) — its
+        // `block()` cleared the per-CPU `current` everywhere
+        // before we trapped, so by the time we acquired the BKL
+        // and looked, the slot was empty. Don't refault forever;
+        // try to dispatch the next runnable thread, falling back
+        // to a HLT loop if none is available. SYSRET into the new
+        // thread bypasses the iretq path entirely.
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            if let Some(next_id) = s.scheduler.choose_thread() {
+                s.scheduler.set_current(Some(next_id));
+                let tcb = s.scheduler.slab.get(next_id);
+                let next_cr3 = tcb.cpu_context.cr3;
+                let next_ctx = tcb.user_context;
+                if next_cr3 != 0 {
+                    let cur_cr3: u64;
+                    core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+                        options(nomem, nostack, preserves_flags));
+                    if next_cr3 != cur_cr3 {
+                        core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
+                            options(nostack, preserves_flags));
+                    }
+                }
+                let pcc = crate::arch::x86_64::syscall_entry
+                    ::current_cpu_user_ctx_mut();
+                *pcc = next_ctx;
+                crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
+                    pcc as *const _);
+                // unreachable
+            }
+        }
+        crate::arch::log("[USER #PF no current, no runnable cs=0x");
+        log_hex64(saved_cs);
+        crate::arch::log(" rip=0x");
+        log_hex64(saved_rip);
+        crate::arch::log(" cr2=0x");
+        log_hex64(cr2);
+        crate::arch::log(" — halt cpu=");
+        let cpu = crate::arch::get_cpu_id();
+        let mut buf = [b'0'; 4]; let mut v = cpu as u64; let mut i = 4;
+        if v == 0 { crate::arch::log("0"); }
+        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
+        crate::arch::log("]\n");
+        loop { unsafe { core::arch::asm!("sti", "hlt"); } }
+    }
+    let faulter = current.unwrap();
     let fault = crate::fault::FaultMessage::VMFault {
         addr: cr2,
         fsr: error_code,
@@ -226,7 +269,7 @@ extern "C" fn handle_page_fault_typed(
     crate::arch::log(" rip=0x");
     log_hex64(saved_rip);
     crate::arch::log("]\n");
-    if crate::fault::deliver_fault(faulter, fault).is_err() {
+    let suspended = if crate::fault::deliver_fault(faulter, fault).is_err() {
         crate::arch::log("[no fault handler — suspending thread]\n");
         unsafe {
             crate::kernel::KERNEL.get().scheduler.block(
@@ -234,15 +277,55 @@ extern "C" fn handle_page_fault_typed(
                 crate::tcb::ThreadStateType::Inactive,
             );
         }
+        true
+    } else {
+        // deliver_fault blocks the faulter on the fault EP and may
+        // wake the handler. Either way the faulter is no longer
+        // current.
+        true
+    };
+
+    // If we just blocked the faulter, iretq would dump us back
+    // into its now-unmapped page and refault forever (and on the
+    // refault `current` would be None → the no-current path
+    // halts this CPU). Pick the next runnable thread and SYSRET
+    // into it directly, bypassing iretq.
+    if suspended {
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            let next = s.scheduler.choose_thread();
+            if let Some(next_id) = next {
+                s.scheduler.set_current(Some(next_id));
+                let tcb = s.scheduler.slab.get(next_id);
+                let next_cr3 = tcb.cpu_context.cr3;
+                let next_ctx = tcb.user_context;
+                if next_cr3 != 0 {
+                    let cur_cr3: u64;
+                    core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+                        options(nomem, nostack, preserves_flags));
+                    if next_cr3 != cur_cr3 {
+                        core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
+                            options(nostack, preserves_flags));
+                    }
+                }
+                // Stage in the per-CPU UserContext save slot so the
+                // dispatcher tail can restore registers correctly,
+                // then sysret directly — never returns to iretq.
+                let pcc = crate::arch::x86_64::syscall_entry
+                    ::current_cpu_user_ctx_mut();
+                *pcc = next_ctx;
+                crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
+                    pcc as *const _);
+                // unreachable
+            }
+            // No runnable thread on this CPU: stall in HLT until
+            // an IRQ wakes us. Don't iretq.
+            crate::arch::log("[user #PF: no next thread, halting CPU]\n");
+            loop { core::arch::asm!("sti", "hlt"); }
+        }
     }
-    // Either way: iretq from this handler returns to where the
-    // CPU thinks it should resume — that's the FAULTING RIP,
-    // which would just refault. Phase 26+ will add proper IRQ-
-    // entry-style "save user state, schedule next, sysret" so
-    // we land on a different thread instead. For now, exit
-    // cleanly so the spec runner sees we got here.
-    #[cfg(feature = "spec")]
-    crate::arch::qemu_exit(0);
+    // (suspended is always true above; this branch is dead but kept
+    // for clarity should the deliver_fault path change.)
 }
 
 fn log_hex64(v: u64) {
