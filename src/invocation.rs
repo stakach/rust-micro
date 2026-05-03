@@ -1165,17 +1165,24 @@ fn decode_irq_control(
 /// Common worker for `X86IRQIssueIRQHandlerIOAPIC` /
 /// `X86IRQIssueIRQHandlerMSI`. Resolves the destination slot via
 /// `extraCaps[0]` + `(index, depth)` and stamps a fresh
-/// `Cap::IrqHandler` at that slot.
+/// `Cap::IrqHandler` at that slot. For the IOAPIC variant, also
+/// programs the IOAPIC redirection-table entry so the requested
+/// pin actually delivers `vector` to the BSP (otherwise the line
+/// stays masked and the user's handler never fires).
 fn issue_x86_irq_handler(
     args: &SyscallArgs,
     invoker: TcbId,
-    _msi: bool,
+    msi: bool,
 ) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
         let inv_tcb = s.scheduler.slab.get_mut(invoker);
         let dest_cptr = inv_tcb.msg_regs[0];
         let depth = inv_tcb.msg_regs[1] as u32;
+        let _ioapic_id = inv_tcb.msg_regs[2];
+        let pin = inv_tcb.msg_regs[3];
+        let level = inv_tcb.msg_regs[4];
+        let polarity = inv_tcb.msg_regs[5];
         let vector = inv_tcb.msg_regs[6];
         let dest_root = if inv_tcb.pending_extra_caps_count > 0 {
             inv_tcb.pending_extra_caps[0]
@@ -1201,6 +1208,17 @@ fn issue_x86_irq_handler(
                 seL4_Error::seL4_DeleteFirst)));
         }
         slot.set_cap(&Cap::IrqHandler { irq: vector as u16 });
+
+        // Program the hardware so the line actually fires.
+        // MSI variant goes through PCI config space — TODO; for
+        // IOAPIC we drive the redirection table directly.
+        if !msi {
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::ioapic::program_redirection(
+                pin as u32, vector as u32, level as u32, polarity as u32,
+            );
+        }
+        let _ = (pin, level, polarity);
     }
     Ok(())
 }

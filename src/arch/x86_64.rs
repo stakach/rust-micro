@@ -9,6 +9,7 @@ pub mod cpu;
 pub mod exceptions;
 pub mod gdt;
 pub mod interrupts;
+pub mod ioapic;
 pub mod lapic;
 pub mod msr;
 pub mod paging;
