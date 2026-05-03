@@ -49,8 +49,12 @@ pub const MAX_REPLIES: usize = 16;
 pub const CNODE_RADIX: u8 = 12;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 
-/// Maximum pre-allocated CNodes.
-pub const MAX_CNODES: usize = 4;
+/// Maximum pre-allocated CNodes. Bumped from 4 → 8 in Phase 42 so
+/// sel4test's BIND0001+ tests (each spawns a test_process with its
+/// own CSpace via Untyped→CNode retype) don't exhaust the pool.
+/// 8 CNodes × 4096 slots × 32 bytes = 1 MiB of static BSS — keeps
+/// us under the kernel image's ~2 MiB linker window.
+pub const MAX_CNODES: usize = 8;
 
 /// One pre-allocated CNode: 32 slots × 32 bytes = 1 KiB.
 #[repr(C, align(32))]
@@ -224,10 +228,16 @@ impl KernelState {
     }
 
     pub fn cnode_ptr(i: usize) -> PPtr<CNodeStorage> {
-        PPtr::<CNodeStorage>::new(i as u64 + 1).expect("non-zero")
+        // CnodeCap encodes the pointer with the low bit shifted off
+        // (seL4 assumes ≥2-byte CNode alignment so it can pack extra
+        // fields into bit 0). Our slab indexing has to keep every
+        // synthesized addr even, otherwise odd-`i` slots round-trip
+        // through the cap encoding to a different slab index. Use a
+        // 2-byte stride: i=0→addr=2, i=1→addr=4, etc.
+        PPtr::<CNodeStorage>::new(((i as u64) + 1) << 1).expect("non-zero")
     }
     pub fn cnode_index(p: PPtr<CNodeStorage>) -> usize {
-        (p.addr() - 1) as usize
+        ((p.addr() >> 1) - 1) as usize
     }
 
     pub fn ntfn_ptr(i: usize) -> PPtr<NotificationObj> {

@@ -800,46 +800,76 @@ fn decode_asid_pool(
     };
     match label {
         InvocationLabel::X86ASIDPoolAssign => {
-            // ABI: a2 = vspace cap_ptr (must be Cap::PML4).
-            let vspace_cptr = args.a2;
+            // Two ABI shapes coexist:
+            //   * Upstream (libsel4 stub `seL4_X86_ASIDPool_Assign`):
+            //     vspace cap passed as `extraCaps[0]`. Tag carries
+            //     `extra_caps=1`. The cptr the sender used appears
+            //     in the IPC buffer at `caps_or_badges_offset[0]`.
+            //   * Legacy (internal specs): vspace cap_ptr in `a2`.
+            //     No extra caps.
+            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+            let upstream = info.extra_caps() > 0;
             unsafe {
                 let s = KERNEL.get();
                 let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let cnode_ptr = match invoker_cspace {
-                    Cap::CNode { ptr, .. } => ptr,
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
-                };
-                let cnode_idx = KernelState::cnode_index(cnode_ptr);
-                let slot_idx = vspace_cptr as usize;
-                let slots = &mut s.cnodes[cnode_idx].0;
-                if slot_idx >= slots.len() {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_RangeError)));
-                }
-                match slots[slot_idx].cap() {
-                    Cap::PML4 { ptr, mapped, asid: 0 } => {
-                        // Allocate the next ASID in this pool. We use
-                        // `asid_base + (low 9 bits of NEXT_ASID_OFFSET)`,
-                        // bumped per assignment within the pool. Phase 31
-                        // is a coarse first cut — proper allocation
-                        // tracking lives in the AsidPool storage page
-                        // (asid_map[]) once we plumb it.
-                        let assigned = asid_base.saturating_add(
-                            (NEXT_ASID_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) & 0x1FF) as u16,
-                        );
-                        slots[slot_idx].set_cap(&Cap::PML4 {
-                            ptr,
-                            mapped,
-                            asid: assigned,
-                        });
-                        Ok(())
+                let (slot_cnode_idx, slot_idx, vspace_cap) = if upstream {
+                    let inv_tcb = s.scheduler.slab.get(invoker);
+                    if inv_tcb.pending_extra_caps_count == 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
                     }
-                    Cap::PML4 { .. } => Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst))),
-                    _ => Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
-                }
+                    let cap = inv_tcb.pending_extra_caps[0];
+                    let buf_paddr = inv_tcb.ipc_buffer_paddr;
+                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+                    if buf_paddr == 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr)
+                        as *const u64;
+                    let cptr = core::ptr::read_volatile(
+                        buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET));
+                    let res = crate::cspace::resolve_address_bits(
+                        s, &invoker_cspace, cptr, 64)?;
+                    if res.bits_remaining != 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_FailedLookup)));
+                    }
+                    (KernelState::cnode_index(res.slot_ptr), res.slot_index, cap)
+                } else {
+                    let cnode_ptr = match invoker_cspace {
+                        Cap::CNode { ptr, .. } => ptr,
+                        _ => return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability))),
+                    };
+                    let cnode_idx = KernelState::cnode_index(cnode_ptr);
+                    let slot_idx = args.a2 as usize;
+                    let slots = &s.cnodes[cnode_idx].0;
+                    if slot_idx >= slots.len() {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_RangeError)));
+                    }
+                    (cnode_idx, slot_idx, slots[slot_idx].cap())
+                };
+                let (ptr, mapped) = match vspace_cap {
+                    Cap::PML4 { ptr, mapped, asid: 0 } => (ptr, mapped),
+                    Cap::PML4 { .. } => return Err(KException::SyscallError(
+                        SyscallError::new(seL4_Error::seL4_DeleteFirst))),
+                    _ => return Err(KException::SyscallError(
+                        SyscallError::new(seL4_Error::seL4_InvalidCapability))),
+                };
+                // Allocate the next ASID in this pool. Phase 31 is a
+                // coarse first cut — proper allocation tracking lives
+                // in the AsidPool storage page (asid_map[]) once we
+                // plumb it.
+                let assigned = asid_base.saturating_add(
+                    (NEXT_ASID_OFFSET.fetch_add(
+                        1, core::sync::atomic::Ordering::Relaxed,
+                    ) & 0x1FF) as u16,
+                );
+                let slot = &mut s.cnodes[slot_cnode_idx].0[slot_idx];
+                slot.set_cap(&Cap::PML4 { ptr, mapped, asid: assigned });
+                Ok(())
             }
         }
         _ => Err(KException::SyscallError(SyscallError::new(
