@@ -370,18 +370,24 @@ fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResu
         _ => unreachable!(),
     };
 
-    // Phase 28g — actually clear the PTE in the live page tables
-    // and fan a TLB shootdown to other CPUs. Outside spec mode the
-    // cap chain backs real mappings; spec mode synthesizes caps
-    // without a populated PML4, so we skip the hardware step there.
-    #[cfg(all(not(feature = "spec"), target_arch = "x86_64"))]
+    // Phase 28g / 42 — actually clear the PTE in the live page
+    // tables and fan a TLB shootdown to other CPUs.
+    // `unmap_user_4k_public` walks page tables via the linear map
+    // and silently no-ops if any intermediate level is missing
+    // (which is the spec-test case where the cap chain doesn't
+    // back a real mapping), so we no longer need the spec gate
+    // we previously had — and skipping the hardware step in spec
+    // mode meant sel4test's Frame_Unmap left stale PTEs that the
+    // next allocator-recycled Frame_Map then tripped over with
+    // DeleteFirst.
+    #[cfg(target_arch = "x86_64")]
     if let Some(vaddr) = mapped_vaddr {
         unsafe {
             crate::arch::x86_64::usermode::unmap_user_4k_public(vaddr);
             crate::smp::shootdown_tlb(vaddr);
         }
     }
-    #[cfg(any(feature = "spec", not(target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     let _ = mapped_vaddr;
 
     // Walk the CSpace and zero the mapping in the matching cap.
@@ -1214,9 +1220,26 @@ fn decode_irq_handler(
                         seL4_Error::seL4_InvalidCapability)))
             }
             InvocationLabel::IRQSetIRQHandler => {
-                // a2 = CPtr to a Notification cap to bind.
-                let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-                let ntfn_cap = crate::cspace::lookup_cap(s, &cspace_root, args.a2)?;
+                // Two ABI shapes:
+                //   * legacy (microtest): a2 = cptr to Notification
+                //     in invoker's CSpace.
+                //   * upstream (sel4test): notification passed as
+                //     extraCaps[0]; no message words.
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                let upstream = info.extra_caps() > 0;
+                let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                let ntfn_cap = if upstream {
+                    if inv_tcb.pending_extra_caps_count == 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    let c = inv_tcb.pending_extra_caps[0];
+                    inv_tcb.pending_extra_caps_count = 0;
+                    c
+                } else {
+                    let cspace_root = inv_tcb.cspace_root;
+                    crate::cspace::lookup_cap(s, &cspace_root, args.a2)?
+                };
                 let ntfn_ptr = match ntfn_cap {
                     Cap::Notification { ptr, .. } => ptr,
                     _ => return Err(KException::SyscallError(SyscallError::new(
@@ -1927,7 +1950,6 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 seL4_Error::seL4_FailedLookup)));
         }
         let cnode_idx = KernelState::cnode_index(res.slot_ptr);
-        let slot = &mut s.cnodes[cnode_idx].0[res.slot_index];
         if INV_TRACE {
             crate::arch::log("[del -> cnode=");
             log_dec(cnode_idx as u64);
@@ -1935,10 +1957,90 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             log_dec(res.slot_index as u64);
             crate::arch::log("]\n");
         }
-        slot.set_cap(&Cap::Null);
-        slot.set_parent(None);
+
+        // Snapshot the cap + parent edge BEFORE clearing — the
+        // Untyped reclaim below needs them to know what to give
+        // back and to whom.
+        let deleted_cap = s.cnodes[cnode_idx].0[res.slot_index].cap();
+        let parent_id = s.cnodes[cnode_idx].0[res.slot_index].parent();
+
+        s.cnodes[cnode_idx].0[res.slot_index].set_cap(&Cap::Null);
+        s.cnodes[cnode_idx].0[res.slot_index].set_parent(None);
+
+        // Phase 42 — Untyped reclaim. allocman's split allocator
+        // calls CNode_Delete on bisect-ladder children and expects
+        // the parent Untyped's `free_index` to roll back so the
+        // memory becomes allocatable again. We approximate the
+        // upstream MDB-driven cleanup by, on every Untyped delete,
+        // walking up the parent chain and recomputing each parent's
+        // `free_index` as `max(child.base + child.size) -
+        // parent.base` over its surviving children. If no children
+        // remain the parent is reset to fully-free.
+        if matches!(deleted_cap, Cap::Untyped { .. }) {
+            reclaim_untyped_chain(parent_id);
+        }
     }
     Ok(())
+}
+
+/// Walk up the parent chain starting at `start`. For each parent
+/// CTE that holds an Untyped cap, recompute its `free_index` as the
+/// maximum end-paddr (`base + 2^block_bits`) over its surviving
+/// children, minus its base. If no children remain, the free_index
+/// drops to 0. Stops when a parent has surviving children whose
+/// free_index doesn't change (no further reclaim is possible).
+unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
+    let s = KERNEL.get();
+    let mut cursor = start;
+    while let Some(pid) = cursor {
+        let pcn = pid.cnode_idx() as usize;
+        let psl = pid.slot() as usize;
+        if pcn >= s.cnodes.len() || psl >= s.cnodes[pcn].0.len() {
+            return;
+        }
+        let cap = s.cnodes[pcn].0[psl].cap();
+        let (parent_base, parent_block_bits) = match cap {
+            Cap::Untyped { ptr, block_bits, .. } => (ptr.addr(), block_bits as u32),
+            _ => return,
+        };
+        let parent_total = 1u64 << parent_block_bits;
+        let parent_end = parent_base + parent_total;
+
+        // Find the highest end-paddr among surviving children of pid.
+        let mut max_end: u64 = parent_base; // == "no children" sentinel
+        for ci in 0..s.cnodes.len() {
+            for si in 0..s.cnodes[ci].0.len() {
+                let cte = &s.cnodes[ci].0[si];
+                if cte.parent() != Some(pid) {
+                    continue;
+                }
+                if let Cap::Untyped { ptr, block_bits, .. } = cte.cap() {
+                    let end = ptr.addr() + (1u64 << block_bits);
+                    if end > max_end {
+                        max_end = end;
+                    }
+                }
+            }
+        }
+        let new_fi = max_end - parent_base;
+        // Read the live cap, write back with updated free_index.
+        if let Cap::Untyped { ptr, block_bits, free_index, is_device } =
+            s.cnodes[pcn].0[psl].cap()
+        {
+            if new_fi < free_index {
+                let updated = Cap::Untyped {
+                    ptr, block_bits, free_index: new_fi, is_device,
+                };
+                s.cnodes[pcn].0[psl].set_cap(&updated);
+                // Continue up: maybe the parent's parent also has a
+                // tail to reclaim now that this one shrank.
+                cursor = s.cnodes[pcn].0[psl].parent();
+                let _ = parent_end;
+                continue;
+            }
+        }
+        return;
+    }
 }
 
 // ---------------------------------------------------------------------------
