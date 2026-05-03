@@ -930,8 +930,14 @@ fn decode_asid_pool(
 
 /// Per-pool offset bumper. Coarse — Phase 31+ replaces with a
 /// proper per-pool free-bitmap living in the AsidPool storage page.
+///
+/// Phase 43 — starts at 2 so the first user-process assignment doesn't
+/// collide with `ROOTSERVER_ASID = 1` (set in `rootserver::launch_rootserver`).
+/// A duplicate ASID confuses `pml4_paddr_for_asid`'s linear scan: it
+/// returns the first match, and a test-process Frame::Unmap could
+/// land on the rootserver's PML4 instead of the test process's.
 static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(1);
+    core::sync::atomic::AtomicU32::new(2);
 
 // ---------------------------------------------------------------------------
 // Phase 36d — Reply cap invocations. Send on a Cap::Reply wakes
