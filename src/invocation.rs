@@ -2387,11 +2387,77 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // child Untypeds. The parent's free_index was bumped at
         // Retype regardless of the resulting child type, so a
         // deleted Frame/TCB/EP/PT/PD/etc. should release the same
-        // bytes back to the parent.
-        let _ = deleted_cap;
-        reclaim_untyped_chain(parent_id);
+        // bytes back to the parent. Pass the deleted cap's
+        // (base, size) so reclaim can fast-path the common case
+        // where the deleted child wasn't at the parent's tail.
+        let (deleted_base, deleted_size) = cap_extent(&deleted_cap);
+        reclaim_untyped_chain_at_tail(parent_id, deleted_base, deleted_size);
     }
     Ok(())
+}
+
+/// Compute (base, size) of a cap's underlying object's physical
+/// memory. Used by the reclaim fast-path to decide whether a delete
+/// might shrink the parent's free_index. Returns (0, 0) for caps
+/// whose ptr field encodes a pool index (TCB, Endpoint, Notification,
+/// CNode, Reply) rather than a real paddr — for those we can't
+/// fast-path and must fall through to the full walk.
+fn cap_extent(cap: &Cap) -> (u64, u64) {
+    match cap {
+        Cap::Untyped { ptr, block_bits, .. } => (ptr.addr(), 1u64 << block_bits),
+        Cap::Frame { ptr, size, .. } => {
+            let n: u64 = match size {
+                crate::cap::FrameSize::Small => 4096,
+                crate::cap::FrameSize::Large => 2 * 1024 * 1024,
+                crate::cap::FrameSize::Huge => 1024 * 1024 * 1024,
+            };
+            (ptr.addr(), n)
+        }
+        Cap::PageTable { ptr, .. } => (ptr.addr(), 4096),
+        Cap::PageDirectory { ptr, .. } => (ptr.addr(), 4096),
+        Cap::Pdpt { ptr, .. } => (ptr.addr(), 4096),
+        Cap::PML4 { ptr, .. } => (ptr.addr(), 4096),
+        Cap::SchedContext { ptr, size_bits, .. } => (ptr.addr(), 1u64 << size_bits),
+        // Pool-indexed caps — ptr.addr() is NOT a paddr, so we can't
+        // compare ranges. Force fall-through to full walk by returning
+        // an extent of (0, 0).
+        _ => (0, 0),
+    }
+}
+
+/// Phase 43 — fast-path reclaim. If the deleted child's end_paddr is
+/// strictly less than the parent's effective end (parent.base +
+/// free_index), some other surviving child still extends past it, so
+/// the parent's free_index can't shrink — bail out without the
+/// expensive O(N) walk. Otherwise fall through to the full walk.
+unsafe fn reclaim_untyped_chain_at_tail(
+    start: Option<crate::cte::MdbId>,
+    deleted_base: u64,
+    deleted_size: u64,
+) {
+    // (0, 0) means the deleted cap is pool-indexed (TCB/EP/etc.); we
+    // can't compare paddrs, so fall through to the full walk.
+    if deleted_size != 0 {
+        let s = KERNEL.get();
+        if let Some(pid) = start {
+            let pcn = pid.cnode_idx() as usize;
+            let psl = pid.slot() as usize;
+            if pcn < s.cnodes.len() && psl < s.cnodes[pcn].0.len() {
+                if let Cap::Untyped { ptr, free_index, .. } = s.cnodes[pcn].0[psl].cap() {
+                    let parent_base = ptr.addr();
+                    let parent_eff_end = parent_base + free_index;
+                    let deleted_end = deleted_base + deleted_size;
+                    // Deleted child's tail is below parent's
+                    // effective end → some other child still holds
+                    // the tail. No shrink possible.
+                    if deleted_end < parent_eff_end {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    reclaim_untyped_chain(start);
 }
 
 /// Walk up the parent chain starting at `start`. For each parent
