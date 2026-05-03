@@ -495,9 +495,17 @@ pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool) {
 /// invariant says we only Unmap pages that Frame::Map installed
 /// at 4 KiB granularity, but we're defensive).
 pub unsafe fn unmap_user_4k_public(vaddr: u64) {
+    let pml4_paddr = read_cr3() & 0x000F_FFFF_FFFF_F000;
+    unmap_user_4k_in_pml4(pml4_paddr, vaddr);
+}
+
+/// Phase 43 — unmap a 4 KiB page from a SPECIFIC vspace (identified
+/// by its PML4 paddr). Used by Frame::Unmap so the kernel walks the
+/// vspace the cap was mapped in, not whatever happens to be current.
+pub unsafe fn unmap_user_4k_in_pml4(pml4_paddr: u64, vaddr: u64) {
     use super::paging::{PTE_PRESENT, PTE_PS};
     let pml4 = super::paging::phys_to_lin(
-        read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;

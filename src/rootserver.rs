@@ -411,10 +411,16 @@ pub unsafe fn launch_rootserver() -> ! {
     t.ipc_buffer = img.ipc_buffer_vaddr;
     t.ipc_buffer_paddr = img.ipc_buffer_paddr;
     t.cspace_root = cnode_cap;
+    // Phase 43 — assign a reserved sentinel ASID (1) to the
+    // rootserver's vspace so Frame::Unmap can locate this PML4 by
+    // asid lookup. ASID 0 means "unmapped/unassigned" and would
+    // make our Frame::Unmap no-op even for legitimate same-vspace
+    // unmaps.
+    const ROOTSERVER_ASID: u16 = 1;
     t.vspace_root = Cap::PML4 {
         ptr: PPtr::<Pml4Storage>::new(img.pml4_paddr).expect("pml4 paddr"),
         mapped: true,
-        asid: 0,
+        asid: ROOTSERVER_ASID,
     };
     let id = s.scheduler.admit(t);
 
@@ -454,14 +460,14 @@ pub unsafe fn launch_rootserver() -> ! {
     s.cnodes[ROOTSERVER_CNODE_IDX].0[3] = Cte::with_cap(&Cap::PML4 {
         ptr: PPtr::<Pml4Storage>::new(img.pml4_paddr).expect("pml4 paddr"),
         mapped: true,
-        asid: 0,
+        asid: ROOTSERVER_ASID,
     });
     s.cnodes[ROOTSERVER_CNODE_IDX].0[9] = Cte::with_cap(&Cap::Frame {
         ptr: PPtr::<FrameStorage>::new(img.bootinfo_paddr).expect("bi paddr"),
         size: FrameSize::Small,
         rights: FrameRights::ReadOnly,
         mapped: Some(img.bootinfo_vaddr),
-        asid: 0,
+        asid: ROOTSERVER_ASID,
         is_device: false,
     });
     s.cnodes[ROOTSERVER_CNODE_IDX].0[10] = Cte::with_cap(&Cap::Frame {
@@ -469,7 +475,7 @@ pub unsafe fn launch_rootserver() -> ! {
         size: FrameSize::Small,
         rights: FrameRights::ReadWrite,
         mapped: Some(img.ipc_buffer_vaddr),
-        asid: 0,
+        asid: ROOTSERVER_ASID,
         is_device: false,
     });
     // Phase 33b / 36e — IRQControl at canonical slot 4.
@@ -565,7 +571,7 @@ pub unsafe fn launch_rootserver() -> ! {
                 size: FrameSize::Small,
                 rights,
                 mapped: Some(pm.vaddr),
-                asid: 0,
+                asid: ROOTSERVER_ASID,
                 is_device: false,
             });
     }

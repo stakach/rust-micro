@@ -333,7 +333,14 @@ extern "C" fn handle_page_fault_typed(
         fsr: error_code,
         instruction: (error_code & (1 << 4)) != 0,
     };
-    crate::arch::log("[user #PF: cr2=0x");
+    crate::arch::log("[user #PF: tcb=");
+    {
+        let mut buf = [b'0'; 6]; let mut v = faulter.0 as u64; let mut i = 6;
+        if v == 0 { crate::arch::log("0"); }
+        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
+        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
+    }
+    crate::arch::log(" cr2=0x");
     log_hex64(cr2);
     crate::arch::log(" err=0x");
     log_hex64(error_code);

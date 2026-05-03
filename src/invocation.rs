@@ -285,8 +285,11 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         )));
     }
 
+    let asid_for_cap: u16;
     unsafe {
-        let pml4_paddr_opt: Option<u64> = if upstream {
+        // Track BOTH the PML4 paddr and the vspace's ASID so Unmap
+        // can later walk this exact vspace by asid lookup.
+        let pml4_info_opt: Option<(u64, u16)> = if upstream {
             let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
             let count = inv_tcb.pending_extra_caps_count as usize;
             let cap = if count > 0 {
@@ -296,7 +299,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             };
             inv_tcb.pending_extra_caps_count = 0;
             match cap {
-                Some(Cap::PML4 { ptr, .. }) => Some(ptr.addr()),
+                Some(Cap::PML4 { ptr, asid, .. }) => Some((ptr.addr(), asid)),
                 _ => return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_InvalidCapability))),
             }
@@ -304,13 +307,15 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
             let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a4)?;
             match pml4_cap {
-                Cap::PML4 { ptr, .. } => Some(ptr.addr()),
+                Cap::PML4 { ptr, asid, .. } => Some((ptr.addr(), asid)),
                 _ => return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_InvalidCapability))),
             }
         } else {
             None
         };
+        let pml4_paddr_opt = pml4_info_opt.map(|(p, _)| p);
+        asid_for_cap = pml4_info_opt.map(|(_, a)| a).unwrap_or(0);
 
         if let Some(pml4_paddr) = pml4_paddr_opt {
             if let Err(missing) = usermode::map_user_4k_into_foreign_pml4(
@@ -367,7 +372,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
                         size,
                         rights,
                         mapped: Some(vaddr),
-                        asid: 0,
+                        asid: asid_for_cap,
                         is_device: _device,
                     };
                     slot.set_cap(&updated);
@@ -379,27 +384,53 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     Ok(())
 }
 
+/// Phase 43 — find the PML4 paddr for a given ASID by scanning every
+/// CNode for a `Cap::PML4` whose `asid` field matches. Returns 0 if
+/// no match (caller should treat as a no-op).
+///
+/// Linear scan — fine for single-tenant sel4test where a handful of
+/// PML4 caps exist. A proper ASID-pool lookup would be the upstream
+/// way; deferring until we have multi-process workloads.
+#[cfg(target_arch = "x86_64")]
+fn pml4_paddr_for_asid(asid: u16) -> u64 {
+    if asid == 0 { return 0; }
+    unsafe {
+        let s = KERNEL.get();
+        for cn in s.cnodes.iter() {
+            for slot in cn.0.iter() {
+                if let Cap::PML4 { ptr, asid: a, .. } = slot.cap() {
+                    if a == asid {
+                        return ptr.addr();
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
 fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    let (paddr, mapped_vaddr) = match target {
-        Cap::Frame { ptr, mapped, .. } => (ptr.addr(), mapped),
+    let (paddr, mapped_vaddr, asid) = match target {
+        Cap::Frame { ptr, mapped, asid, .. } => (ptr.addr(), mapped, asid),
         _ => unreachable!(),
     };
 
-    // Phase 28g / 42 — actually clear the PTE in the live page
-    // tables and fan a TLB shootdown to other CPUs.
-    // `unmap_user_4k_public` walks page tables via the linear map
-    // and silently no-ops if any intermediate level is missing
-    // (which is the spec-test case where the cap chain doesn't
-    // back a real mapping), so we no longer need the spec gate
-    // we previously had — and skipping the hardware step in spec
-    // mode meant sel4test's Frame_Unmap left stale PTEs that the
-    // next allocator-recycled Frame_Map then tripped over with
-    // DeleteFirst.
+    // Phase 28g / 42 / 43 — clear the PTE in the live page tables
+    // for the VSPACE the frame is mapped in (via asid → PML4) and
+    // fan a TLB shootdown to other CPUs. The previous version walked
+    // current CR3, which is wrong when the invoker's CSpace contains
+    // a frame cap mapped in a *different* vspace (sel4test's driver
+    // unmapping pages from the test process's vspace clobbered the
+    // driver's own page tables at the same vaddr).
     #[cfg(target_arch = "x86_64")]
     if let Some(vaddr) = mapped_vaddr {
         unsafe {
-            crate::arch::x86_64::usermode::unmap_user_4k_public(vaddr);
-            crate::smp::shootdown_tlb(vaddr);
+            let pml4_paddr = pml4_paddr_for_asid(asid);
+            if pml4_paddr != 0 {
+                crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                    pml4_paddr, vaddr);
+                crate::smp::shootdown_tlb(vaddr);
+            }
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -1681,7 +1712,6 @@ fn decode_untyped_retype(
             )));
         }
     };
-
     let dest_offset = node_offset;
 
     // Resolve the destination CNode. When extraCaps[0] is provided
@@ -1728,6 +1758,21 @@ fn decode_untyped_retype(
             log_dec(node_depth as u64);
             crate::arch::log("]\n");
         }
+        // Resolve the SOURCE untyped's slot in the invoker's CSpace
+        // BEFORE we take a mutable borrow on `s.cnodes`. We use this
+        // (src_cnode_idx, src_slot_index) as the parent_id for each
+        // child cap so cnode_revoke walks the right MDB chain. (Using
+        // the dest CNode would point children at random slots in the
+        // test process's CNode and Revoke would shoot down unrelated
+        // caps.)
+        let invoker_root = s.scheduler.slab.get(invoker).cspace_root;
+        let src_res = crate::cspace::resolve_address_bits(
+            s, &invoker_root, args.a0,
+            crate::cspace::WORD_BITS,
+        ).map_err(|_| KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_FailedLookup)))?;
+        let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
+        let src_slot_index = src_res.slot_index;
         let cnode_slots = &mut s.cnodes[cnode_idx].0;
 
         // Verify the destination range is empty — Retype refuses
@@ -1769,12 +1814,11 @@ fn decode_untyped_retype(
         // borrow's aliasing constraint.
         let s_ptr: *mut crate::kernel::KernelState = KERNEL.get();
         // Phase 30 — record each carved child's parent CTE in the
-        // MDB. The source untyped lives at slot `args.a0` of the
-        // invoker's CSpace (we use a0 directly because our flat
-        // radix-5 CNode + guard_size=59 makes cptr == slot).
+        // MDB. We resolved the source untyped's location above
+        // (src_cnode_idx, src_slot_index).
         let parent_id = crate::cte::MdbId::pack(
-            cnode_idx as u8,
-            args.a0 as u16,
+            src_cnode_idx as u8,
+            src_slot_index as u16,
         );
         let result = crate::untyped::retype(
             &mut state, object_type, size_bits, num_objects,
@@ -2020,6 +2064,21 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // here. Keep `is_derived_from` available for any code that
         // still wants the structural check (none does today).
         let _ = source_id;
+
+        // Phase 43 — if the source is an Untyped, every derived
+        // object has been cleared, so reset the source's free index
+        // back to 0 so the next Retype starts from the bottom of the
+        // block. Otherwise the second test's allocations exhaust the
+        // untyped even though the memory is now free.
+        let source = s.cnodes[cnode_idx].0[src_index].cap();
+        if let Cap::Untyped { ptr, block_bits, is_device, .. } = source {
+            s.cnodes[cnode_idx].0[src_index].set_cap(&Cap::Untyped {
+                ptr,
+                block_bits,
+                free_index: 0,
+                is_device,
+            });
+        }
     }
     Ok(())
 }
@@ -2324,9 +2383,13 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // `free_index` as `max(child.base + child.size) -
         // parent.base` over its surviving children. If no children
         // remain the parent is reset to fully-free.
-        if matches!(deleted_cap, Cap::Untyped { .. }) {
-            reclaim_untyped_chain(parent_id);
-        }
+        // Phase 43 — reclaim runs for *any* deleted cap, not just
+        // child Untypeds. The parent's free_index was bumped at
+        // Retype regardless of the resulting child type, so a
+        // deleted Frame/TCB/EP/PT/PD/etc. should release the same
+        // bytes back to the parent.
+        let _ = deleted_cap;
+        reclaim_untyped_chain(parent_id);
     }
     Ok(())
 }
@@ -2355,6 +2418,10 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
         let parent_end = parent_base + parent_total;
 
         // Find the highest end-paddr among surviving children of pid.
+        // Count ALL child cap types (not just Untyped) — Untyped::Retype
+        // bumps the parent's free_index regardless of the resulting
+        // child type, so frames/TCBs/EPs/etc. all consume the same
+        // parent bytes and need to be tracked here too.
         let mut max_end: u64 = parent_base; // == "no children" sentinel
         for ci in 0..s.cnodes.len() {
             for si in 0..s.cnodes[ci].0.len() {
@@ -2362,11 +2429,41 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
                 if cte.parent() != Some(pid) {
                     continue;
                 }
-                if let Cap::Untyped { ptr, block_bits, .. } = cte.cap() {
-                    let end = ptr.addr() + (1u64 << block_bits);
-                    if end > max_end {
-                        max_end = end;
+                let (cbase, csize) = match cte.cap() {
+                    Cap::Untyped { ptr, block_bits, .. } => {
+                        (ptr.addr(), 1u64 << block_bits)
                     }
+                    Cap::Frame { ptr, size, .. } => {
+                        let n: u64 = match size {
+                            crate::cap::FrameSize::Small => 4096,
+                            crate::cap::FrameSize::Large => 2 * 1024 * 1024,
+                            crate::cap::FrameSize::Huge => 1024 * 1024 * 1024,
+                        };
+                        (ptr.addr(), n)
+                    }
+                    Cap::PageTable { ptr, .. } => (ptr.addr(), 4096),
+                    Cap::PageDirectory { ptr, .. } => (ptr.addr(), 4096),
+                    Cap::Pdpt { ptr, .. } => (ptr.addr(), 4096),
+                    Cap::PML4 { ptr, .. } => (ptr.addr(), 4096),
+                    Cap::Endpoint { ptr, .. } => (ptr.addr(), 16),
+                    Cap::Notification { ptr, .. } => (ptr.addr(), 32),
+                    Cap::CNode { ptr, radix, .. } => {
+                        // CNode storage = 2^radix * sizeof(Cte) bytes.
+                        // We don't actually know the cte size here; use a
+                        // conservative 32 bytes (matches Cte layout).
+                        let n = (1u64 << radix) * 32;
+                        (ptr.addr(), n)
+                    }
+                    Cap::Reply { ptr, .. } => (ptr.addr(), 32),
+                    Cap::Thread { tcb } => (tcb.addr(), 4096),
+                    Cap::SchedContext { ptr, size_bits, .. } => {
+                        (ptr.addr(), 1u64 << size_bits)
+                    }
+                    _ => continue,
+                };
+                let end = cbase + csize;
+                if end > max_end {
+                    max_end = end;
                 }
             }
         }
