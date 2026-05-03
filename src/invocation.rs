@@ -2067,6 +2067,43 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 {
                     let id = crate::cte::MdbId::pack(ci as u8, si as u16);
                     child_count_reset(id);
+                    // Phase 43 — free pool slots so long sel4test
+                    // runs don't exhaust the static pools. Only the
+                    // FIRST cap (where the object was retyped from
+                    // an Untyped) does the free; copies via Mint
+                    // would call free again for the same pool slot
+                    // which is harmless (free is idempotent).
+                    let cap_to_free = s.cnodes[ci].0[si].cap();
+                    match cap_to_free {
+                        Cap::Thread { tcb } => {
+                            let id = crate::tcb::TcbId(tcb.addr() as u16);
+                            s.scheduler.block(
+                                id, crate::tcb::ThreadStateType::Inactive);
+                            s.scheduler.slab.entries[id.0 as usize] = None;
+                        }
+                        Cap::Endpoint { ptr, .. } => {
+                            s.free_endpoint(KernelState::endpoint_index(ptr));
+                        }
+                        Cap::Notification { ptr, .. } => {
+                            s.free_notification(KernelState::ntfn_index(ptr));
+                        }
+                        Cap::SchedContext { ptr, .. } => {
+                            s.free_sched_context(
+                                KernelState::sched_context_index(ptr));
+                        }
+                        Cap::Reply { ptr, .. } => {
+                            s.free_reply(KernelState::reply_index(ptr));
+                        }
+                        Cap::CNode { ptr, .. } => {
+                            // Recursing into the freed CNode could
+                            // re-clear what we already cleared. Safe
+                            // because set_cap below reads & writes
+                            // a different slot (this slot in the
+                            // OUTER cnode, not the inner one).
+                            s.free_cnode(KernelState::cnode_index(ptr));
+                        }
+                        _ => {}
+                    }
                     s.cnodes[ci].0[si].set_cap(&Cap::Null);
                     s.cnodes[ci].0[si].set_parent(None);
                 }
@@ -2392,16 +2429,40 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         s.cnodes[cnode_idx].0[res.slot_index].set_parent(None);
 
         // Phase 43 — deleting the LAST cap to a TCB triggers thread
-        // destruction in upstream seL4. We approximate by suspending
-        // the TCB on every Thread cap delete (cheap if already
-        // Inactive). Without this, sel4utils_destroy_process leaves
-        // BIND0001's test-process TCB in `Running` state in our slab,
-        // and it competes with the driver for CPU during BIND0002
-        // setup — turning the apparent BIND0002 hang into ~3s/sec
-        // wall-clock progress.
-        if let Cap::Thread { tcb } = deleted_cap {
-            let id = crate::tcb::TcbId(tcb.addr() as u16);
-            s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
+        // destruction in upstream seL4. We approximate: on every
+        // Thread cap delete, suspend the TCB. On every Endpoint /
+        // Notification / SchedContext / Reply / CNode cap delete,
+        // release the pool slot for reuse (so long sel4test runs
+        // don't exhaust pool sizes).
+        match deleted_cap {
+            Cap::Thread { tcb } => {
+                let id = crate::tcb::TcbId(tcb.addr() as u16);
+                s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
+                // Free the slab entry so subsequent test-process
+                // spawns can reuse it.
+                s.scheduler.slab.entries[id.0 as usize] = None;
+            }
+            Cap::Endpoint { ptr, .. } => {
+                let i = KernelState::endpoint_index(ptr);
+                s.free_endpoint(i);
+            }
+            Cap::Notification { ptr, .. } => {
+                let i = KernelState::ntfn_index(ptr);
+                s.free_notification(i);
+            }
+            Cap::SchedContext { ptr, .. } => {
+                let i = KernelState::sched_context_index(ptr);
+                s.free_sched_context(i);
+            }
+            Cap::Reply { ptr, .. } => {
+                let i = KernelState::reply_index(ptr);
+                s.free_reply(i);
+            }
+            Cap::CNode { ptr, .. } => {
+                let i = KernelState::cnode_index(ptr);
+                s.free_cnode(i);
+            }
+            _ => {}
         }
 
         // Phase 42 — Untyped reclaim. allocman's split allocator

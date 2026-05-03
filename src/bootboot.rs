@@ -20,9 +20,9 @@ pub const INITRD_MAXSIZE: u32 = 16;
 
 pub const BOOTBOOT_MMIO: u64 = 0xfffffffff8000000;  /* memory mapped IO virtual address */
 pub const BOOTBOOT_FB: u64 = 0xfffffffffc000000;  /* frame buffer virtual address */
-pub const BOOTBOOT_INFO: u64 = 0xffffffffffe00000;  /* bootboot struct virtual address */
-pub const BOOTBOOT_ENV: u64 = 0xffffffffffe01000;  /* environment string virtual address */
-pub const BOOTBOOT_CORE: u64 = 0xffffffffffe02000;  /* core loadable segment start */
+pub const BOOTBOOT_INFO: u64 = 0xffffffffff800000;  /* bootboot struct virtual address */
+pub const BOOTBOOT_ENV: u64 = 0xffffffffff801000;  /* environment string virtual address */
+pub const BOOTBOOT_CORE: u64 = 0xffffffffff802000;  /* core loadable segment start */
 
 
 #[repr(C, packed)]

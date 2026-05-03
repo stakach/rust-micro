@@ -32,8 +32,8 @@ ENTRY(_start)
 
 mmio        = 0xfffffffff8000000;              /* these are configurable for level 2 loaders */
 fb          = 0xfffffffffc000000;
-bootboot    = 0xffffffffffe00000;
-environment = 0xffffffffffe01000;
+bootboot    = 0xffffffffff800000;
+environment = 0xffffffffff801000;
 /* Bumped from BOOTBOOT's default 4 KiB to 64 KiB. Kernel data
  * structures (Scheduler, TcbSlab, ready queues) easily exceed 4 KiB
  * once we hold them on the stack inside specs. 64 KiB is comfortable
@@ -41,7 +41,7 @@ environment = 0xffffffffffe01000;
  * concern for the BOOTBOOT loader. */
 initstack = 65536;
 
-KERNEL_OFFSET = 0xffffffffffe02000;
+KERNEL_OFFSET = 0xffffffffff802000;
 
 PHDRS
 {
@@ -49,7 +49,7 @@ PHDRS
 }
 SECTIONS
 {
-    . = 0xffffffffffe02000;
+    . = 0xffffffffff802000;
     .text . + SIZEOF_HEADERS : AT(ADDR(.text) - KERNEL_OFFSET + SIZEOF_HEADERS) {
         __text_start = .;
         KEEP(*(.text.boot)) *(.text .text.* .gnu.linkonce.t*)   /* code */

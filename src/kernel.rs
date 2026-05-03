@@ -27,16 +27,16 @@ use crate::tcb::{Tcb, TcbId, ThreadStateType};
 /// Maximum endpoints in the in-kernel pool. Production seL4
 /// allocates them via Untyped retype with no fixed cap; the slab
 /// is just a convenience until we wire that path.
-pub const MAX_ENDPOINTS: usize = 32;
+pub const MAX_ENDPOINTS: usize = 256;
 
 /// Maximum notifications in the in-kernel pool.
-pub const MAX_NTFNS: usize = 16;
+pub const MAX_NTFNS: usize = 128;
 
 /// Maximum SchedContexts in the in-kernel pool (Phase 32c).
-pub const MAX_SCHED_CONTEXTS: usize = 16;
+pub const MAX_SCHED_CONTEXTS: usize = 128;
 
 /// Maximum Reply objects in the in-kernel pool (Phase 34e).
-pub const MAX_REPLIES: usize = 16;
+pub const MAX_REPLIES: usize = 128;
 
 /// CTEs per pre-allocated CNode in the in-kernel pool.
 ///
@@ -54,7 +54,7 @@ pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 /// own CSpace via Untyped→CNode retype) don't exhaust the pool.
 /// 8 CNodes × 4096 slots × 32 bytes = 1 MiB of static BSS — keeps
 /// us under the kernel image's ~2 MiB linker window.
-pub const MAX_CNODES: usize = 8;
+pub const MAX_CNODES: usize = 16;
 
 /// One pre-allocated CNode: 32 slots × 32 bytes = 1 KiB.
 #[repr(C, align(32))]
@@ -102,6 +102,23 @@ pub struct KernelState {
     pub next_reply: usize,
 }
 
+/// Phase 43 — pool-recycling bitmap. Bit set means slot is in use.
+/// Separate static so we can mutate without borrowing all of
+/// `KernelState`. BKL serialises access.
+struct PoolBitmaps {
+    pub endpoints: [u64; (MAX_ENDPOINTS + 63) / 64],
+    pub notifications: [u64; (MAX_NTFNS + 63) / 64],
+    pub cnodes: [u64; (MAX_CNODES + 63) / 64],
+    pub replies: [u64; (MAX_REPLIES + 63) / 64],
+}
+
+static mut POOL_BITMAPS: PoolBitmaps = PoolBitmaps {
+    endpoints: [0; (MAX_ENDPOINTS + 63) / 64],
+    notifications: [0; (MAX_NTFNS + 63) / 64],
+    cnodes: [0; (MAX_CNODES + 63) / 64],
+    replies: [0; (MAX_REPLIES + 63) / 64],
+};
+
 impl KernelState {
     pub const fn new() -> Self {
         const EMPTY_EP: Endpoint = Endpoint::new();
@@ -130,59 +147,171 @@ impl KernelState {
         }
     }
 
-    /// Allocate the next free in-kernel endpoint. Returns the slot
-    /// index; the caller owns the Endpoint there. Returns `None` if
-    /// the pool is exhausted. Caller holds BKL.
+    /// Allocate the next free in-kernel endpoint.
     pub fn alloc_endpoint(&mut self) -> Option<usize> {
-        if self.next_endpoint >= MAX_ENDPOINTS {
-            return None;
+        if self.next_endpoint < MAX_ENDPOINTS {
+            let i = self.next_endpoint;
+            self.next_endpoint += 1;
+            self.endpoints[i] = Endpoint::new();
+            return Some(i);
         }
-        let i = self.next_endpoint;
-        self.next_endpoint += 1;
-        // Reset to an Idle endpoint regardless of prior content.
-        self.endpoints[i] = Endpoint::new();
-        Some(i)
+        // Recycle: an endpoint with no waiters is free for reuse.
+        for i in 0..MAX_ENDPOINTS {
+            let ep = &self.endpoints[i];
+            if ep.head.is_none() && ep.tail.is_none()
+                && matches!(ep.state, crate::endpoint::EpState::Idle)
+            {
+                // Need a sentinel to distinguish "freshly idle" from
+                // "in-use but currently idle". We use a side-bitmap.
+                if !self.ep_in_use(i) {
+                    self.endpoints[i] = Endpoint::new();
+                    self.set_ep_in_use(i, true);
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
-    /// Same shape as `alloc_endpoint` for notifications.
+    pub fn free_endpoint(&mut self, i: usize) {
+        if i < MAX_ENDPOINTS {
+            self.endpoints[i] = Endpoint::new();
+            self.set_ep_in_use(i, false);
+        }
+    }
+
     pub fn alloc_notification(&mut self) -> Option<usize> {
-        if self.next_notification >= MAX_NTFNS {
-            return None;
+        if self.next_notification < MAX_NTFNS {
+            let i = self.next_notification;
+            self.next_notification += 1;
+            self.notifications[i] = Notification::new();
+            self.set_ntfn_in_use(i, true);
+            return Some(i);
         }
-        let i = self.next_notification;
-        self.next_notification += 1;
-        self.notifications[i] = Notification::new();
-        Some(i)
+        for i in 0..MAX_NTFNS {
+            if !self.ntfn_in_use(i) {
+                self.notifications[i] = Notification::new();
+                self.set_ntfn_in_use(i, true);
+                return Some(i);
+            }
+        }
+        None
     }
 
-    /// Same shape for CNodes — userspace's `Untyped::Retype` of a
-    /// CNode lands in one of these pre-allocated pages.
+    pub fn free_notification(&mut self, i: usize) {
+        if i < MAX_NTFNS {
+            self.notifications[i] = Notification::new();
+            self.set_ntfn_in_use(i, false);
+        }
+    }
+
     pub fn alloc_cnode(&mut self) -> Option<usize> {
-        if self.next_cnode >= MAX_CNODES {
-            return None;
+        if self.next_cnode < MAX_CNODES {
+            let i = self.next_cnode;
+            self.next_cnode += 1;
+            for slot in self.cnodes[i].0.iter_mut() {
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+            }
+            self.set_cnode_in_use(i, true);
+            return Some(i);
         }
-        let i = self.next_cnode;
-        self.next_cnode += 1;
-        // Wipe any leftover slots.
-        for slot in self.cnodes[i].0.iter_mut() {
-            slot.set_cap(&Cap::Null);
+        for i in 0..MAX_CNODES {
+            if !self.cnode_in_use(i) {
+                for slot in self.cnodes[i].0.iter_mut() {
+                    slot.set_cap(&Cap::Null);
+                    slot.set_parent(None);
+                }
+                self.set_cnode_in_use(i, true);
+                return Some(i);
+            }
         }
-        Some(i)
+        None
+    }
+
+    pub fn free_cnode(&mut self, i: usize) {
+        if i < MAX_CNODES {
+            for slot in self.cnodes[i].0.iter_mut() {
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+            }
+            self.set_cnode_in_use(i, false);
+        }
+    }
+
+    // Phase 43 — bitmap-based "in-use" tracking for pool recycling.
+    fn ep_in_use(&self, i: usize) -> bool {
+        unsafe { (POOL_BITMAPS.endpoints[i / 64] >> (i % 64)) & 1 == 1 }
+    }
+    fn set_ep_in_use(&self, i: usize, v: bool) {
+        unsafe {
+            let w = &mut POOL_BITMAPS.endpoints[i / 64];
+            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+        }
+    }
+    fn ntfn_in_use(&self, i: usize) -> bool {
+        unsafe { (POOL_BITMAPS.notifications[i / 64] >> (i % 64)) & 1 == 1 }
+    }
+    fn set_ntfn_in_use(&self, i: usize, v: bool) {
+        unsafe {
+            let w = &mut POOL_BITMAPS.notifications[i / 64];
+            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+        }
+    }
+    fn cnode_in_use(&self, i: usize) -> bool {
+        unsafe { (POOL_BITMAPS.cnodes[i / 64] >> (i % 64)) & 1 == 1 }
+    }
+    fn set_cnode_in_use(&self, i: usize, v: bool) {
+        unsafe {
+            let w = &mut POOL_BITMAPS.cnodes[i / 64];
+            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+        }
+    }
+    fn reply_in_use(&self, i: usize) -> bool {
+        unsafe { (POOL_BITMAPS.replies[i / 64] >> (i % 64)) & 1 == 1 }
+    }
+    fn set_reply_in_use(&self, i: usize, v: bool) {
+        unsafe {
+            let w = &mut POOL_BITMAPS.replies[i / 64];
+            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+        }
+    }
+
+    pub fn free_reply(&mut self, i: usize) {
+        if i < MAX_REPLIES {
+            self.replies[i] = crate::reply::Reply::new();
+            self.set_reply_in_use(i, false);
+        }
     }
 
     /// Phase 32c — allocate the next free SchedContext slot.
-    /// Returns the pool index; the caller's `Cap::SchedContext`
-    /// PPtr should encode `index + 1`.
+    /// Phase 43 — scan from `next_sched_context` then fall back to a
+    /// linear search for a recycled slot (one with `bound_tcb=None`
+    /// AND `count==0`, i.e. never configured or freed). This lets
+    /// long sel4test runs reuse slots cleared by `free_sched_context`.
     pub fn alloc_sched_context(&mut self) -> Option<usize> {
-        if self.next_sched_context >= MAX_SCHED_CONTEXTS {
-            return None;
+        if self.next_sched_context < MAX_SCHED_CONTEXTS {
+            let i = self.next_sched_context;
+            self.next_sched_context += 1;
+            self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
+            return Some(i);
         }
-        let i = self.next_sched_context;
-        self.next_sched_context += 1;
-        // Reset to a fresh zero-budget SC; userspace later
-        // `SchedControl::Configure`s the period/budget.
-        self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
-        Some(i)
+        for i in 0..MAX_SCHED_CONTEXTS {
+            if self.sched_contexts[i].bound_tcb.is_none()
+                && self.sched_contexts[i].count == 0
+            {
+                self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Phase 43 — release a SchedContext slot for reuse.
+    pub fn free_sched_context(&mut self, i: usize) {
+        if i < MAX_SCHED_CONTEXTS {
+            self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
+        }
     }
 
     /// `PPtr<SchedContextStorage>` for SC pool slot `i` — encodes
@@ -201,13 +330,21 @@ impl KernelState {
 
     /// Phase 34e — allocate the next free Reply slot.
     pub fn alloc_reply(&mut self) -> Option<usize> {
-        if self.next_reply >= MAX_REPLIES {
-            return None;
+        if self.next_reply < MAX_REPLIES {
+            let i = self.next_reply;
+            self.next_reply += 1;
+            self.replies[i] = crate::reply::Reply::new();
+            self.set_reply_in_use(i, true);
+            return Some(i);
         }
-        let i = self.next_reply;
-        self.next_reply += 1;
-        self.replies[i] = crate::reply::Reply::new();
-        Some(i)
+        for i in 0..MAX_REPLIES {
+            if !self.reply_in_use(i) {
+                self.replies[i] = crate::reply::Reply::new();
+                self.set_reply_in_use(i, true);
+                return Some(i);
+            }
+        }
+        None
     }
 
     pub fn reply_ptr(i: usize) -> PPtr<crate::cap::ReplyStorage> {
