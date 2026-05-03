@@ -586,6 +586,24 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 )));
             }
         };
+        // Bound-notification pre-check
+        if let Some(bn_idx) = s.scheduler.slab.get(current).bound_notification {
+            let s_ptr: *mut crate::kernel::KernelState = s;
+            let ntfn = &mut (*s_ptr).notifications[bn_idx as usize];
+            if matches!(ntfn.state, crate::notification::NtfnState::Active) {
+                let badge = ntfn.pending_badge;
+                ntfn.pending_badge = 0;
+                ntfn.state = crate::notification::NtfnState::Idle;
+                let tcb = s.scheduler.slab.get_mut(current);
+                tcb.ipc_badge = badge;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    tcb.user_context.rdi = badge;
+                    tcb.user_context.rsi = 0;
+                }
+                return Ok(());
+            }
+        }
         let idx = crate::kernel::KernelState::endpoint_index(ep_ptr);
         let opts = RecvOptions { blocking };
         let s_ptr: *mut crate::kernel::KernelState = s;

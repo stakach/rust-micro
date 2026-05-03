@@ -345,6 +345,7 @@ impl Scheduler {
     pub fn make_runnable(&mut self, id: TcbId) {
         let was_runnable = self.slab.get(id).is_runnable();
         let cpu = self.slab.get(id).affinity as usize;
+        let prio = self.slab.get(id).priority;
         self.slab.get_mut(id).state = ThreadStateType::Running;
         if !was_runnable {
             self.nodes[cpu].queues.enqueue(&mut self.slab, id);
@@ -360,6 +361,29 @@ impl Scheduler {
                 let my_cpu = crate::arch::get_cpu_id() as usize;
                 if cpu != my_cpu && self.nodes[cpu].current.is_none() {
                     crate::smp::kick_cpu(cpu as u32);
+                }
+            }
+        }
+        // Phase 43 — possibleSwitchTo: if the woken thread is higher
+        // priority than the CPU's current thread, force a reschedule
+        // by clearing `current`. The dispatcher's next loop will call
+        // choose_thread and pick the higher-priority thread.
+        // sel4test's BIND0001 relies on this — sender_async runs at
+        // priority N-1 and signals the bound TCB at N; without
+        // preemption sender keeps the CPU and merges 10 signals into
+        // one Active state, so the receiver only sees one badge.
+        if let Some(cur) = self.nodes[cpu].current {
+            if cur != id {
+                let cur_prio = self.slab.get(cur).priority;
+                if prio > cur_prio {
+                    self.nodes[cpu].current = None;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let my_cpu = crate::arch::get_cpu_id() as usize;
+                        if cpu != my_cpu {
+                            crate::smp::kick_cpu(cpu as u32);
+                        }
+                    }
                 }
             }
         }

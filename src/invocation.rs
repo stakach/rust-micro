@@ -2856,17 +2856,28 @@ fn decode_tcb(
                     _ => return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability))),
                 };
-                // Refuse double-bind (matches seL4's behaviour).
+                // Refuse double-bind (matches seL4's behaviour) on
+                // either side of the link.
                 let t = s.scheduler.slab.get_mut(id);
                 if t.bound_notification.is_some() {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_DeleteFirst)));
                 }
-                t.bound_notification = Some(ntfn_idx);
+                if s.notifications[ntfn_idx as usize].bound_tcb.is_some() {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_DeleteFirst)));
+                }
+                s.scheduler.slab.get_mut(id).bound_notification = Some(ntfn_idx);
+                s.notifications[ntfn_idx as usize].bound_tcb = Some(id);
                 Ok(())
             }
             InvocationLabel::TCBUnbindNotification => {
-                s.scheduler.slab.get_mut(id).bound_notification = None;
+                let t = s.scheduler.slab.get_mut(id);
+                if let Some(ntfn_idx) = t.bound_notification.take() {
+                    if let Some(n) = s.notifications.get_mut(ntfn_idx as usize) {
+                        n.bound_tcb = None;
+                    }
+                }
                 Ok(())
             }
             // MCS api_tcb_configure calls SetTimeoutEndpoint with the

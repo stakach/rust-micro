@@ -129,6 +129,38 @@ pub fn signal(
 ) -> Option<TcbId> {
     match ntfn.state {
         NtfnState::Idle => {
+            // Bound-TCB short-circuit: if a TCB is bound to this
+            // notification AND that TCB is currently BlockedOnReceive
+            // on some endpoint, upstream `sendSignal` cancels the
+            // IPC and wakes the TCB with the badge in the badge
+            // register. sel4test's test_notification_binding relies
+            // on this — it Wait's on a sync endpoint and expects
+            // bound-notification signals to wake it through that
+            // wait. Without this short-circuit, the bound TCB
+            // never wakes for a notification while it's blocked
+            // on an endpoint.
+            if let Some(bt) = ntfn.bound_tcb {
+                let state = sched.slab.get(bt).state;
+                if matches!(state, ThreadStateType::BlockedOnReceive) {
+                    // Walk all endpoints to find which queue holds
+                    // `bt` and dequeue from there. We don't track
+                    // the endpoint id on the TCB, so a linear scan
+                    // is the simplest way to keep the queue links
+                    // consistent.
+                    crate::endpoint::cancel_ipc_anywhere(sched, bt);
+                    {
+                        let tcb = sched.slab.get_mut(bt);
+                        tcb.ipc_badge = badge;
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            tcb.user_context.rdi = badge;
+                            tcb.user_context.rsi = 0;
+                        }
+                    }
+                    sched.make_runnable(bt);
+                    return Some(bt);
+                }
+            }
             ntfn.state = NtfnState::Active;
             ntfn.pending_badge = badge;
             None

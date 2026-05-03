@@ -238,6 +238,45 @@ pub fn receive_ipc(
     }
 }
 
+/// Walk all in-kernel endpoints, find the one currently holding
+/// `thread` in its sender or receiver queue, and dequeue. Used by
+/// `notification::signal` for the bound-TCB short-circuit, where
+/// we need to lift a `BlockedOnReceive` TCB out of an unknown
+/// endpoint queue and immediately re-wake it via `make_runnable`.
+///
+/// Leaves the thread in `Inactive` state so the caller's
+/// `make_runnable` sees `was_runnable == false` and actually
+/// enqueues onto the ready queue. (Setting it to `Restart` here
+/// would short-circuit `make_runnable`'s enqueue, since `Restart`
+/// is "runnable" but the thread is not yet on the ready queue.)
+pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
+    use crate::kernel::{KERNEL, KernelState};
+    let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
+    for i in 0..crate::kernel::MAX_ENDPOINTS {
+        let ep = unsafe { &mut (*s_ptr).endpoints[i] };
+        if !ep_queue_contains(ep, sched, thread) {
+            continue;
+        }
+        queue_remove(ep, sched, thread);
+        if queue_is_empty(ep) {
+            ep.state = EpState::Idle;
+        }
+        sched.slab.get_mut(thread).state = ThreadStateType::Inactive;
+        return;
+    }
+}
+
+fn ep_queue_contains(ep: &Endpoint, sched: &Scheduler, thread: TcbId) -> bool {
+    let mut cur = ep.head;
+    while let Some(c) = cur {
+        if c == thread {
+            return true;
+        }
+        cur = sched.slab.try_get(c).and_then(|t| t.ep_next);
+    }
+    false
+}
+
 /// Cancel an in-flight IPC: remove the thread from whichever
 /// endpoint queue it's parked on, mark it Restart so the caller can
 /// retry. Mirrors `cancelIPC` in seL4 for the endpoint case only.
