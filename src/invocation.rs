@@ -818,6 +818,7 @@ fn decode_asid_control(
                     untyped_cptr as u16,
                 );
                 slots[dest_offset].set_parent(Some(parent_id));
+                child_count_inc(parent_id, 1);
 
                 // Commit the bumped Untyped state back into its slot.
                 for slot in slots.iter_mut() {
@@ -1935,6 +1936,7 @@ fn decode_untyped_retype(
                 }
                 cnode_slots[emit_idx].set_cap(&cap_to_store);
                 cnode_slots[emit_idx].set_parent(Some(parent_id));
+                child_count_inc(parent_id, 1);
                 emit_idx += 1;
             },
         );
@@ -2049,16 +2051,24 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         }
 
         // Clear every revoked slot except the source itself.
+        // Also reset the child_count for both the cleared slot
+        // (no longer holds anything that has children) and decrement
+        // the parent's count (we just removed one of its children).
         for ci in 0..s.cnodes.len() {
             for si in 0..SLOTS_PER_NODE.min(s.cnodes[ci].0.len()) {
                 if revoked[ci][si]
                     && !(ci == cnode_idx && si == src_index)
                 {
+                    let id = crate::cte::MdbId::pack(ci as u8, si as u16);
+                    child_count_reset(id);
                     s.cnodes[ci].0[si].set_cap(&Cap::Null);
                     s.cnodes[ci].0[si].set_parent(None);
                 }
             }
         }
+        // The source itself kept the cap but lost all its descendants.
+        let src_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u16);
+        child_count_reset(src_id);
 
         // Silence unused: the structural fallback used to live
         // here. Keep `is_derived_from` available for any code that
@@ -2251,6 +2261,7 @@ fn cnode_copy_or_mint(
         let src_id = crate::cte::MdbId::pack(
             src_cnode_idx as u8, src_res.slot_index as u16);
         s.cnodes[dest_cnode_idx].0[dest_res.slot_index].set_parent(Some(src_id));
+        child_count_inc(src_id, 1);
     }
     Ok(())
 }
@@ -2425,6 +2436,52 @@ fn cap_extent(cap: &Cap) -> (u64, u64) {
     }
 }
 
+/// Phase 43 — per-parent live-child counter. Indexed by
+/// `cnode_idx * CNODE_SLOTS + slot_index`. Maintained on Retype
+/// (increment per child emitted) and on cnode_delete (decrement).
+/// When a delete brings the count to 0 we reset the parent Untyped's
+/// `free_index` to 0 — no need for the O(N) reclaim walk in the
+/// common alloc-then-free-all pattern. ~128 KiB BSS.
+const CHILD_COUNT_LEN: usize = crate::kernel::MAX_CNODES * crate::kernel::CNODE_SLOTS;
+static mut CHILD_COUNTS: [u32; CHILD_COUNT_LEN] = [0; CHILD_COUNT_LEN];
+
+#[inline]
+fn child_count_idx(pid: crate::cte::MdbId) -> Option<usize> {
+    let ci = pid.cnode_idx() as usize;
+    let si = pid.slot() as usize;
+    if ci < crate::kernel::MAX_CNODES && si < crate::kernel::CNODE_SLOTS {
+        Some(ci * crate::kernel::CNODE_SLOTS + si)
+    } else {
+        None
+    }
+}
+
+pub unsafe fn child_count_inc(pid: crate::cte::MdbId, by: u32) {
+    if let Some(idx) = child_count_idx(pid) {
+        let counts = &mut *core::ptr::addr_of_mut!(CHILD_COUNTS);
+        counts[idx] = counts[idx].saturating_add(by);
+    }
+}
+
+unsafe fn child_count_dec(pid: crate::cte::MdbId) -> u32 {
+    if let Some(idx) = child_count_idx(pid) {
+        let counts = &mut *core::ptr::addr_of_mut!(CHILD_COUNTS);
+        if counts[idx] > 0 {
+            counts[idx] -= 1;
+        }
+        counts[idx]
+    } else {
+        u32::MAX
+    }
+}
+
+unsafe fn child_count_reset(pid: crate::cte::MdbId) {
+    if let Some(idx) = child_count_idx(pid) {
+        let counts = &mut *core::ptr::addr_of_mut!(CHILD_COUNTS);
+        counts[idx] = 0;
+    }
+}
+
 /// Phase 43 — fast-path reclaim. If the deleted child's end_paddr is
 /// strictly less than the parent's effective end (parent.base +
 /// free_index), some other surviving child still extends past it, so
@@ -2435,6 +2492,42 @@ unsafe fn reclaim_untyped_chain_at_tail(
     deleted_base: u64,
     deleted_size: u64,
 ) {
+    // Phase 43 — child-counter only path. Decrement the parent's
+    // counter; if zero we reset free_index and recurse upward (the
+    // parent itself has now disappeared from its parent's view).
+    // For non-zero counts we DO NOT shrink free_index — the next
+    // Retype starts from the high watermark instead of filling holes
+    // left by intermediate deletes. This is less precise than
+    // upstream's per-cap MDB walk but ~free in time, and it matches
+    // the alloc-N/free-N pattern vka uses in practice (free_index
+    // only shrinks once *all* children are gone).
+    if let Some(pid) = start {
+        let remaining = child_count_dec(pid);
+        if remaining == 0 {
+            let s = KERNEL.get();
+            let pcn = pid.cnode_idx() as usize;
+            let psl = pid.slot() as usize;
+            if pcn < s.cnodes.len() && psl < s.cnodes[pcn].0.len() {
+                if let Cap::Untyped { ptr, block_bits, is_device, .. } =
+                    s.cnodes[pcn].0[psl].cap()
+                {
+                    s.cnodes[pcn].0[psl].set_cap(&Cap::Untyped {
+                        ptr, block_bits, free_index: 0, is_device,
+                    });
+                    // Walk further up — this level just emptied,
+                    // so the parent's-parent might also have its
+                    // last child gone now. Recurse with this empty
+                    // parent as the deleted-cap.
+                    let parent_of_parent = s.cnodes[pcn].0[psl].parent();
+                    let _ = (deleted_base, deleted_size);
+                    reclaim_untyped_chain_at_tail(
+                        parent_of_parent, ptr.addr(), 1u64 << block_bits);
+                }
+            }
+        }
+        return;
+    }
+
     // (0, 0) means the deleted cap is pool-indexed (TCB/EP/etc.); we
     // can't compare paddrs, so fall through to the full walk.
     if deleted_size != 0 {
