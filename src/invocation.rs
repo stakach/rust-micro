@@ -2020,6 +2020,9 @@ fn decode_cnode(
         InvocationLabel::CNodeMutate => cnode_move(target, args, invoker, /* mutate */ true),
         InvocationLabel::CNodeDelete => cnode_delete(target, args, invoker),
         InvocationLabel::CNodeRevoke => cnode_revoke(target, args, invoker),
+        InvocationLabel::CNodeCancelBadgedSends => {
+            cnode_cancel_badged_sends(target, args, invoker)
+        }
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
@@ -2034,6 +2037,62 @@ fn decode_cnode(
 /// revoked-or-source. The source slot itself is left intact —
 /// Revoke deletes the children only; callers use CNodeDelete to
 /// remove the source.
+/// Phase 43 — `seL4_CNode_CancelBadgedSends`. Walks the target
+/// CNode looking for an Endpoint cap at slot `args.a2`; for that
+/// endpoint, finds all queued senders whose stored badge matches
+/// the cap's badge, removes them from the queue, and Restarts them.
+/// Mirrors upstream's `cancelBadgedSends` (we ignore non-badged
+/// caps, returning Ok with no work).
+fn cnode_cancel_badged_sends(
+    target: Cap,
+    args: &SyscallArgs,
+    _invoker: TcbId,
+) -> KResult<()> {
+    let src_index = args.a2 as usize;
+    let cnode_ptr = match target {
+        Cap::CNode { ptr, .. } => ptr,
+        _ => return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability))),
+    };
+    unsafe {
+        let s = KERNEL.get();
+        let cnode_idx = KernelState::cnode_index(cnode_ptr);
+        if src_index >= s.cnodes[cnode_idx].0.len() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_RangeError)));
+        }
+        let cap = s.cnodes[cnode_idx].0[src_index].cap();
+        let (ep_idx, badge) = match cap {
+            Cap::Endpoint { ptr, badge, .. } => {
+                let i = KernelState::endpoint_index(ptr);
+                (i, badge.0)
+            }
+            _ => return Ok(()),
+        };
+        // Badge of 0 = unbadged, no-op.
+        if badge == 0 { return Ok(()); }
+        let s_ptr: *mut crate::kernel::KernelState = s;
+        let ep = &mut (*s_ptr).endpoints[ep_idx];
+        if !matches!(ep.state, crate::endpoint::EpState::Send) {
+            return Ok(());
+        }
+        // Walk the send queue and remove threads whose ipc_badge
+        // matches our badge.
+        let mut cur = ep.head;
+        while let Some(t) = cur {
+            let next = (*s_ptr).scheduler.slab.get(t).ep_next;
+            let t_badge = (*s_ptr).scheduler.slab.get(t).ipc_badge;
+            if t_badge == badge {
+                crate::endpoint::cancel_ipc_anywhere(
+                    &mut (*s_ptr).scheduler, t);
+                (*s_ptr).scheduler.make_runnable(t);
+            }
+            cur = next;
+        }
+    }
+    Ok(())
+}
+
 fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
     let src_index = args.a2 as usize;
     let cnode_ptr = match target {
