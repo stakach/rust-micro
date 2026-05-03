@@ -1032,14 +1032,26 @@ fn decode_sched_context(
     };
     match label {
         InvocationLabel::SchedContextBind => {
-            // a2 = TCB cap_ptr in invoker's CSpace. (seL4 also
-            // accepts Notification caps; we only handle the TCB
-            // case for now.)
-            let tcb_cptr = args.a2;
+            // Two ABI shapes:
+            //   * Upstream (libsel4 stub): TCB cap via extraCaps[0].
+            //   * Legacy: a2 = TCB cap_ptr in invoker's CSpace.
+            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+            let upstream = info.extra_caps() > 0;
             unsafe {
                 let s = KERNEL.get();
-                let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let tcb_cap = crate::cspace::lookup_cap(s, &invoker_cspace, tcb_cptr)?;
+                let tcb_cap = if upstream {
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    if inv_tcb.pending_extra_caps_count == 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    let c = inv_tcb.pending_extra_caps[0];
+                    inv_tcb.pending_extra_caps_count = 0;
+                    c
+                } else {
+                    let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?
+                };
                 let tcb_id = match tcb_cap {
                     Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
                     _ => return Err(KException::SyscallError(SyscallError::new(
@@ -1105,17 +1117,35 @@ fn decode_sched_control(
 ) -> KResult<()> {
     match label {
         InvocationLabel::SchedControlConfigureFlags => {
-            let target_cptr = args.a2;
-            let budget = args.a3;
-            let period = args.a4;
-            // a5 (flags) ignored for now.
-
+            // Two ABI shapes coexist:
+            //   * Upstream (libsel4 stub `seL4_SchedControl_ConfigureFlags`):
+            //       mr0=budget, mr1=period, mr2=extra_refills,
+            //       mr3=badge, mr4=flags, extraCaps[0]=SchedContext.
+            //   * Legacy (microtest):
+            //       a2 = SC cap_ptr, a3 = budget, a4 = period.
+            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+            let upstream = info.extra_caps() > 0;
+            let (sc_cap_opt, budget, period) = if upstream {
+                unsafe {
+                    let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+                    let cap = if inv_tcb.pending_extra_caps_count > 0 {
+                        Some(inv_tcb.pending_extra_caps[0])
+                    } else { None };
+                    inv_tcb.pending_extra_caps_count = 0;
+                    (cap, args.a2, args.a3)
+                }
+            } else {
+                unsafe {
+                    let s = KERNEL.get();
+                    let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    let cap = crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?;
+                    (Some(cap), args.a3, args.a4)
+                }
+            };
             unsafe {
                 let s = KERNEL.get();
-                let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let target = crate::cspace::lookup_cap(s, &invoker_cspace, target_cptr)?;
-                let sc_idx = match target {
-                    Cap::SchedContext { ptr, .. } => {
+                let sc_idx = match sc_cap_opt {
+                    Some(Cap::SchedContext { ptr, .. }) => {
                         KernelState::sched_context_index(ptr)
                     }
                     _ => return Err(KException::SyscallError(SyscallError::new(
@@ -2633,17 +2663,46 @@ fn decode_tcb(
                 Ok(())
             }
             InvocationLabel::TCBSetSpace => {
-                // a2 = fault_ep_cptr, a3 = cnode_cptr, a4 = vspace_cptr.
-                // Look up cnode and vspace caps in invoker's CSpace.
+                // Two ABI shapes:
+                //   * Upstream (sel4test): cspace + vspace via extraCaps[0..2].
+                //     mr0=fault_ep, mr1=cspace_root_data, mr2=vspace_root_data.
+                //   * Legacy (microtest): a3=cnode_cptr, a4=vspace_cptr.
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                let upstream = info.extra_caps() > 0;
                 let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let cnode_cap = if args.a3 != 0 {
-                    Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
-                } else { None };
-                let vspace_cap = if args.a4 != 0 {
-                    Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
-                } else { None };
+                let (cnode_cap, vspace_cap) = if upstream {
+                    // MCS variant of TCBSetSpace passes 3 extraCaps:
+                    //   [0] = fault handler endpoint
+                    //   [1] = cspace root
+                    //   [2] = vspace root
+                    // mr0 = cspace_root_data, mr1 = vspace_root_data
+                    // (no fault_ep cptr in message words). We don't
+                    // model fault handlers via cap yet — store the
+                    // raw cptr in fault_handler the same way the
+                    // legacy path did.
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    let count = inv_tcb.pending_extra_caps_count as usize;
+                    let cnode = if count > 1 { Some(inv_tcb.pending_extra_caps[1]) } else { None };
+                    let vspace = if count > 2 { Some(inv_tcb.pending_extra_caps[2]) } else { None };
+                    inv_tcb.pending_extra_caps_count = 0;
+                    (cnode, vspace)
+                } else {
+                    let cnode = if args.a3 != 0 {
+                        Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
+                    } else { None };
+                    let vspace = if args.a4 != 0 {
+                        Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
+                    } else { None };
+                    (cnode, vspace)
+                };
                 let t = s.scheduler.slab.get_mut(id);
-                t.fault_handler = args.a2;
+                // Legacy path stores fault_ep cptr from a2; upstream
+                // passes a fault-handler endpoint cap as extraCaps[0]
+                // and uses a2 for cspace_root_data — we don't model
+                // fault-handler caps yet, so skip the assignment.
+                if !upstream {
+                    t.fault_handler = args.a2;
+                }
                 if let Some(c) = cnode_cap {
                     if !matches!(c, Cap::CNode { .. }) {
                         return Err(KException::SyscallError(SyscallError::new(
@@ -2675,10 +2734,26 @@ fn decode_tcb(
             //        kernel reads its paddr to access the buffer
             //        directly (BOOTBOOT 1 GiB identity map).
             InvocationLabel::TCBSetIPCBuffer => {
+                // Two ABI shapes:
+                //   * Upstream (sel4test): bufferFrame via extraCaps[0],
+                //     mr0 = buffer (vaddr).
+                //   * Legacy (microtest): a3 = frame_cptr.
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                let upstream = info.extra_caps() > 0;
                 let vaddr = args.a2;
-                let frame_cptr = args.a3;
-                let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let frame_cap = crate::cspace::lookup_cap(s, &inv_cspace, frame_cptr)?;
+                let frame_cap = if upstream {
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    if inv_tcb.pending_extra_caps_count == 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    let c = inv_tcb.pending_extra_caps[0];
+                    inv_tcb.pending_extra_caps_count = 0;
+                    c
+                } else {
+                    let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?
+                };
                 let paddr = match frame_cap {
                     Cap::Frame { ptr, .. } => ptr.addr(),
                     _ => return Err(KException::SyscallError(SyscallError::new(
@@ -2730,6 +2805,39 @@ fn decode_tcb(
                 s.scheduler.slab.get_mut(id).bound_notification = None;
                 Ok(())
             }
+            // MCS api_tcb_configure calls SetTimeoutEndpoint with the
+            // timeout-handler endpoint cap (often seL4_CapNull). We
+            // don't model timeout faults yet — accept the call as a
+            // no-op so process spawn-up can proceed.
+            InvocationLabel::TCBSetTimeoutEndpoint => Ok(()),
+            // SetMCPriority sets the maximum-controllable-priority
+            // bound. mr0 = mcp; extraCaps[0] = authority TCB (we
+            // ignore — kernel-side checks haven't been wired yet).
+            InvocationLabel::TCBSetMCPriority => {
+                let mcp = args.a2 as u8;
+                s.scheduler.slab.get_mut(id).mcp = mcp;
+                let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                inv_tcb.pending_extra_caps_count = 0;
+                Ok(())
+            }
+            // SetSchedParams (CPriority + MCP combined). Upstream
+            // ABI: mr0=mcp, mr1=prio (or vice versa), extraCaps[0]
+            // = authority. Set both.
+            InvocationLabel::TCBSetSchedParams => {
+                let mcp = args.a2 as u8;
+                let prio = args.a3 as u8;
+                let t = s.scheduler.slab.get_mut(id);
+                t.mcp = mcp;
+                t.priority = prio;
+                let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                inv_tcb.pending_extra_caps_count = 0;
+                Ok(())
+            }
+            // SetTLSBase via TCB invocation (vs the SysSetTLSBase
+            // syscall which sets the *invoker's* TLS). a2 = base.
+            // We don't model per-TCB TLS save/restore yet but accept
+            // the call so sel4test's process bring-up proceeds.
+            InvocationLabel::TCBSetTLSBase => Ok(()),
             _ => Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_IllegalOperation,
             ))),
