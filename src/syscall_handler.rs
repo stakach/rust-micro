@@ -384,7 +384,8 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
             // msg[] starts at offset 1).
             if length > 4 && snd.ipc_buffer_paddr != 0 {
                 let buf_paddr = snd.ipc_buffer_paddr;
-                let buf = (buf_paddr as *const u64).wrapping_add(1);
+                let buf = (crate::arch::x86_64::paging::phys_to_lin(buf_paddr)
+                    as *const u64).wrapping_add(1);
                 let max = (length as usize).min(snd.msg_regs.len());
                 for i in 4..max {
                     snd.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -400,7 +401,8 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                 (snd.ipc_buffer_paddr, snd.cspace_root)
             };
             if buf_paddr != 0 {
-                let buf = buf_paddr as *const u64;
+                let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr)
+                    as *const u64;
                 let mut staged: [crate::cap::Cap; 3] =
                     [crate::cap::Cap::Null; 3];
                 let mut count = 0u8;
@@ -492,7 +494,8 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                     // Buffer layout: word 0 = tag, words 1..N = msg.
                     let ipc_paddr = inv_tcb.ipc_buffer_paddr;
                     if ipc_paddr != 0 {
-                        let buf = (ipc_paddr as *mut u64).wrapping_add(1);
+                        let buf = (crate::arch::x86_64::paging::phys_to_lin(
+                            ipc_paddr) as *mut u64).wrapping_add(1);
                         let n = (length as usize).min(inv_tcb.msg_regs.len());
                         for i in 0..n {
                             core::ptr::write_volatile(

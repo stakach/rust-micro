@@ -880,7 +880,8 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             let me = s.scheduler.slab.get_mut(invoker);
             let length = me.ipc_length as usize;
             if length > 4 && me.ipc_buffer_paddr != 0 {
-                let buf = (me.ipc_buffer_paddr as *const u64).wrapping_add(1);
+                let buf = (crate::arch::x86_64::paging::phys_to_lin(
+                    me.ipc_buffer_paddr) as *const u64).wrapping_add(1);
                 let max = length.min(me.msg_regs.len());
                 for i in 4..max {
                     me.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -901,7 +902,8 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             r.msg_regs[..n].copy_from_slice(&regs[..n]);
             // Mirror words 4..length into the caller's IPC buffer.
             if length > 4 && r.ipc_buffer_paddr != 0 {
-                let buf = (r.ipc_buffer_paddr as *mut u64).wrapping_add(1);
+                let buf = (crate::arch::x86_64::paging::phys_to_lin(
+                    r.ipc_buffer_paddr) as *mut u64).wrapping_add(1);
                 let max = (length as usize).min(regs.len());
                 for i in 4..max {
                     core::ptr::write_volatile(buf.add(i), regs[i]);
@@ -1565,11 +1567,11 @@ fn decode_untyped_retype(
                         _ => None,
                     };
                     if let Some((paddr, len)) = zero_range {
-                        // BOOTBOOT identity-maps low memory at vaddr=paddr,
-                        // and our user-page region + rootserver UT pool
-                        // both live in that region — so paddr doubles
-                        // as a kernel-writable vaddr.
-                        let dst = paddr as *mut u8;
+                        // Reach the page through the kernel-half
+                        // linear map (PML4[256+]) — keeps the
+                        // rootserver's PML4[0] free for user mappings.
+                        let dst = crate::arch::x86_64::paging::phys_to_lin(paddr)
+                            as *mut u8;
                         core::ptr::write_bytes(dst, 0, len as usize);
                     }
                 }
@@ -2103,7 +2105,8 @@ fn decode_tcb(
                             if idx < inv.msg_regs.len() {
                                 regs[i] = inv.msg_regs[idx];
                             } else if inv.ipc_buffer_paddr != 0 {
-                                let buf = (inv.ipc_buffer_paddr as *const u64)
+                                let buf = (crate::arch::x86_64::paging::phys_to_lin(
+                                    inv.ipc_buffer_paddr) as *const u64)
                                     .wrapping_add(1);
                                 regs[i] = core::ptr::read_volatile(buf.add(idx));
                             }
@@ -2211,7 +2214,8 @@ fn decode_tcb(
                         // invoker's IPC buffer so userspace's
                         // libsel4 stub can read the whole array.
                         if count > inv.msg_regs.len() && ipc_paddr != 0 {
-                            let buf = (ipc_paddr as *mut u64).wrapping_add(1);
+                            let buf = (crate::arch::x86_64::paging::phys_to_lin(
+                                ipc_paddr) as *mut u64).wrapping_add(1);
                             for i in inv.msg_regs.len()..count {
                                 core::ptr::write_volatile(buf.add(i), regs[i]);
                             }

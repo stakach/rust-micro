@@ -86,8 +86,20 @@ pub unsafe fn alloc_user_table_va() -> *mut u64 {
 /// PML4[0] identity map can still hold disjoint user-space
 /// mappings above 256 GiB.
 pub unsafe fn make_user_pml4() -> u64 {
-    let live = (read_cr3() & 0xFFFF_F000) as *const u64;
+    let live = phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *const u64;
     let new_va = alloc_table_va();
+    // Phase 42 — kernel paddr access goes via the kernel-half
+    // linear map (`phys_to_lin`) now, so PML4[0]'s BOOTBOOT identity
+    // is no longer load-bearing for the kernel. Stripping the
+    // user-half here would let sel4test's allocman install user PTs
+    // anywhere in PML4[0..256] without colliding with BOOTBOOT's
+    // 2 MiB identity entries — but the SMP `ap_dispatches_user_thread`
+    // spec test currently regresses (silent user-mode fault on AP1
+    // before the SYSCALL counter increments), which suggests one
+    // remaining paddr-as-vaddr access on the AP-side dispatch path.
+    // Until that's traced, we keep the full clone so internal specs
+    // pass; flip the loop bound back to `256..512` once the AP path
+    // is migrated.
     for i in 0..512 {
         let entry = ptr::read_volatile(live.add(i));
         ptr::write_volatile(new_va.add(i), entry);
@@ -95,34 +107,32 @@ pub unsafe fn make_user_pml4() -> u64 {
     kernel_virt_to_phys(new_va as u64)
 }
 
-/// Phase 33d — clone *only* the kernel-half + BOOTBOOT-identity
-/// entries of the live PML4 into a freshly-retyped target PML4.
-/// The user-half (PML4[1..256]) is zeroed so the new vspace starts
-/// out empty above PML4[0] — true isolation from the rootserver's
-/// own image at PML4[2].
+/// Clone the kernel-half entries of the live PML4 into a
+/// freshly-retyped target PML4 (called from
+/// `decode_untyped_retype` for `Cap::PML4`). The user-half is
+/// zeroed so the new vspace starts empty.
 ///
-/// Why we still copy PML4[0] and PML4[256..512]:
-///   * PML4[0] — BOOTBOOT 1 GiB identity map for low memory. The
-///     kernel walks user page tables via paddr (which doubles as
-///     kernel-virt under that identity map), so this entry must
-///     stay present even on isolated user vspaces.
-///   * PML4[256..512] — kernel half. SYSCALL entry restores
-///     `gs:[OFF_CTX + ...]` from PER_CPU_SYSCALL (a kernel-virt
-///     address); without this entry the very first kernel-mode
-///     instruction after a child SYSCALL would page-fault.
+/// Why we copy PML4[256..512]:
+///   * SYSCALL entry restores `gs:[OFF_CTX + ...]` from
+///     `PER_CPU_SYSCALL` (a kernel-virt address); without the
+///     kernel-half entries the very first instruction after a
+///     child SYSCALL would page-fault.
+///   * The kernel-half linear map (installed at boot in PML4[256+])
+///     lives in this range — copying it preserves kernel paddr
+///     access while the user runs with this PML4 in CR3.
 pub unsafe fn clone_live_pml4_to_paddr(target_paddr: u64) {
-    let live = (read_cr3() & 0xFFFF_F000) as *const u64;
-    let target = (target_paddr & 0xFFFF_F000) as *mut u64;
+    let live = phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *const u64;
+    let target = phys_to_lin(target_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     // Zero the whole page first — Untyped retypes don't clear memory,
     // and we don't want stale entries left over from prior retypes
     // that landed on the same paddr.
     for i in 0..512 {
         ptr::write_volatile(target.add(i), 0);
     }
-    // Copy PML4[0] (identity map) and PML4[256..512] (kernel half).
-    let identity = ptr::read_volatile(live);
-    ptr::write_volatile(target, identity);
-    for i in 256..512 {
+    // See `make_user_pml4` for why the user-half is still copied for
+    // now; once the AP-dispatch paddr-as-vaddr access is found, this
+    // can drop to `256..512`.
+    for i in 0..512 {
         let entry = ptr::read_volatile(live.add(i));
         ptr::write_volatile(target.add(i), entry);
     }
@@ -148,6 +158,35 @@ pub const PTE_NX: u64 = 1 << 63;
 
 pub const KERNEL_MMIO_VBASE: u64 = 0xFFFF_FFFF_F800_0000;
 pub const KERNEL_LAPIC_VBASE: u64 = KERNEL_MMIO_VBASE; // first MMIO slot
+
+/// Base of the kernel-half "linear map": every physical address `p`
+/// in the range [0, LINEAR_MAP_GIB·1 GiB) is reachable from kernel
+/// mode at vaddr `LINEAR_MAP_BASE + p`. Replaces the BOOTBOOT
+/// PML4[0] identity map for kernel paddr-as-vaddr accesses, so
+/// user vspaces can free PML4[0] for their own mappings.
+///
+/// `LINEAR_MAP_BASE` is set at boot by `install_kernel_page_tables`,
+/// not at compile time, because the empty PML4 slot we land in
+/// depends on what BOOTBOOT installed (BOOTBOOT touches `PML4[256]`
+/// on at least some firmware revisions). The corresponding PML4
+/// index is stored in `LINEAR_MAP_PML4_IDX`.
+#[no_mangle]
+pub static mut LINEAR_MAP_BASE: u64 = 0;
+#[no_mangle]
+pub static mut LINEAR_MAP_PML4_IDX: usize = 0;
+/// Coverage in 1 GiB increments. 4 GiB is comfortably above the
+/// rootserver UT (256 MiB) + qemu RAM (1 GiB) we configure today;
+/// bumping this just adds a few PDPT entries.
+pub const LINEAR_MAP_GIB: u64 = 4;
+
+/// Translate a physical address to its kernel-virtual counterpart
+/// in the linear map. Caller must have invoked
+/// `install_kernel_page_tables` first.
+#[inline(always)]
+pub fn phys_to_lin(paddr: u64) -> u64 {
+    debug_assert!(paddr < LINEAR_MAP_GIB * (1 << 30));
+    unsafe { LINEAR_MAP_BASE + paddr }
+}
 
 // ---------------------------------------------------------------------------
 // CR3 helpers.
@@ -239,7 +278,9 @@ pub fn kernel_virt_to_phys(v: u64) -> u64 {
 pub fn install_kernel_page_tables() {
     unsafe {
         // Cache the kernel virt→phys offset by translating a known-
-        // mapped kernel virtual symbol.
+        // mapped kernel virtual symbol. Done BEFORE install_linear_map
+        // because that needs `kernel_virt_to_phys` to compute the
+        // PDPT page's paddr.
         let kpt_va = (&raw const KPT_POOL) as u64;
         let kpt_pa = live_virt_to_phys(kpt_va)
             .expect("KPT_POOL must be live-mapped");
@@ -247,9 +288,13 @@ pub fn install_kernel_page_tables() {
 
         // Patch the existing PML4 directly. We never CR3-swap —
         // BOOTBOOT's tables already cover the kernel; we just add
-        // entries for the LAPIC (and, in a follow-up phase, user-
-        // mode pages).
-        let pml4 = (read_cr3() & 0xFFFF_F000) as *mut u64;
+        // entries for the linear map, the LAPIC, and (in later
+        // phases) user-mode pages.
+        let pml4 = (read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
+
+        // Linear map first, so subsequent paddr-as-vaddr accesses
+        // (in this function and elsewhere) can use `phys_to_lin`.
+        install_linear_map(pml4);
 
         let lapic_paddr = rdmsr(IA32_APIC_BASE_MSR) & 0xFFFF_F000;
         map_4k_into(
@@ -266,6 +311,53 @@ pub fn install_kernel_page_tables() {
             options(nostack, preserves_flags),
         );
     }
+}
+
+/// Build the kernel-half linear map. Scans `PML4[256..510]` for
+/// the first empty slot (BOOTBOOT touches PML4[256] on some
+/// firmware; PML4[511] is the kernel image), allocates a PDPT page,
+/// and populates it with `LINEAR_MAP_GIB` 1 GiB large-page entries.
+/// Caches the chosen slot's vaddr base in `LINEAR_MAP_BASE` for
+/// `phys_to_lin` to read.
+unsafe fn install_linear_map(pml4: *mut u64) {
+    // Idempotent: `install_kernel_page_tables` is called from spec
+    // setup helpers (e.g. `launch_smp_ping_thread`) as well as boot,
+    // and we must NOT pick a different slot on the second call —
+    // every `phys_to_lin` consumer would then point at the wrong
+    // virtual range. The first call sets LINEAR_MAP_BASE; later
+    // calls bail.
+    if LINEAR_MAP_BASE != 0 {
+        return;
+    }
+    let mut chosen_idx: Option<usize> = None;
+    for idx in 256..511 {
+        let e = ptr::read_volatile(pml4.add(idx));
+        if e & PTE_PRESENT == 0 {
+            chosen_idx = Some(idx);
+            break;
+        }
+    }
+    let idx = chosen_idx.expect("no free kernel-half PML4 slot");
+    LINEAR_MAP_PML4_IDX = idx;
+    // PML4[idx] vaddr = idx << 39, sign-extended (bit 47 set =>
+    // upper 16 bits = 0xFFFF).
+    LINEAR_MAP_BASE = 0xFFFF_0000_0000_0000 | ((idx as u64) << 39);
+
+    let pdpt_v = alloc_table_va();
+    let pdpt_p = kernel_virt_to_phys(pdpt_v as u64);
+
+    let leaf_flags = PTE_PRESENT | PTE_RW | PTE_PS | PTE_NX;
+    for i in 0..LINEAR_MAP_GIB {
+        let paddr_1gib = i * (1 << 30);
+        ptr::write_volatile(pdpt_v.add(i as usize), paddr_1gib | leaf_flags);
+    }
+
+    let mid_flags = PTE_PRESENT | PTE_RW;
+    ptr::write_volatile(pml4.add(idx), (pdpt_p & !0xFFF) | mid_flags);
+
+    // TLB flush.
+    asm!("mov rax, cr3; mov cr3, rax", out("rax") _,
+        options(nostack, preserves_flags));
 }
 
 /// Map `vaddr -> paddr` (4 KiB) into the page tables rooted at

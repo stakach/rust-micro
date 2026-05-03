@@ -281,7 +281,8 @@ fn transfer(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) 
     // buffer page so userspace can read them. Words 0..3 ride in
     // registers (rdx/r10/r8/r9 below) and don't need the buffer.
     if length > 4 && r.ipc_buffer_paddr != 0 {
-        let buf = (r.ipc_buffer_paddr as *mut u64).wrapping_add(1); // skip tag word
+        let buf = (crate::arch::x86_64::paging::phys_to_lin(
+            r.ipc_buffer_paddr) as *mut u64).wrapping_add(1); // skip tag word
         let max = (length as usize).min(regs.len());
         for i in 4..max {
             unsafe { core::ptr::write_volatile(buf.add(i), regs[i]); }
@@ -335,7 +336,8 @@ pub fn transfer_extra_caps(
 
     // Read receive descriptor from receiver's IPC buffer.
     let (recv_cnode_cptr, recv_index) = unsafe {
-        let buf = recv_buf_paddr as *const u64;
+        let buf = crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr)
+            as *const u64;
         (
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET)),
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET))
@@ -449,10 +451,15 @@ pub mod spec {
         let receiver = s.scheduler.admit(runnable(50));
 
         unsafe {
+            // Spec buffers live in kernel image vaddrs; convert to
+            // paddr so the ipc-path's `phys_to_lin` round-trips back
+            // to the same kernel-virt address via the linear map.
             s.scheduler.slab.get_mut(sender).ipc_buffer_paddr =
-                (&raw mut SENDER_BUF) as u64;
+                crate::arch::x86_64::paging::kernel_virt_to_phys(
+                    (&raw mut SENDER_BUF) as u64);
             s.scheduler.slab.get_mut(receiver).ipc_buffer_paddr =
-                (&raw mut RECEIVER_BUF) as u64;
+                crate::arch::x86_64::paging::kernel_virt_to_phys(
+                    (&raw mut RECEIVER_BUF) as u64);
         }
 
         // Receiver names slot 5 of its own CSpace as the receive
@@ -537,9 +544,11 @@ pub mod spec {
         let receiver = sched.admit(runnable(50));
         unsafe {
             sched.slab.get_mut(sender).ipc_buffer_paddr =
-                (&raw mut SENDER_BUF) as u64;
+                crate::arch::x86_64::paging::kernel_virt_to_phys(
+                    (&raw mut SENDER_BUF) as u64);
             sched.slab.get_mut(receiver).ipc_buffer_paddr =
-                (&raw mut RECEIVER_BUF) as u64;
+                crate::arch::x86_64::paging::kernel_virt_to_phys(
+                    (&raw mut RECEIVER_BUF) as u64);
         }
 
         // Stage an 8-word message. Words 0..3 in msg_regs (the

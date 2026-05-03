@@ -91,8 +91,8 @@ unsafe fn alloc_page() -> u64 {
         used, (*region).size);
     let paddr = (*region).base_paddr + used;
     (*region).used = used + 4096;
-    // Zero the page via paddr-as-vaddr (BOOTBOOT identity).
-    let p = paddr as *mut u8;
+    // Zero the page through the kernel-half linear map.
+    let p = crate::arch::x86_64::paging::phys_to_lin(paddr) as *mut u8;
     for i in 0..4096 {
         core::ptr::write_volatile(p.add(i), 0);
     }
@@ -598,19 +598,10 @@ pub unsafe fn launch_rootserver() -> ! {
 /// KERNEL_VIRT_TO_PHYS_OFFSET`. We avoid exposing the offset
 /// directly; just invert `kernel_virt_to_phys`.
 unsafe fn phys_to_kernel_virt(paddr: u64) -> u64 {
-    // Phase 41 — two regimes:
-    //   * paddrs in BOOTBOOT's lower-1 GiB identity map (which is
-    //     where alloc_page hands out pages) — kvaddr == paddr.
-    //   * paddrs in the kernel-image's high-memory mapping — kvaddr
-    //     = paddr + KERNEL_VIRT_TO_PHYS_OFFSET (recovered by
-    //     translating a known kernel-image symbol).
-    if paddr < 0x4000_0000 {
-        return paddr;
-    }
-    let probe_va = (&raw const USER_PAGE_REGION) as u64;
-    let probe_pa = kernel_virt_to_phys(probe_va);
-    let offset = probe_va - probe_pa;
-    paddr + offset
+    // Phase 42 — single regime: every paddr (alloc_page output,
+    // kernel-image-pool output, etc.) is reachable through the
+    // kernel-half linear map.
+    crate::arch::x86_64::paging::phys_to_lin(paddr)
 }
 
 unsafe fn build_bootinfo(
@@ -762,11 +753,11 @@ unsafe fn load_segment(
     let mut page_vaddr = start_page;
     while page_vaddr < end_page {
         // Find or allocate the kernel-virt backing for this page.
-        // `alloc_page` returns a paddr that doubles as a valid
-        // kernel-virtual pointer (BOOTBOOT identity at PML4[0]).
+        // `alloc_page` returns a paddr; we reach it from kernel mode
+        // through the linear map at `phys_to_lin(paddr)`.
         let writable = seg.writable();
-        let kva = match find_seen(seen, *n_seen, page_vaddr) {
-            Some(kv) => kv,
+        let phys_addr = match find_seen(seen, *n_seen, page_vaddr) {
+            Some(p) => p,
             None => {
                 let phys = alloc_page();
                 map_user_4k_into_pml4(pml4, page_vaddr, phys, writable);
@@ -774,6 +765,7 @@ unsafe fn load_segment(
                 phys
             }
         };
+        let kva = crate::arch::x86_64::paging::phys_to_lin(phys_addr);
 
         // Copy the slice of this segment that lies in this page:
         // [max(seg.vaddr, page_vaddr) .. min(seg.vaddr + filesize, page_vaddr + 4096)).
