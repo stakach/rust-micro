@@ -88,19 +88,7 @@ pub unsafe fn alloc_user_table_va() -> *mut u64 {
 pub unsafe fn make_user_pml4() -> u64 {
     let live = phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *const u64;
     let new_va = alloc_table_va();
-    // Phase 42 — kernel paddr access goes via the kernel-half
-    // linear map (`phys_to_lin`) now, so PML4[0]'s BOOTBOOT identity
-    // is no longer load-bearing for the kernel. Stripping the
-    // user-half here would let sel4test's allocman install user PTs
-    // anywhere in PML4[0..256] without colliding with BOOTBOOT's
-    // 2 MiB identity entries — but the SMP `ap_dispatches_user_thread`
-    // spec test currently regresses (silent user-mode fault on AP1
-    // before the SYSCALL counter increments), which suggests one
-    // remaining paddr-as-vaddr access on the AP-side dispatch path.
-    // Until that's traced, we keep the full clone so internal specs
-    // pass; flip the loop bound back to `256..512` once the AP path
-    // is migrated.
-    for i in 0..512 {
+    for i in 256..512 {
         let entry = ptr::read_volatile(live.add(i));
         ptr::write_volatile(new_va.add(i), entry);
     }

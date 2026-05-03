@@ -2,16 +2,23 @@ use crate::arch::CpuId;
 use core::arch::asm;
 
 pub fn get_cpu_id() -> CpuId {
-    // Read the APIC ID from the APIC ID register (not x2APIC mode)
+    // Read the APIC ID register. Two regimes coexist:
+    //   * Pre-`install_kernel_page_tables` (very-early boot, before
+    //     we have the kernel-half linear map): BOOTBOOT identity-
+    //     maps low memory + MMIO at PML4[0], so dereferencing the
+    //     raw paddr from IA32_APIC_BASE just works.
+    //   * After `install_kernel_page_tables`: the linear map is up
+    //     and `phys_to_lin` returns a kernel-half vaddr that's
+    //     reachable from any vspace (including user vspaces that
+    //     strip PML4[0] for sel4test).
+    // `phys_to_lin` returns the bare paddr when `LINEAR_MAP_BASE`
+    // is still zero, so a single call covers both regimes.
     let apic_base = get_apic_base();
     const APIC_ID_OFFSET: u64 = 0x20;
-    
     let apic_id_reg = unsafe {
-        let apic_id_addr = (apic_base + APIC_ID_OFFSET) as *const u32;
-        core::ptr::read_volatile(apic_id_addr)
+        let kva = super::paging::phys_to_lin(apic_base + APIC_ID_OFFSET);
+        core::ptr::read_volatile(kva as *const u32)
     };
-    
-    // In standard APIC mode, APIC ID is in bits 31:24 of the ID register
     (apic_id_reg >> 24) & 0xFF
 }
 
