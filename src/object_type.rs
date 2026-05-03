@@ -54,7 +54,7 @@ pub const MAX_UNTYPED_SIZE_BITS: u32 = 47;
 /// Phase 32b — minimum size for a SchedContext object. seL4 uses 8
 /// bits (256 bytes) as the smallest size that fits the SC header
 /// plus a couple of refills.
-pub const MIN_SCHED_CONTEXT_BITS: u32 = 8;
+pub const MIN_SCHED_CONTEXT_BITS: u32 = 7;
 /// Largest sensible SchedContext — bounded to keep the field width
 /// (`capSCSizeBits`, 6 bits) addressable.
 pub const MAX_SCHED_CONTEXT_BITS: u32 = 16;

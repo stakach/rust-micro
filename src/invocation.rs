@@ -255,12 +255,18 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             seL4_Error::seL4_InvalidArgument,
         )));
     }
-    if current_mapped.is_some() {
+    let vaddr = args.a2;
+    if let Some(prev) = current_mapped {
+        // Upstream `decodeX86FrameMapInvocation` allows re-mapping a
+        // Frame cap at the *same* vaddr as a no-op. Different vaddr
+        // requires Unmap first.
+        if prev == vaddr {
+            return Ok(());
+        }
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_DeleteFirst,
         )));
     }
-    let vaddr = args.a2;
     let rights = crate::cap::FrameRights::from_word(args.a3);
     let writable = matches!(rights, crate::cap::FrameRights::ReadWrite);
 
@@ -341,7 +347,10 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
 
     // Update the cap to reflect the mapping. We need to find the
     // source slot that holds this Frame cap and rewrite it. Walk
-    // the invoker's CSpace.
+    // the invoker's CSpace, matching paddr AND `mapped == None` so
+    // we update the FRESH (just-being-mapped) cap rather than a
+    // sibling like a userImageFrame that already has its own
+    // mapped vaddr — same hazard as in `decode_frame_unmap`.
     unsafe {
         let s = KERNEL.get();
         let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
@@ -351,7 +360,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         };
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
         for slot in s.cnodes[cnode_idx].0.iter_mut() {
-            if let Cap::Frame { ptr, .. } = slot.cap() {
+            if let Cap::Frame { ptr, mapped: None, .. } = slot.cap() {
                 if ptr.addr() == paddr {
                     let updated = Cap::Frame {
                         ptr,
@@ -397,6 +406,15 @@ fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResu
     let _ = mapped_vaddr;
 
     // Walk the CSpace and zero the mapping in the matching cap.
+    // Match BOTH paddr AND mapped-vaddr — multiple caps in the same
+    // CSpace can share a paddr (e.g. a userImageFrame at one vaddr +
+    // a sel4test-allocated copy at a different vaddr), and we need
+    // to clear the specific cap the user invoked, not the first one
+    // we trip over while iterating. Without the mapped-vaddr match,
+    // sel4test's ELF loader Unmap would clear a userImageFrame's
+    // mapping while leaving the loader_frame_cap stuck on its old
+    // vaddr, and the next iteration's Map would reject with
+    // DeleteFirst.
     unsafe {
         let s = KERNEL.get();
         let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
@@ -406,8 +424,8 @@ fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResu
         };
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
         for slot in s.cnodes[cnode_idx].0.iter_mut() {
-            if let Cap::Frame { ptr, size, rights, is_device, .. } = slot.cap() {
-                if ptr.addr() == paddr {
+            if let Cap::Frame { ptr, size, rights, is_device, mapped, .. } = slot.cap() {
+                if ptr.addr() == paddr && mapped == mapped_vaddr {
                     slot.set_cap(&Cap::Frame {
                         ptr,
                         size,
@@ -2067,6 +2085,33 @@ fn cnode_copy_or_mint(
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst)));
         }
+        // Mirror upstream `Arch_deriveCap` for x86 paging-structure
+        // caps: the derived (copied/minted) cap starts with mapped
+        // state cleared. The original cap retains its mapping; its
+        // copies are independent and must be Map'd before use. Without
+        // this, sel4test's allocman recycles slots, copies frame caps
+        // to new slots, then tries to map them — and the kernel
+        // returns DeleteFirst because the source cap's stale mapped
+        // vaddr propagates through the copy.
+        match &mut copy {
+            Cap::Frame { mapped, asid, .. } => {
+                *mapped = None;
+                *asid = 0;
+            }
+            Cap::PageTable { mapped, asid, .. } => {
+                *mapped = None;
+                *asid = 0;
+            }
+            Cap::PageDirectory { mapped, asid, .. } => {
+                *mapped = None;
+                *asid = 0;
+            }
+            Cap::Pdpt { mapped, asid, .. } => {
+                *mapped = None;
+                *asid = 0;
+            }
+            _ => {}
+        }
         if mint {
             // Mint can re-badge an Endpoint/Notification cap. The
             // badge lives in mr5 per the upstream layout above; the
@@ -3335,15 +3380,26 @@ pub mod spec {
         let translated = crate::arch::x86_64::paging::live_virt_to_phys(vaddr);
         assert_eq!(translated, Some(paddr));
 
-        // Re-mapping the same frame surfaces DeleteFirst.
+        // Re-mapping at the SAME vaddr is a no-op (mirrors upstream
+        // `decodeX86FrameMapInvocation`), so it should succeed.
         let args = SyscallArgs {
             a1: (InvocationLabel::X86PageMap as u64) << 12,
             a2: vaddr,
             a3: FrameRights::ReadWrite.to_word(),
             ..Default::default()
         };
-        // Use the freshly-stored cap (which has mapped=Some).
         let now_cap = unsafe { KERNEL.get().cnodes[0].0[1].cap() };
+        decode_invocation(now_cap, &args, invoker).expect("remap same vaddr ok");
+
+        // Re-mapping at a DIFFERENT vaddr is rejected with DeleteFirst —
+        // userspace must Unmap first.
+        let other_vaddr = vaddr + 0x1000;
+        let args = SyscallArgs {
+            a1: (InvocationLabel::X86PageMap as u64) << 12,
+            a2: other_vaddr,
+            a3: FrameRights::ReadWrite.to_word(),
+            ..Default::default()
+        };
         let r = decode_invocation(now_cap, &args, invoker);
         assert!(matches!(r,
             Err(KException::SyscallError(SyscallError {

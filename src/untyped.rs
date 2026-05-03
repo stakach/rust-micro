@@ -409,8 +409,11 @@ pub mod spec {
             }
             other => panic!("expected Cap::SchedContext, got {:?}", other),
         }
-        // Untyped advanced by exactly 1 << 8 = 256 bytes.
-        assert_eq!(ut.free_index_bytes, 256);
+        // Untyped advanced by exactly 1 << MIN_SCHED_CONTEXT_BITS bytes.
+        assert_eq!(
+            ut.free_index_bytes,
+            1u64 << crate::object_type::MIN_SCHED_CONTEXT_BITS,
+        );
         arch::log("  ✓ Untyped::Retype produces a typed SchedContext cap\n");
     }
 
