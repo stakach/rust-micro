@@ -376,11 +376,12 @@ pub mod spec {
 
         let before = SYSCALL_COUNT_PER_CPU[1].load(Ordering::SeqCst);
 
-        unsafe {
+        let id = unsafe {
             bkl_acquire();
-            let _id = crate::arch::x86_64::usermode::launch_smp_ping_thread();
+            let id = crate::arch::x86_64::usermode::launch_smp_ping_thread();
             bkl_release();
-        }
+            id
+        };
 
         // Wait for AP1 to dispatch + the ping thread to syscall a
         // healthy number of times. ~64 syscalls is plenty to prove
@@ -392,6 +393,16 @@ pub mod spec {
             if now >= target {
                 arch::log("  ✓ AP1 dispatched user thread; ");
                 arch::log("AP1 SYSCALL count climbed past 64\n");
+                // Phase 43 — block the ping thread so it stops
+                // chewing AP1 cycles once the spec is satisfied.
+                // Otherwise it stays in a SysYield loop forever and
+                // throttles the rest of the kernel via the BKL.
+                unsafe {
+                    bkl_acquire();
+                    crate::kernel::KERNEL.get().scheduler.block(
+                        id, crate::tcb::ThreadStateType::Inactive);
+                    bkl_release();
+                }
                 return;
             }
             spins += 1;
