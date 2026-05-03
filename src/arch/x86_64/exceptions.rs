@@ -24,7 +24,9 @@ interrupt_with_error!(double_fault_handler, handle_double_fault, 8);
 interrupt_with_error!(invalid_tss_handler, handle_invalid_tss, 10);
 interrupt_with_error!(segment_not_present_handler, handle_segment_not_present, 11);
 interrupt_with_error!(stack_segment_fault_handler, handle_stack_segment_fault, 12);
-interrupt_with_error!(general_protection_fault_handler, handle_general_protection_fault, 13);
+// general_protection_fault_handler defined manually below — we want
+// the saved RIP/CS/RSP for diagnostics, which the macro stub doesn't
+// pass.
 interrupt_with_error!(page_fault_handler, handle_page_fault, 14);
 interrupt!(x87_floating_point_handler, handle_x87_floating_point);
 interrupt_with_error!(alignment_check_handler, handle_alignment_check, 17);
@@ -120,9 +122,42 @@ extern "C" fn handle_stack_segment_fault(error_code: u64, exception_num: u64) {
     fatal_exception(exception_num, error_code);
 }
 
-extern "C" fn handle_general_protection_fault(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: General protection fault\n");
-    fatal_exception(exception_num, error_code);
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn general_protection_fault_handler() {
+    core::arch::naked_asm!(
+        // Stack on entry from a #GP (vector 13):
+        //   [rsp+0]  = error_code   (CPU pushed)
+        //   [rsp+8]  = saved RIP
+        //   [rsp+16] = saved CS
+        //   [rsp+24] = saved RFLAGS
+        //   [rsp+32] = saved RSP
+        //   [rsp+40] = saved SS
+        "mov rdi, [rsp]",
+        "mov rsi, [rsp + 8]",
+        "mov rdx, [rsp + 16]",
+        "mov rcx, [rsp + 32]",
+        "call {handler}",
+        "add rsp, 8",
+        "iretq",
+        handler = sym handle_general_protection_fault_typed,
+    );
+}
+
+extern "C" fn handle_general_protection_fault_typed(
+    error_code: u64,
+    saved_rip: u64,
+    saved_cs: u64,
+    saved_rsp: u64,
+) {
+    crate::arch::log("EXCEPTION: General protection fault @ rip=0x");
+    log_hex64(saved_rip);
+    crate::arch::log(", cs=0x");
+    log_hex64(saved_cs);
+    crate::arch::log(", rsp=0x");
+    log_hex64(saved_rsp);
+    crate::arch::log("\n");
+    fatal_exception(13, error_code);
 }
 
 extern "C" fn handle_page_fault(error_code: u64, exception_num: u64) {
@@ -230,6 +265,7 @@ extern "C" fn handle_page_fault_typed(
                 s.scheduler.set_current(Some(next_id));
                 let tcb = s.scheduler.slab.get(next_id);
                 let next_cr3 = tcb.cpu_context.cr3;
+                let next_fs_base = tcb.cpu_context.fs_base;
                 let next_ctx = tcb.user_context;
                 if next_cr3 != 0 {
                     let cur_cr3: u64;
@@ -240,6 +276,8 @@ extern "C" fn handle_page_fault_typed(
                             options(nostack, preserves_flags));
                     }
                 }
+                crate::arch::x86_64::msr::wrmsr(
+                    crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
                 let pcc = crate::arch::x86_64::syscall_entry
                     ::current_cpu_user_ctx_mut();
                 *pcc = next_ctx;

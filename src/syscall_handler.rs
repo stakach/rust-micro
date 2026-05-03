@@ -180,15 +180,17 @@ pub fn handle_syscall(
         }
         Syscall::SysSetTLSBase => {
             // Phase 41 — set IA32_FS_BASE for the current thread.
-            // sel4test-driver's musllibc uses this to anchor TLS at
-            // a known vaddr. We just write the MSR for now; per-TCB
-            // save/restore on context switch is a follow-up — for
-            // the smoke test the rootserver is the only thread
-            // touching FS_BASE.
+            // Save it on the TCB so the dispatcher can restore the
+            // value next time this thread runs after a context switch
+            // away (e.g. multi-threaded sel4test).
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 use crate::arch::x86_64::msr::{wrmsr, IA32_FS_BASE};
                 wrmsr(IA32_FS_BASE, args.a0);
+                if let Some(cur) = crate::kernel::current_thread() {
+                    let s = crate::kernel::KERNEL.get();
+                    s.scheduler.slab.get_mut(cur).cpu_context.fs_base = args.a0;
+                }
             }
             Ok(())
         }
@@ -198,7 +200,14 @@ pub fn handle_syscall(
             // index, args.a1 = value.
             #[cfg(target_arch = "x86_64")]
             unsafe {
+                use crate::arch::x86_64::msr::IA32_FS_BASE;
                 crate::arch::x86_64::msr::wrmsr(args.a0 as u32, args.a1);
+                if args.a0 as u32 == IA32_FS_BASE {
+                    if let Some(cur) = crate::kernel::current_thread() {
+                        let s = crate::kernel::KERNEL.get();
+                        s.scheduler.slab.get_mut(cur).cpu_context.fs_base = args.a1;
+                    }
+                }
             }
             Ok(())
         }

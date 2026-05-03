@@ -592,6 +592,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // touch below via the naked stub's restore tail) all
             // live in the kernel half.
             let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
+            let next_fs_base = s.scheduler.slab.get(next).cpu_context.fs_base;
             if next_cr3 != 0 {
                 let cur_cr3: u64;
                 core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
@@ -601,6 +602,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                         options(nostack, preserves_flags));
                 }
             }
+            // Restore per-thread FS_BASE so userspace TLS (`%fs:0`)
+            // sees this thread's TLS after a context-switch syscall
+            // tail. Same-thread case is a no-op write.
+            crate::arch::x86_64::msr::wrmsr(
+                crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
             // Phase 15a: fan IPC delivery state from the receiving
             // TCB into its user-visible registers. Mirrors upstream
             // seL4's IPC return ABI (`x64_sys_recv`):
@@ -691,6 +697,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     s.scheduler.set_current(Some(next_id));
                     let tcb = s.scheduler.slab.get(next_id);
                     let next_cr3 = tcb.cpu_context.cr3;
+                    let next_fs_base = tcb.cpu_context.fs_base;
                     let next_ctx = tcb.user_context;
                     if next_cr3 != 0 {
                         let cur_cr3: u64;
@@ -701,6 +708,8 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                                 options(nostack, preserves_flags));
                         }
                     }
+                    crate::arch::x86_64::msr::wrmsr(
+                        crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
                     let pcc = current_cpu_user_ctx_mut();
                     *pcc = next_ctx;
                     crate::smp::bkl_release();

@@ -1965,16 +1965,22 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         let source_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u16);
 
         // Tombstone bitmap: bit set means "this CTE has been
-        // revoked-or-is-source". Sized to MAX_CNODES * 32 (radix-5
-        // CNode = 32 slots). We assume each CNode uses 32 slots.
-        const SLOTS_PER_NODE: usize = 32;
-        let mut revoked: [[bool; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES] =
+        // revoked-or-is-source". Sized to MAX_CNODES * CNODE_SLOTS so
+        // it covers a full radix-12 CNode (sel4test's driver CSpace).
+        // Held in a static (BKL-serialised) so we don't blow the
+        // kernel stack.
+        const SLOTS_PER_NODE: usize = crate::kernel::CNODE_SLOTS;
+        static mut REVOKED: [[bool; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES] =
             [[false; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES];
+        let revoked = &mut *core::ptr::addr_of_mut!(REVOKED);
+        for row in revoked.iter_mut() {
+            for v in row.iter_mut() { *v = false; }
+        }
         revoked[cnode_idx][src_index] = true;
 
         // Iterate to fixed point: any CTE whose parent is revoked
         // gets revoked too. Capacity-bounded — at most
-        // `MAX_CNODES * 32` CTEs to mark, so this loop is bounded.
+        // `MAX_CNODES * CNODE_SLOTS` CTEs to mark.
         let mut progress = true;
         while progress {
             progress = false;
@@ -2910,9 +2916,20 @@ fn decode_tcb(
             }
             // SetTLSBase via TCB invocation (vs the SysSetTLSBase
             // syscall which sets the *invoker's* TLS). a2 = base.
-            // We don't model per-TCB TLS save/restore yet but accept
-            // the call so sel4test's process bring-up proceeds.
-            InvocationLabel::TCBSetTLSBase => Ok(()),
+            // Save into the target TCB's cpu_context.fs_base so the
+            // dispatcher restores it on next entry.
+            InvocationLabel::TCBSetTLSBase => {
+                let base = args.a2;
+                s.scheduler.slab.get_mut(id).cpu_context.fs_base = base;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    if Some(id) == crate::kernel::current_thread() {
+                        use crate::arch::x86_64::msr::{wrmsr, IA32_FS_BASE};
+                        wrmsr(IA32_FS_BASE, base);
+                    }
+                }
+                Ok(())
+            }
             _ => Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_IllegalOperation,
             ))),

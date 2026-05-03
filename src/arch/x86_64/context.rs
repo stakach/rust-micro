@@ -149,8 +149,8 @@ pub mod spec {
     #[repr(C, align(16))]
     struct StackPage([u8; 16384]);
     static mut SECONDARY_STACK: StackPage = StackPage([0; 16384]);
-    static mut SECONDARY_CTX: CpuContext = CpuContext { ksp: 0, cr3: 0 };
-    static mut PRIMARY_CTX: CpuContext = CpuContext { ksp: 0, cr3: 0 };
+    static mut SECONDARY_CTX: CpuContext = CpuContext { ksp: 0, cr3: 0, fs_base: 0 };
+    static mut PRIMARY_CTX: CpuContext = CpuContext { ksp: 0, cr3: 0, fs_base: 0 };
 
     extern "C" fn secondary_entry(arg: u64) -> ! {
         SECONDARY_RAN.fetch_add(arg, Ordering::Relaxed);

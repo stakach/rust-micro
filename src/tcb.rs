@@ -115,6 +115,10 @@ pub struct CpuContext {
     /// (CR3 on x86_64). Zero means "no per-thread vspace, keep
     /// whatever's loaded".
     pub cr3: u64,
+    /// IA32_FS_BASE — userspace TLS anchor. Set by SysSetTLSBase or
+    /// the TCBSetTLSBase invocation. Restored on dispatch so each
+    /// thread sees its own `%fs:0` reads.
+    pub fs_base: u64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -248,7 +252,7 @@ impl Default for Tcb {
             ipc_length: 0,
             msg_regs: [0; SCRATCH_MSG_LEN],
             ipc_badge: 0,
-            cpu_context: CpuContext { ksp: 0, cr3: 0 },
+            cpu_context: CpuContext { ksp: 0, cr3: 0, fs_base: 0 },
             cspace_root: crate::cap::Cap::Null,
             #[cfg(target_arch = "x86_64")]
             user_context:

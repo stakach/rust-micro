@@ -368,6 +368,13 @@ fn ap_scheduler_loop() -> ! {
                             );
                         }
 
+                        // Restore per-thread FS_BASE so userspace TLS
+                        // (`%fs:0` reads) sees this thread's TLS.
+                        crate::arch::x86_64::msr::wrmsr(
+                            crate::arch::x86_64::msr::IA32_FS_BASE,
+                            tcb.cpu_context.fs_base,
+                        );
+
                         let pcc = crate::arch::x86_64::syscall_entry
                             ::current_cpu_user_ctx_mut();
                         *pcc = tcb.user_context;
