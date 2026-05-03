@@ -117,10 +117,16 @@ pub unsafe fn clone_live_pml4_to_paddr(target_paddr: u64) {
     for i in 0..512 {
         ptr::write_volatile(target.add(i), 0);
     }
-    // See `make_user_pml4` for why the user-half is still copied for
-    // now; once the AP-dispatch paddr-as-vaddr access is found, this
-    // can drop to `256..512`.
-    for i in 0..512 {
+    // Only copy the kernel half (PML4[256..512]). Copying the user
+    // half too would inherit the rootserver's mappings into every
+    // freshly-retyped PML4, so the moment sel4test creates a child
+    // process and tries to map a page at e.g. 0x400000 (the standard
+    // ELF base — which the rootserver itself has mapped) the kernel
+    // walks pml4[0]→PDPT→PD→PT, finds an existing PTE at PT[0], and
+    // returns DeleteFirst instead of FailedLookup. The user-half
+    // entries the new process needs come from explicit
+    // PDPT_Map/PD_Map/PT_Map invocations against the new PML4 cap.
+    for i in 256..512 {
         let entry = ptr::read_volatile(live.add(i));
         ptr::write_volatile(target.add(i), entry);
     }

@@ -158,6 +158,22 @@ pub fn retype(
     }
 
     // Looks good — build child caps, then commit free_index.
+    // Zero non-device retyped memory so paging-structure objects
+    // (PT/PD/PDPT/PML4) start with empty entries — otherwise garbage
+    // present-bits in the object's prior life as untyped scratch
+    // make X86Page_Map's PT-slot-busy check fire spuriously, and
+    // the ELF loader's first map at vaddr 0x400000 returns
+    // seL4_DeleteFirst. Mirrors upstream seL4's `clearMemory` in
+    // src/object/untyped.c.
+    if !untyped.is_device {
+        let total_bytes = num_objects * per_object;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let lin = crate::arch::x86_64::paging::phys_to_lin(
+                untyped.base + aligned_offset);
+            core::ptr::write_bytes(lin as *mut u8, 0, total_bytes as usize);
+        }
+    }
     for i in 0..num_objects {
         let offset_in_untyped = aligned_offset + i * per_object;
         let object_addr = untyped.base + offset_in_untyped;
