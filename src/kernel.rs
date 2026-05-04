@@ -40,19 +40,19 @@ pub const MAX_REPLIES: usize = 128;
 
 /// CTEs per pre-allocated CNode in the in-kernel pool.
 ///
-/// Phase 36e bumped from 5 → 6 (32 → 64 slots) for the canonical
-/// initial-cap layout. Phase 42 bumped further to 12 (4096 slots)
-/// because sel4test's allocman walks `bi.empty` to allocate
-/// hundreds of caps for tests; 64 slots ran out almost immediately.
-/// Each Cte is 32 bytes → ~128 KiB per CNode × MAX_CNODES = ~512
-/// KiB of static memory, comfortably within the kernel's BSS.
+/// Phase 36e bumped from 5 → 6 (32 → 64 slots). Phase 42 bumped
+/// further to 12 (4096 slots) because sel4test's allocman walks
+/// `bi.empty` to allocate hundreds of caps in the rootserver's
+/// radix-12 CSpace. Lower than 4096 silently truncates allocman's
+/// addressable range and the driver can't load ELFs.
 pub const CNODE_RADIX: u8 = 12;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 
-/// Maximum pre-allocated big CNodes. Bumped 4→8→16→32→48 across phases.
-/// 48 CNodes × 4096 slots × 32 bytes = 6 MiB of static BSS (kernel
-/// virtual range is only 8 MiB, capped by link.ld's 0xff800000
-/// bootboot reservation).
+/// Maximum pre-allocated big CNodes. 48 × 4096 × 32 = 6 MiB of
+/// static BSS (kernel virt range capped at 8 MiB by link.ld's
+/// 0xff800000 bootboot reservation). Bumping further requires
+/// either growing the kernel virtual window or splitting into a
+/// small-CNode pool — see `MAX_SMALL_CNODES`.
 pub const MAX_CNODES: usize = 48;
 
 /// One pre-allocated CNode: 32 slots × 32 bytes = 1 KiB.
