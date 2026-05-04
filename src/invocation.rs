@@ -2837,6 +2837,23 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             }
             false
         };
+        // Frame caps need PT-entry cleanup BEFORE the cap is gone:
+        // FRAMEDIPC0003 deletes a mapped frame cap and expects later
+        // user accesses to that vaddr to fault. Without this, the page
+        // stays mapped via stale PTE and the test thread silently
+        // continues into corrupted state.
+        if let Cap::Frame { ptr, mapped: Some(vaddr), asid, .. } = deleted_cap {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let pml4_paddr = pml4_paddr_for_asid(asid);
+                if pml4_paddr != 0 {
+                    crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                        pml4_paddr, vaddr);
+                    crate::smp::shootdown_tlb(vaddr);
+                }
+            }
+            let _ = (ptr, asid, vaddr);
+        }
         if !same_obj_lives(&deleted_cap) {
             match deleted_cap {
                 Cap::Thread { tcb } => {
@@ -3595,15 +3612,33 @@ fn decode_tcb(
                     //   [1] = cspace root
                     //   [2] = vspace root
                     // mr0 = cspace_root_data, mr1 = vspace_root_data
-                    // (no fault_ep cptr in message words). We don't
-                    // model fault handlers via cap yet — store the
-                    // raw cptr in fault_handler the same way the
-                    // legacy path did.
-                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    // (no fault_ep cptr in message words). Recover the
+                    // fault EP cptr from the invoker's IPC buffer's
+                    // caps_or_badges[0] so deliver_fault has something
+                    // to look up later. FRAMEDIPC0003 needs this — its
+                    // helper page-faults on a deleted-frame access and
+                    // expects the kernel to send a fault to its fault
+                    // EP, not to silently suspend.
+                    let inv_tcb = s.scheduler.slab.get(invoker);
+                    let ipc_paddr = inv_tcb.ipc_buffer_paddr;
                     let count = inv_tcb.pending_extra_caps_count as usize;
+                    let fault_cptr = if count > 0 && ipc_paddr != 0 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            let buf = crate::arch::x86_64::paging::phys_to_lin(
+                                ipc_paddr) as *const u64;
+                            core::ptr::read_volatile(
+                                buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET))
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        { 0 }
+                    } else { 0 };
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
                     let cnode = if count > 1 { Some(inv_tcb.pending_extra_caps[1]) } else { None };
                     let vspace = if count > 2 { Some(inv_tcb.pending_extra_caps[2]) } else { None };
                     inv_tcb.pending_extra_caps_count = 0;
+                    // Stash the fault EP cptr on the target TCB.
+                    s.scheduler.slab.get_mut(id).fault_handler = fault_cptr;
                     (cnode, vspace)
                 } else {
                     let cnode = if args.a3 != 0 {
