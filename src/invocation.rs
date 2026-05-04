@@ -1812,8 +1812,8 @@ fn decode_untyped_retype(
         } else {
             s.scheduler.slab.get(invoker).cspace_root
         };
-        let cnode_ptr = match dest_cnode_cap {
-            Cap::CNode { ptr, .. } => ptr,
+        let (cnode_ptr, dest_radix) = match dest_cnode_cap {
+            Cap::CNode { ptr, radix, .. } => (ptr, radix),
             _ => {
                 return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_InvalidCapability,
@@ -1850,8 +1850,19 @@ fn decode_untyped_retype(
         let cnode_slots = &mut s.cnodes[cnode_idx].0;
 
         // Verify the destination range is empty — Retype refuses
-        // to overwrite caps.
+        // to overwrite caps. Use the dest CNode cap's logical radix,
+        // not the underlying storage capacity, so a 4-slot dest
+        // (radix=2) really has only 4 valid offsets even though
+        // every CNode in our pool is physically 4096 slots.
+        // RETYPE0000 in sel4test cares: it sizes the dest CNode at 4
+        // and expects offset >= 4 to fail with seL4_RangeError.
+        let logical_capacity = 1usize << dest_radix;
         let upper = dest_offset + num_objects as usize;
+        if upper > logical_capacity {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_RangeError,
+            )));
+        }
         if upper > cnode_slots.len() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_RangeError,
@@ -3864,6 +3875,7 @@ pub mod spec {
         untyped_retype_via_invocation();
         untyped_retype_upstream_abi_far_offset();
         revoke_chain_clears_only_descendants();
+        repeated_alloc_free_reclaims_untyped();
         cnode_copy_via_invocation();
         cnode_move_clears_source();
         cnode_revoke_zaps_descendants();
@@ -4228,6 +4240,20 @@ pub mod spec {
     #[inline(never)]
     fn untyped_retype_upstream_abi_far_offset() {
         let invoker = setup_invoker(0);
+        // Override the invoker's CSpace cap to advertise the full
+        // CNODE_RADIX so the retype can place a child at a "far"
+        // slot index (>= 32). setup_invoker uses radix=5 by default
+        // for legacy microtest specs.
+        unsafe {
+            let s = KERNEL.get();
+            let cnode_ptr = KernelState::cnode_ptr(0);
+            s.scheduler.slab.get_mut(invoker).cspace_root = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: crate::kernel::CNODE_RADIX,
+                guard_size: 64 - crate::kernel::CNODE_RADIX,
+                guard: 0,
+            };
+        }
         let untyped_base = 0x0090_0000u64;
         let ut_cap = Cap::Untyped {
             ptr: PPtr::<crate::cap::UntypedStorage>::new(untyped_base).unwrap(),
@@ -4301,6 +4327,18 @@ pub mod spec {
     #[inline(never)]
     fn revoke_chain_clears_only_descendants() {
         let invoker = setup_invoker(0);
+        // Override cspace_root with full radix so slots 100, 200, 0x57f
+        // are reachable.
+        unsafe {
+            let s = KERNEL.get();
+            let cnode_ptr = KernelState::cnode_ptr(0);
+            s.scheduler.slab.get_mut(invoker).cspace_root = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: crate::kernel::CNODE_RADIX,
+                guard_size: 64 - crate::kernel::CNODE_RADIX,
+                guard: 0,
+            };
+        }
         let parent_ut = Cap::Untyped {
             ptr: PPtr::<crate::cap::UntypedStorage>::new(0x00A0_0000).unwrap(),
             block_bits: 14,
@@ -4378,6 +4416,78 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Revoke walks only the actual descendant subtree\n");
+    }
+
+    /// Phase 43 — TRIVIAL0001 in sel4test allocates an endpoint,
+    /// frees it, and repeats 100 times. vka_alloc retypes the untyped;
+    /// vka_free cnode_deletes the endpoint cap. After enough cycles the
+    /// untyped's free_index must roll back so the next retype has room.
+    /// Verify the alloc/free/realloc loop completes without
+    /// NotEnoughMemory by exercising the kernel-side path directly.
+    #[inline(never)]
+    fn repeated_alloc_free_reclaims_untyped() {
+        let invoker = setup_invoker(0);
+        // 16 KiB Untyped — only fits ~256 16-byte endpoints with no
+        // reclaim. We'll do 500 cycles to force reclaim to actually
+        // happen.
+        let ut_cap = Cap::Untyped {
+            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x00C0_0000).unwrap(),
+            block_bits: 14,
+            free_index: 0,
+            is_device: false,
+        };
+        unsafe {
+            let s = KERNEL.get();
+            s.cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+        }
+        let cnode_cap = unsafe {
+            KERNEL.get().scheduler.slab.get(invoker).cspace_root
+        };
+        for cycle in 0..500u32 {
+            // Retype 1 endpoint at slot 4.
+            let args = SyscallArgs {
+                a1: (InvocationLabel::UntypedRetype as u64) << 12,
+                a2: ObjectType::Endpoint.to_word(),
+                a3: 1,
+                a4: 4,
+                ..Default::default()
+            };
+            let r = decode_invocation(ut_cap, &args, invoker);
+            if r.is_err() {
+                panic!("retype failed at cycle {} (free_index didn't reclaim?)",
+                    cycle);
+            }
+            // Confirm cap landed.
+            unsafe {
+                let s = KERNEL.get();
+                assert!(matches!(s.cnodes[0].0[4].cap(), Cap::Endpoint { .. }),
+                    "endpoint missing at cycle {}", cycle);
+            }
+            // Mirror vka_free_object: revoke then delete. Some
+            // vka implementations only call cnode_delete; others
+            // do revoke + delete. Either should work.
+            let rev_args = SyscallArgs {
+                a1: (InvocationLabel::CNodeRevoke as u64) << 12,
+                a2: 4,
+                ..Default::default()
+            };
+            decode_invocation(cnode_cap, &rev_args, invoker)
+                .expect("revoke ok");
+            let del_args = SyscallArgs {
+                a1: (InvocationLabel::CNodeDelete as u64) << 12,
+                a2: 4,
+                ..Default::default()
+            };
+            decode_invocation(cnode_cap, &del_args, invoker)
+                .expect("delete ok");
+            unsafe {
+                let s = KERNEL.get();
+                assert!(s.cnodes[0].0[4].cap().is_null(),
+                    "slot 4 should be empty at cycle {}", cycle);
+            }
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ 500 alloc/free cycles reclaim untyped free_index\n");
     }
 
     #[inline(never)]
