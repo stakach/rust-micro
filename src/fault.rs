@@ -35,7 +35,12 @@ impl FaultMessage {
             FaultMessage::CapFault { .. } => 1,
             FaultMessage::UnknownSyscall { .. } => 2,
             FaultMessage::UserException { .. } => 3,
-            FaultMessage::VMFault { .. } => 5,
+            // Phase 43 — was 5; upstream's seL4_Fault_VMFault is 6
+            // (slot 5 is Timeout). FRAMEDIPC0003's helper checks
+            // `info.label == seL4_Fault_VMFault` and returns -1 if
+            // mismatch, surfacing as the test's
+            // `(uintptr_t)res(18446744073709551615) == dest` failure.
+            FaultMessage::VMFault { .. } => 6,
         }
     }
 
@@ -230,7 +235,7 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(faulter).state,
                 ThreadStateType::BlockedOnReply);
             assert_eq!(s.scheduler.slab.get(handler).reply_to, Some(faulter));
-            assert_eq!(s.scheduler.slab.get(handler).msg_regs[0], 5); // VMFault
+            assert_eq!(s.scheduler.slab.get(handler).msg_regs[0], 6); // VMFault (upstream label)
             assert_eq!(s.scheduler.slab.get(handler).msg_regs[1], 0xDEAD_BEEF);
             assert_eq!(s.scheduler.slab.get(handler).msg_regs[2], 0x4);
         }
