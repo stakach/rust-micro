@@ -103,10 +103,15 @@ pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
                 seL4_Error::seL4_InvalidCapability))),
         };
         // Stage the fault as a Call-shaped message: handler runs,
-        // does SysReply to resume the faulter.
+        // does SysReply to resume the faulter. Layout of msg_regs
+        // matches upstream's per-arch fault enum (e.g.
+        // `seL4_UserException_Msg` on x86_64 = FaultIP, SP, FLAGS,
+        // Number, Code → length 5). sel4utils_print_fault_message
+        // asserts on the length, so the wire format has to be
+        // accurate even if the test only inspects the label.
         let regs_n = {
             let f = s.scheduler.slab.get_mut(faulter);
-            let n = fault.encode(&mut f.msg_regs);
+            let n = encode_for_arch(&fault, f);
             f.ipc_label = fault.type_word();
             f.ipc_length = n as u32;
             n
@@ -123,6 +128,70 @@ pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
         });
         Ok(())
     }
+}
+
+/// Per-arch fault payload encoder. Mirrors libsel4's
+/// `seL4_*_Msg` enums so `sel4utils_print_fault_message`'s
+/// length assertions pass.
+#[cfg(target_arch = "x86_64")]
+fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
+    let ctx = f.user_context;
+    let regs = &mut f.msg_regs;
+    match *fault {
+        FaultMessage::Null => 0,
+        FaultMessage::CapFault { addr, in_recv } => {
+            // libsel4 x86_64 seL4_CapFault_Msg: IP, Addr,
+            // InRecvPhase, LookupFailureType, MR4..MR7. We only
+            // populate IP/Addr/InRecvPhase; pad to length 8 with
+            // zeros (test code typically inspects the first 3).
+            regs[0] = ctx.rcx;
+            regs[1] = addr;
+            regs[2] = in_recv as u64;
+            for r in regs.iter_mut().take(8).skip(3) { *r = 0; }
+            8
+        }
+        FaultMessage::UnknownSyscall { number } => {
+            // x86_64 seL4_UnknownSyscall_Msg goes RAX..R15, RIP, SP,
+            // FLAGS, Syscall (18 words). Our msg_regs is only
+            // SCRATCH_MSG_LEN=8 — truncate to that until we wire up
+            // the IPC-buffer overflow path. Fault handlers that walk
+            // past mr7 will see zeros, but the kernel-side length is
+            // still capped at the buffer.
+            regs[0] = ctx.rax;
+            regs[1] = ctx.rbx;
+            regs[2] = ctx.rcx;
+            regs[3] = ctx.rdx;
+            regs[4] = ctx.rsi;
+            regs[5] = ctx.rdi;
+            regs[6] = ctx.rbp;
+            regs[7] = number;
+            regs.len()
+        }
+        FaultMessage::UserException { number, code } => {
+            // x86_64 seL4_UserException_Msg: FaultIP, SP, FLAGS,
+            // Number, Code → length 5.
+            regs[0] = ctx.rcx;       // FaultIP — sysret restores from RCX
+            regs[1] = ctx.rsp;       // user SP
+            regs[2] = ctx.r11;       // RFLAGS — sysret restores from R11
+            regs[3] = number as u64;
+            regs[4] = code as u64;
+            5
+        }
+        FaultMessage::VMFault { addr, fsr, instruction } => {
+            // x86_64 seL4_VMFault_Msg: IP, Addr, PrefetchFault,
+            // FSR → length 4.
+            regs[0] = ctx.rcx;
+            regs[1] = addr;
+            regs[2] = instruction as u64;
+            regs[3] = fsr;
+            4
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
+    fault.encode(&mut f.msg_regs)
 }
 
 #[cfg(feature = "spec")]
@@ -230,14 +299,17 @@ pub mod spec {
 
         unsafe {
             let s = KERNEL.get();
-            // Faulter is parked on Reply; handler is runnable
-            // with the fault message in msg_regs.
+            // Faulter is parked on Reply; handler is runnable with
+            // the fault payload in msg_regs. Layout matches upstream
+            // x86_64 seL4_VMFault_Msg: IP, Addr, PrefetchFault, FSR.
+            // The fault label (6 = VMFault) lives in `ipc_label`,
+            // not msg_regs.
             assert_eq!(s.scheduler.slab.get(faulter).state,
                 ThreadStateType::BlockedOnReply);
             assert_eq!(s.scheduler.slab.get(handler).reply_to, Some(faulter));
-            assert_eq!(s.scheduler.slab.get(handler).msg_regs[0], 6); // VMFault (upstream label)
+            assert_eq!(s.scheduler.slab.get(handler).ipc_label, 6);
             assert_eq!(s.scheduler.slab.get(handler).msg_regs[1], 0xDEAD_BEEF);
-            assert_eq!(s.scheduler.slab.get(handler).msg_regs[2], 0x4);
+            assert_eq!(s.scheduler.slab.get(handler).msg_regs[3], 0x4);
         }
 
         // Handler does SysReply to resume the faulter. Phase 36b —
