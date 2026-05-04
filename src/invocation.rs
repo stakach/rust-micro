@@ -3703,6 +3703,28 @@ fn decode_tcb(
             }
             InvocationLabel::TCBSetPriority => {
                 let prio = args.a2 as u8;
+                // SCHED0005 — when the upstream form is used
+                // (extraCaps[0] = authority TCB), reject prio that
+                // exceeds authority's MCP with seL4_RangeError.
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                if info.extra_caps() > 0 {
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    let count = inv_tcb.pending_extra_caps_count as usize;
+                    let auth_cap = if count > 0 { Some(inv_tcb.pending_extra_caps[0]) } else { None };
+                    inv_tcb.pending_extra_caps_count = 0;
+                    let auth_mcp = match auth_cap {
+                        Some(Cap::Thread { tcb }) => {
+                            let auth_id = crate::tcb::TcbId(tcb.addr() as u16);
+                            s.scheduler.slab.get(auth_id).mcp
+                        }
+                        _ => return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability))),
+                    };
+                    if prio > auth_mcp {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_RangeError)));
+                    }
+                }
                 // Phase 43 — properly migrate the thread between
                 // priority queues. Without this, a TCB's priority
                 // field is updated but it stays in its OLD priority
@@ -4187,26 +4209,64 @@ fn decode_tcb(
             // no-op so process spawn-up can proceed.
             InvocationLabel::TCBSetTimeoutEndpoint => Ok(()),
             // SetMCPriority sets the maximum-controllable-priority
-            // bound. mr0 = mcp; extraCaps[0] = authority TCB (we
-            // ignore — kernel-side checks haven't been wired yet).
+            // bound. mr0 = mcp; extraCaps[0] = authority TCB.
+            // SCHED0005 — new MCP must not exceed authority's MCP.
             InvocationLabel::TCBSetMCPriority => {
                 let mcp = args.a2 as u8;
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                if info.extra_caps() > 0 {
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    let count = inv_tcb.pending_extra_caps_count as usize;
+                    let auth_cap = if count > 0 { Some(inv_tcb.pending_extra_caps[0]) } else { None };
+                    inv_tcb.pending_extra_caps_count = 0;
+                    let auth_mcp = match auth_cap {
+                        Some(Cap::Thread { tcb }) => {
+                            let auth_id = crate::tcb::TcbId(tcb.addr() as u16);
+                            s.scheduler.slab.get(auth_id).mcp
+                        }
+                        _ => return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability))),
+                    };
+                    if mcp > auth_mcp {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_RangeError)));
+                    }
+                } else {
+                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+                }
                 s.scheduler.slab.get_mut(id).mcp = mcp;
-                let inv_tcb = s.scheduler.slab.get_mut(invoker);
-                inv_tcb.pending_extra_caps_count = 0;
                 Ok(())
             }
             // SetSchedParams (CPriority + MCP combined). Upstream
-            // ABI: mr0=mcp, mr1=prio (or vice versa), extraCaps[0]
-            // = authority. Set both.
+            // ABI: mr0=mcp, mr1=prio, extraCaps[0]=authority.
+            // SCHED0005-style — both bounded by authority's MCP.
             InvocationLabel::TCBSetSchedParams => {
                 let mcp = args.a2 as u8;
                 let prio = args.a3 as u8;
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                if info.extra_caps() > 0 {
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    let count = inv_tcb.pending_extra_caps_count as usize;
+                    let auth_cap = if count > 0 { Some(inv_tcb.pending_extra_caps[0]) } else { None };
+                    inv_tcb.pending_extra_caps_count = 0;
+                    let auth_mcp = match auth_cap {
+                        Some(Cap::Thread { tcb }) => {
+                            let auth_id = crate::tcb::TcbId(tcb.addr() as u16);
+                            s.scheduler.slab.get(auth_id).mcp
+                        }
+                        _ => return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability))),
+                    };
+                    if mcp > auth_mcp || prio > auth_mcp {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_RangeError)));
+                    }
+                } else {
+                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+                }
                 let t = s.scheduler.slab.get_mut(id);
                 t.mcp = mcp;
                 t.priority = prio;
-                let inv_tcb = s.scheduler.slab.get_mut(invoker);
-                inv_tcb.pending_extra_caps_count = 0;
                 Ok(())
             }
             // SetTLSBase via TCB invocation (vs the SysSetTLSBase

@@ -611,6 +611,7 @@ pub fn bootstrap_boot_thread() -> TcbId {
         let s = KERNEL.get();
         let mut t = Tcb::default();
         t.priority = 254; // top priority — kernel boot
+        t.mcp = 254;      // rootserver = authority for all spawned TCBs
         t.state = ThreadStateType::Running;
         let id = s.scheduler.admit(t);
         s.scheduler.set_current(Some(id));
