@@ -28,9 +28,16 @@ pub struct Cte {
 impl Cte {
     pub const SIZE_BYTES: usize = 32;
 
-    /// A null CTE: null cap, default MDB node.
+    /// A null CTE: null cap, parent = None (sentinel 0xFFFF).
+    /// Without the parent sentinel, a freshly-zeroed CTE decodes its
+    /// parent as `Some(MdbId(0))` = (cnode 0, slot 0). cnode_revoke on
+    /// that slot would then mark every default-parent CTE as a
+    /// descendant and clear it — wiping unrelated Untyped/CNode/Frame
+    /// caps across the kernel. Manifested as a Cap::Null at cptr 0x57f
+    /// when DOMAINS0001's basic_set_up retypes a fresh page directory
+    /// after the rootserver had revoked some innocuous slot 0 cap.
     pub const fn null() -> Self {
-        Self { cap_words: [0; 2], mdb_words: [0; 2] }
+        Self { cap_words: [0; 2], mdb_words: [0xFFFF, 0] }
     }
 
     /// Convenience constructor used by the specs.

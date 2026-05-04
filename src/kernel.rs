@@ -49,12 +49,12 @@ pub const MAX_REPLIES: usize = 128;
 pub const CNODE_RADIX: u8 = 12;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 
-/// Maximum pre-allocated CNodes. Bumped from 4 → 8 in Phase 42 so
-/// sel4test's BIND0001+ tests (each spawns a test_process with its
-/// own CSpace via Untyped→CNode retype) don't exhaust the pool.
-/// 8 CNodes × 4096 slots × 32 bytes = 1 MiB of static BSS — keeps
-/// us under the kernel image's ~2 MiB linker window.
-pub const MAX_CNODES: usize = 16;
+/// Maximum pre-allocated CNodes. Bumped 4→8→16→32 across phases so
+/// sel4test's per-test process spawns (each retyped Untyped→CNode for
+/// its own CSpace) don't exhaust the pool when running multiple tests
+/// back-to-back. 32 CNodes × 4096 slots × 32 bytes = 4 MiB of static
+/// BSS — link.ld's kernel half has room.
+pub const MAX_CNODES: usize = 32;
 
 /// One pre-allocated CNode: 32 slots × 32 bytes = 1 KiB.
 #[repr(C, align(32))]
