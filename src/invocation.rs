@@ -365,19 +365,21 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             _ => return Ok(()),
         };
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        for slot in s.cnodes[cnode_idx].0.iter_mut() {
-            if let Cap::Frame { ptr, mapped: None, .. } = slot.cap() {
-                if ptr.addr() == paddr {
-                    let updated = Cap::Frame {
-                        ptr,
-                        size,
-                        rights,
-                        mapped: Some(vaddr),
-                        asid: asid_for_cap,
-                        is_device: _device,
-                    };
-                    slot.set_cap(&updated);
-                    break;
+        if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
+            for slot in slots.iter_mut() {
+                if let Cap::Frame { ptr, mapped: None, .. } = slot.cap() {
+                    if ptr.addr() == paddr {
+                        let updated = Cap::Frame {
+                            ptr,
+                            size,
+                            rights,
+                            mapped: Some(vaddr),
+                            asid: asid_for_cap,
+                            is_device: _device,
+                        };
+                        slot.set_cap(&updated);
+                        break;
+                    }
                 }
             }
         }
@@ -397,8 +399,12 @@ fn pml4_paddr_for_asid(asid: u16) -> u64 {
     if asid == 0 { return 0; }
     unsafe {
         let s = KERNEL.get();
-        for cn in s.cnodes.iter() {
-            for slot in cn.0.iter() {
+        for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
+            let slots = match s.cnode_slots_at(ci) {
+                Some(s) => s,
+                None => continue,
+            };
+            for slot in slots.iter() {
                 if let Cap::PML4 { ptr, asid: a, .. } = slot.cap() {
                     if a == asid {
                         return ptr.addr();
@@ -455,18 +461,20 @@ fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResu
             _ => return Ok(()),
         };
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        for slot in s.cnodes[cnode_idx].0.iter_mut() {
-            if let Cap::Frame { ptr, size, rights, is_device, mapped, .. } = slot.cap() {
-                if ptr.addr() == paddr && mapped == mapped_vaddr {
-                    slot.set_cap(&Cap::Frame {
-                        ptr,
-                        size,
-                        rights,
-                        mapped: None,
-                        asid: 0,
-                        is_device,
-                    });
-                    break;
+        if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
+            for slot in slots.iter_mut() {
+                if let Cap::Frame { ptr, size, rights, is_device, mapped, .. } = slot.cap() {
+                    if ptr.addr() == paddr && mapped == mapped_vaddr {
+                        slot.set_cap(&Cap::Frame {
+                            ptr,
+                            size,
+                            rights,
+                            mapped: None,
+                            asid: 0,
+                            is_device,
+                        });
+                        break;
+                    }
                 }
             }
         }
@@ -688,7 +696,11 @@ fn rewrite_paging_cap_in_cspace(invoker: TcbId, cap: &Cap, new_mapped: Option<u6
             _ => return,
         };
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        for slot in s.cnodes[cnode_idx].0.iter_mut() {
+        let slots = match s.cnode_slots_at_mut(cnode_idx) {
+            Some(s) => s,
+            None => return,
+        };
+        for slot in slots.iter_mut() {
             let updated = match slot.cap() {
                 Cap::PageTable { ptr, asid, .. } if ptr.addr() == target_paddr => {
                     Some(Cap::PageTable { ptr, mapped: new_mapped, asid })
@@ -786,7 +798,11 @@ fn decode_asid_control(
                         seL4_Error::seL4_InvalidCapability))),
                 };
                 let cnode_idx = KernelState::cnode_index(cnode_ptr);
-                let slots = &mut s.cnodes[cnode_idx].0;
+                let slots = match s.cnode_slots_at_mut(cnode_idx) {
+                    Some(s) => s,
+                    None => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability))),
+                };
                 if dest_offset >= slots.len() || !slots[dest_offset].cap().is_null() {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_DeleteFirst)));
@@ -895,7 +911,11 @@ fn decode_asid_pool(
                     };
                     let cnode_idx = KernelState::cnode_index(cnode_ptr);
                     let slot_idx = args.a2 as usize;
-                    let slots = &s.cnodes[cnode_idx].0;
+                    let slots = match s.cnode_slots_at(cnode_idx) {
+                        Some(s) => s,
+                        None => return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability))),
+                    };
                     if slot_idx >= slots.len() {
                         return Err(KException::SyscallError(SyscallError::new(
                             seL4_Error::seL4_RangeError)));
@@ -918,8 +938,9 @@ fn decode_asid_pool(
                         1, core::sync::atomic::Ordering::Relaxed,
                     ) & 0x1FF) as u16,
                 );
-                let slot = &mut s.cnodes[slot_cnode_idx].0[slot_idx];
-                slot.set_cap(&Cap::PML4 { ptr, mapped, asid: assigned });
+                if let Some(slot) = s.cnode_slot_mut(slot_cnode_idx, slot_idx) {
+                    slot.set_cap(&Cap::PML4 { ptr, mapped, asid: assigned });
+                }
                 Ok(())
             }
         }
@@ -1304,7 +1325,12 @@ fn decode_irq_control(
                     ))),
                 };
                 let cnode_idx = KernelState::cnode_index(cnode_ptr);
-                let slots = &mut s.cnodes[cnode_idx].0;
+                let slots = match s.cnode_slots_at_mut(cnode_idx) {
+                    Some(s) => s,
+                    None => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    ))),
+                };
                 if dest_index >= slots.len() {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_RangeError,
@@ -1392,7 +1418,11 @@ fn issue_x86_irq_handler(
                 seL4_Error::seL4_FailedLookup)));
         }
         let cnode_idx = KernelState::cnode_index(res.slot_ptr);
-        let slot = &mut s.cnodes[cnode_idx].0[res.slot_index];
+        let slot = match s.cnode_slot_mut(cnode_idx, res.slot_index) {
+            Some(s) => s,
+            None => return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability))),
+        };
         if !slot.cap().is_null() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst)));
@@ -1632,7 +1662,11 @@ fn decode_io_port_control(
                 seL4_Error::seL4_FailedLookup)));
         }
         let cnode_idx = KernelState::cnode_index(res.slot_ptr);
-        let slot = &mut s.cnodes[cnode_idx].0[res.slot_index];
+        let slot = match s.cnode_slot_mut(cnode_idx, res.slot_index) {
+            Some(s) => s,
+            None => return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability))),
+        };
         if !slot.cap().is_null() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst)));
@@ -1831,6 +1865,23 @@ fn decode_untyped_retype(
     };
     let dest_offset = node_offset;
 
+    // Upstream rejects `num_objects` outside [1, CONFIG_RETYPE_FAN_OUT_LIMIT]
+    // with seL4_RangeError, and stamps mr0=1 (min) + mr1=limit so userspace
+    // can read the bounds back via seL4_GetMR. RETYPE0000 in sel4test
+    // probes this with `num_objects = 0` and asserts on both bounds.
+    const RETYPE_FAN_OUT_LIMIT: u64 = 256;
+    if num_objects == 0 || num_objects > RETYPE_FAN_OUT_LIMIT {
+        unsafe {
+            let inv = KERNEL.get().scheduler.slab.get_mut(invoker);
+            inv.msg_regs[0] = 1;
+            inv.msg_regs[1] = RETYPE_FAN_OUT_LIMIT;
+            inv.ipc_length = 2;
+        }
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_RangeError,
+        )));
+    }
+
     // Resolve the destination CNode. When extraCaps[0] is provided
     // (upstream path), walk it with node_depth bits to land on the
     // actual dest CNode. Otherwise fall back to the invoker's
@@ -1850,7 +1901,8 @@ fn decode_untyped_retype(
                         seL4_Error::seL4_FailedLookup)));
                 }
                 let cnode_idx = KernelState::cnode_index(res.slot_ptr);
-                s.cnodes[cnode_idx].0[res.slot_index].cap()
+                s.cnode_slot(cnode_idx, res.slot_index)
+                    .map(|c| c.cap()).unwrap_or(Cap::Null)
             }
         } else {
             s.scheduler.slab.get(invoker).cspace_root
@@ -1890,7 +1942,17 @@ fn decode_untyped_retype(
             seL4_Error::seL4_FailedLookup)))?;
         let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
         let src_slot_index = src_res.slot_index;
-        let cnode_slots = &mut s.cnodes[cnode_idx].0;
+        // Borrow as raw slice so we don't lock the whole `s` —
+        // the surrounding code needs separate access to
+        // `s.scheduler` etc. BKL serialises kernel state.
+        let cnode_slots: &mut [Cte] = {
+            let raw = match s.cnode_slots_at_mut(cnode_idx) {
+                Some(s) => s as *mut [Cte],
+                None => return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability))),
+            };
+            &mut *raw
+        };
 
         // Verify the destination range is empty — Retype refuses
         // to overwrite caps. Use the dest CNode cap's logical radix,
@@ -2002,9 +2064,19 @@ fn decode_untyped_retype(
                         }
                     }
                     Cap::CNode { radix, guard_size, guard, .. } => {
-                        match (*s_ptr).alloc_cnode() {
-                            Some(i) => Cap::CNode {
-                                ptr: KernelState::cnode_ptr(i),
+                        // Pick small pool for radix ≤ SMALL_CNODE_RADIX
+                        // (CSPACE0001's 64 radix-1 CNodes etc.). Fall
+                        // back to big pool if small is full or radix
+                        // exceeds the small pool's capacity.
+                        let alloc = if radix <= crate::kernel::SMALL_CNODE_RADIX {
+                            (*s_ptr).alloc_small_cnode()
+                                .or_else(|| (*s_ptr).alloc_cnode())
+                        } else {
+                            (*s_ptr).alloc_cnode()
+                        };
+                        match alloc {
+                            Some(vi) => Cap::CNode {
+                                ptr: KernelState::cnode_ptr(vi),
                                 radix,
                                 guard_size,
                                 guard,
@@ -2115,7 +2187,9 @@ fn decode_untyped_retype(
         if let Ok(res) = source_resolved {
             if res.bits_remaining == 0 {
                 let src_idx = KernelState::cnode_index(res.slot_ptr);
-                s.cnodes[src_idx].0[res.slot_index].set_cap(&state.to_cap());
+                if let Some(slot) = s.cnode_slot_mut(src_idx, res.slot_index) {
+                    slot.set_cap(&state.to_cap());
+                }
             }
         }
     }
@@ -2213,19 +2287,23 @@ fn cnode_rotate(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
                 seL4_Error::seL4_IllegalOperation)));
         }
         // src must be non-empty.
-        let src_cap = s.cnodes[src_cn].0[src_si].cap();
+        let src_cap = s.cnode_slot(src_cn, src_si)
+            .map(|c| c.cap()).unwrap_or(Cap::Null);
         if src_cap.is_null() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_FailedLookup)));
         }
         // dest must be empty unless dest == src (swap with self).
         if !(dest_cn == src_cn && dest_si == src_si) {
-            if !s.cnodes[dest_cn].0[dest_si].cap().is_null() {
+            let dest_occupied = s.cnode_slot(dest_cn, dest_si)
+                .map(|c| !c.cap().is_null()).unwrap_or(false);
+            if dest_occupied {
                 return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_DeleteFirst)));
             }
         }
-        let pivot_cap = s.cnodes[pivot_cn].0[pivot_si].cap();
+        let pivot_cap = s.cnode_slot(pivot_cn, pivot_si)
+            .map(|c| c.cap()).unwrap_or(Cap::Null);
         if pivot_cap.is_null() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_FailedLookup)));
@@ -2234,11 +2312,17 @@ fn cnode_rotate(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         // Order of writes matters when dest == src: clear src first
         // would lose the cap. Do dest assignment first; only clear
         // src if it's a distinct slot.
-        s.cnodes[dest_cn].0[dest_si].set_cap(&src_cap);
-        s.cnodes[pivot_cn].0[pivot_si].set_cap(&pivot_cap);
+        if let Some(slot) = s.cnode_slot_mut(dest_cn, dest_si) {
+            slot.set_cap(&src_cap);
+        }
+        if let Some(slot) = s.cnode_slot_mut(pivot_cn, pivot_si) {
+            slot.set_cap(&pivot_cap);
+        }
         if !(dest_cn == src_cn && dest_si == src_si) {
-            s.cnodes[src_cn].0[src_si].set_cap(&Cap::Null);
-            s.cnodes[src_cn].0[src_si].set_parent(None);
+            if let Some(slot) = s.cnode_slot_mut(src_cn, src_si) {
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+            }
         }
     }
     Ok(())
@@ -2272,11 +2356,14 @@ fn cnode_cancel_badged_sends(
     unsafe {
         let s = KERNEL.get();
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        if src_index >= s.cnodes[cnode_idx].0.len() {
+        let slot_count = s.cnode_slots_at(cnode_idx)
+            .map(|sl| sl.len()).unwrap_or(0);
+        if src_index >= slot_count {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_RangeError)));
         }
-        let cap = s.cnodes[cnode_idx].0[src_index].cap();
+        let cap = s.cnode_slot(cnode_idx, src_index)
+            .map(|c| c.cap()).unwrap_or(Cap::Null);
         let (ep_idx, badge) = match cap {
             Cap::Endpoint { ptr, badge, .. } => {
                 let i = KernelState::endpoint_index(ptr);
@@ -2336,7 +2423,9 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
     unsafe {
         let s = KERNEL.get();
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        if src_index >= s.cnodes[cnode_idx].0.len() {
+        let cn_slot_count = s.cnode_slots_at(cnode_idx)
+            .map(|sl| sl.len()).unwrap_or(0);
+        if src_index >= cn_slot_count {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_RangeError,
             )));
@@ -2344,38 +2433,78 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         let source_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u16);
 
         // Tombstone bitmap: bit set means "this CTE has been
-        // revoked-or-is-source". Sized to MAX_CNODES * CNODE_SLOTS so
-        // it covers a full radix-12 CNode (sel4test's driver CSpace).
-        // Held in a static (BKL-serialised) so we don't blow the
-        // kernel stack.
+        // revoked-or-is-source". Held in a static (BKL-serialised)
+        // so we don't blow the kernel stack. Split into per-pool
+        // backing arrays sized to each pool's actual capacity —
+        // packing as a single MAX_CNODES * CNODE_SLOTS array would
+        // grow ~3x once the small pool is included.
         const SLOTS_PER_NODE: usize = crate::kernel::CNODE_SLOTS;
-        static mut REVOKED: [[bool; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES] =
+        const SMALL_SLOTS: usize = crate::kernel::SMALL_CNODE_SLOTS;
+        static mut REVOKED_BIG:
+            [[bool; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES] =
             [[false; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES];
-        let revoked = &mut *core::ptr::addr_of_mut!(REVOKED);
-        for row in revoked.iter_mut() {
+        static mut REVOKED_SMALL:
+            [[bool; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES] =
+            [[false; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES];
+        // Reset both pool bitmaps. We touch the statics through raw
+        // pointers below to keep the borrow checker out of the way —
+        // the closures used by the marking + clearing phases need
+        // overlapping reads/writes that &mut won't permit.
+        for row in (&mut *core::ptr::addr_of_mut!(REVOKED_BIG)).iter_mut() {
             for v in row.iter_mut() { *v = false; }
         }
-        revoked[cnode_idx][src_index] = true;
+        for row in (&mut *core::ptr::addr_of_mut!(REVOKED_SMALL)).iter_mut() {
+            for v in row.iter_mut() { *v = false; }
+        }
+        // Helpers: dispatch on virtual cnode index.
+        let is_revoked = |ci: usize, si: usize| -> bool {
+            if ci < crate::kernel::MAX_CNODES {
+                if si < SLOTS_PER_NODE {
+                    (*core::ptr::addr_of!(REVOKED_BIG))[ci][si]
+                } else { false }
+            } else if ci < crate::kernel::KernelState::cnode_pool_count() {
+                let small_i = ci - crate::kernel::MAX_CNODES;
+                if si < SMALL_SLOTS {
+                    (*core::ptr::addr_of!(REVOKED_SMALL))[small_i][si]
+                } else { false }
+            } else {
+                false
+            }
+        };
+        let mark_revoked = |ci: usize, si: usize| {
+            if ci < crate::kernel::MAX_CNODES {
+                if si < SLOTS_PER_NODE {
+                    (*core::ptr::addr_of_mut!(REVOKED_BIG))[ci][si] = true;
+                }
+            } else if ci < crate::kernel::KernelState::cnode_pool_count() {
+                let small_i = ci - crate::kernel::MAX_CNODES;
+                if si < SMALL_SLOTS {
+                    (*core::ptr::addr_of_mut!(REVOKED_SMALL))[small_i][si] = true;
+                }
+            }
+        };
+        mark_revoked(cnode_idx, src_index);
 
         // Iterate to fixed point: any CTE whose parent is revoked
         // gets revoked too. Capacity-bounded — at most
-        // `MAX_CNODES * CNODE_SLOTS` CTEs to mark.
+        // `cnode_pool_count() * CNODE_SLOTS` CTEs to mark.
         let mut progress = true;
         while progress {
             progress = false;
-            for ci in 0..s.cnodes.len() {
-                for si in 0..SLOTS_PER_NODE.min(s.cnodes[ci].0.len()) {
-                    if revoked[ci][si] {
-                        continue;
-                    }
-                    if let Some(p) = s.cnodes[ci].0[si].parent() {
+            for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
+                let slot_count = if ci < crate::kernel::MAX_CNODES {
+                    s.cnodes[ci].0.len()
+                } else {
+                    SMALL_SLOTS
+                };
+                for si in 0..slot_count {
+                    if is_revoked(ci, si) { continue; }
+                    let parent = s.cnode_slot(ci, si).and_then(|c| c.parent());
+                    if let Some(p) = parent {
                         let pi = p.cnode_idx() as usize;
                         let ps = p.slot() as usize;
-                        if pi < crate::kernel::MAX_CNODES
-                            && ps < SLOTS_PER_NODE
-                            && revoked[pi][ps]
-                        {
-                            revoked[ci][si] = true;
+                        if is_revoked(pi, ps) {
+                            mark_revoked(ci, si);
                             progress = true;
                         }
                     }
@@ -2387,101 +2516,117 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // Also reset the child_count for both the cleared slot
         // (no longer holds anything that has children) and decrement
         // the parent's count (we just removed one of its children).
-        for ci in 0..s.cnodes.len() {
-            for si in 0..SLOTS_PER_NODE.min(s.cnodes[ci].0.len()) {
-                if revoked[ci][si]
-                    && !(ci == cnode_idx && si == src_index)
+        for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
+            let slot_count = if ci < crate::kernel::MAX_CNODES {
+                s.cnodes[ci].0.len()
+            } else {
+                SMALL_SLOTS
+            };
+            for si in 0..slot_count {
+                if !is_revoked(ci, si)
+                    || (ci == cnode_idx && si == src_index)
                 {
-                    let id = crate::cte::MdbId::pack(ci as u8, si as u16);
-                    child_count_reset(id);
-                    // Phase 43 — free pool slots so long sel4test
-                    // runs don't exhaust the static pools. Only the
-                    // FIRST cap (where the object was retyped from
-                    // an Untyped) does the free; copies via Mint
-                    // would call free again for the same pool slot
-                    // which is harmless (free is idempotent).
-                    let cap_to_free = s.cnodes[ci].0[si].cap();
-                    // Phase 43 — only free the underlying object when
-                    // no OTHER live cap points at the same pointer.
-                    // Mint/Copy create derivative caps that share the
-                    // object — freeing on every delete wipes the EP /
-                    // Notification / etc. while the master cap still
-                    // refers to it. CANCEL_BADGED_SENDS_0001 hit this:
-                    // revoking a badged endpoint cap reset the master
-                    // endpoint, dropping all 32 queued senders.
-                    // `KernelState::*_ptr` use the same `(i+1)`
-                    // encoding scheme across pools, so TCB id N
-                    // collides with Endpoint index N-1, etc. Match
-                    // discriminator + ptr to keep cross-type
-                    // collisions out.
-                    let same_obj_lives = |target: &Cap| -> bool {
-                        let (want_disc, want_ptr) = match target {
-                            Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
-                            Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
-                            Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
-                            Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
-                            Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
-                            Cap::Thread { tcb } => (6u8, tcb.addr()),
-                            _ => return false,
-                        };
-                        // For CNode caps: skip self-references inside
-                        // the CNode itself; they become unreachable
-                        // once the last external ref is gone.
-                        let target_self_cnode_idx = match target {
-                            Cap::CNode { ptr, .. } =>
-                                Some(KernelState::cnode_index(*ptr)),
-                            _ => None,
-                        };
-                        for ci2 in 0..s.cnodes.len() {
-                            if Some(ci2) == target_self_cnode_idx { continue; }
-                            for si2 in 0..SLOTS_PER_NODE.min(s.cnodes[ci2].0.len()) {
-                                if ci2 == ci && si2 == si { continue; }
-                                if revoked[ci2][si2] { continue; }
-                                let (other_disc, other_ptr) =
-                                    match s.cnodes[ci2].0[si2].cap()
-                                {
-                                    Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
-                                    Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
-                                    Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
-                                    Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
-                                    Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
-                                    Cap::Thread { tcb } => (6u8, tcb.addr()),
-                                    _ => continue,
-                                };
-                                if other_disc == want_disc && other_ptr == want_ptr {
-                                    return true;
-                                }
-                            }
-                        }
-                        false
+                    continue;
+                }
+                let id = crate::cte::MdbId::pack(ci as u8, si as u16);
+                child_count_reset(id);
+                // Phase 43 — free pool slots so long sel4test
+                // runs don't exhaust the static pools. Only the
+                // FIRST cap (where the object was retyped from
+                // an Untyped) does the free; copies via Mint
+                // would call free again for the same pool slot
+                // which is harmless (free is idempotent).
+                let cap_to_free = s.cnode_slot(ci, si)
+                    .map(|c| c.cap())
+                    .unwrap_or(Cap::Null);
+                // Phase 43 — only free the underlying object when
+                // no OTHER live cap points at the same pointer.
+                // Mint/Copy create derivative caps that share the
+                // object — freeing on every delete wipes the EP /
+                // Notification / etc. while the master cap still
+                // refers to it. CANCEL_BADGED_SENDS_0001 hit this:
+                // revoking a badged endpoint cap reset the master
+                // endpoint, dropping all 32 queued senders.
+                // `KernelState::*_ptr` use the same `(i+1)`
+                // encoding scheme across pools, so TCB id N
+                // collides with Endpoint index N-1, etc. Match
+                // discriminator + ptr to keep cross-type
+                // collisions out.
+                let same_obj_lives = |target: &Cap| -> bool {
+                    let (want_disc, want_ptr) = match target {
+                        Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
+                        Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
+                        Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
+                        Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
+                        Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
+                        Cap::Thread { tcb } => (6u8, tcb.addr()),
+                        _ => return false,
                     };
-                    if !same_obj_lives(&cap_to_free) {
-                        match cap_to_free {
-                            Cap::Thread { tcb } => {
-                                let id = crate::tcb::TcbId(tcb.addr() as u16);
-                                destroy_tcb(s, id);
+                    // For CNode caps: skip self-references inside
+                    // the CNode itself; they become unreachable
+                    // once the last external ref is gone.
+                    let target_self_cnode_idx = match target {
+                        Cap::CNode { ptr, .. } =>
+                            Some(KernelState::cnode_index(*ptr)),
+                        _ => None,
+                    };
+                    for ci2 in 0..crate::kernel::KernelState::cnode_pool_count() {
+                        if Some(ci2) == target_self_cnode_idx { continue; }
+                        let inner_count = if ci2 < crate::kernel::MAX_CNODES {
+                            s.cnodes[ci2].0.len()
+                        } else {
+                            SMALL_SLOTS
+                        };
+                        for si2 in 0..inner_count {
+                            if ci2 == ci && si2 == si { continue; }
+                            if is_revoked(ci2, si2) { continue; }
+                            let other_cap = s.cnode_slot(ci2, si2)
+                                .map(|c| c.cap())
+                                .unwrap_or(Cap::Null);
+                            let (other_disc, other_ptr) = match other_cap {
+                                Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
+                                Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
+                                Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
+                                Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
+                                Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
+                                Cap::Thread { tcb } => (6u8, tcb.addr()),
+                                _ => continue,
+                            };
+                            if other_disc == want_disc && other_ptr == want_ptr {
+                                return true;
                             }
-                            Cap::Endpoint { ptr, .. } => {
-                                s.free_endpoint(KernelState::endpoint_index(ptr));
-                            }
-                            Cap::Notification { ptr, .. } => {
-                                s.free_notification(KernelState::ntfn_index(ptr));
-                            }
-                            Cap::SchedContext { ptr, .. } => {
-                                s.free_sched_context(
-                                    KernelState::sched_context_index(ptr));
-                            }
-                            Cap::Reply { ptr, .. } => {
-                                s.free_reply(KernelState::reply_index(ptr));
-                            }
-                            Cap::CNode { ptr, .. } => {
-                                s.free_cnode(KernelState::cnode_index(ptr));
-                            }
-                            _ => {}
                         }
                     }
-                    s.cnodes[ci].0[si].set_cap(&Cap::Null);
-                    s.cnodes[ci].0[si].set_parent(None);
+                    false
+                };
+                if !same_obj_lives(&cap_to_free) {
+                    match cap_to_free {
+                        Cap::Thread { tcb } => {
+                            let id = crate::tcb::TcbId(tcb.addr() as u16);
+                            destroy_tcb(s, id);
+                        }
+                        Cap::Endpoint { ptr, .. } => {
+                            s.free_endpoint(KernelState::endpoint_index(ptr));
+                        }
+                        Cap::Notification { ptr, .. } => {
+                            s.free_notification(KernelState::ntfn_index(ptr));
+                        }
+                        Cap::SchedContext { ptr, .. } => {
+                            s.free_sched_context(
+                                KernelState::sched_context_index(ptr));
+                        }
+                        Cap::Reply { ptr, .. } => {
+                            s.free_reply(KernelState::reply_index(ptr));
+                        }
+                        Cap::CNode { ptr, .. } => {
+                            s.free_cnode_virt(KernelState::cnode_index(ptr));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(slot) = s.cnode_slot_mut(ci, si) {
+                    slot.set_cap(&Cap::Null);
+                    slot.set_parent(None);
                 }
             }
         }
@@ -2499,14 +2644,17 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // back to 0 so the next Retype starts from the bottom of the
         // block. Otherwise the second test's allocations exhaust the
         // untyped even though the memory is now free.
-        let source = s.cnodes[cnode_idx].0[src_index].cap();
+        let source = s.cnode_slot(cnode_idx, src_index)
+            .map(|c| c.cap()).unwrap_or(Cap::Null);
         if let Cap::Untyped { ptr, block_bits, is_device, .. } = source {
-            s.cnodes[cnode_idx].0[src_index].set_cap(&Cap::Untyped {
-                ptr,
-                block_bits,
-                free_index: 0,
-                is_device,
-            });
+            if let Some(slot) = s.cnode_slot_mut(cnode_idx, src_index) {
+                slot.set_cap(&Cap::Untyped {
+                    ptr,
+                    block_bits,
+                    free_index: 0,
+                    is_device,
+                });
+            }
         }
     }
     Ok(())
@@ -2604,8 +2752,11 @@ fn cnode_copy_or_mint(
         }
         let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
 
-        let mut copy = s.cnodes[src_cnode_idx].0[src_res.slot_index].cap();
-        if !s.cnodes[dest_cnode_idx].0[dest_res.slot_index].cap().is_null() {
+        let mut copy = s.cnode_slot(src_cnode_idx, src_res.slot_index)
+            .map(|c| c.cap()).unwrap_or(Cap::Null);
+        let dest_occupied = s.cnode_slot(dest_cnode_idx, dest_res.slot_index)
+            .map(|c| !c.cap().is_null()).unwrap_or(false);
+        if dest_occupied {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst)));
         }
@@ -2678,13 +2829,15 @@ fn cnode_copy_or_mint(
                 _ => {}
             }
         }
-        s.cnodes[dest_cnode_idx].0[dest_res.slot_index].set_cap(&copy);
-        // Phase 30 — the new cap is derived from the source slot;
-        // its MDB parent is the source CTE.
-        let src_id = crate::cte::MdbId::pack(
-            src_cnode_idx as u8, src_res.slot_index as u16);
-        s.cnodes[dest_cnode_idx].0[dest_res.slot_index].set_parent(Some(src_id));
-        child_count_inc(src_id, 1);
+        if let Some(slot) = s.cnode_slot_mut(dest_cnode_idx, dest_res.slot_index) {
+            slot.set_cap(&copy);
+            // Phase 30 — the new cap is derived from the source slot;
+            // its MDB parent is the source CTE.
+            let src_id = crate::cte::MdbId::pack(
+                src_cnode_idx as u8, src_res.slot_index as u16);
+            slot.set_parent(Some(src_id));
+            child_count_inc(src_id, 1);
+        }
     }
     Ok(())
 }
@@ -2751,11 +2904,14 @@ fn cnode_move(
         // Snapshot src cap before mutating either slot — both might
         // be in the same CNode, in which case the borrow checker
         // would object to two simultaneous &mut on the same array.
-        let src_cap = s.cnodes[src_cnode_idx].0[src_res.slot_index].cap();
+        let src_cap = s.cnode_slot(src_cnode_idx, src_res.slot_index)
+            .map(|c| c.cap()).unwrap_or(Cap::Null);
         // Upstream order: dest-not-empty check first (DeleteFirst),
         // then src-empty check (FailedLookup). Matches sel4test's
         // `is_slot_empty` helper in helpers.c.
-        if !s.cnodes[dest_cnode_idx].0[dest_res.slot_index].cap().is_null() {
+        let dest_occupied = s.cnode_slot(dest_cnode_idx, dest_res.slot_index)
+            .map(|c| !c.cap().is_null()).unwrap_or(false);
+        if dest_occupied {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst)));
         }
@@ -2763,8 +2919,12 @@ fn cnode_move(
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_FailedLookup)));
         }
-        s.cnodes[dest_cnode_idx].0[dest_res.slot_index].set_cap(&src_cap);
-        s.cnodes[src_cnode_idx].0[src_res.slot_index].set_cap(&Cap::Null);
+        if let Some(slot) = s.cnode_slot_mut(dest_cnode_idx, dest_res.slot_index) {
+            slot.set_cap(&src_cap);
+        }
+        if let Some(slot) = s.cnode_slot_mut(src_cnode_idx, src_res.slot_index) {
+            slot.set_cap(&Cap::Null);
+        }
     }
     Ok(())
 }
@@ -2850,11 +3010,15 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // Snapshot the cap + parent edge BEFORE clearing — the
         // Untyped reclaim below needs them to know what to give
         // back and to whom.
-        let deleted_cap = s.cnodes[cnode_idx].0[res.slot_index].cap();
-        let parent_id = s.cnodes[cnode_idx].0[res.slot_index].parent();
+        let (deleted_cap, parent_id) = match s.cnode_slot(cnode_idx, res.slot_index) {
+            Some(c) => (c.cap(), c.parent()),
+            None => (Cap::Null, None),
+        };
 
-        s.cnodes[cnode_idx].0[res.slot_index].set_cap(&Cap::Null);
-        s.cnodes[cnode_idx].0[res.slot_index].set_parent(None);
+        if let Some(slot) = s.cnode_slot_mut(cnode_idx, res.slot_index) {
+            slot.set_cap(&Cap::Null);
+            slot.set_parent(None);
+        }
 
         // Phase 43 — deleting the LAST cap to a TCB triggers thread
         // destruction in upstream seL4. We approximate: on every
@@ -2891,13 +3055,16 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 Cap::CNode { ptr, .. } => Some(KernelState::cnode_index(*ptr)),
                 _ => None,
             };
-            for ci in 0..s.cnodes.len() {
+            for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
                 if Some(ci) == target_self_cnode_idx { continue; }
-                for si in 0..crate::kernel::CNODE_SLOTS
-                    .min(s.cnodes[ci].0.len())
-                {
+                let inner_count = s.cnode_slots_at(ci)
+                    .map(|sl| sl.len())
+                    .unwrap_or(0);
+                for si in 0..inner_count {
                     if ci == cnode_idx && si == res.slot_index { continue; }
-                    let (other_disc, other_ptr) = match s.cnodes[ci].0[si].cap() {
+                    let other_cap = s.cnode_slot(ci, si)
+                        .map(|c| c.cap()).unwrap_or(Cap::Null);
+                    let (other_disc, other_ptr) = match other_cap {
                         Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
                         Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
                         Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
@@ -2961,13 +3128,17 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                     // basic_set_up fails on Untyped exhaustion after
                     // a handful of test processes.
                     let inner_idx = KernelState::cnode_index(ptr);
+                    let inner_slot_count = s.cnode_slots_at(inner_idx)
+                        .map(|sl| sl.len())
+                        .unwrap_or(0);
                     {
-                    if inner_idx < s.cnodes.len() {
-                        for slot_i in 0..s.cnodes[inner_idx].0.len() {
-                            let inner_cap =
-                                s.cnodes[inner_idx].0[slot_i].cap();
-                            let inner_parent =
-                                s.cnodes[inner_idx].0[slot_i].parent();
+                    if inner_slot_count > 0 {
+                        for slot_i in 0..inner_slot_count {
+                            let inner_slot = s.cnode_slot(inner_idx, slot_i);
+                            let (inner_cap, inner_parent) = match inner_slot {
+                                Some(c) => (c.cap(), c.parent()),
+                                None => continue,
+                            };
                             // Skip Null and self-references (the CNode
                             // having a cap to itself). Also skip caps
                             // that have other live references — same
@@ -2981,10 +3152,11 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                             }
                             // Borrow re-check across the closure call.
                             let mut other_ref = false;
-                            'scan: for ci2 in 0..s.cnodes.len() {
-                                for si2 in 0..crate::kernel::CNODE_SLOTS
-                                    .min(s.cnodes[ci2].0.len())
-                                {
+                            'scan: for ci2 in 0..crate::kernel::KernelState::cnode_pool_count() {
+                                let inner_count = s.cnode_slots_at(ci2)
+                                    .map(|sl| sl.len())
+                                    .unwrap_or(0);
+                                for si2 in 0..inner_count {
                                     if ci2 == inner_idx && si2 == slot_i { continue; }
                                     let want = match &inner_cap {
                                         Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
@@ -2995,7 +3167,9 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                                         Cap::Thread { tcb } => (6u8, tcb.addr()),
                                         _ => break 'scan,
                                     };
-                                    let (od, op) = match s.cnodes[ci2].0[si2].cap() {
+                                    let other_cap = s.cnode_slot(ci2, si2)
+                                        .map(|c| c.cap()).unwrap_or(Cap::Null);
+                                    let (od, op) = match other_cap {
                                         Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
                                         Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
                                         Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
@@ -3012,8 +3186,10 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                             }
                             // Clear the slot first so a recursive call
                             // that walks cnodes again sees it empty.
-                            s.cnodes[inner_idx].0[slot_i].set_cap(&Cap::Null);
-                            s.cnodes[inner_idx].0[slot_i].set_parent(None);
+                            if let Some(slot) = s.cnode_slot_mut(inner_idx, slot_i) {
+                                slot.set_cap(&Cap::Null);
+                                slot.set_parent(None);
+                            }
                             if !other_ref {
                                 match inner_cap {
                                     Cap::Thread { tcb } => {
@@ -3034,7 +3210,7 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                                         s.free_reply(KernelState::reply_index(p));
                                     }
                                     Cap::CNode { ptr: p, .. } => {
-                                        s.free_cnode(KernelState::cnode_index(p));
+                                        s.free_cnode_virt(KernelState::cnode_index(p));
                                     }
                                     _ => {}
                                 }
@@ -3048,7 +3224,7 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                         }
                     }
                     }
-                    s.free_cnode(inner_idx);
+                    s.free_cnode_virt(inner_idx);
                 }
                 _ => {}
             }
@@ -3176,22 +3352,21 @@ unsafe fn reclaim_untyped_chain_at_tail(
             let s = KERNEL.get();
             let pcn = pid.cnode_idx() as usize;
             let psl = pid.slot() as usize;
-            if pcn < s.cnodes.len() && psl < s.cnodes[pcn].0.len() {
-                if let Cap::Untyped { ptr, block_bits, is_device, .. } =
-                    s.cnodes[pcn].0[psl].cap()
-                {
-                    s.cnodes[pcn].0[psl].set_cap(&Cap::Untyped {
+            let parent_cap = s.cnode_slot(pcn, psl).map(|c| c.cap());
+            let parent_of_parent = s.cnode_slot(pcn, psl).and_then(|c| c.parent());
+            if let Some(Cap::Untyped { ptr, block_bits, is_device, .. }) = parent_cap {
+                if let Some(slot) = s.cnode_slot_mut(pcn, psl) {
+                    slot.set_cap(&Cap::Untyped {
                         ptr, block_bits, free_index: 0, is_device,
                     });
-                    // Walk further up — this level just emptied,
-                    // so the parent's-parent might also have its
-                    // last child gone now. Recurse with this empty
-                    // parent as the deleted-cap.
-                    let parent_of_parent = s.cnodes[pcn].0[psl].parent();
-                    let _ = (deleted_base, deleted_size);
-                    reclaim_untyped_chain_at_tail(
-                        parent_of_parent, ptr.addr(), 1u64 << block_bits);
                 }
+                // Walk further up — this level just emptied,
+                // so the parent's-parent might also have its
+                // last child gone now. Recurse with this empty
+                // parent as the deleted-cap.
+                let _ = (deleted_base, deleted_size);
+                reclaim_untyped_chain_at_tail(
+                    parent_of_parent, ptr.addr(), 1u64 << block_bits);
             }
         }
         return;
@@ -3204,17 +3379,17 @@ unsafe fn reclaim_untyped_chain_at_tail(
         if let Some(pid) = start {
             let pcn = pid.cnode_idx() as usize;
             let psl = pid.slot() as usize;
-            if pcn < s.cnodes.len() && psl < s.cnodes[pcn].0.len() {
-                if let Cap::Untyped { ptr, free_index, .. } = s.cnodes[pcn].0[psl].cap() {
-                    let parent_base = ptr.addr();
-                    let parent_eff_end = parent_base + free_index;
-                    let deleted_end = deleted_base + deleted_size;
-                    // Deleted child's tail is below parent's
-                    // effective end → some other child still holds
-                    // the tail. No shrink possible.
-                    if deleted_end < parent_eff_end {
-                        return;
-                    }
+            if let Some(Cap::Untyped { ptr, free_index, .. }) =
+                s.cnode_slot(pcn, psl).map(|c| c.cap())
+            {
+                let parent_base = ptr.addr();
+                let parent_eff_end = parent_base + free_index;
+                let deleted_end = deleted_base + deleted_size;
+                // Deleted child's tail is below parent's
+                // effective end → some other child still holds
+                // the tail. No shrink possible.
+                if deleted_end < parent_eff_end {
+                    return;
                 }
             }
         }
@@ -3234,10 +3409,10 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
     while let Some(pid) = cursor {
         let pcn = pid.cnode_idx() as usize;
         let psl = pid.slot() as usize;
-        if pcn >= s.cnodes.len() || psl >= s.cnodes[pcn].0.len() {
-            return;
-        }
-        let cap = s.cnodes[pcn].0[psl].cap();
+        let cap = match s.cnode_slot(pcn, psl) {
+            Some(c) => c.cap(),
+            None => return,
+        };
         let (parent_base, parent_block_bits, parent_free_index) = match cap {
             Cap::Untyped { ptr, block_bits, free_index, .. } => {
                 (ptr.addr(), block_bits as u32, free_index)
@@ -3259,9 +3434,14 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
         // child type, so frames/TCBs/EPs/etc. all consume the same
         // parent bytes and need to be tracked here too.
         let mut max_end: u64 = parent_base; // == "no children" sentinel
-        for ci in 0..s.cnodes.len() {
-            for si in 0..s.cnodes[ci].0.len() {
-                let cte = &s.cnodes[ci].0[si];
+        for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
+            let inner_count = s.cnode_slots_at(ci)
+                .map(|sl| sl.len()).unwrap_or(0);
+            for si in 0..inner_count {
+                let cte = match s.cnode_slot(ci, si) {
+                    Some(c) => c,
+                    None => continue,
+                };
                 if cte.parent() != Some(pid) {
                     continue;
                 }
@@ -3305,17 +3485,19 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
         }
         let new_fi = max_end - parent_base;
         // Read the live cap, write back with updated free_index.
-        if let Cap::Untyped { ptr, block_bits, free_index, is_device } =
-            s.cnodes[pcn].0[psl].cap()
+        if let Some(Cap::Untyped { ptr, block_bits, free_index, is_device }) =
+            s.cnode_slot(pcn, psl).map(|c| c.cap())
         {
             if new_fi < free_index {
                 let updated = Cap::Untyped {
                     ptr, block_bits, free_index: new_fi, is_device,
                 };
-                s.cnodes[pcn].0[psl].set_cap(&updated);
+                if let Some(slot) = s.cnode_slot_mut(pcn, psl) {
+                    slot.set_cap(&updated);
+                }
                 // Continue up: maybe the parent's parent also has a
                 // tail to reclaim now that this one shrank.
-                cursor = s.cnodes[pcn].0[psl].parent();
+                cursor = s.cnode_slot(pcn, psl).and_then(|c| c.parent());
                 let _ = parent_end;
                 continue;
             }

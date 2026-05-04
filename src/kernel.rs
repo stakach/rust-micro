@@ -63,6 +63,27 @@ impl Default for CNodePage {
     fn default() -> Self { Self([Cte::null(); CNODE_SLOTS]) }
 }
 
+/// Small CNode pool — radix ≤ 6 (64 slots). Lets CSPACE0001
+/// allocate 64 simultaneous radix-1 CNodes without burning the
+/// 128 KiB-per-slot big pool. 96 entries × 64 slots × 32 bytes
+/// = 192 KiB of static BSS — sized to CSPACE0001's exact 64
+/// demand plus headroom for parallel test churn. Bigger pushes
+/// the kernel image past the 8 MiB virt cap.
+pub const SMALL_CNODE_RADIX: u8 = 6;
+pub const SMALL_CNODE_SLOTS: usize = 1 << SMALL_CNODE_RADIX;
+pub const MAX_SMALL_CNODES: usize = 96;
+/// `MAX_CNODES + MAX_SMALL_CNODES` must fit in MdbId's 8-bit
+/// cnode_idx (0..=254 — 0xFF is part of the SENTINEL). 48 + 96
+/// = 144 ✓.
+const _: () = assert!(MAX_CNODES + MAX_SMALL_CNODES <= 254);
+
+#[repr(C, align(32))]
+pub struct SmallCNodePage(pub [Cte; SMALL_CNODE_SLOTS]);
+
+impl Default for SmallCNodePage {
+    fn default() -> Self { Self([Cte::null(); SMALL_CNODE_SLOTS]) }
+}
+
 pub struct KernelState {
     pub scheduler: Scheduler,
     /// In-kernel endpoint pool. Entry `i` is reachable through a
@@ -84,6 +105,11 @@ pub struct KernelState {
     /// Pre-allocated CNode pool. Same 1-based indexing convention
     /// for `Cap::CNode { ptr, .. }`.
     pub cnodes: [CNodePage; MAX_CNODES],
+    /// Pre-allocated small-CNode pool. Used for CSPACE0001-style
+    /// allocations of many radix-≤6 CNodes that would otherwise
+    /// exhaust the big pool. Virtual cnode_idx range:
+    /// MAX_CNODES..MAX_CNODES+MAX_SMALL_CNODES.
+    pub small_cnodes: [SmallCNodePage; MAX_SMALL_CNODES],
     /// Per-IRQ binding table.
     pub irqs: IrqTable,
 
@@ -97,6 +123,7 @@ pub struct KernelState {
     pub next_endpoint: usize,
     pub next_notification: usize,
     pub next_cnode: usize,
+    pub next_small_cnode: usize,
     pub next_sched_context: usize,
     pub next_reply: usize,
 }
@@ -108,6 +135,7 @@ struct PoolBitmaps {
     pub endpoints: [u64; (MAX_ENDPOINTS + 63) / 64],
     pub notifications: [u64; (MAX_NTFNS + 63) / 64],
     pub cnodes: [u64; (MAX_CNODES + 63) / 64],
+    pub small_cnodes: [u64; (MAX_SMALL_CNODES + 63) / 64],
     pub replies: [u64; (MAX_REPLIES + 63) / 64],
 }
 
@@ -115,6 +143,7 @@ static mut POOL_BITMAPS: PoolBitmaps = PoolBitmaps {
     endpoints: [0; (MAX_ENDPOINTS + 63) / 64],
     notifications: [0; (MAX_NTFNS + 63) / 64],
     cnodes: [0; (MAX_CNODES + 63) / 64],
+    small_cnodes: [0; (MAX_SMALL_CNODES + 63) / 64],
     replies: [0; (MAX_REPLIES + 63) / 64],
 };
 
@@ -123,6 +152,8 @@ impl KernelState {
         const EMPTY_EP: Endpoint = Endpoint::new();
         const EMPTY_NT: Notification = Notification::new();
         const EMPTY_CN: CNodePage = CNodePage([Cte::null(); CNODE_SLOTS]);
+        const EMPTY_SCN: SmallCNodePage =
+            SmallCNodePage([Cte::null(); SMALL_CNODE_SLOTS]);
         const EMPTY_SC: crate::sched_context::SchedContext =
             crate::sched_context::SchedContext::new(0, 0);
         const EMPTY_REPLY: crate::reply::Reply = crate::reply::Reply::new();
@@ -131,6 +162,7 @@ impl KernelState {
             endpoints: [EMPTY_EP; MAX_ENDPOINTS],
             notifications: [EMPTY_NT; MAX_NTFNS],
             cnodes: [EMPTY_CN; MAX_CNODES],
+            small_cnodes: [EMPTY_SCN; MAX_SMALL_CNODES],
             sched_contexts: [EMPTY_SC; MAX_SCHED_CONTEXTS],
             replies: [EMPTY_REPLY; MAX_REPLIES],
             irqs: IrqTable::new(),
@@ -141,6 +173,7 @@ impl KernelState {
             next_endpoint: 4,
             next_notification: 0,
             next_cnode: 4,
+            next_small_cnode: 0,
             next_sched_context: 0,
             next_reply: 0,
         }
@@ -241,6 +274,18 @@ impl KernelState {
         }
     }
 
+    /// Pool-aware free for a virtual cnode index. Dispatches to
+    /// `free_cnode` (big pool) or `free_small_cnode` (small pool)
+    /// based on `vi`. Use this from cap-delete paths so callers
+    /// don't have to know which pool a `Cap::CNode` lives in.
+    pub fn free_cnode_virt(&mut self, vi: usize) {
+        if vi < MAX_CNODES {
+            self.free_cnode(vi);
+        } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
+            self.free_small_cnode(vi);
+        }
+    }
+
     /// Claim a CNode index whose contents were populated by code
     /// outside the alloc_cnode path (e.g. the rootserver's CNode at
     /// boot). Without this, the in-use bitmap doesn't see the CNode
@@ -253,6 +298,90 @@ impl KernelState {
                 self.next_cnode = i + 1;
             }
         }
+    }
+
+    /// Allocate a slot from the small CNode pool. Returns the
+    /// VIRTUAL cnode_idx (`MAX_CNODES + small_idx`) so callers
+    /// can use `cnode_ptr_virt(virt_idx)` and `cnode_slots(virt_idx)`
+    /// uniformly across both pools.
+    pub fn alloc_small_cnode(&mut self) -> Option<usize> {
+        for i in 0..self.next_small_cnode.min(MAX_SMALL_CNODES) {
+            if !self.small_cnode_in_use(i) {
+                for slot in self.small_cnodes[i].0.iter_mut() {
+                    slot.set_cap(&Cap::Null);
+                    slot.set_parent(None);
+                }
+                self.set_small_cnode_in_use(i, true);
+                return Some(MAX_CNODES + i);
+            }
+        }
+        if self.next_small_cnode < MAX_SMALL_CNODES {
+            let i = self.next_small_cnode;
+            self.next_small_cnode += 1;
+            for slot in self.small_cnodes[i].0.iter_mut() {
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+            }
+            self.set_small_cnode_in_use(i, true);
+            return Some(MAX_CNODES + i);
+        }
+        None
+    }
+
+    /// Free a small CNode slot. `virt_idx` is the VIRTUAL index
+    /// (must be in `MAX_CNODES..MAX_CNODES+MAX_SMALL_CNODES`).
+    pub fn free_small_cnode(&mut self, virt_idx: usize) {
+        if virt_idx >= MAX_CNODES
+            && virt_idx < MAX_CNODES + MAX_SMALL_CNODES
+        {
+            let i = virt_idx - MAX_CNODES;
+            for slot in self.small_cnodes[i].0.iter_mut() {
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+            }
+            self.set_small_cnode_in_use(i, false);
+        }
+    }
+
+    /// Total virtual cnode count = big + small. Used by revoke /
+    /// delete walks that need to scan both pools.
+    pub const fn cnode_pool_count() -> usize {
+        MAX_CNODES + MAX_SMALL_CNODES
+    }
+
+    /// Backing slot slice for virtual cnode index `vi`.
+    /// Dispatches to either `cnodes[vi]` (big) or
+    /// `small_cnodes[vi - MAX_CNODES]` (small).
+    pub fn cnode_slots_at(&self, vi: usize) -> Option<&[Cte]> {
+        if vi < MAX_CNODES {
+            self.cnodes.get(vi).map(|p| &p.0[..])
+        } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
+            self.small_cnodes.get(vi - MAX_CNODES).map(|p| &p.0[..])
+        } else {
+            None
+        }
+    }
+
+    pub fn cnode_slots_at_mut(&mut self, vi: usize) -> Option<&mut [Cte]> {
+        if vi < MAX_CNODES {
+            self.cnodes.get_mut(vi).map(|p| &mut p.0[..])
+        } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
+            self.small_cnodes
+                .get_mut(vi - MAX_CNODES)
+                .map(|p| &mut p.0[..])
+        } else {
+            None
+        }
+    }
+
+    /// Convenience accessor: a single Cte at `(vi, si)`.
+    pub fn cnode_slot(&self, vi: usize, si: usize) -> Option<&Cte> {
+        self.cnode_slots_at(vi).and_then(|s| s.get(si))
+    }
+    pub fn cnode_slot_mut(&mut self, vi: usize, si: usize)
+        -> Option<&mut Cte>
+    {
+        self.cnode_slots_at_mut(vi).and_then(|s| s.get_mut(si))
     }
 
     // Phase 43 — bitmap-based "in-use" tracking for pool recycling.
@@ -280,6 +409,15 @@ impl KernelState {
     fn set_cnode_in_use(&self, i: usize, v: bool) {
         unsafe {
             let w = &mut POOL_BITMAPS.cnodes[i / 64];
+            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+        }
+    }
+    fn small_cnode_in_use(&self, i: usize) -> bool {
+        unsafe { (POOL_BITMAPS.small_cnodes[i / 64] >> (i % 64)) & 1 == 1 }
+    }
+    fn set_small_cnode_in_use(&self, i: usize, v: bool) {
+        unsafe {
+            let w = &mut POOL_BITMAPS.small_cnodes[i / 64];
             if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
         }
     }
@@ -387,10 +525,19 @@ impl KernelState {
         // synthesized addr even, otherwise odd-`i` slots round-trip
         // through the cap encoding to a different slab index. Use a
         // 2-byte stride: i=0→addr=2, i=1→addr=4, etc.
+        //
+        // `i` is the *virtual* cnode index — the same encoding covers
+        // both the big pool (i ∈ [0, MAX_CNODES)) and the small pool
+        // (i ∈ [MAX_CNODES, MAX_CNODES + MAX_SMALL_CNODES)). Dispatch
+        // happens in `cnode_slots_at`.
         PPtr::<CNodeStorage>::new(((i as u64) + 1) << 1).expect("non-zero")
     }
     pub fn cnode_index(p: PPtr<CNodeStorage>) -> usize {
         ((p.addr() >> 1) - 1) as usize
+    }
+    /// Returns true if `vi` indexes the small pool.
+    pub const fn is_small_cnode_idx(vi: usize) -> bool {
+        vi >= MAX_CNODES && vi < MAX_CNODES + MAX_SMALL_CNODES
     }
 
     pub fn ntfn_ptr(i: usize) -> PPtr<NotificationObj> {
@@ -415,10 +562,10 @@ impl KernelState {
 impl CSpace for KernelState {
     fn cnode_at(&self, ptr: PPtr<CNodeStorage>, count: usize) -> Option<&[Cte]> {
         let idx = Self::cnode_index(ptr);
-        let page = self.cnodes.get(idx)?;
-        let slots = &page.0;
-        // Caller may ask for fewer than CNODE_SLOTS — lookup_cap
-        // bounds the slice on `slot_count = 1 << radix`.
+        let slots = self.cnode_slots_at(idx)?;
+        // Caller may ask for fewer than the backing storage capacity —
+        // lookup_cap bounds the slice on `slot_count = 1 << radix`.
+        // Both pools use the same dispatch via `cnode_slots_at`.
         Some(&slots[..count.min(slots.len())])
     }
 }
@@ -492,7 +639,40 @@ pub mod spec {
         bootstrap_registers_boot_thread();
         scheduler_state_persists_across_calls();
         claim_cnode_pins_directly_initialised_slot();
+        small_cnode_pool_alloc_free_dispatch();
         arch::log("KernelState tests completed\n");
+    }
+
+    /// Phase 43 — small CNode pool. `alloc_small_cnode` returns a
+    /// VIRTUAL index ≥ MAX_CNODES that `cnode_slots_at` dispatches to
+    /// `small_cnodes[]`. CSPACE0001 in sel4test relies on having 64
+    /// simultaneous radix-1 CNodes; the big pool's 48-slot cap can't
+    /// fit them and the kernel virt range can't grow further.
+    #[inline(never)]
+    fn small_cnode_pool_alloc_free_dispatch() {
+        unsafe {
+            let s = KERNEL.get();
+            let vi = s.alloc_small_cnode().expect("alloc_small_cnode");
+            assert!(vi >= MAX_CNODES,
+                "small alloc returned virtual index {} (must be >= MAX_CNODES={})",
+                vi, MAX_CNODES);
+            assert!(vi < MAX_CNODES + MAX_SMALL_CNODES);
+            // `cnode_slots_at` must dispatch to the small backing array
+            // and surface SMALL_CNODE_SLOTS slots (not CNODE_SLOTS).
+            let slots = s.cnode_slots_at(vi).expect("slots present");
+            assert_eq!(slots.len(), SMALL_CNODE_SLOTS,
+                "small pool slot dispatch wrong: got {} slots, expected {}",
+                slots.len(), SMALL_CNODE_SLOTS);
+            // PPtr round-trip: encoding a small virtual index and
+            // decoding it must come back to the same virtual index.
+            let ptr = KernelState::cnode_ptr(vi);
+            assert_eq!(KernelState::cnode_index(ptr), vi);
+            assert!(KernelState::is_small_cnode_idx(vi));
+            s.free_small_cnode(vi);
+            assert!(!s.small_cnode_in_use(vi - MAX_CNODES));
+            arch::log(
+                "  \u{2713} small CNode pool alloc/free dispatch via virtual index\n");
+        }
     }
 
     /// Phase 43 — `claim_cnode` must mark a directly-initialised CNode

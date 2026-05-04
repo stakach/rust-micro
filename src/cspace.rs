@@ -163,20 +163,21 @@ pub fn resolve_address_bits<C: CSpace>(
 
 /// Convenience wrapper: resolve a full `WORD_BITS`-deep CPtr starting
 /// from the given root cap, then fetch the cap stored at that slot.
+///
+/// Upstream `lookupCapAndSlot` treats "ran out of CNode-cap intermediates
+/// before consuming all bits" as a SUCCESSFUL lookup that returns the
+/// last-visited slot's cap (commonly `Cap::Null`). Only guard mismatches
+/// and `InvalidRoot` actually surface as `LookupFault`. CSPACE0001's
+/// chain-of-radix-1-CNodes test exercises this: probing cptr 0 walks
+/// `cnode[0] → slot 0 (CNode) → cnode[1] → slot 0 (Null)` and expects
+/// `seL4_InvalidCapability` back from the dispatch on `Null`, not a
+/// fault.
 pub fn lookup_cap<C: CSpace>(
     cspace: &C,
     root: &Cap,
     cptr: Word,
 ) -> Result<Cap, LookupFault> {
     let res = resolve_address_bits(cspace, root, cptr, WORD_BITS)?;
-    if res.bits_remaining != 0 {
-        // Per seL4 `lookupSlotForCNodeOp`, leftover bits with a slot
-        // resolution count as a depth mismatch from the user's POV.
-        return Err(LookupFault::DepthMismatch {
-            bits_left: 0,
-            bits_found: res.bits_remaining,
-        });
-    }
     let slots = cspace
         .cnode_at(res.slot_ptr, res.slot_count)
         .ok_or(LookupFault::InvalidRoot)?;
@@ -390,10 +391,16 @@ pub mod spec {
         let slots = cspace.cnode_at(res.slot_ptr, 16).unwrap();
         assert_eq!(slots[res.slot_index].cap(), target);
 
-        // And `lookup_cap` itself rejects this with a depth mismatch.
+        // And `lookup_cap` returns the endpoint cap — upstream's
+        // semantics treat "ran out of CNode intermediates with bits
+        // left" as success returning the slot's cap (Null typically,
+        // but here it's the endpoint we planted). CSPACE0001 in
+        // sel4test relies on this: probing `cptr 0` through a chain
+        // of single-slot CNodes lands on Null and the dispatcher
+        // turns Null into seL4_InvalidCapability.
         match lookup_cap(&cspace, &root, cptr) {
-            Err(LookupFault::DepthMismatch { bits_left: 0, bits_found: 4 }) => {}
-            other => panic!("expected DepthMismatch from lookup_cap, got {:?}", other),
+            Ok(c) => assert_eq!(c, target),
+            other => panic!("expected target cap from lookup_cap, got {:?}", other),
         }
         arch::log("  ✓ traversal stops early at non-CNode caps\n");
     }

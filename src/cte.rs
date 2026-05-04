@@ -28,7 +28,7 @@ pub struct Cte {
 impl Cte {
     pub const SIZE_BYTES: usize = 32;
 
-    /// A null CTE: null cap, parent = None (sentinel 0xFFFF).
+    /// A null CTE: null cap, parent = None (sentinel `MdbId::SENTINEL`).
     /// Without the parent sentinel, a freshly-zeroed CTE decodes its
     /// parent as `Some(MdbId(0))` = (cnode 0, slot 0). cnode_revoke on
     /// that slot would then mark every default-parent CTE as a
@@ -37,7 +37,7 @@ impl Cte {
     /// when DOMAINS0001's basic_set_up retypes a fresh page directory
     /// after the rootserver had revoked some innocuous slot 0 cap.
     pub const fn null() -> Self {
-        Self { cap_words: [0; 2], mdb_words: [0xFFFF, 0] }
+        Self { cap_words: [0; 2], mdb_words: [MdbId::SENTINEL as u64, 0] }
     }
 
     /// Convenience constructor used by the specs.
@@ -74,35 +74,42 @@ impl Cte {
     // descendants and exactly that walk is what `Revoke` needs. Phase
     // 30+ can grow the encoding to use the rest of `mdb_words`.
     //
-    // Encoding: low 16 bits of `mdb_words[0]` = packed `MdbId` (see
-    // `mdb_id_pack`). Sentinel `0xFFFF` = "no parent" (a root cap, or
-    // one that pre-dates the MDB).
+    // Encoding: low 20 bits of `mdb_words[0]` = packed `MdbId`
+    // (8-bit cnode_idx + 12-bit slot, see `MdbId::pack`). Sentinel
+    // `MdbId::SENTINEL` = "no parent" (a root cap, or one that
+    // pre-dates the MDB).
 
     pub fn parent(&self) -> Option<MdbId> {
-        let raw = (self.mdb_words[0] & 0xFFFF) as u16;
-        if raw == 0xFFFF { None } else { Some(MdbId(raw)) }
+        let raw = (self.mdb_words[0] & 0xFFFFF) as u32;
+        if raw == MdbId::SENTINEL { None } else { Some(MdbId(raw)) }
     }
 
     pub fn set_parent(&mut self, parent: Option<MdbId>) {
-        let raw = parent.map_or(0xFFFFu16, |p| p.0);
-        self.mdb_words[0] = (self.mdb_words[0] & !0xFFFFu64) | (raw as u64);
+        let raw = parent.map_or(MdbId::SENTINEL, |p| p.0);
+        self.mdb_words[0] = (self.mdb_words[0] & !0xFFFFFu64) | (raw as u64);
     }
 }
 
 /// Packed (cnode_idx, slot) handle on a CTE somewhere in
-/// `KernelState::cnodes`. 4 bits cnode_idx (up to 16 cnodes; we
-/// have MAX_CNODES=4) + 12 bits slot (up to 4096; CNodes are
-/// radix-5 = 32 slots today).
+/// `KernelState`'s big or small CNode pool. 8 bits cnode_idx
+/// (0..256 — enough for MAX_CNODES=48 big + MAX_SMALL_CNODES up
+/// to ~200 small, virtually-indexed) + 12 bits slot (0..4096 —
+/// matches CNODE_SLOTS for the big pool; small pool uses fewer).
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
-pub struct MdbId(pub u16);
+pub struct MdbId(pub u32);
 
 impl MdbId {
-    /// `cnode_idx`: 0..16, `slot`: 0..4096.
+    /// 20 all-ones means "no parent". Picked over (cnode=0xFF,
+    /// slot=0xFFF) so a real cap at the highest virtual cnode +
+    /// last slot is still distinguishable.
+    pub const SENTINEL: u32 = 0xFFFFF;
+
+    /// `cnode_idx`: 0..256, `slot`: 0..4096.
     pub const fn pack(cnode_idx: u8, slot: u16) -> Self {
-        Self(((cnode_idx as u16 & 0xF) << 12) | (slot & 0xFFF))
+        Self(((cnode_idx as u32) << 12) | (slot as u32 & 0xFFF))
     }
     pub const fn cnode_idx(self) -> u8 { (self.0 >> 12) as u8 }
-    pub const fn slot(self) -> u16 { self.0 & 0xFFF }
+    pub const fn slot(self) -> u16 { (self.0 & 0xFFF) as u16 }
 }
 
 const _: () = assert!(core::mem::size_of::<Cte>() == Cte::SIZE_BYTES);
