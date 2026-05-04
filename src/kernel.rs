@@ -205,6 +205,19 @@ impl KernelState {
     }
 
     pub fn alloc_cnode(&mut self) -> Option<usize> {
+        // Phase 43 — recycle freed slots BEFORE bumping next_cnode, so
+        // the bump-allocator doesn't blow through MAX_CNODES while
+        // there are perfectly good freed slots sitting at low indices.
+        for i in 0..self.next_cnode.min(MAX_CNODES) {
+            if !self.cnode_in_use(i) {
+                for slot in self.cnodes[i].0.iter_mut() {
+                    slot.set_cap(&Cap::Null);
+                    slot.set_parent(None);
+                }
+                self.set_cnode_in_use(i, true);
+                return Some(i);
+            }
+        }
         if self.next_cnode < MAX_CNODES {
             let i = self.next_cnode;
             self.next_cnode += 1;
@@ -214,16 +227,6 @@ impl KernelState {
             }
             self.set_cnode_in_use(i, true);
             return Some(i);
-        }
-        for i in 0..MAX_CNODES {
-            if !self.cnode_in_use(i) {
-                for slot in self.cnodes[i].0.iter_mut() {
-                    slot.set_cap(&Cap::Null);
-                    slot.set_parent(None);
-                }
-                self.set_cnode_in_use(i, true);
-                return Some(i);
-            }
         }
         None
     }
