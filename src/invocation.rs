@@ -251,11 +251,6 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         Cap::Frame { ptr, size, is_device, mapped, .. } => (ptr.addr(), size, is_device, mapped),
         _ => unreachable!(),
     };
-    if !matches!(size, crate::cap::FrameSize::Small) {
-        return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_InvalidArgument,
-        )));
-    }
     let vaddr = args.a2;
     if let Some(prev) = current_mapped {
         // Upstream `decodeX86FrameMapInvocation` allows re-mapping a
@@ -280,7 +275,17 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
 
-    if vaddr & 0xFFF != 0 {
+    // Per-size alignment. Small=4 KiB (12-bit), Large=2 MiB (21-bit),
+    // Huge=1 GiB (30-bit). FRAMEEXPORTS0001 reserves a 1 GiB-aligned
+    // vaddr range so all three sizes share the same base — only the
+    // size_bits-derived stride between mappings matters.
+    let align_bits: u32 = match size {
+        crate::cap::FrameSize::Small => 12,
+        crate::cap::FrameSize::Large => 21,
+        crate::cap::FrameSize::Huge  => 30,
+    };
+    let align_mask = (1u64 << align_bits) - 1;
+    if vaddr & align_mask != 0 {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_AlignmentError,
         )));
@@ -319,17 +324,27 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         asid_for_cap = pml4_info_opt.map(|(_, a)| a).unwrap_or(0);
 
         if let Some(pml4_paddr) = pml4_paddr_opt {
-            if let Err(missing) = usermode::map_user_4k_into_foreign_pml4(
-                pml4_paddr, vaddr, paddr, writable)
-            {
-                // map_user_4k_into_foreign_pml4 returns 1..4 for the
-                // *level whose entry is empty*. The next-higher
-                // table needs to be allocated + installed. Translate
-                // to seL4_MappingFailedLookupLevel() bit-positions:
-                //   missing=1 (PML4 entry empty)  → need PDPT (39)
-                //   missing=2 (PDPT entry empty)  → need PD   (30)
-                //   missing=3 (PD entry empty)    → need PT   (21)
-                //   missing=4 (PT slot busy)      → DeleteFirst.
+            // Dispatch to the right map helper for this Frame size.
+            // Each helper returns the level-empty error code:
+            //   missing=1: PML4 entry empty → need PDPT (level 39)
+            //   missing=2: PDPT entry empty → need PD   (level 30)
+            //   missing=3: PD entry empty   → need PT   (level 21)
+            //   missing=4: leaf slot busy   → DeleteFirst
+            let map_result = match size {
+                crate::cap::FrameSize::Small => {
+                    usermode::map_user_4k_into_foreign_pml4(
+                        pml4_paddr, vaddr, paddr, writable)
+                }
+                crate::cap::FrameSize::Large => {
+                    usermode::map_user_2m_into_foreign_pml4(
+                        pml4_paddr, vaddr, paddr, writable)
+                }
+                crate::cap::FrameSize::Huge => {
+                    usermode::map_user_1g_into_foreign_pml4(
+                        pml4_paddr, vaddr, paddr, writable)
+                }
+            };
+            if let Err(missing) = map_result {
                 if missing == 4 {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_DeleteFirst)));
@@ -346,8 +361,12 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
                 return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_FailedLookup)));
             }
-        } else {
+        } else if matches!(size, crate::cap::FrameSize::Small) {
             usermode::map_user_4k_public(vaddr, paddr, writable);
+        } else {
+            // Legacy microtest path doesn't support Large/Huge.
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidArgument)));
         }
     }
 
@@ -417,8 +436,9 @@ fn pml4_paddr_for_asid(asid: u16) -> u64 {
 }
 
 fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    let (paddr, mapped_vaddr, asid) = match target {
-        Cap::Frame { ptr, mapped, asid, .. } => (ptr.addr(), mapped, asid),
+    let (paddr, size, mapped_vaddr, asid) = match target {
+        Cap::Frame { ptr, size, mapped, asid, .. } =>
+            (ptr.addr(), size, mapped, asid),
         _ => unreachable!(),
     };
 
@@ -434,14 +454,26 @@ fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResu
         unsafe {
             let pml4_paddr = pml4_paddr_for_asid(asid);
             if pml4_paddr != 0 {
-                crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
-                    pml4_paddr, vaddr);
+                match size {
+                    crate::cap::FrameSize::Small => {
+                        crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                            pml4_paddr, vaddr);
+                    }
+                    crate::cap::FrameSize::Large => {
+                        crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
+                            pml4_paddr, vaddr);
+                    }
+                    crate::cap::FrameSize::Huge => {
+                        crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
+                            pml4_paddr, vaddr);
+                    }
+                }
                 crate::smp::shootdown_tlb(vaddr);
             }
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = mapped_vaddr;
+    { let _ = mapped_vaddr; let _ = size; }
 
     // Walk the CSpace and zero the mapping in the matching cap.
     // Match BOTH paddr AND mapped-vaddr — multiple caps in the same
@@ -3085,17 +3117,29 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // user accesses to that vaddr to fault. Without this, the page
         // stays mapped via stale PTE and the test thread silently
         // continues into corrupted state.
-        if let Cap::Frame { ptr, mapped: Some(vaddr), asid, .. } = deleted_cap {
+        if let Cap::Frame { ptr, size, mapped: Some(vaddr), asid, .. } = deleted_cap {
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 let pml4_paddr = pml4_paddr_for_asid(asid);
                 if pml4_paddr != 0 {
-                    crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
-                        pml4_paddr, vaddr);
+                    match size {
+                        crate::cap::FrameSize::Small => {
+                            crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                                pml4_paddr, vaddr);
+                        }
+                        crate::cap::FrameSize::Large => {
+                            crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
+                                pml4_paddr, vaddr);
+                        }
+                        crate::cap::FrameSize::Huge => {
+                            crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
+                                pml4_paddr, vaddr);
+                        }
+                    }
                     crate::smp::shootdown_tlb(vaddr);
                 }
             }
-            let _ = (ptr, asid, vaddr);
+            let _ = (ptr, asid, vaddr, size);
         }
         if !same_obj_lives(&deleted_cap) {
             match deleted_cap {

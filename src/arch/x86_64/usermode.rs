@@ -736,6 +736,138 @@ pub unsafe fn map_user_4k_into_foreign_pml4(
     Ok(())
 }
 
+/// Map a 2 MiB Large frame into a foreign PML4. Walks PML4 → PDPT
+/// → PD and stamps the PD entry with the `PS` bit set, marking it
+/// as a 2 MiB leaf. Returns the same lookup-level error codes as
+/// `map_user_4k_into_foreign_pml4` so the seL4_FailedLookup
+/// `mr2 = level` ABI matches:
+///   Err(1) = PML4 entry empty (need PDPT)
+///   Err(2) = PDPT entry empty (need PD)
+///   Err(4) = PD slot busy (DeleteFirst)
+pub unsafe fn map_user_2m_into_foreign_pml4(
+    pml4_paddr: u64,
+    vaddr: u64,
+    frame_paddr: u64,
+    writable: bool,
+) -> Result<(), u32> {
+    use super::paging::PTE_PS;
+    let pml4 = super::paging::phys_to_lin(
+        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+        return Err(1);
+    }
+    let pdpt = super::paging::phys_to_lin(
+        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
+        return Err(2);
+    }
+    let pd = super::paging::phys_to_lin(
+        pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let cur = core::ptr::read_volatile(pd.add(pd_idx));
+    if cur & PTE_PRESENT != 0 {
+        return Err(4);
+    }
+    let mut flags = PTE_PRESENT | PTE_USER | PTE_PS;
+    if writable {
+        flags |= PTE_RW;
+    }
+    // 2 MiB-aligned paddr: low 21 bits zero.
+    core::ptr::write_volatile(
+        pd.add(pd_idx),
+        (frame_paddr & !((1u64 << 21) - 1)) | flags,
+    );
+    Ok(())
+}
+
+/// Map a 1 GiB Huge frame into a foreign PML4. Walks PML4 → PDPT
+/// and stamps the PDPT entry with `PS` set.
+///   Err(1) = PML4 entry empty (need PDPT)
+///   Err(4) = PDPT slot busy (DeleteFirst)
+pub unsafe fn map_user_1g_into_foreign_pml4(
+    pml4_paddr: u64,
+    vaddr: u64,
+    frame_paddr: u64,
+    writable: bool,
+) -> Result<(), u32> {
+    use super::paging::PTE_PS;
+    let pml4 = super::paging::phys_to_lin(
+        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+        return Err(1);
+    }
+    let pdpt = super::paging::phys_to_lin(
+        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let cur = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+    if cur & PTE_PRESENT != 0 {
+        return Err(4);
+    }
+    let mut flags = PTE_PRESENT | PTE_USER | PTE_PS;
+    if writable {
+        flags |= PTE_RW;
+    }
+    // 1 GiB-aligned paddr: low 30 bits zero.
+    core::ptr::write_volatile(
+        pdpt.add(pdpt_idx),
+        (frame_paddr & !((1u64 << 30) - 1)) | flags,
+    );
+    Ok(())
+}
+
+/// Unmap a 2 MiB Large frame from a specific vspace. Bails if the
+/// PD entry isn't actually a 2 MiB leaf.
+pub unsafe fn unmap_user_2m_in_pml4(pml4_paddr: u64, vaddr: u64) {
+    use super::paging::{PTE_PRESENT, PTE_PS};
+    let pml4 = super::paging::phys_to_lin(
+        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+
+    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 { return; }
+    let pdpt = super::paging::phys_to_lin(
+        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 { return; }
+    let pd = super::paging::phys_to_lin(
+        pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pde = core::ptr::read_volatile(pd.add(pd_idx));
+    if pde & PTE_PRESENT == 0 || pde & PTE_PS == 0 {
+        // Not a 2 MiB leaf — nothing to do.
+        return;
+    }
+    core::ptr::write_volatile(pd.add(pd_idx), 0);
+    asm!("invlpg [{a}]", a = in(reg) vaddr, options(nostack, preserves_flags));
+}
+
+/// Unmap a 1 GiB Huge frame from a specific vspace.
+pub unsafe fn unmap_user_1g_in_pml4(pml4_paddr: u64, vaddr: u64) {
+    use super::paging::{PTE_PRESENT, PTE_PS};
+    let pml4 = super::paging::phys_to_lin(
+        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 { return; }
+    let pdpt = super::paging::phys_to_lin(
+        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS == 0 {
+        // Not a 1 GiB leaf — nothing to do.
+        return;
+    }
+    core::ptr::write_volatile(pdpt.add(pdpt_idx), 0);
+    asm!("invlpg [{a}]", a = in(reg) vaddr, options(nostack, preserves_flags));
+}
+
 /// Install a paging-structure entry. Returns Ok(()) on success.
 /// On Err, the value is the seL4_MappingFailedLookupLevel value
 /// (21=PT, 30=PD, 39=PDPT) — i.e. the bit-position of the *missing*
