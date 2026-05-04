@@ -2055,10 +2055,106 @@ fn decode_cnode(
         InvocationLabel::CNodeCancelBadgedSends => {
             cnode_cancel_badged_sends(target, args, invoker)
         }
+        InvocationLabel::CNodeRotate => cnode_rotate(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
+}
+
+/// `seL4_CNode_Rotate(_service=dest_root, dest_index, dest_depth,
+///   dest_badge, pivot_root, pivot_index, pivot_depth, pivot_badge,
+///   src_root, src_index, src_depth)` — atomic 3-way move.
+///
+/// libsel4's stub: msginfo length=8, extra_caps=2.
+///   mr0=dest_index, mr1=dest_depth, mr2=dest_badge, mr3=pivot_index,
+///   mr4=pivot_depth, mr5=pivot_badge, mr6=src_index, mr7=src_depth,
+///   extraCaps[0]=pivot_root, extraCaps[1]=src_root.
+///
+/// Semantics (mirrors upstream): the cap at `src` moves to `dest`,
+/// `src` is cleared, and `pivot` keeps its cap (possibly rebadged).
+/// Constraints: dest must be empty (else DeleteFirst), src must be
+/// non-empty (else FailedLookup), src != pivot (else IllegalOperation).
+fn cnode_rotate(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    let dest_root = target;
+    let dest_index = args.a2;
+    let dest_depth = args.a3 as u32;
+    let pivot_index = args.a5;
+    unsafe {
+        let s = KERNEL.get();
+        let inv_tcb = s.scheduler.slab.get(invoker);
+        let pivot_depth = inv_tcb.msg_regs[4] as u32;
+        let src_index = inv_tcb.msg_regs[6];
+        let src_depth = inv_tcb.msg_regs[7] as u32;
+        let (pivot_root, src_root) = if inv_tcb.pending_extra_caps_count >= 2 {
+            (inv_tcb.pending_extra_caps[0], inv_tcb.pending_extra_caps[1])
+        } else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_TruncatedMessage)));
+        };
+        s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+
+        // Resolve all three slots.
+        let dest_res = crate::cspace::resolve_address_bits(
+            s, &dest_root, dest_index, dest_depth)?;
+        if dest_res.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+        let pivot_res = crate::cspace::resolve_address_bits(
+            s, &pivot_root, pivot_index, pivot_depth)?;
+        if pivot_res.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+        let src_res = crate::cspace::resolve_address_bits(
+            s, &src_root, src_index, src_depth)?;
+        if src_res.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+        let dest_cn = KernelState::cnode_index(dest_res.slot_ptr);
+        let pivot_cn = KernelState::cnode_index(pivot_res.slot_ptr);
+        let src_cn = KernelState::cnode_index(src_res.slot_ptr);
+        let dest_si = dest_res.slot_index;
+        let pivot_si = pivot_res.slot_index;
+        let src_si = src_res.slot_index;
+
+        // src == pivot is illegal — would lose the cap.
+        if src_cn == pivot_cn && src_si == pivot_si {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_IllegalOperation)));
+        }
+        // src must be non-empty.
+        let src_cap = s.cnodes[src_cn].0[src_si].cap();
+        if src_cap.is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+        // dest must be empty unless dest == src (swap with self).
+        if !(dest_cn == src_cn && dest_si == src_si) {
+            if !s.cnodes[dest_cn].0[dest_si].cap().is_null() {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_DeleteFirst)));
+            }
+        }
+        let pivot_cap = s.cnodes[pivot_cn].0[pivot_si].cap();
+        if pivot_cap.is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+
+        // Order of writes matters when dest == src: clear src first
+        // would lose the cap. Do dest assignment first; only clear
+        // src if it's a distinct slot.
+        s.cnodes[dest_cn].0[dest_si].set_cap(&src_cap);
+        s.cnodes[pivot_cn].0[pivot_si].set_cap(&pivot_cap);
+        if !(dest_cn == src_cn && dest_si == src_si) {
+            s.cnodes[src_cn].0[src_si].set_cap(&Cap::Null);
+            s.cnodes[src_cn].0[src_si].set_parent(None);
+        }
+    }
+    Ok(())
 }
 
 /// CNode::Revoke — Phase 30. Delete every cap whose MDB-parent
@@ -2099,9 +2195,14 @@ fn cnode_cancel_badged_sends(
                 let i = KernelState::endpoint_index(ptr);
                 (i, badge.0)
             }
-            _ => return Ok(()),
+            // Upstream's `decodeCNodeInvocation` rejects non-Endpoint
+            // (and non-Notification) targets here with IllegalOperation.
+            // CNODEOP0006 calls cancelBadgedSends on an empty slot and
+            // expects exactly that.
+            _ => return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_IllegalOperation))),
         };
-        // Badge of 0 = unbadged, no-op.
+        // Badge of 0 = unbadged, no-op (success).
         if badge == 0 { return Ok(()); }
         let s_ptr: *mut crate::kernel::KernelState = s;
         let ep = &mut (*s_ptr).endpoints[ep_idx];
