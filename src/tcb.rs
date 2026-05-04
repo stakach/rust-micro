@@ -89,11 +89,13 @@ impl TcbId {
 pub const NUM_PRIORITIES: usize = 256;
 pub const MAX_PRIORITY: u8 = (NUM_PRIORITIES - 1) as u8;
 
-/// Maximum number of message-register words we model in this phase.
-/// seL4's `seL4_MsgMaxLength` is 120 — we keep the full ABI value as
-/// a constant in `types.rs` but cap the in-kernel staging buffer to
-/// keep TCB size sane during specs. Production TCB stores the full
-/// register set in arch-side `tcbContext` instead.
+/// Maximum number of message-register words we stage on the TCB.
+/// Kept at 8 to bound TCB size — `seL4_MsgMaxLength` is 120 words
+/// (960 B), but only the first 4 ride in registers; the rest live
+/// in the per-TCB IPC buffer page already. Long-IPC paths copy
+/// words 8..length directly from sender's IPC buffer to receiver's
+/// at handoff time so we don't need 120 words on every TCB. See
+/// `endpoint::transfer_long_msg`.
 pub const SCRATCH_MSG_LEN: usize = 8;
 
 /// Per-TCB kernel stack size. seL4 uses 4 KiB; we match that.

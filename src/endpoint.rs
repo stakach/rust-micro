@@ -340,9 +340,9 @@ fn transfer(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) 
     // We need both TCBs mutable simultaneously. Borrow each entry
     // separately by index — the Slab guarantees they're distinct
     // memory because TcbIds are unique.
-    let (label, length, regs) = {
+    let (label, length, regs, snd_buf_paddr) = {
         let s = sched.slab.get(sender);
-        (s.ipc_label, s.ipc_length, s.msg_regs)
+        (s.ipc_label, s.ipc_length, s.msg_regs, s.ipc_buffer_paddr)
     };
     let r = sched.slab.get_mut(receiver);
     r.ipc_label = label;
@@ -354,12 +354,30 @@ fn transfer(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) 
     // Phase 34c — fan words 4..length out to the receiver's IPC
     // buffer page so userspace can read them. Words 0..3 ride in
     // registers (rdx/r10/r8/r9 below) and don't need the buffer.
-    if length > 4 && r.ipc_buffer_paddr != 0 {
+    let recv_buf_paddr = r.ipc_buffer_paddr;
+    if length > 4 && recv_buf_paddr != 0 {
         let buf = (crate::arch::x86_64::paging::phys_to_lin(
-            r.ipc_buffer_paddr) as *mut u64).wrapping_add(1); // skip tag word
-        let max = (length as usize).min(regs.len());
-        for i in 4..max {
+            recv_buf_paddr) as *mut u64).wrapping_add(1); // skip tag word
+        let staged_max = (length as usize).min(regs.len());
+        for i in 4..staged_max {
             unsafe { core::ptr::write_volatile(buf.add(i), regs[i]); }
+        }
+        // Long-message tail: words SCRATCH_MSG_LEN..length live in
+        // the sender's IPC buffer page and bypass the on-TCB
+        // staging entirely (which is bounded at SCRATCH_MSG_LEN to
+        // keep TCBs small). Copy buffer → buffer directly via the
+        // kernel's linear map. Both pages are present because they
+        // were allocated as user Frames whose phys range is in our
+        // mapped low-mem region.
+        if length as usize > regs.len() && snd_buf_paddr != 0 {
+            let snd_buf = (crate::arch::x86_64::paging::phys_to_lin(
+                snd_buf_paddr) as *const u64).wrapping_add(1);
+            for i in regs.len()..(length as usize)
+                .min(crate::types::seL4_MsgMaxLength)
+            {
+                let w = unsafe { core::ptr::read_volatile(snd_buf.add(i)) };
+                unsafe { core::ptr::write_volatile(buf.add(i), w); }
+            }
         }
     }
 

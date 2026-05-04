@@ -110,14 +110,72 @@ pub fn handle_syscall(
         // expecting a Call) will matter once cap-based reply lands.
         Syscall::SysWait => handle_recv(args, /* blocking */ true),
         Syscall::SysNBWait => handle_recv(args, /* blocking */ false),
-        // Phase 36b — atomic Send+Recv composites. Not implemented
-        // yet; surface IllegalOperation so user code spots the gap.
-        Syscall::SysNBSendRecv | Syscall::SysNBSendWait => {
-            Err(crate::error::KException::SyscallError(
-                crate::error::SyscallError::new(
-                    crate::types::seL4_Error::seL4_IllegalOperation,
-                ),
-            ))
+        // MCS atomic non-blocking-send + blocking-recv composite.
+        // Upstream's x86_64 x64_sys_nbsend_recv ABI:
+        //   rdi (a0)  = src cptr           (recv source)
+        //   rsi (a1)  = send msginfo
+        //   r10/r8/r9/r15 (a2..a5) = send mr0..mr3
+        //   r13       = dest cptr          (send target)
+        //   r12       = reply cap          (consumed by handle_recv)
+        //
+        // sel4test's IPC0002 / IPC0003 replywait_func opens with
+        // an empty NBSendRecv used purely as a Recv (no actual send
+        // because there's nothing to reply to yet). Implement as
+        // non-blocking-send-then-blocking-recv — if the send has no
+        // queued receiver it just drops, and the Recv proceeds.
+        Syscall::SysNBSendRecv => {
+            let dest_cptr = {
+                let s = unsafe { crate::kernel::KERNEL.get() };
+                let cur = s.scheduler.current().ok_or_else(|| {
+                    crate::error::KException::SyscallError(
+                        crate::error::SyscallError::new(
+                            crate::types::seL4_Error::seL4_InvalidCapability,
+                        ),
+                    )
+                })?;
+                s.scheduler.slab.get(cur).user_context.r13
+            };
+            let send_args = SyscallArgs {
+                a0: dest_cptr,
+                a1: args.a1,
+                a2: args.a2,
+                a3: args.a3,
+                a4: args.a4,
+                a5: args.a5,
+            };
+            // NB-send: blocking=false, call=false. Errors are
+            // intentionally swallowed — send drops if no receiver,
+            // exactly what NBSend should do.
+            let _ = handle_send(&send_args, /* blocking */ false,
+                /* call */ false);
+            handle_recv(args, /* blocking */ true)
+        }
+        // SysNBSendWait — same as NBSendRecv but the Recv side is a
+        // notification-only Wait (no reply cap captured). For now
+        // treat it the same since handle_recv falls back to
+        // notification handling when the target is a Notification cap.
+        Syscall::SysNBSendWait => {
+            let dest_cptr = {
+                let s = unsafe { crate::kernel::KERNEL.get() };
+                let cur = s.scheduler.current().ok_or_else(|| {
+                    crate::error::KException::SyscallError(
+                        crate::error::SyscallError::new(
+                            crate::types::seL4_Error::seL4_InvalidCapability,
+                        ),
+                    )
+                })?;
+                s.scheduler.slab.get(cur).user_context.r13
+            };
+            let send_args = SyscallArgs {
+                a0: dest_cptr,
+                a1: args.a1,
+                a2: args.a2,
+                a3: args.a3,
+                a4: args.a4,
+                a5: args.a5,
+            };
+            let _ = handle_send(&send_args, false, false);
+            handle_recv(args, true)
         }
         Syscall::SysYield => {
             // Phase 29h — when the rootserver demo is live, yield
@@ -299,9 +357,10 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
         // Copy from current → caller. We can reuse endpoint's
         // transfer if we expose it; for clarity we inline the
         // minimal copy here.
-        let (label, length, regs): (Word, u32, [Word; crate::tcb::SCRATCH_MSG_LEN]) = {
+        let (label, length, regs, snd_buf_paddr):
+            (Word, u32, [Word; crate::tcb::SCRATCH_MSG_LEN], u64) = {
             let me = s.scheduler.slab.get(current);
-            (me.ipc_label, me.ipc_length, me.msg_regs)
+            (me.ipc_label, me.ipc_length, me.msg_regs, me.ipc_buffer_paddr)
         };
         {
             let r = s.scheduler.slab.get_mut(caller);
@@ -328,14 +387,29 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
                 r.user_context.r15 = r.msg_regs[3];
             }
             // Mirror words 4..length into the caller's IPC buffer.
-            if length > 4 && r.ipc_buffer_paddr != 0 {
+            // Words SCRATCH_MSG_LEN..length come straight from the
+            // replier's IPC buffer (bypassing the on-TCB staging,
+            // which is bounded). Mirrors the long-msg path in
+            // `endpoint::transfer`.
+            let recv_buf_paddr = r.ipc_buffer_paddr;
+            if length > 4 && recv_buf_paddr != 0 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
                     let buf = (crate::arch::x86_64::paging::phys_to_lin(
-                        r.ipc_buffer_paddr) as *mut u64).wrapping_add(1);
-                    let max = (length as usize).min(regs.len());
-                    for i in 4..max {
+                        recv_buf_paddr) as *mut u64).wrapping_add(1);
+                    let staged_max = (length as usize).min(regs.len());
+                    for i in 4..staged_max {
                         core::ptr::write_volatile(buf.add(i), regs[i]);
+                    }
+                    if length as usize > regs.len() && snd_buf_paddr != 0 {
+                        let snd_buf = (crate::arch::x86_64::paging::phys_to_lin(
+                            snd_buf_paddr) as *const u64).wrapping_add(1);
+                        for i in regs.len()..(length as usize)
+                            .min(crate::types::seL4_MsgMaxLength)
+                        {
+                            let w = core::ptr::read_volatile(snd_buf.add(i));
+                            core::ptr::write_volatile(buf.add(i), w);
+                        }
                     }
                 }
             }
