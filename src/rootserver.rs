@@ -505,8 +505,12 @@ pub unsafe fn launch_rootserver() -> ! {
     // to PIT (which it does whenever ACPI/HPET discovery fails),
     // so without this cap the timer driver silently bails.
     s.cnodes[ROOTSERVER_CNODE_IDX].0[7] = Cte::with_cap(&Cap::IOPortControl);
-    // Slots 8, 11, 12, 13, 15: empty (no IO / Domain / SMMU /
-    // SMC support).
+    // Phase 43 — slot 11 is the canonical seL4_CapDomain. sel4test's
+    // DOMAINS0001-3 invoke DomainSet_Set on it; the kernel's decode_
+    // domain handler stamps the domain field on the target TCB
+    // (NUM_DOMAINS=1, so only domain 0 is valid).
+    s.cnodes[ROOTSERVER_CNODE_IDX].0[11] = Cte::with_cap(&Cap::Domain);
+    // Slots 8, 12, 13, 15: empty (no IO / SMMU / SMC support).
     // Phase 37b — InitThreadSC at canonical slot 14. The
     // SchedContext object was allocated above and bound to the
     // rootserver TCB.

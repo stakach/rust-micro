@@ -199,6 +199,7 @@ pub fn decode_invocation(
         Cap::SchedContext { .. } => decode_sched_context(target, label, args, invoker),
         Cap::SchedControl { .. } => decode_sched_control(label, args, invoker),
         Cap::Reply { .. } => decode_reply(target, args, invoker),
+        Cap::Domain => decode_domain(label, args, invoker),
         Cap::IOPort { first_port, last_port } => {
             decode_io_port(first_port, last_port, label, args, invoker)
         }
@@ -1541,6 +1542,48 @@ fn decode_io_port(
                     seL4_Error::seL4_IllegalOperation)));
             }
         }
+    }
+    Ok(())
+}
+
+/// `seL4_DomainSet_Set(target=DomainSet, domain, thread)` — assigns
+/// a TCB to a scheduling domain. We model a single domain (CONFIG_NUM
+/// _DOMAINS=1 in the matched libsel4), so any non-zero domain is
+/// rejected with InvalidArgument; domain=0 just stamps the field on
+/// the target TCB. DOMAINS0001/0002/0003 in sel4test verify exactly
+/// this contract.
+fn decode_domain(
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    if !matches!(label, InvocationLabel::DomainSetSet) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation)));
+    }
+    let domain = (args.a2 & 0xff) as u8;
+    // Sel4test's matched config compiles libsel4 with NUM_DOMAINS=1,
+    // so the only valid domain is 0.
+    const NUM_DOMAINS: u8 = 1;
+    if domain >= NUM_DOMAINS {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument)));
+    }
+    unsafe {
+        let s = KERNEL.get();
+        let inv_tcb = s.scheduler.slab.get_mut(invoker);
+        if inv_tcb.pending_extra_caps_count == 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_TruncatedMessage)));
+        }
+        let tcb_cap = inv_tcb.pending_extra_caps[0];
+        inv_tcb.pending_extra_caps_count = 0;
+        let tcb_id = match tcb_cap {
+            Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
+            _ => return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability))),
+        };
+        s.scheduler.slab.get_mut(tcb_id).domain = domain;
     }
     Ok(())
 }
