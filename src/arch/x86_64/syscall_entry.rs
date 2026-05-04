@@ -208,6 +208,49 @@ pub fn current_cpu_user_ctx_mut() -> &'static mut UserContext {
     }
 }
 
+/// CR0 task-switched bit. Setting it makes the CPU raise #NM (vector
+/// 7) on any FPU instruction; mirrors upstream `disableFpu()`. The
+/// FPU0004 sel4test sequence relies on this to trap a thread that
+/// just had `seL4_TCBFlag_fpuDisabled` set.
+const CR0_TS: u64 = 1 << 3;
+
+/// Read CR0.
+#[inline]
+unsafe fn read_cr0() -> u64 {
+    let mut cr0: u64;
+    core::arch::asm!("mov {}, cr0", out(reg) cr0,
+        options(nomem, nostack, preserves_flags));
+    cr0
+}
+
+/// Either set or clear CR0.TS to match `set`. Call at every
+/// user-mode resume so the next instruction in the resumed thread
+/// either traps (if `set`) or runs through (if cleared). Mirrors
+/// upstream `lazyFPURestore`'s disable / enable branches.
+#[inline]
+pub unsafe fn set_cr0_ts(set: bool) {
+    let cr0 = read_cr0();
+    let want = if set { cr0 | CR0_TS } else { cr0 & !CR0_TS };
+    if want != cr0 {
+        if set {
+            core::arch::asm!("mov cr0, {}", in(reg) want,
+                options(nostack, preserves_flags));
+        } else {
+            // `clts` is the canonical way to clear TS — slightly
+            // cheaper than a CR0 write because it doesn't serialise.
+            core::arch::asm!("clts", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Apply the FPU-disabled gate for `tcb` before resuming user mode.
+/// Reads `tcb.flags` for `seL4_TCBFlag_fpuDisabled` (bit 0).
+#[inline]
+pub unsafe fn apply_fpu_gate_for(tcb: &crate::tcb::Tcb) {
+    const FPU_DISABLED: u64 = 0x1;
+    set_cr0_ts((tcb.flags & FPU_DISABLED) != 0);
+}
+
 // ---------------------------------------------------------------------------
 // Field offsets the naked stub references. Keep these in sync with
 // `PerCpuSyscallArea` — `static_assertions` would catch drift but
@@ -659,6 +702,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // the next entry sees them too (idempotent).
             s.scheduler.slab.get_mut(next).user_context = new_ctx;
             *ctx = new_ctx;
+            // FPU0004: gate CR0.TS based on the resumed thread's
+            // flags. The asm tail is about to sysretq into the
+            // thread; if `fpuDisabled` is set, the next FPU op
+            // there must trap into our #NM handler.
+            apply_fpu_gate_for(s.scheduler.slab.get(next));
         } else if from_user != 0 {
             // No runnable thread on this CPU. The asm restore tail
             // would otherwise sysretq back to the original caller's
@@ -710,6 +758,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     }
                     crate::arch::x86_64::msr::wrmsr(
                         crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+                    apply_fpu_gate_for(s.scheduler.slab.get(next_id));
                     let pcc = current_cpu_user_ctx_mut();
                     *pcc = next_ctx;
                     crate::smp::bkl_release();

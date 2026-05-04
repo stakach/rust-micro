@@ -43,7 +43,11 @@ pub fn init_exceptions() {
         IDT[4] = IdtEntry::new(overflow_handler as u64, 0x08, 0, 0x8E);
         IDT[5] = IdtEntry::new(bound_range_handler as u64, 0x08, 0, 0x8E);
         IDT[6] = IdtEntry::new(invalid_opcode_handler as u64, 0x08, 0, 0x8E);
-        IDT[7] = IdtEntry::new(device_not_available_handler as u64, 0x08, 0, 0x8E);
+        // FPU0004 — replace the macro stub with `device_not_available_entry`,
+        // which captures saved CS so the handler can distinguish user-mode
+        // (CPL=3 → check `tcbFlags & seL4_TCBFlag_fpuDisabled`) from
+        // kernel-mode #NM. Same pattern the page-fault handler uses.
+        IDT[7] = IdtEntry::new(device_not_available_entry as u64, 0x08, 0, 0x8E);
         IDT[8] = IdtEntry::new(double_fault_handler as u64, 0x08, 0, 0x8E);
         IDT[10] = IdtEntry::new(invalid_tss_handler as u64, 0x08, 0, 0x8E);
         IDT[11] = IdtEntry::new(segment_not_present_handler as u64, 0x08, 0, 0x8E);
@@ -98,8 +102,191 @@ extern "C" fn handle_invalid_opcode(error_code: u64, exception_num: u64) {
 }
 
 extern "C" fn handle_device_not_available(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Device not available\n");
+    // The plain `interrupt!` stub doesn't pass saved CS or RIP, so
+    // route #NM through `device_not_available_entry` instead (see
+    // init_exceptions). This wrapper is unreachable in practice but
+    // kept so the macro-generated stub compiles.
+    crate::arch::log("EXCEPTION: Device not available (legacy stub)\n");
     fatal_exception(exception_num, error_code);
+}
+
+/// Custom #NM (Device Not Available, vector 7) entry. CPU pushes no
+/// error code for this vector. We need both the saved CS / RIP (to
+/// decide whether the trap came from user mode, CPL=3) AND the user
+/// GPRs (so the faulter can resume cleanly after the fault handler
+/// replies — without saving, sysretq would restore stale registers
+/// from the last syscall save and the helper page-faults on return).
+///
+/// Stack on entry (no error code from CPU):
+///   [rsp+0]  = saved RIP
+///   [rsp+8]  = saved CS
+///   [rsp+16] = saved RFLAGS
+///   [rsp+24] = saved RSP
+///   [rsp+32] = saved SS
+///
+/// We assume #NM only ever fires from user mode — kernel never sets
+/// CR0.TS for itself; the gate is applied just before sysretq for
+/// `fpuDisabled` threads. So we always `swapgs`. If a kernel-mode
+/// #NM ever fires, the handler logs and clears TS defensively, and
+/// the asm tail restores the (mostly-stale) GPRs before iretq.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn device_not_available_entry() {
+    core::arch::naked_asm!(
+        // Switch to kernel GS_BASE so gs:[16+...] addresses the
+        // per-CPU UserContext save slot.
+        "swapgs",
+        // Save user GPRs into per-CPU user_ctx (same layout the
+        // syscall entry uses — see UserContext).
+        "mov gs:[16 + 0],   rax",
+        "mov gs:[16 + 8],   rbx",
+        "mov gs:[16 + 16],  rcx",
+        "mov gs:[16 + 24],  rdx",
+        "mov gs:[16 + 32],  rsi",
+        "mov gs:[16 + 40],  rdi",
+        "mov gs:[16 + 48],  rbp",
+        "mov gs:[16 + 56],  r8",
+        "mov gs:[16 + 64],  r9",
+        "mov gs:[16 + 72],  r10",
+        "mov gs:[16 + 80],  r11",
+        "mov gs:[16 + 88],  r12",
+        "mov gs:[16 + 96],  r13",
+        "mov gs:[16 + 104], r14",
+        "mov gs:[16 + 112], r15",
+        // Stamp the iretq frame's saved RIP / RFLAGS / RSP into
+        // user_ctx. sysretq restores RIP from rcx and RFLAGS from
+        // r11, so user_ctx.rcx = RIP and user_ctx.r11 = RFLAGS.
+        "mov rax, [rsp + 0]",
+        "mov gs:[16 + 16],  rax",   // user_ctx.rcx = saved RIP
+        "mov rax, [rsp + 16]",
+        "mov gs:[16 + 80],  rax",   // user_ctx.r11 = saved RFLAGS
+        "mov rax, [rsp + 24]",
+        "mov gs:[16 + 120], rax",   // user_ctx.rsp = saved RSP
+        // Call the typed Rust handler with (saved_rip, saved_cs).
+        // Stack stays on the IDT-pushed kernel stack (TSS RSP0 for
+        // user-mode entry). Plenty of room for one C call.
+        "mov rdi, [rsp + 0]",
+        "mov rsi, [rsp + 8]",
+        "call {handler}",
+        // Handler returns only on the spurious-TS / kernel-mode
+        // path. Restore GPRs from the per-CPU snapshot, swapgs
+        // back, and iretq.
+        "mov rax, gs:[16 + 0]",
+        "mov rbx, gs:[16 + 8]",
+        "mov rcx, gs:[16 + 16]",
+        "mov rdx, gs:[16 + 24]",
+        "mov rsi, gs:[16 + 32]",
+        "mov rdi, gs:[16 + 40]",
+        "mov rbp, gs:[16 + 48]",
+        "mov r8,  gs:[16 + 56]",
+        "mov r9,  gs:[16 + 64]",
+        "mov r10, gs:[16 + 72]",
+        "mov r11, gs:[16 + 80]",
+        "mov r12, gs:[16 + 88]",
+        "mov r13, gs:[16 + 96]",
+        "mov r14, gs:[16 + 104]",
+        "mov r15, gs:[16 + 112]",
+        "swapgs",
+        "iretq",
+        handler = sym handle_device_not_available_typed,
+    );
+}
+
+extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
+    // CPL is the low 2 bits of CS. User mode = 3.
+    let from_user = (saved_cs & 3) == 3;
+    if !from_user {
+        // Kernel-mode #NM is unexpected (we only set CR0.TS just
+        // before sysretq). Clear and proceed defensively rather
+        // than panic.
+        unsafe {
+            crate::arch::x86_64::syscall_entry::set_cr0_ts(false);
+        }
+        return;
+    }
+
+    // User-mode #NM: BKL on, look up current thread's flags.
+    crate::smp::bkl_acquire();
+    let _bkl = BklGuard;
+
+    unsafe {
+        let s = crate::kernel::KERNEL.get();
+        let current = match s.scheduler.current() {
+            Some(c) => c,
+            None => {
+                // No current thread — shouldn't happen from user
+                // mode but be defensive.
+                crate::arch::x86_64::syscall_entry::set_cr0_ts(false);
+                return;
+            }
+        };
+        const FPU_DISABLED: u64 = 0x1;
+        let flags = s.scheduler.slab.get(current).flags;
+        if (flags & FPU_DISABLED) == 0 {
+            // Spurious TS — thread isn't actually disabled, just
+            // clear and resume. This shouldn't normally fire (we
+            // only set TS for fpuDisabled threads) but tolerate it.
+            crate::arch::x86_64::syscall_entry::set_cr0_ts(false);
+            return;
+        }
+
+        // Real fpuDisabled trap. Mirror the per-CPU UserContext
+        // snapshot the asm stub just stamped (saved RIP/RFLAGS/RSP
+        // already in there) into the faulter's TCB so the resume
+        // path sees the right state — without this, sysretq would
+        // restore from whatever was saved on the last syscall and
+        // the helper page-faults on return from the fault reply.
+        let pcc_snapshot = *crate::arch::x86_64::syscall_entry
+            ::current_cpu_user_ctx_mut();
+        s.scheduler.slab.get_mut(current).user_context = pcc_snapshot;
+        let _ = saved_rip; // already in pcc_snapshot.rcx
+        let _ = crate::fault::deliver_fault(
+            current,
+            crate::fault::FaultMessage::UserException {
+                number: 7,
+                code: 0,
+            },
+        );
+
+        // The faulter is now BlockedOnReply (or suspended if no
+        // handler). iretq'ing back to it would re-execute the FPU
+        // instruction. Context-switch to the next runnable thread
+        // by sysretq'ing into it directly — same pattern the page
+        // fault handler uses. Drop the BKL just before sysretq.
+        let next = s.scheduler.choose_thread();
+        if let Some(next_id) = next {
+            s.scheduler.set_current(Some(next_id));
+            let tcb = s.scheduler.slab.get(next_id);
+            let next_cr3 = tcb.cpu_context.cr3;
+            let next_fs_base = tcb.cpu_context.fs_base;
+            let next_ctx = tcb.user_context;
+            if next_cr3 != 0 {
+                let cur_cr3: u64;
+                core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+                    options(nomem, nostack, preserves_flags));
+                if next_cr3 != cur_cr3 {
+                    core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
+                        options(nostack, preserves_flags));
+                }
+            }
+            crate::arch::x86_64::msr::wrmsr(
+                crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+            crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
+                s.scheduler.slab.get(next_id));
+            let pcc = crate::arch::x86_64::syscall_entry
+                ::current_cpu_user_ctx_mut();
+            *pcc = next_ctx;
+            // Release BKL via Drop on _bkl, then sysret.
+            drop(_bkl);
+            crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
+                pcc as *const _);
+            // unreachable
+        }
+        // No runnable thread — idle this CPU until an IRQ wakes it.
+        crate::arch::log("[#NM: no next thread, idling CPU]\n");
+        drop(_bkl);
+        loop { core::arch::asm!("sti", "hlt"); }
+    }
 }
 
 extern "C" fn handle_double_fault(error_code: u64, exception_num: u64) {
@@ -392,6 +579,8 @@ extern "C" fn handle_page_fault_typed(
                 let pcc = crate::arch::x86_64::syscall_entry
                     ::current_cpu_user_ctx_mut();
                 *pcc = next_ctx;
+                crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
+                    s.scheduler.slab.get(next_id));
                 crate::smp::bkl_release();
                 crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
                     pcc as *const _);
