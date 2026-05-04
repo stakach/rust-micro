@@ -489,7 +489,46 @@ pub mod spec {
         arch::log("Running KernelState tests...\n");
         bootstrap_registers_boot_thread();
         scheduler_state_persists_across_calls();
+        claim_cnode_pins_directly_initialised_slot();
         arch::log("KernelState tests completed\n");
+    }
+
+    /// Phase 43 — `claim_cnode` must mark a directly-initialised CNode
+    /// as in-use AND advance `next_cnode` so a subsequent
+    /// `alloc_cnode` cannot recycle that slot. Regression test for
+    /// the bug that caused DOMAINS0001's vka to retype against a
+    /// silently-wiped Untyped: rootserver init populated cn3
+    /// directly, didn't claim it, then alloc_cnode looking for a free
+    /// slot found cn3 and zeroed every cap.
+    #[inline(never)]
+    fn claim_cnode_pins_directly_initialised_slot() {
+        unsafe {
+            let s = KERNEL.get();
+            // Take a snapshot — specs above us may have already
+            // touched the bitmap. We claim slot 7 and verify only the
+            // claim affects it.
+            let target = 7usize;
+            assert!(target < MAX_CNODES);
+            let was_in_use = s.cnode_in_use(target);
+            let was_next = s.next_cnode;
+            s.claim_cnode(target);
+            assert!(s.cnode_in_use(target),
+                "claim_cnode should mark slot in-use");
+            assert!(s.next_cnode > target,
+                "next_cnode should advance past a claimed slot");
+            // alloc_cnode must NOT now hand back our claimed slot.
+            let alloced = s.alloc_cnode().expect("alloc_cnode");
+            assert!(alloced != target,
+                "alloc_cnode handed back our claimed slot {} (got {})",
+                target, alloced);
+            // Cleanup: free both back so other specs see the original
+            // bookkeeping.
+            s.free_cnode(alloced);
+            if !was_in_use { s.free_cnode(target); }
+            s.next_cnode = was_next;
+            arch::log(
+                "  \u{2713} claim_cnode pins a directly-initialised CNode\n");
+        }
     }
 
     #[inline(never)]
