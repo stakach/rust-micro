@@ -47,17 +47,36 @@ impl Endpoint {
 // ---------------------------------------------------------------------------
 
 fn queue_push(ep: &mut Endpoint, sched: &mut Scheduler, t: TcbId) {
-    let prev_tail = ep.tail;
+    // Priority-ordered insertion under MCS (mirrors upstream
+    // `tcbEPAppend` in include/object/tcb.h). Walk back from the
+    // tail while the inserted TCB outranks the cursor — so highest
+    // priority ends up at head, equal priorities preserve FIFO.
+    // SCHED0007 expects the receiver to service callers in priority
+    // order regardless of arrival order.
+    let new_prio = sched.slab.get(t).priority;
+    let mut before = ep.tail;
+    let mut after: Option<TcbId> = None;
+    while let Some(b) = before {
+        if new_prio > sched.slab.get(b).priority {
+            after = Some(b);
+            before = sched.slab.get(b).ep_prev;
+        } else {
+            break;
+        }
+    }
     {
         let tcb = sched.slab.get_mut(t);
-        tcb.ep_prev = prev_tail;
-        tcb.ep_next = None;
+        tcb.ep_prev = before;
+        tcb.ep_next = after;
     }
-    match prev_tail {
-        Some(p) => sched.slab.get_mut(p).ep_next = Some(t),
+    match before {
+        Some(b) => sched.slab.get_mut(b).ep_next = Some(t),
         None => ep.head = Some(t),
     }
-    ep.tail = Some(t);
+    match after {
+        Some(a) => sched.slab.get_mut(a).ep_prev = Some(t),
+        None => ep.tail = Some(t),
+    }
 }
 
 fn queue_pop_head(ep: &mut Endpoint, sched: &mut Scheduler) -> Option<TcbId> {

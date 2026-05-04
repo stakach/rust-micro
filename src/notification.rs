@@ -75,17 +75,32 @@ impl Notification {
 // clarity rather than coupling notification.rs to endpoint.rs.
 
 fn queue_push(ntfn: &mut Notification, sched: &mut Scheduler, t: TcbId) {
-    let prev_tail = ntfn.tail;
+    // Priority-ordered insertion (matches endpoint queue under MCS;
+    // mirrors upstream tcbEPAppend).
+    let new_prio = sched.slab.get(t).priority;
+    let mut before = ntfn.tail;
+    let mut after: Option<TcbId> = None;
+    while let Some(b) = before {
+        if new_prio > sched.slab.get(b).priority {
+            after = Some(b);
+            before = sched.slab.get(b).ep_prev;
+        } else {
+            break;
+        }
+    }
     {
         let tcb = sched.slab.get_mut(t);
-        tcb.ep_prev = prev_tail;
-        tcb.ep_next = None;
+        tcb.ep_prev = before;
+        tcb.ep_next = after;
     }
-    match prev_tail {
-        Some(p) => sched.slab.get_mut(p).ep_next = Some(t),
+    match before {
+        Some(b) => sched.slab.get_mut(b).ep_next = Some(t),
         None => ntfn.head = Some(t),
     }
-    ntfn.tail = Some(t);
+    match after {
+        Some(a) => sched.slab.get_mut(a).ep_prev = Some(t),
+        None => ntfn.tail = Some(t),
+    }
 }
 
 fn queue_pop_head(ntfn: &mut Notification, sched: &mut Scheduler) -> Option<TcbId> {
