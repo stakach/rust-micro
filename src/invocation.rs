@@ -3734,6 +3734,18 @@ fn decode_tcb(
                             }
                         }
                     }
+                    // SCHED0020 — if we raised ANOTHER thread above
+                    // the current thread's priority on this CPU,
+                    // force a reschedule. Mirrors upstream
+                    // `possibleSwitchTo`.
+                    if let Some(cur) = s.scheduler.nodes[cpu].current {
+                        if cur != id {
+                            let cur_prio = s.scheduler.slab.get(cur).priority;
+                            if prio > cur_prio {
+                                s.scheduler.nodes[cpu].current = None;
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
