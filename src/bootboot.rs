@@ -20,9 +20,9 @@ pub const INITRD_MAXSIZE: u32 = 16;
 
 pub const BOOTBOOT_MMIO: u64 = 0xfffffffff8000000;  /* memory mapped IO virtual address */
 pub const BOOTBOOT_FB: u64 = 0xfffffffffc000000;  /* frame buffer virtual address */
-pub const BOOTBOOT_INFO: u64 = 0xffffffffffe00000;  /* bootboot struct virtual address */
-pub const BOOTBOOT_ENV: u64 = 0xffffffffffe01000;  /* environment string virtual address */
-pub const BOOTBOOT_CORE: u64 = 0xffffffffffe02000;  /* core loadable segment start */
+pub const BOOTBOOT_INFO: u64 = 0xffffffffff800000;  /* bootboot struct virtual address */
+pub const BOOTBOOT_ENV: u64 = 0xffffffffff801000;  /* environment string virtual address */
+pub const BOOTBOOT_CORE: u64 = 0xffffffffff802000;  /* core loadable segment start */
 
 
 #[repr(C, packed)]
@@ -95,4 +95,10 @@ pub struct arch_aarch64 {
 pub fn get_bootstrap_processor_id() -> u16 {
     let bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
     bootboot_r.bspid
+}
+
+/// Total number of CPU cores BOOTBOOT brought up (BSP + APs).
+pub fn get_num_cores() -> u16 {
+    let bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
+    bootboot_r.numcores
 }

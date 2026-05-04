@@ -2,7 +2,8 @@
 name = "mykernel-rust"
 version = "0.0.1"
 authors = ["Vinay Chandra"]
-edition = "2018"
+edition = "2021"
+build = "build.rs"
 
 [dependencies]
 rlibc = "1.0"
@@ -12,4 +13,28 @@ default = ["arch-x86_64"]
 spec = []
 arch-x86_64 = []
 arch-aarch64 = []
-
+# Mixed-Criticality Systems is the only scheduler model. The
+# `mcs` cargo feature is retained as a no-op so existing
+# `--features mcs` invocations don't break; nothing is gated on
+# it any more.
+mcs = []
+# Multi-CPU support — per-CPU state, IPI dispatch. Phase 10b.
+smp = []
+# Hot-path IPC bypassing the slowpath. Phase 10c.
+fastpath = []
+# Lazy FPU state-switch. Phase 10d.
+fpu = []
+# Hardware-virtualisation extensions (VT-x). Phase 10e.
+vmx = []
+# Phase 34a — when set, the build script also builds the
+# rootserver crate with `--features microtest` so the embedded
+# rootserver runs the structured test harness instead of the
+# legacy demos. Kernel-side this is a no-op flag (the sentinel
+# matcher in syscall_entry runs unconditionally).
+microtest = []
+# Phase 38d — replace the embedded rootserver ELF with the
+# `vendor/libsel4-build/out/hello.elf` C program built against the
+# real upstream libsel4. Used to validate our kernel's SYSCALL ABI
+# matches what libsel4-compiled code emits, as a stepping stone
+# toward running sel4test.
+libsel4-hello = []
