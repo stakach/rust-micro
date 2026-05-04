@@ -1871,53 +1871,85 @@ fn decode_untyped_retype(
                             priority: 0,
                             ..Default::default()
                         });
+                        // Phase 43 — scrub any stale kernel
+                        // references to this slab slot. The slot may
+                        // have been reused after a previous TCB was
+                        // freed by a path that didn't fully clean up
+                        // (e.g. spec test cleanup that calls
+                        // `slab.free` directly). Without this, an SC's
+                        // bound_tcb / notification's bound_tcb /
+                        // reply's bound_tcb could still point at the
+                        // re-used id, and a subsequent mcs_tick or
+                        // signal would dereference what it expected to
+                        // be a different TCB.
+                        scrub_tcb_refs(s_ptr.as_mut().unwrap(), id);
                         Cap::Thread {
                             tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64)
                                 .expect("nonzero tcb id"),
                         }
                     }
                     Cap::Endpoint { badge, rights, .. } => {
-                        let i = (*s_ptr).alloc_endpoint()
-                            .expect("endpoint pool exhausted");
-                        Cap::Endpoint {
-                            ptr: KernelState::endpoint_ptr(i),
-                            badge,
-                            rights,
+                        match (*s_ptr).alloc_endpoint() {
+                            Some(i) => Cap::Endpoint {
+                                ptr: KernelState::endpoint_ptr(i),
+                                badge,
+                                rights,
+                            },
+                            None => {
+                                crate::arch::log("[retype: endpoint pool exhausted]\n");
+                                Cap::Null
+                            }
                         }
                     }
                     Cap::Notification { badge, rights, .. } => {
-                        let i = (*s_ptr).alloc_notification()
-                            .expect("notification pool exhausted");
-                        Cap::Notification {
-                            ptr: KernelState::ntfn_ptr(i),
-                            badge,
-                            rights,
+                        match (*s_ptr).alloc_notification() {
+                            Some(i) => Cap::Notification {
+                                ptr: KernelState::ntfn_ptr(i),
+                                badge,
+                                rights,
+                            },
+                            None => {
+                                crate::arch::log("[retype: ntfn pool exhausted]\n");
+                                Cap::Null
+                            }
                         }
                     }
                     Cap::CNode { radix, guard_size, guard, .. } => {
-                        let i = (*s_ptr).alloc_cnode()
-                            .expect("cnode pool exhausted");
-                        Cap::CNode {
-                            ptr: KernelState::cnode_ptr(i),
-                            radix,
-                            guard_size,
-                            guard,
+                        match (*s_ptr).alloc_cnode() {
+                            Some(i) => Cap::CNode {
+                                ptr: KernelState::cnode_ptr(i),
+                                radix,
+                                guard_size,
+                                guard,
+                            },
+                            None => {
+                                crate::arch::log("[retype: cnode pool exhausted]\n");
+                                Cap::Null
+                            }
                         }
                     }
                     Cap::SchedContext { size_bits, .. } => {
-                        let i = (*s_ptr).alloc_sched_context()
-                            .expect("sched_context pool exhausted");
-                        Cap::SchedContext {
-                            ptr: KernelState::sched_context_ptr(i),
-                            size_bits,
+                        match (*s_ptr).alloc_sched_context() {
+                            Some(i) => Cap::SchedContext {
+                                ptr: KernelState::sched_context_ptr(i),
+                                size_bits,
+                            },
+                            None => {
+                                crate::arch::log("[retype: sc pool exhausted]\n");
+                                Cap::Null
+                            }
                         }
                     }
                     Cap::Reply { can_grant, .. } => {
-                        let i = (*s_ptr).alloc_reply()
-                            .expect("reply pool exhausted");
-                        Cap::Reply {
-                            ptr: KernelState::reply_ptr(i),
-                            can_grant,
+                        match (*s_ptr).alloc_reply() {
+                            Some(i) => Cap::Reply {
+                                ptr: KernelState::reply_ptr(i),
+                                can_grant,
+                            },
+                            None => {
+                                crate::arch::log("[retype: reply pool exhausted]\n");
+                                Cap::Null
+                            }
                         }
                     }
                     // Phase 33d — when the rootserver retypes a fresh
@@ -2085,6 +2117,20 @@ fn cnode_cancel_badged_sends(
             if t_badge == badge {
                 crate::endpoint::cancel_ipc_anywhere(
                     &mut (*s_ptr).scheduler, t);
+                // Phase 43 — the cancelled sender resumes from its
+                // blocked seL4_Call as if the call returned a reply
+                // with `seL4_InvalidCapability` as the label, which
+                // is what test_ep_cancelBadgedSends asserts on.
+                // Without this fan-in, rsi still holds the SENT
+                // msginfo (label = 0) and the test fails.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let cancelled = (*s_ptr).scheduler.slab.get_mut(t);
+                    let label = seL4_Error::seL4_InvalidCapability as u64;
+                    cancelled.user_context.rsi = label << 12;
+                    cancelled.user_context.rdi = 0;
+                    cancelled.blocked_is_call = false;
+                }
                 (*s_ptr).scheduler.make_runnable(t);
             }
             cur = next;
@@ -2167,35 +2213,75 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                     // would call free again for the same pool slot
                     // which is harmless (free is idempotent).
                     let cap_to_free = s.cnodes[ci].0[si].cap();
-                    match cap_to_free {
-                        Cap::Thread { tcb } => {
-                            let id = crate::tcb::TcbId(tcb.addr() as u16);
-                            s.scheduler.block(
-                                id, crate::tcb::ThreadStateType::Inactive);
-                            s.scheduler.slab.entries[id.0 as usize] = None;
+                    // Phase 43 — only free the underlying object when
+                    // no OTHER live cap points at the same pointer.
+                    // Mint/Copy create derivative caps that share the
+                    // object — freeing on every delete wipes the EP /
+                    // Notification / etc. while the master cap still
+                    // refers to it. CANCEL_BADGED_SENDS_0001 hit this:
+                    // revoking a badged endpoint cap reset the master
+                    // endpoint, dropping all 32 queued senders.
+                    // `KernelState::*_ptr` use the same `(i+1)`
+                    // encoding scheme across pools, so TCB id N
+                    // collides with Endpoint index N-1, etc. Match
+                    // discriminator + ptr to keep cross-type
+                    // collisions out.
+                    let same_obj_lives = |target: &Cap| -> bool {
+                        let (want_disc, want_ptr) = match target {
+                            Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
+                            Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
+                            Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
+                            Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
+                            Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
+                            Cap::Thread { tcb } => (6u8, tcb.addr()),
+                            _ => return false,
+                        };
+                        for ci2 in 0..s.cnodes.len() {
+                            for si2 in 0..SLOTS_PER_NODE.min(s.cnodes[ci2].0.len()) {
+                                if ci2 == ci && si2 == si { continue; }
+                                if revoked[ci2][si2] { continue; }
+                                let (other_disc, other_ptr) =
+                                    match s.cnodes[ci2].0[si2].cap()
+                                {
+                                    Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
+                                    Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
+                                    Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
+                                    Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
+                                    Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
+                                    Cap::Thread { tcb } => (6u8, tcb.addr()),
+                                    _ => continue,
+                                };
+                                if other_disc == want_disc && other_ptr == want_ptr {
+                                    return true;
+                                }
+                            }
                         }
-                        Cap::Endpoint { ptr, .. } => {
-                            s.free_endpoint(KernelState::endpoint_index(ptr));
+                        false
+                    };
+                    if !same_obj_lives(&cap_to_free) {
+                        match cap_to_free {
+                            Cap::Thread { tcb } => {
+                                let id = crate::tcb::TcbId(tcb.addr() as u16);
+                                destroy_tcb(s, id);
+                            }
+                            Cap::Endpoint { ptr, .. } => {
+                                s.free_endpoint(KernelState::endpoint_index(ptr));
+                            }
+                            Cap::Notification { ptr, .. } => {
+                                s.free_notification(KernelState::ntfn_index(ptr));
+                            }
+                            Cap::SchedContext { ptr, .. } => {
+                                s.free_sched_context(
+                                    KernelState::sched_context_index(ptr));
+                            }
+                            Cap::Reply { ptr, .. } => {
+                                s.free_reply(KernelState::reply_index(ptr));
+                            }
+                            Cap::CNode { ptr, .. } => {
+                                s.free_cnode(KernelState::cnode_index(ptr));
+                            }
+                            _ => {}
                         }
-                        Cap::Notification { ptr, .. } => {
-                            s.free_notification(KernelState::ntfn_index(ptr));
-                        }
-                        Cap::SchedContext { ptr, .. } => {
-                            s.free_sched_context(
-                                KernelState::sched_context_index(ptr));
-                        }
-                        Cap::Reply { ptr, .. } => {
-                            s.free_reply(KernelState::reply_index(ptr));
-                        }
-                        Cap::CNode { ptr, .. } => {
-                            // Recursing into the freed CNode could
-                            // re-clear what we already cleared. Safe
-                            // because set_cap below reads & writes
-                            // a different slot (this slot in the
-                            // OUTER cnode, not the inner one).
-                            s.free_cnode(KernelState::cnode_index(ptr));
-                        }
-                        _ => {}
                     }
                     s.cnodes[ci].0[si].set_cap(&Cap::Null);
                     s.cnodes[ci].0[si].set_parent(None);
@@ -2325,6 +2411,10 @@ fn cnode_copy_or_mint(
         if !s.cnodes[dest_cnode_idx].0[dest_res.slot_index].cap().is_null() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst)));
+        }
+        if copy.is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
         }
         // Mirror upstream `Arch_deriveCap` for x86 paging-structure
         // caps: the derived (copied/minted) cap starts with mapped
@@ -2465,14 +2555,62 @@ fn cnode_move(
         // be in the same CNode, in which case the borrow checker
         // would object to two simultaneous &mut on the same array.
         let src_cap = s.cnodes[src_cnode_idx].0[src_res.slot_index].cap();
+        // Upstream order: dest-not-empty check first (DeleteFirst),
+        // then src-empty check (FailedLookup). Matches sel4test's
+        // `is_slot_empty` helper in helpers.c.
         if !s.cnodes[dest_cnode_idx].0[dest_res.slot_index].cap().is_null() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst)));
+        }
+        if src_cap.is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
         }
         s.cnodes[dest_cnode_idx].0[dest_res.slot_index].set_cap(&src_cap);
         s.cnodes[src_cnode_idx].0[src_res.slot_index].set_cap(&Cap::Null);
     }
     Ok(())
+}
+
+/// Phase 43 — clear every `Option<TcbId>` field across the kernel
+/// that points at `id`. Used both at TCB destruction time
+/// (`destroy_tcb`) and at slot-reuse time in retype, so a freshly
+/// allocated TCB doesn't inherit dangling back-references from a
+/// previous occupant of its slab slot.
+unsafe fn scrub_tcb_refs(s: &mut crate::kernel::KernelState, id: TcbId) {
+    for n in s.notifications.iter_mut() {
+        if n.bound_tcb == Some(id) { n.bound_tcb = None; }
+    }
+    for sc in s.sched_contexts.iter_mut() {
+        if sc.bound_tcb == Some(id) { sc.bound_tcb = None; }
+    }
+    for r in s.replies.iter_mut() {
+        if r.bound_tcb == Some(id) { r.bound_tcb = None; }
+    }
+    for opt in s.scheduler.slab.entries.iter_mut() {
+        if let Some(t) = opt.as_mut() {
+            if t.reply_to == Some(id) { t.reply_to = None; }
+        }
+    }
+}
+
+/// Phase 43 — destroy a TCB whose last cap was just deleted.
+/// Walks every kernel structure that might still reference `id` and
+/// scrubs the link before freeing the slab entry. Without this, a
+/// later signal_or_wait / pop_head / mcs_tick can dereference a stale
+/// id (manifests as `TcbSlab::get on empty slot id=N`).
+unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
+    // Idempotent: revoke walks call this once per cleared slot, so a
+    // TCB cap duplicated across multiple slots in the revoked subtree
+    // would otherwise re-enter destroy after the first call already
+    // freed the slab entry. Bail if we've already freed this slot.
+    if s.scheduler.slab.entries[id.0 as usize].is_none() {
+        return;
+    }
+    crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
+    s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
+    scrub_tcb_refs(s, id);
+    s.scheduler.slab.entries[id.0 as usize] = None;
 }
 
 fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
@@ -2526,36 +2664,167 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // Thread cap delete, suspend the TCB. On every Endpoint /
         // Notification / SchedContext / Reply / CNode cap delete,
         // release the pool slot for reuse (so long sel4test runs
-        // don't exhaust pool sizes).
-        match deleted_cap {
-            Cap::Thread { tcb } => {
-                let id = crate::tcb::TcbId(tcb.addr() as u16);
-                s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
-                // Free the slab entry so subsequent test-process
-                // spawns can reuse it.
-                s.scheduler.slab.entries[id.0 as usize] = None;
+        // don't exhaust pool sizes). But ONLY when no other cap
+        // refers to the same object — Mint/Copy create derivatives
+        // sharing the underlying object. (See
+        // CANCEL_BADGED_SENDS_0001: deleting a derived endpoint cap
+        // with the master still live used to wipe queued senders.)
+        // Match by (discriminator, ptr) so cross-pool index collisions
+        // (TCB id N == endpoint slot N+1 etc.) don't keep the object
+        // pinned spuriously.
+        let same_obj_lives = |target: &Cap| -> bool {
+            let (want_disc, want_ptr) = match target {
+                Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
+                Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
+                Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
+                Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
+                Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
+                Cap::Thread { tcb } => (6u8, tcb.addr()),
+                _ => return false,
+            };
+            for ci in 0..s.cnodes.len() {
+                for si in 0..crate::kernel::CNODE_SLOTS
+                    .min(s.cnodes[ci].0.len())
+                {
+                    if ci == cnode_idx && si == res.slot_index { continue; }
+                    let (other_disc, other_ptr) = match s.cnodes[ci].0[si].cap() {
+                        Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
+                        Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
+                        Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
+                        Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
+                        Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
+                        Cap::Thread { tcb } => (6u8, tcb.addr()),
+                        _ => continue,
+                    };
+                    if other_disc == want_disc && other_ptr == want_ptr {
+                        return true;
+                    }
+                }
             }
-            Cap::Endpoint { ptr, .. } => {
-                let i = KernelState::endpoint_index(ptr);
-                s.free_endpoint(i);
+            false
+        };
+        if !same_obj_lives(&deleted_cap) {
+            match deleted_cap {
+                Cap::Thread { tcb } => {
+                    let id = crate::tcb::TcbId(tcb.addr() as u16);
+                    destroy_tcb(s, id);
+                }
+                Cap::Endpoint { ptr, .. } => {
+                    s.free_endpoint(KernelState::endpoint_index(ptr));
+                }
+                Cap::Notification { ptr, .. } => {
+                    s.free_notification(KernelState::ntfn_index(ptr));
+                }
+                Cap::SchedContext { ptr, .. } => {
+                    s.free_sched_context(
+                        KernelState::sched_context_index(ptr));
+                }
+                Cap::Reply { ptr, .. } => {
+                    s.free_reply(KernelState::reply_index(ptr));
+                }
+                Cap::CNode { ptr, .. } => {
+                    // Phase 43 — destroying the LAST cap to a CNode
+                    // means the contents become unreachable too;
+                    // walk the slots and destroy each one's underlying
+                    // object so the memory returns to the Untyped pool.
+                    // sel4utils_destroy_process relies on this: it
+                    // revokes the CSpace cap then deletes it; without
+                    // this recursive cleanup, all the test process's
+                    // TCBs/Endpoints/Frames leak and DOMAINS0001's
+                    // basic_set_up fails on Untyped exhaustion after
+                    // a handful of test processes.
+                    let inner_idx = KernelState::cnode_index(ptr);
+                    {
+                    if inner_idx < s.cnodes.len() {
+                        for slot_i in 0..s.cnodes[inner_idx].0.len() {
+                            let inner_cap =
+                                s.cnodes[inner_idx].0[slot_i].cap();
+                            let inner_parent =
+                                s.cnodes[inner_idx].0[slot_i].parent();
+                            // Skip Null and self-references (the CNode
+                            // having a cap to itself). Also skip caps
+                            // that have other live references — same
+                            // refcount-aware logic as the cap-delete
+                            // path above.
+                            if inner_cap.is_null() { continue; }
+                            if matches!(inner_cap, Cap::CNode { ptr: ip, .. }
+                                if ip.addr() == ptr.addr())
+                            {
+                                continue;
+                            }
+                            // Borrow re-check across the closure call.
+                            let mut other_ref = false;
+                            'scan: for ci2 in 0..s.cnodes.len() {
+                                for si2 in 0..crate::kernel::CNODE_SLOTS
+                                    .min(s.cnodes[ci2].0.len())
+                                {
+                                    if ci2 == inner_idx && si2 == slot_i { continue; }
+                                    let want = match &inner_cap {
+                                        Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
+                                        Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
+                                        Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
+                                        Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
+                                        Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
+                                        Cap::Thread { tcb } => (6u8, tcb.addr()),
+                                        _ => break 'scan,
+                                    };
+                                    let (od, op) = match s.cnodes[ci2].0[si2].cap() {
+                                        Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
+                                        Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
+                                        Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
+                                        Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
+                                        Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
+                                        Cap::Thread { tcb } => (6u8, tcb.addr()),
+                                        _ => continue,
+                                    };
+                                    if od == want.0 && op == want.1 {
+                                        other_ref = true;
+                                        break 'scan;
+                                    }
+                                }
+                            }
+                            // Clear the slot first so a recursive call
+                            // that walks cnodes again sees it empty.
+                            s.cnodes[inner_idx].0[slot_i].set_cap(&Cap::Null);
+                            s.cnodes[inner_idx].0[slot_i].set_parent(None);
+                            if !other_ref {
+                                match inner_cap {
+                                    Cap::Thread { tcb } => {
+                                        let tid = crate::tcb::TcbId(tcb.addr() as u16);
+                                        destroy_tcb(s, tid);
+                                    }
+                                    Cap::Endpoint { ptr: p, .. } => {
+                                        s.free_endpoint(KernelState::endpoint_index(p));
+                                    }
+                                    Cap::Notification { ptr: p, .. } => {
+                                        s.free_notification(KernelState::ntfn_index(p));
+                                    }
+                                    Cap::SchedContext { ptr: p, .. } => {
+                                        s.free_sched_context(
+                                            KernelState::sched_context_index(p));
+                                    }
+                                    Cap::Reply { ptr: p, .. } => {
+                                        s.free_reply(KernelState::reply_index(p));
+                                    }
+                                    Cap::CNode { ptr: p, .. } => {
+                                        s.free_cnode(KernelState::cnode_index(p));
+                                    }
+                                    _ => {}
+                                }
+                                // Roll back the cap's parent Untyped
+                                // free_index too — same as a regular
+                                // cnode_delete would.
+                                let (db, ds) = cap_extent(&inner_cap);
+                                reclaim_untyped_chain_at_tail(
+                                    inner_parent, db, ds);
+                            }
+                        }
+                    }
+                    }
+                    s.free_cnode(inner_idx);
+                }
+                _ => {}
             }
-            Cap::Notification { ptr, .. } => {
-                let i = KernelState::ntfn_index(ptr);
-                s.free_notification(i);
-            }
-            Cap::SchedContext { ptr, .. } => {
-                let i = KernelState::sched_context_index(ptr);
-                s.free_sched_context(i);
-            }
-            Cap::Reply { ptr, .. } => {
-                let i = KernelState::reply_index(ptr);
-                s.free_reply(i);
-            }
-            Cap::CNode { ptr, .. } => {
-                let i = KernelState::cnode_index(ptr);
-                s.free_cnode(i);
-            }
-            _ => {}
         }
 
         // Phase 42 — Untyped reclaim. allocman's split allocator
@@ -3132,7 +3401,13 @@ fn decode_tcb(
                             0,                     // 18 fs_base (not modelled)
                             0,                     // 19 gs_base (not modelled)
                         ];
-                        let count = (args.a4 as usize).min(regs.len());
+                        // Phase 43 — count is mr1 (= args.a3) per
+                        // libsel4's `seL4_TCB_ReadRegisters` stub
+                        // (mr0=suspend|flags, mr1=count, mr2..=output).
+                        // We were reading it from mr2 (args.a4=0 here),
+                        // which made `are_tcbs_distinct` see length=0
+                        // and report "different TCBs".
+                        let count = (args.a3 as usize).min(regs.len());
                         let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
                         let inv = s.scheduler.slab.get_mut(invoker);
                         let in_regs = count.min(inv.msg_regs.len());
