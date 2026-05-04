@@ -3802,15 +3802,31 @@ fn decode_tcb(
                         }
                         let t = s.scheduler.slab.get_mut(id);
                         let n = count;
-                        if n > 0  { t.user_context.rcx = regs[0]; }   // rip
+                        // Upstream `seL4_UserContext` slot order:
+                        //   0=rip, 1=rsp, 2=rflags, 3=rax, 4=rbx,
+                        //   5=rcx, 6=rdx, 7=rsi, 8=rdi, 9=rbp,
+                        //   10=r8, 11=r9, 12=r10, 13=r11, 14=r12,
+                        //   15=r13, 16=r14, 17=r15, 18=fs_base,
+                        //   19=gs_base.
+                        //
+                        // Two independent contexts:
+                        //   * `user_context.rcx` / `.r11` —
+                        //     the sysretq path's RIP / RFLAGS slots
+                        //     (sysretq destroys those registers).
+                        //   * `user_context.rip` / `.rflags` —
+                        //     the iretq resume path's RIP / RFLAGS.
+                        // sysretq is the default; iretq fires only
+                        // when the user wrote an RCX or R11 value
+                        // that the sysretq path would lose. For all
+                        // OTHER cases, leave rcx/r11 = rip/rflags so
+                        // sysretq's tail sees a valid resume RIP.
+                        let new_rip = if n > 0 { regs[0] } else { 0 };
+                        let new_rflags = if n > 2 { regs[2] } else { 0x202 };
+                        if n > 0  { t.user_context.rip = new_rip; }
                         if n > 1  { t.user_context.rsp = regs[1]; }
-                        if n > 2  { t.user_context.r11 = regs[2]; }   // rflags
+                        if n > 2  { t.user_context.rflags = new_rflags; }
                         if n > 3  { t.user_context.rax = regs[3]; }
                         if n > 4  { t.user_context.rbx = regs[4]; }
-                        // Slot 5 is "rcx" in the upstream userctx,
-                        // but we already use TCB.user_context.rcx
-                        // as the iretq RIP slot. The real rcx is
-                        // unused at sysretq (= caller RIP); skip.
                         if n > 6  { t.user_context.rdx = regs[6]; }
                         if n > 7  { t.user_context.rsi = regs[7]; }
                         if n > 8  { t.user_context.rdi = regs[8]; }
@@ -3818,13 +3834,32 @@ fn decode_tcb(
                         if n > 10 { t.user_context.r8  = regs[10]; }
                         if n > 11 { t.user_context.r9  = regs[11]; }
                         if n > 12 { t.user_context.r10 = regs[12]; }
-                        // Slot 13 is "r11" in upstream — same slot
-                        // as our rflags; would clobber if we wrote
-                        // it. Skip.
                         if n > 14 { t.user_context.r12 = regs[14]; }
                         if n > 15 { t.user_context.r13 = regs[15]; }
                         if n > 16 { t.user_context.r14 = regs[16]; }
                         if n > 17 { t.user_context.r15 = regs[17]; }
+                        // Decide on resume path BEFORE writing rcx
+                        // and r11, since the choice affects what we
+                        // store there.
+                        let user_rcx = if n > 5 { regs[5] } else { 0 };
+                        let user_r11 = if n > 13 { regs[13] } else { 0 };
+                        // If user-set RCX / R11 are independently
+                        // meaningful, we MUST use iretq — store the
+                        // user values in rcx/r11 and set the flag.
+                        let need_iretq = (n > 5 && user_rcx != new_rip)
+                            || (n > 13 && user_r11 != new_rflags);
+                        if need_iretq {
+                            t.user_context.rcx = user_rcx;
+                            t.user_context.r11 = user_r11;
+                            t.use_iretq_resume = true;
+                        } else {
+                            // sysretq path: rcx serves as RIP, r11
+                            // as RFLAGS. Store rip/rflags there so
+                            // the sysretq tail jumps to the right
+                            // place.
+                            t.user_context.rcx = new_rip;
+                            t.user_context.r11 = new_rflags;
+                        }
                         // fs_base / gs_base (slots 18, 19) ignored.
                         if resume {
                             s.scheduler.make_runnable(id);

@@ -247,6 +247,12 @@ pub struct Tcb {
     /// transfer extra caps. Without this, IPCRIGHTS0003's queued
     /// no-grant Send would still smuggle a cap to the receiver.
     pub blocked_can_grant: bool,
+    /// Set by `seL4_TCB_WriteRegisters(resume=true)` to flag the
+    /// thread for the iretq-based resume path. Sysretq clobbers
+    /// RCX (with RIP) and R11 (with RFLAGS), so a written context
+    /// where those registers have meaningful user-set values needs
+    /// iretq instead. Cleared at next syscall entry.
+    pub use_iretq_resume: bool,
     /// Phase 43 — `seL4_TCBFlag_*` bitset (e.g. `fpuDisabled`).
     /// Only stored / round-tripped today; the kernel doesn't enforce
     /// any flag yet. FPU0003 / FPU0004 in sel4test verify the
@@ -289,6 +295,7 @@ impl Default for Tcb {
             pending_reply: None,
             blocked_is_call: false,
             blocked_can_grant: false,
+            use_iretq_resume: false,
             flags: 0,
         }
     }

@@ -114,7 +114,8 @@ pub fn efer() -> u64 { unsafe { rdmsr(IA32_EFER) } }
 pub struct UserContext {
     pub rax: u64,
     pub rbx: u64,
-    pub rcx: u64,  // user RIP
+    pub rcx: u64,  // doubles as RIP slot for sysretq path (SYSCALL
+                   // destroys RCX so we save the return RIP here)
     pub rdx: u64,
     pub rsi: u64,
     pub rdi: u64,
@@ -122,12 +123,22 @@ pub struct UserContext {
     pub r8: u64,
     pub r9: u64,
     pub r10: u64,
-    pub r11: u64, // user RFLAGS
+    pub r11: u64, // doubles as RFLAGS slot for sysretq path
     pub r12: u64,
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
     pub rsp: u64, // user RSP
+    // Anything past here is OUTSIDE the gs:[16+0..120] save window the
+    // syscall asm stub uses, so it's safe to grow the struct.
+    /// Independent RIP slot used by the iretq resume path
+    /// (`enter_user_via_iretq`). WriteRegisters writes here so the
+    /// resumed thread's RIP and RCX can differ — sysretq's path
+    /// can't preserve that distinction.
+    pub rip: u64,
+    /// Independent RFLAGS slot for the iretq resume path. Same
+    /// reasoning as `rip`.
+    pub rflags: u64,
 }
 
 impl UserContext {
@@ -135,7 +146,7 @@ impl UserContext {
         Self {
             rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
             r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-            rsp: 0,
+            rsp: 0, rip: 0, rflags: 0,
         }
     }
 
@@ -145,6 +156,8 @@ impl UserContext {
         let mut c = Self::new_zero();
         c.rcx = entry;        // sysretq reloads RIP from rcx
         c.r11 = 0x202;        // RFLAGS: bit 1 reserved=1, IF=1
+        c.rip = entry;        // iretq path reads from .rip directly
+        c.rflags = 0x202;
         c.rsp = rsp;
         c.rdi = arg0;
         c
@@ -176,7 +189,7 @@ const PER_CPU_INIT: PerCpuSyscallArea = PerCpuSyscallArea {
     user_ctx: UserContext {
         rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
         r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-        rsp: 0,
+        rsp: 0, rip: 0, rflags: 0,
     },
 };
 
@@ -283,6 +296,62 @@ pub fn init_per_cpu_gs() {
         wrmsr(IA32_KERNEL_GS_BASE, base);
         wrmsr(IA32_GS_BASE, base);
     }
+}
+
+/// Enter a user thread via iretq with full GPR restoration —
+/// independent of RIP and RFLAGS, unlike sysretq which clobbers
+/// both via RCX and R11. Used after `seL4_TCB_WriteRegisters`
+/// (REGRESSIONS0001 verifies all 16 GPRs round-trip), and any
+/// other path that needs to restore an arbitrary register set.
+///
+/// `ctx.rip` and `ctx.rflags` source the iretq frame. `ctx.rcx`
+/// and `ctx.r11` are restored to the actual RCX/R11 registers.
+///
+/// User code segment: USER_CS = 0x2B (GDT entry 5, RPL=3). Stack
+/// segment: USER_DS = 0x23 (entry 4, RPL=3). Mirrors the values
+/// installed by `gdt::init_gdt`.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn enter_user_via_iretq(ctx: *const UserContext) -> ! {
+    core::arch::naked_asm!(
+        // Build the iretq frame on the kernel stack:
+        //   [rsp+32] = SS    = 0x23                 (USER_DS | 3)
+        //   [rsp+24] = RSP   = ctx.rsp              (offset 120)
+        //   [rsp+16] = RFLAGS = ctx.rflags          (offset 136)
+        //   [rsp+8]  = CS    = 0x2B                 (USER_CS | 3)
+        //   [rsp+0]  = RIP   = ctx.rip              (offset 128)
+        // We push in reverse order (top-of-stack last in mem terms).
+        "mov rax, 0x23",
+        "push rax",
+        "mov rax, [rdi + 120]",   // RSP
+        "push rax",
+        "mov rax, [rdi + 136]",   // RFLAGS
+        "push rax",
+        "mov rax, 0x2B",
+        "push rax",
+        "mov rax, [rdi + 128]",   // RIP
+        "push rax",
+        // Restore GPRs from ctx (but skip RDI — we still need it).
+        "mov rax, [rdi + 0]",
+        "mov rbx, [rdi + 8]",
+        "mov rcx, [rdi + 16]",    // user-set RCX (independent of RIP)
+        "mov rdx, [rdi + 24]",
+        "mov rsi, [rdi + 32]",
+        "mov rbp, [rdi + 48]",
+        "mov r8,  [rdi + 56]",
+        "mov r9,  [rdi + 64]",
+        "mov r10, [rdi + 72]",
+        "mov r11, [rdi + 80]",    // user-set R11
+        "mov r12, [rdi + 88]",
+        "mov r13, [rdi + 96]",
+        "mov r14, [rdi + 104]",
+        "mov r15, [rdi + 112]",
+        "mov rdi, [rdi + 40]",    // restore RDI last (we just used it)
+        // Mirror the swapgs round-trip the sysretq path does so
+        // the active/KERNEL gs invariant stays balanced.
+        "swapgs",
+        "iretq",
+    );
 }
 
 /// First-launch a user thread. Loads `ctx`'s GPRs and uses sysretq
@@ -707,6 +776,20 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // thread; if `fpuDisabled` is set, the next FPU op
             // there must trap into our #NM handler.
             apply_fpu_gate_for(s.scheduler.slab.get(next));
+            // REGRESSIONS0001 — if `next` was set up via
+            // seL4_TCB_WriteRegisters and the user expects RCX/R11
+            // to round-trip as register values (not RIP/RFLAGS),
+            // bypass the sysretq tail and iretq directly. Clear
+            // the flag so subsequent syscall returns use sysretq
+            // again.
+            if s.scheduler.slab.get(next).use_iretq_resume {
+                s.scheduler.slab.get_mut(next).use_iretq_resume = false;
+                let pcc = current_cpu_user_ctx_mut();
+                *pcc = new_ctx;
+                crate::smp::bkl_release();
+                enter_user_via_iretq(pcc as *const _);
+                // unreachable
+            }
         } else if from_user != 0 {
             // No runnable thread on this CPU. The asm restore tail
             // would otherwise sysretq back to the original caller's
@@ -761,6 +844,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     apply_fpu_gate_for(s.scheduler.slab.get(next_id));
                     let pcc = current_cpu_user_ctx_mut();
                     *pcc = next_ctx;
+                    if s.scheduler.slab.get(next_id).use_iretq_resume {
+                        s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
+                        crate::smp::bkl_release();
+                        enter_user_via_iretq(pcc as *const _);
+                    }
                     crate::smp::bkl_release();
                     enter_user_via_sysret(pcc as *const _);
                     // unreachable

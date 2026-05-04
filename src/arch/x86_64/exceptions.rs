@@ -276,6 +276,13 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
             let pcc = crate::arch::x86_64::syscall_entry
                 ::current_cpu_user_ctx_mut();
             *pcc = next_ctx;
+            // Honour use_iretq_resume on this resume path too.
+            if s.scheduler.slab.get(next_id).use_iretq_resume {
+                s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
+                drop(_bkl);
+                crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
+                    pcc as *const _);
+            }
             // Release BKL via Drop on _bkl, then sysret.
             drop(_bkl);
             crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
@@ -589,6 +596,12 @@ extern "C" fn handle_page_fault_typed(
                 *pcc = next_ctx;
                 crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
                     s.scheduler.slab.get(next_id));
+                if s.scheduler.slab.get(next_id).use_iretq_resume {
+                    s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
+                    crate::smp::bkl_release();
+                    crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
+                        pcc as *const _);
+                }
                 crate::smp::bkl_release();
                 crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
                     pcc as *const _);
