@@ -742,6 +742,9 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 ptr
             }
             // Phase 18a: Recv on a Notification cap is wait().
+            // Non-blocking variant (NBWait / Poll) returns the
+            // pending badge if Active, or 0 in rdi if Idle —
+            // doesn't block.
             Cap::Notification { ptr, rights, .. } => {
                 if !rights.can_receive {
                     let _ = crate::fault::deliver_fault(
@@ -757,6 +760,20 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 let s_ptr: *mut crate::kernel::KernelState = s;
                 let ntfn = &mut (*s_ptr).notifications[idx];
                 let sched = &mut (*s_ptr).scheduler;
+                if !blocking
+                    && !matches!(ntfn.state,
+                        crate::notification::NtfnState::Active)
+                {
+                    // NBWait on Idle notification — return 0 badge.
+                    let tcb = sched.slab.get_mut(current);
+                    tcb.ipc_badge = 0;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        tcb.user_context.rdi = 0;
+                        tcb.user_context.rsi = 0;
+                    }
+                    return Ok(());
+                }
                 let _outcome = crate::notification::wait(ntfn, sched, current);
                 return Ok(());
             }
@@ -789,7 +806,18 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         let s_ptr: *mut crate::kernel::KernelState = s;
         let ep = &mut (*s_ptr).endpoints[idx];
         let sched = &mut (*s_ptr).scheduler;
-        receive_ipc(ep, sched, current, opts);
+        let outcome = receive_ipc(ep, sched, current, opts);
+        // For NBRecv that found nothing, mirror upstream's
+        // contract: badge = 0 in rdi, msginfo = 0 in rsi. Without
+        // this, userspace reads stale registers and NBWAIT0001 sees
+        // a non-zero badge.
+        #[cfg(target_arch = "x86_64")]
+        if matches!(outcome, crate::endpoint::IpcOutcome::Skipped) {
+            let tcb = s.scheduler.slab.get_mut(current);
+            tcb.ipc_badge = 0;
+            tcb.user_context.rdi = 0;
+            tcb.user_context.rsi = 0;
+        }
         Ok(())
     }
 }

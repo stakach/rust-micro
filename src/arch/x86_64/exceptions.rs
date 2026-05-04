@@ -515,6 +515,14 @@ extern "C" fn handle_page_fault_typed(
         loop { unsafe { core::arch::asm!("sti", "hlt"); } }
     }
     let faulter = current.unwrap();
+    // Stamp the saved RIP into the faulter's user_context before
+    // deliver_fault so the VMFault message's seL4_VMFault_IP slot
+    // (= ctx.rcx in encode_for_arch) carries the actual faulting
+    // PC, not whatever was in rcx at the last syscall.
+    unsafe {
+        crate::kernel::KERNEL.get().scheduler.slab
+            .get_mut(faulter).user_context.rcx = saved_rip;
+    }
     let fault = crate::fault::FaultMessage::VMFault {
         addr: cr2,
         fsr: error_code,
