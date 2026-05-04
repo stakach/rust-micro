@@ -3693,6 +3693,8 @@ pub mod spec {
     pub fn test_invocation() {
         arch::log("Running invocation tests...\n");
         untyped_retype_via_invocation();
+        untyped_retype_upstream_abi_far_offset();
+        revoke_chain_clears_only_descendants();
         cnode_copy_via_invocation();
         cnode_move_clears_source();
         cnode_revoke_zaps_descendants();
@@ -4042,6 +4044,171 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Untyped::Retype invocation creates child caps\n");
+    }
+
+    /// Phase 43 — sel4test driver issues `seL4_Untyped_Retype` via
+    /// libsel4's upstream ABI:
+    ///   msginfo: label=UntypedRetype, extra_caps=1, length=6
+    ///   mr0=type, mr1=size_bits, mr2=node_index, mr3=node_depth
+    ///   IPC buf [4]=node_offset, [5]=num_objects
+    ///   extraCaps[0]=root (dest CNode)
+    /// We were silently failing to land the emitted cap at far slot
+    /// indices for some test sequences. Reproduce the exact path here
+    /// so any regression shows up in the kernel-spec phase rather than
+    /// downstream as `_utspace_split_alloc: Failed to retype untyped`.
+    #[inline(never)]
+    fn untyped_retype_upstream_abi_far_offset() {
+        let invoker = setup_invoker(0);
+        let untyped_base = 0x0090_0000u64;
+        let ut_cap = Cap::Untyped {
+            ptr: PPtr::<crate::cap::UntypedStorage>::new(untyped_base).unwrap(),
+            block_bits: 14,
+            free_index: 0,
+            is_device: false,
+        };
+        unsafe {
+            let s = KERNEL.get();
+            s.cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+        }
+        // Stage the upstream ABI on the invoker's TCB: msg_regs[4] =
+        // node_offset, msg_regs[5] = num_objects, pending_extra_caps[0]
+        // = root cap. Mirrors what `handle_send` would have populated
+        // from the IPC buffer + caps_or_badges[].
+        let root_cap = unsafe {
+            KERNEL.get().scheduler.slab.get(invoker).cspace_root
+        };
+        let target_slot = 0x57f;
+        unsafe {
+            let s = KERNEL.get();
+            let t = s.scheduler.slab.get_mut(invoker);
+            t.msg_regs[4] = target_slot;
+            t.msg_regs[5] = 1;
+            t.pending_extra_caps[0] = root_cap;
+            t.pending_extra_caps_count = 1;
+        }
+        // Upstream ABI args:
+        //   info.label = UntypedRetype, info.extra_caps = 1, length = 6
+        //   a2 = type, a3 = size_bits, a4 = node_index, a5 = node_depth
+        let info_word = ((InvocationLabel::UntypedRetype as u64) << 12)
+            | (1u64 << 7)    // extra_caps = 1
+            | 6u64;          // length = 6
+        let args = SyscallArgs {
+            a0: 0,
+            a1: info_word,
+            a2: ObjectType::Endpoint.to_word(),
+            a3: 0,           // size_bits (unused for Endpoint)
+            a4: 0,           // node_index = 0 (root cap IS dest CNode)
+            a5: 0,           // node_depth = 0 (root cap directly)
+        };
+        decode_invocation(ut_cap, &args, invoker).expect("retype far ok");
+
+        // Verify cap landed at the FAR slot we requested, not somewhere
+        // else.
+        unsafe {
+            let s = KERNEL.get();
+            match s.cnodes[0].0[target_slot as usize].cap() {
+                Cap::Endpoint { .. } => {}
+                other => panic!(
+                    "expected Endpoint at far slot 0x{:x}, got {:?}",
+                    target_slot, other),
+            }
+            // No collateral writes at slot 4 (the LEGACY-ABI default
+            // dest_offset).
+            assert!(s.cnodes[0].0[4].cap().is_null(),
+                "slot 4 should remain Null when upstream ABI requests slot 0x{:x}",
+                target_slot);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ Untyped::Retype upstream ABI lands at requested far slot\n");
+    }
+
+    /// Phase 43 — sel4test's basic_tear_down revokes each rootserver
+    /// Untyped after every test. Verify revoke clears the proper
+    /// descendant subtree and leaves UNRELATED slots alone, even
+    /// when those slots are far from the source slot index.
+    /// (DOMAINS0001 fails after 17 tests; if revoke is silently
+    /// nulling slot 0x57f despite no derivation chain to it, this
+    /// spec will catch it.)
+    #[inline(never)]
+    fn revoke_chain_clears_only_descendants() {
+        let invoker = setup_invoker(0);
+        let parent_ut = Cap::Untyped {
+            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x00A0_0000).unwrap(),
+            block_bits: 14,
+            free_index: 0,
+            is_device: false,
+        };
+        // Plant an UNRELATED Untyped at slot 0x57f — must survive a
+        // revoke of slot 0.
+        let unrelated_ut = Cap::Untyped {
+            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x00B0_0000).unwrap(),
+            block_bits: 14,
+            free_index: 0,
+            is_device: false,
+        };
+        unsafe {
+            let s = KERNEL.get();
+            s.cnodes[0].0[0] = Cte::with_cap(&parent_ut);
+            s.cnodes[0].0[0x57f] = Cte::with_cap(&unrelated_ut);
+            // Default parent for the unrelated cap is None (sentinel).
+            assert!(s.cnodes[0].0[0x57f].parent().is_none(),
+                "fresh Cte::with_cap should have parent=None");
+        }
+        // Retype parent into a sub-Untyped at slot 100, then sub into
+        // an Endpoint at slot 200 (chained derivation). Both should
+        // be revoked when we revoke slot 0; slot 0x57f must NOT be.
+        let cnode_cap = unsafe {
+            KERNEL.get().scheduler.slab.get(invoker).cspace_root
+        };
+        // Legacy ABI: a3 = (size_bits << 32) | num_objects.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::UntypedRetype as u64) << 12,
+            a2: ObjectType::Untyped.to_word(),
+            a3: (8u64 << 32) | 1,   // size_bits=8 (256B), num=1
+            a4: 100,                // dest_offset
+            ..Default::default()
+        };
+        decode_invocation(parent_ut, &args, invoker).expect("retype sub-ut");
+
+        // Snapshot the sub-Untyped cap.
+        let sub_ut = unsafe { KERNEL.get().cnodes[0].0[100].cap() };
+        let args = SyscallArgs {
+            a1: (InvocationLabel::UntypedRetype as u64) << 12,
+            a2: ObjectType::Endpoint.to_word(),
+            a3: 1,
+            a4: 200,
+            ..Default::default()
+        };
+        decode_invocation(sub_ut, &args, invoker).expect("retype ep");
+
+        // Revoke the parent at slot 0.
+        let args = SyscallArgs {
+            a1: (InvocationLabel::CNodeRevoke as u64) << 12,
+            a2: 0,
+            ..Default::default()
+        };
+        decode_invocation(cnode_cap, &args, invoker).expect("revoke parent");
+
+        unsafe {
+            let s = KERNEL.get();
+            // Parent cap stays in slot 0 (revoke source is preserved).
+            assert!(matches!(s.cnodes[0].0[0].cap(), Cap::Untyped { .. }),
+                "revoke source slot 0 should keep its cap");
+            // Both descendants gone.
+            assert!(s.cnodes[0].0[100].cap().is_null(),
+                "sub-Untyped at 100 should be nulled");
+            assert!(s.cnodes[0].0[200].cap().is_null(),
+                "Endpoint at 200 should be nulled");
+            // The unrelated Untyped MUST survive.
+            match s.cnodes[0].0[0x57f].cap() {
+                Cap::Untyped { ptr, .. } => assert_eq!(ptr.addr(), 0x00B0_0000,
+                    "unrelated Untyped at 0x57f must survive an unrelated revoke"),
+                other => panic!("unrelated cap at 0x57f got nulled by revoke: {:?}",
+                    other),
+            }
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ Revoke walks only the actual descendant subtree\n");
     }
 
     #[inline(never)]
