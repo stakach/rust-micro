@@ -3806,6 +3806,16 @@ fn decode_tcb(
                             }
                         }
                     }
+                } else {
+                    // SCHED0008 — if the thread is blocked in an
+                    // endpoint or notification wait queue, that
+                    // queue is priority-ordered. Reposition so the
+                    // new priority is honoured on the next pop.
+                    use crate::tcb::ThreadStateType::*;
+                    let state = s.scheduler.slab.get(id).state;
+                    if matches!(state, BlockedOnSend | BlockedOnReceive | BlockedOnNotification) {
+                        crate::endpoint::reposition_in_wait_queue(&mut s.scheduler, id);
+                    }
                 }
                 Ok(())
             }

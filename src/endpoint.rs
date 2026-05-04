@@ -343,6 +343,27 @@ pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
     crate::notification::cancel_wait_anywhere(sched, thread);
 }
 
+/// SCHED0008 — reposition `thread` within whatever endpoint or
+/// notification wait-queue currently holds it, using the new
+/// priority. seL4's `tcbEPAppend` is priority-ordered (head =
+/// highest), so a thread whose priority changes while parked must
+/// be moved to a new slot to preserve the invariant. SetPriority
+/// calls this AFTER it's written the new `tcb.priority`.
+pub fn reposition_in_wait_queue(sched: &mut Scheduler, thread: TcbId) {
+    use crate::kernel::{KERNEL, KernelState};
+    let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
+    for i in 0..crate::kernel::MAX_ENDPOINTS {
+        let ep = unsafe { &mut (*s_ptr).endpoints[i] };
+        if !ep_queue_contains(ep, sched, thread) {
+            continue;
+        }
+        queue_remove(ep, sched, thread);
+        queue_push(ep, sched, thread);
+        return;
+    }
+    crate::notification::reposition_in_wait_queue(sched, thread);
+}
+
 fn ep_queue_contains(ep: &Endpoint, sched: &Scheduler, thread: TcbId) -> bool {
     let mut cur = ep.head;
     while let Some(c) = cur {

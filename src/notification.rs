@@ -303,6 +303,27 @@ pub fn cancel_wait(ntfn: &mut Notification, sched: &mut Scheduler, thread: TcbId
     }
 }
 
+/// SCHED0008 — reposition `thread` within whatever notification
+/// wait-queue currently holds it, using the new priority. Mirrors
+/// `endpoint::reposition_in_wait_queue` for notifications.
+pub fn reposition_in_wait_queue(sched: &mut Scheduler, thread: TcbId) {
+    use crate::kernel::{KERNEL, KernelState};
+    let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
+    for i in 0..crate::kernel::MAX_NTFNS {
+        let ntfn = unsafe { &mut (*s_ptr).notifications[i] };
+        let mut found = false;
+        let mut cur = ntfn.head;
+        while let Some(c) = cur {
+            if c == thread { found = true; break; }
+            cur = sched.slab.try_get(c).and_then(|t| t.ep_next);
+        }
+        if !found { continue; }
+        queue_remove(ntfn, sched, thread);
+        queue_push(ntfn, sched, thread);
+        return;
+    }
+}
+
 /// Phase 43 — walk every kernel notification queue, removing `thread`
 /// if found. Mirrors `endpoint::cancel_ipc_anywhere` for notifications;
 /// used by TCB destruction to flush stale ids before the slab slot
