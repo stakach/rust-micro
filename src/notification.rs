@@ -162,6 +162,16 @@ pub fn signal(
                         sched.slab.get_mut(bt).sc = Some(sc_idx);
                     }
                 }
+                // Phase 43 — BIND005 enforcement: a TCB with no SC
+                // (no own + no donation) MUST NOT run. Fall through
+                // to leaving the notification Active so the badge is
+                // parked until SC is later bound (SchedContextBind on
+                // the TCB will pick it up).
+                if sched.slab.get(bt).sc.is_none() {
+                    ntfn.state = NtfnState::Active;
+                    ntfn.pending_badge |= badge;
+                    return None;
+                }
                 let state = sched.slab.get(bt).state;
                 if matches!(state, ThreadStateType::BlockedOnReceive) {
                     // Walk all endpoints to find which queue holds

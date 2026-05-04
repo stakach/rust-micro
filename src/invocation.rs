@@ -1110,6 +1110,39 @@ fn decode_sched_context(
                         }
                         s.scheduler.slab.get_mut(tcb_id).sc = Some(sc_id);
                         s.sched_contexts[sc_id as usize].bound_tcb = Some(tcb_id);
+                        // Phase 43 — BIND005 deferred wake. If a
+                        // notification was signalled while this TCB
+                        // had no SC, the badge is parked in the
+                        // notification's Active state. Now that the
+                        // TCB has an SC again, drain the pending
+                        // badge into the TCB and wake it.
+                        let bn = s.scheduler.slab.get(tcb_id).bound_notification;
+                        if let Some(bn_idx) = bn {
+                            let ntfn = &mut s.notifications[bn_idx as usize];
+                            if matches!(ntfn.state,
+                                crate::notification::NtfnState::Active)
+                            {
+                                let badge = ntfn.pending_badge;
+                                ntfn.pending_badge = 0;
+                                ntfn.state =
+                                    crate::notification::NtfnState::Idle;
+                                let was_blocked_recv = matches!(
+                                    s.scheduler.slab.get(tcb_id).state,
+                                    crate::tcb::ThreadStateType::BlockedOnReceive);
+                                if was_blocked_recv {
+                                    crate::endpoint::cancel_ipc_anywhere(
+                                        &mut s.scheduler, tcb_id);
+                                }
+                                let tcb_t = s.scheduler.slab.get_mut(tcb_id);
+                                tcb_t.ipc_badge = badge;
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    tcb_t.user_context.rdi = badge;
+                                    tcb_t.user_context.rsi = 0;
+                                }
+                                s.scheduler.make_runnable(tcb_id);
+                            }
+                        }
                     }
                     Cap::Notification { ptr, .. } => {
                         let ntfn_idx = KernelState::ntfn_index(ptr);
