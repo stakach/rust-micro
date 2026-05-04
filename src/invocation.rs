@@ -3648,7 +3648,16 @@ fn decode_tcb(
                 Ok(())
             }
             InvocationLabel::TCBResume => {
-                s.scheduler.make_runnable(id);
+                // SCHED0010 — Resume succeeds even on a thread with
+                // no SchedContext, but such a thread cannot run.
+                // Mark Running so a future SchedContextBind picks it
+                // up; only enqueue when an SC is actually present.
+                if s.scheduler.slab.get(id).sc.is_some() {
+                    s.scheduler.make_runnable(id);
+                } else {
+                    s.scheduler.slab.get_mut(id).state =
+                        crate::tcb::ThreadStateType::Running;
+                }
                 Ok(())
             }
             // `seL4_TCB_Configure` — one-shot TCB setup. Two ABI

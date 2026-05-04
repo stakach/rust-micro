@@ -464,6 +464,20 @@ impl KernelState {
     /// Phase 43 — release a SchedContext slot for reuse.
     pub fn free_sched_context(&mut self, i: usize) {
         if i < MAX_SCHED_CONTEXTS {
+            // SCHED0010 — if a TCB is bound to this SC, clear that
+            // link so the scheduler sees `tcb.sc == None` and won't
+            // consider the thread schedulable. Mirror on any
+            // notification holding the SC for passive-server use.
+            if let Some(tcb_id) = self.sched_contexts[i].bound_tcb {
+                if self.scheduler.slab.try_get(tcb_id).is_some() {
+                    self.scheduler.slab.get_mut(tcb_id).sc = None;
+                }
+            }
+            for ntfn in self.notifications.iter_mut() {
+                if ntfn.bound_sc == Some(i as u16) {
+                    ntfn.bound_sc = None;
+                }
+            }
             self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
         }
     }
