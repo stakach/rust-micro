@@ -2424,7 +2424,16 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                             Cap::Thread { tcb } => (6u8, tcb.addr()),
                             _ => return false,
                         };
+                        // For CNode caps: skip self-references inside
+                        // the CNode itself; they become unreachable
+                        // once the last external ref is gone.
+                        let target_self_cnode_idx = match target {
+                            Cap::CNode { ptr, .. } =>
+                                Some(KernelState::cnode_index(*ptr)),
+                            _ => None,
+                        };
                         for ci2 in 0..s.cnodes.len() {
+                            if Some(ci2) == target_self_cnode_idx { continue; }
                             for si2 in 0..SLOTS_PER_NODE.min(s.cnodes[ci2].0.len()) {
                                 if ci2 == ci && si2 == si { continue; }
                                 if revoked[ci2][si2] { continue; }
@@ -2870,7 +2879,20 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 Cap::Thread { tcb } => (6u8, tcb.addr()),
                 _ => return false,
             };
+            // For CNode caps: refs INSIDE the CNode itself (the
+            // canonical seL4_CapInitThreadCNode self-reference) don't
+            // count — once the last EXTERNAL ref is gone, those
+            // self-refs become unreachable. sel4test's
+            // sel4utils_destroy_process leaves a self-ref in the
+            // process's CSpace; without this skip, we'd never free
+            // the test process's CNode and the pool exhausts after
+            // ~MAX_CNODES tests.
+            let target_self_cnode_idx = match target {
+                Cap::CNode { ptr, .. } => Some(KernelState::cnode_index(*ptr)),
+                _ => None,
+            };
             for ci in 0..s.cnodes.len() {
+                if Some(ci) == target_self_cnode_idx { continue; }
                 for si in 0..crate::kernel::CNODE_SLOTS
                     .min(s.cnodes[ci].0.len())
                 {
