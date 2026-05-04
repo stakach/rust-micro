@@ -1240,6 +1240,44 @@ fn decode_sched_context(
             }
             Ok(())
         }
+        // SCHED0017 — SchedContext_YieldTo. Mirrors upstream
+        // decodeSchedContext_YieldTo error paths:
+        //   * unbound SC                          → IllegalOperation
+        //   * target tcb == invoker (self-yield)  → IllegalOperation
+        //   * target.priority > invoker.mcp       → IllegalOperation
+        //   * target unrunnable                   → NoError, consumed=0
+        // The "actually yield budget" path needs timer infrastructure
+        // (charge consumption, swap SCs, reschedule); SCHED0019 is
+        // gated on that and not in the regex yet.
+        InvocationLabel::SchedContextYieldTo => {
+            unsafe {
+                let s = KERNEL.get();
+                let bound = s.sched_contexts[sc_id as usize].bound_tcb;
+                let target_id = match bound {
+                    Some(t) => t,
+                    None => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_IllegalOperation))),
+                };
+                if target_id == invoker {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_IllegalOperation)));
+                }
+                let target_prio = s.scheduler.slab.get(target_id).priority;
+                let inv_mcp = s.scheduler.slab.get(invoker).mcp;
+                if target_prio > inv_mcp {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_IllegalOperation)));
+                }
+                // Stamp consumed=0 in the reply. We don't track
+                // budget consumption without a timer; for the
+                // unrunnable-target case (SCHED0017 case 3) the
+                // contract is exactly 0.
+                let inv = s.scheduler.slab.get_mut(invoker);
+                inv.msg_regs[0] = 0;
+                inv.ipc_length = 1;
+            }
+            Ok(())
+        }
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
