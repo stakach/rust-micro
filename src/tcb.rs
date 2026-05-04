@@ -242,6 +242,11 @@ pub struct Tcb {
     /// registers — manifests as "GetMR(0) != ~msg" in
     /// CANCEL_BADGED_SENDS_0001 etc.
     pub blocked_is_call: bool,
+    /// Carries the `can_grant` bit from the sender's cap into the
+    /// queued state, so a late-arriving receiver knows whether to
+    /// transfer extra caps. Without this, IPCRIGHTS0003's queued
+    /// no-grant Send would still smuggle a cap to the receiver.
+    pub blocked_can_grant: bool,
     /// Phase 43 — `seL4_TCBFlag_*` bitset (e.g. `fpuDisabled`).
     /// Only stored / round-tripped today; the kernel doesn't enforce
     /// any flag yet. FPU0003 / FPU0004 in sel4test verify the
@@ -283,6 +288,7 @@ impl Default for Tcb {
             pending_extra_caps_count: 0,
             pending_reply: None,
             blocked_is_call: false,
+            blocked_can_grant: false,
             flags: 0,
         }
     }

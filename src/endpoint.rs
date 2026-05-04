@@ -101,17 +101,20 @@ fn queue_is_empty(ep: &Endpoint) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Options for `send_ipc`. Mirrors the `bool blocking, bool do_call,
-/// word_t badge` triple in seL4's `sendIPC`.
+/// word_t badge` triple in seL4's `sendIPC`, plus a `can_grant`
+/// gate sourced from the cap's rights — the receive side only
+/// accepts cap-transfer when the sender's cap had grant rights.
 #[derive(Copy, Clone, Debug)]
 pub struct SendOptions {
     pub blocking: bool,
     pub do_call: bool,
     pub badge: Word,
+    pub can_grant: bool,
 }
 
 impl SendOptions {
     pub const fn blocking(badge: Word) -> Self {
-        Self { blocking: true, do_call: false, badge }
+        Self { blocking: true, do_call: false, badge, can_grant: true }
     }
 }
 
@@ -157,6 +160,7 @@ pub fn send_ipc(
             // the receive-pop path can act on it.
             sched.block(sender, ThreadStateType::BlockedOnSend);
             sched.slab.get_mut(sender).blocked_is_call = opts.do_call;
+            sched.slab.get_mut(sender).blocked_can_grant = opts.can_grant;
             queue_push(ep, sched, sender);
             ep.state = EpState::Send;
             IpcOutcome::Blocked
@@ -166,7 +170,18 @@ pub fn send_ipc(
             let receiver = queue_pop_head(ep, sched)
                 .expect("Recv state must have at least one waiter");
             transfer(sched, sender, receiver, opts.badge);
-            transfer_extra_caps(sched, sender, receiver);
+            // Cap transfer requires the sender's cap to carry grant
+            // rights (or grant-reply for Reply paths). Without this
+            // gate, sel4test IPCRIGHTS0003 sees a cap arrive at the
+            // receiver even though the sending EP cap was minted
+            // without grant.
+            if opts.can_grant {
+                transfer_extra_caps(sched, sender, receiver);
+            } else {
+                // Drop staged caps so the next IPC doesn't accidentally
+                // smuggle them.
+                sched.slab.get_mut(sender).pending_extra_caps_count = 0;
+            }
             if opts.do_call {
                 // Call: block sender BlockedOnReply, set the
                 // receiver's reply_to to the caller.
@@ -229,8 +244,16 @@ pub fn receive_ipc(
             // The sender's `ipc_badge` field was set on the original
             // send call — re-use it instead of consulting the cap.
             let badge = sched.slab.get(sender).ipc_badge;
+            // Capture and clear the queued can_grant flag so re-queue
+            // doesn't smuggle stale state.
+            let sender_can_grant = core::mem::replace(
+                &mut sched.slab.get_mut(sender).blocked_can_grant, false);
             transfer(sched, sender, receiver, badge);
-            transfer_extra_caps(sched, sender, receiver);
+            if sender_can_grant {
+                transfer_extra_caps(sched, sender, receiver);
+            } else {
+                sched.slab.get_mut(sender).pending_extra_caps_count = 0;
+            }
             // Phase 43 — if the sender was blocked on a Call (not a
             // plain Send), it must wait for an actual Reply: park it
             // in BlockedOnReply, donate its SC, and bind the
@@ -748,7 +771,7 @@ pub mod spec {
             s.ipc_badge = 0xABCD;
         }
         let r = send_ipc(&mut ep, &mut sched, sender, SendOptions {
-            blocking: true, do_call: false, badge: 0xABCD,
+            blocking: true, do_call: false, badge: 0xABCD, can_grant: true,
         });
         assert_eq!(r, IpcOutcome::Blocked);
         assert_eq!(ep.state, EpState::Send);
@@ -790,7 +813,7 @@ pub mod spec {
         let mut ep = Endpoint::new();
         let sender = sched.admit(runnable(50));
         let r = send_ipc(&mut ep, &mut sched, sender, SendOptions {
-            blocking: false, do_call: false, badge: 0,
+            blocking: false, do_call: false, badge: 0, can_grant: true,
         });
         assert_eq!(r, IpcOutcome::Skipped);
         assert_eq!(ep.state, EpState::Idle);

@@ -2748,14 +2748,21 @@ fn cnode_copy_or_mint(
     //       msg_regs[4] = rights, msg_regs[5] = badge (Mint).
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
-    let (dest_index, dest_depth, src_index, src_depth, badge) = if upstream {
-        let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
-        let b = inv_tcb.msg_regs[5];
-        (args.a2, args.a3 as u32, args.a4, args.a5 as u32, b)
-    } else {
-        (args.a2, crate::cspace::WORD_BITS,
-         args.a3, crate::cspace::WORD_BITS, args.a4)
-    };
+    let (dest_index, dest_depth, src_index, src_depth, badge, rights_word) =
+        if upstream {
+            let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
+            // Upstream wire layout (mirrors libsel4's CNode_Copy /
+            // CNode_Mint stubs): mr4 = rights, mr5 = badge (Mint).
+            let r = inv_tcb.msg_regs[4];
+            let b = inv_tcb.msg_regs[5];
+            (args.a2, args.a3 as u32, args.a4, args.a5 as u32, b, r)
+        } else {
+            // Legacy microtest path passes badge in a4 and gives no
+            // rights word. Default to "all rights" so existing
+            // microtest behaviour is preserved.
+            (args.a2, crate::cspace::WORD_BITS,
+             args.a3, crate::cspace::WORD_BITS, args.a4, !0u64)
+        };
     let dest_root = target;
     unsafe {
         let s = KERNEL.get();
@@ -2821,6 +2828,33 @@ fn cnode_copy_or_mint(
                 *mapped = None;
                 *asid = 0;
             }
+            _ => {}
+        }
+        // Mask rights against `rights_word`. Mirrors upstream
+        // `maskCapRights` — applies to BOTH Copy and Mint, regardless
+        // of badge. Bit layout matches `seL4_CapRights_t`:
+        //   bit 0 = capAllowWrite       (= can_send for EP/NTFN)
+        //   bit 1 = capAllowRead        (= can_receive)
+        //   bit 2 = capAllowGrant       (= can_grant)
+        //   bit 3 = capAllowGrantReply  (= can_grant_reply)
+        // sel4test's IPCRIGHTS0001 mints an EP cap with rights = 0
+        // and verifies seL4_Send through it is silently dropped.
+        const ALLOW_WRITE: u64       = 1 << 0;
+        const ALLOW_READ: u64        = 1 << 1;
+        const ALLOW_GRANT: u64       = 1 << 2;
+        const ALLOW_GRANT_REPLY: u64 = 1 << 3;
+        match &mut copy {
+            Cap::Endpoint { rights, .. } => {
+                rights.can_send        &= rights_word & ALLOW_WRITE != 0;
+                rights.can_receive     &= rights_word & ALLOW_READ != 0;
+                rights.can_grant       &= rights_word & ALLOW_GRANT != 0;
+                rights.can_grant_reply &= rights_word & ALLOW_GRANT_REPLY != 0;
+            }
+            Cap::Notification { rights, .. } => {
+                rights.can_send    &= rights_word & ALLOW_WRITE != 0;
+                rights.can_receive &= rights_word & ALLOW_READ != 0;
+            }
+            // TODO: mask Frame/Reply rights when sel4test exercises them.
             _ => {}
         }
         if mint {

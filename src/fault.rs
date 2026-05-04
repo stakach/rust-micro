@@ -125,6 +125,10 @@ pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
             blocking: true,
             do_call: true,
             badge,
+            // Fault delivery acts as a Call from the faulter to its
+            // fault handler — grant rights so the handler can install
+            // a reply cap and send caps back if it wants to.
+            can_grant: true,
         });
         Ok(())
     }

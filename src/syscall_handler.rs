@@ -46,15 +46,38 @@ pub trait DebugSink {
     fn put_byte(&mut self, byte: u8);
 }
 
-/// Best-effort cap-type tag for `seL4_DebugCapIdentify`. Upstream
-/// returns cap-specific tag values (cap_endpoint_cap = 4 etc.);
-/// libsel4allocman's debug-build sanity checks only care that 0 =
-/// null and any other value = non-null. We honour that contract:
-/// 0 for Null, 1 for everything else.
+/// Cap-type tag for `seL4_DebugCapIdentify`. Returns upstream's
+/// `cap_*_cap` enum values from `structures_64.bf` so libsel4sync
+/// (and other libs) can identify caps by type. Tag values mirror
+/// `crate::cap::tag` — keep in sync.
 #[cfg(target_arch = "x86_64")]
 fn debug_cap_type_tag(cap: &crate::cap::Cap) -> u64 {
+    use crate::cap::{Cap, tag};
     match cap {
-        crate::cap::Cap::Null => 0,
+        Cap::Null              => tag::NULL,
+        Cap::Untyped { .. }    => tag::UNTYPED,
+        Cap::Endpoint { .. }   => tag::ENDPOINT,
+        Cap::Notification { .. } => tag::NOTIFICATION,
+        Cap::Reply { .. }      => tag::REPLY,
+        Cap::CNode { .. }      => tag::CNODE,
+        Cap::Thread { .. }     => tag::THREAD,
+        Cap::IrqControl        => tag::IRQ_CONTROL,
+        Cap::IrqHandler { .. } => tag::IRQ_HANDLER,
+        Cap::Domain            => tag::DOMAIN,
+        Cap::SchedContext { .. } => tag::SCHED_CONTEXT,
+        Cap::SchedControl { .. } => tag::SCHED_CONTROL,
+        Cap::Frame { .. }      => tag::FRAME,
+        Cap::PageTable { .. }  => tag::PAGE_TABLE,
+        Cap::PageDirectory { .. } => tag::PAGE_DIRECTORY,
+        Cap::Pdpt { .. }       => tag::PDPT,
+        Cap::PML4 { .. }       => tag::PML4,
+        Cap::AsidControl       => tag::ASID_CONTROL,
+        Cap::AsidPool { .. }   => tag::ASID_POOL,
+        Cap::IOPort { .. }     => tag::IO_PORT,
+        Cap::IOPortControl     => tag::IO_PORT_CONTROL,
+        // Catch-all for variants we don't model individually
+        // (Zombie, generic Arch). Returning a non-zero non-NULL
+        // value preserves the legacy "any cap = non-null" contract.
         _ => 1,
     }
 }
@@ -556,7 +579,7 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
             }
         }
 
-        let (ep_ptr, badge) = match target {
+        let (ep_ptr, badge, ep_can_grant) = match target {
             Cap::Endpoint { ptr, badge, rights } => {
                 if !rights.can_send {
                     return Err(KException::SyscallError(SyscallError::new(
@@ -567,7 +590,7 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
                 // Endpoint's badge onto the sender. (Non-Endpoint
                 // paths leave it at 0 from staging.)
                 s.scheduler.slab.get_mut(current).ipc_badge = badge.0;
-                (ptr, badge.0)
+                (ptr, badge.0, rights.can_grant)
             }
             // Phase 18a: Send on a Notification cap is signal().
             Cap::Notification { ptr, badge, rights } => {
@@ -645,7 +668,12 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
             }
         };
         let idx = crate::kernel::KernelState::endpoint_index(ep_ptr);
-        let opts = SendOptions { blocking, do_call: call, badge };
+        let opts = SendOptions {
+            blocking,
+            do_call: call,
+            badge,
+            can_grant: ep_can_grant,
+        };
         // Split borrows: we need &mut endpoint AND &mut scheduler at
         // once. Take them through indexing on the same struct.
         let s_ptr: *mut crate::kernel::KernelState = s;
@@ -697,18 +725,33 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         let ep_ptr = match target {
             Cap::Endpoint { ptr, rights, .. } => {
                 if !rights.can_receive {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )));
+                    // IPCRIGHTS0002 / upstream `handleRecv` —
+                    // Recv on a cap without read rights is a CapFault
+                    // (in_recv=true), not an inline error. The
+                    // caller's fault EP gets the message; userspace
+                    // sees no return.
+                    let _ = crate::fault::deliver_fault(
+                        current,
+                        crate::fault::FaultMessage::CapFault {
+                            addr: args.a0,
+                            in_recv: true,
+                        },
+                    );
+                    return Ok(());
                 }
                 ptr
             }
             // Phase 18a: Recv on a Notification cap is wait().
             Cap::Notification { ptr, rights, .. } => {
                 if !rights.can_receive {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )));
+                    let _ = crate::fault::deliver_fault(
+                        current,
+                        crate::fault::FaultMessage::CapFault {
+                            addr: args.a0,
+                            in_recv: true,
+                        },
+                    );
+                    return Ok(());
                 }
                 let idx = crate::kernel::KernelState::ntfn_index(ptr);
                 let s_ptr: *mut crate::kernel::KernelState = s;
