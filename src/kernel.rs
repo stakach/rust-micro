@@ -239,6 +239,20 @@ impl KernelState {
         }
     }
 
+    /// Claim a CNode index whose contents were populated by code
+    /// outside the alloc_cnode path (e.g. the rootserver's CNode at
+    /// boot). Without this, the in-use bitmap doesn't see the CNode
+    /// as occupied and a subsequent `alloc_cnode` recycles it,
+    /// wiping every cap the direct-init code placed there.
+    pub fn claim_cnode(&mut self, i: usize) {
+        if i < MAX_CNODES {
+            self.set_cnode_in_use(i, true);
+            if self.next_cnode <= i {
+                self.next_cnode = i + 1;
+            }
+        }
+    }
+
     // Phase 43 — bitmap-based "in-use" tracking for pool recycling.
     fn ep_in_use(&self, i: usize) -> bool {
         unsafe { (POOL_BITMAPS.endpoints[i / 64] >> (i % 64)) & 1 == 1 }

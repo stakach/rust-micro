@@ -387,6 +387,13 @@ pub unsafe fn launch_rootserver() -> ! {
     for slot in s.cnodes[ROOTSERVER_CNODE_IDX].0.iter_mut() {
         slot.set_cap(&Cap::Null);
     }
+    // Phase 43 — claim the rootserver's CNode in the in-use bitmap.
+    // Direct init bypasses `alloc_cnode`, which is what stamps in_use,
+    // so a later `alloc_cnode` would otherwise see cn3 as free, reuse
+    // it for a sub-CSpace allocation, and zero every rootserver cap.
+    // DOMAINS0001 hit this after sel4test's per-test allocator
+    // exhausted MAX_CNODES and started recycling slots.
+    s.claim_cnode(ROOTSERVER_CNODE_IDX);
 
     // Build the TCB. cspace_root points at the new CNode; the
     // dispatcher consults this for cap lookups.
