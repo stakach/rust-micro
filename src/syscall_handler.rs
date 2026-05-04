@@ -80,7 +80,28 @@ pub fn handle_syscall(
         // existing `handle_reply` path stays callable directly from
         // kernel specs but isn't reachable from userspace.
         Syscall::SysReplyRecv => {
+            // Phase 43 — handle_reply's `make_runnable(caller)` may
+            // clear `scheduler.current` via possibleSwitchTo (when
+            // caller > current priority). The composite syscall still
+            // has the receive part to run, and handle_recv looks up
+            // `scheduler.current()` to find the receiver. Stash the
+            // invoker before the reply and restore it afterwards so
+            // handle_recv sees the right TCB. The actual reschedule
+            // happens at the dispatcher tail once handle_recv is done.
+            #[cfg(target_arch = "x86_64")]
+            let saved_current = unsafe {
+                crate::kernel::KERNEL.get().scheduler.current()
+            };
             handle_reply(args)?;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let s = crate::kernel::KERNEL.get();
+                if s.scheduler.current().is_none() {
+                    if let Some(t) = saved_current {
+                        s.scheduler.set_current(Some(t));
+                    }
+                }
+            }
             handle_recv(args, /* blocking */ true)
         }
         // Phase 36b — MCS notification-only Recv variants. Forward
@@ -579,20 +600,24 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         })?;
         let cspace_root = s.scheduler.slab.get(current).cspace_root;
         let target = lookup_cap(s, &cspace_root, args.a0)?;
-        // Phase 36d — if the receiver passed a Reply cap cptr in
-        // `args.a2`, register the Reply object so any incoming
-        // Call binds it to the caller. This is how seL4 MCS
-        // models `seL4_Recv(ep, &sender, replyCap)`. cptr 0 means
-        // "no reply" — we fall back to the legacy Tcb.reply_to
-        // path that handle_reply / SysReplyRecv still consult.
-        if args.a2 != 0 {
-            if let Ok(Cap::Reply { ptr, .. }) =
-                lookup_cap(s, &cspace_root, args.a2)
-            {
-                let reply_idx =
-                    crate::kernel::KernelState::reply_index(ptr) as u16;
-                s.scheduler.slab.get_mut(current).pending_reply =
-                    Some(reply_idx);
+        // Phase 36d / 43 — MCS reply cap is in `replyRegister = R12`
+        // per upstream's `registerset.h`. libsel4's `MCS_REPLY_DECL`
+        // pins it via `register seL4_Word reply_reg asm("r12") = reply;`.
+        // Read it from the saved `user_context.r12` (NOT args.a2 / r10
+        // which is mr0). cptr 0 means "no reply" — we fall back to the
+        // legacy Tcb.reply_to path that handle_reply consults.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let reply_cptr = s.scheduler.slab.get(current).user_context.r12;
+            if reply_cptr != 0 {
+                if let Ok(Cap::Reply { ptr, .. }) =
+                    lookup_cap(s, &cspace_root, reply_cptr)
+                {
+                    let reply_idx =
+                        crate::kernel::KernelState::reply_index(ptr) as u16;
+                    s.scheduler.slab.get_mut(current).pending_reply =
+                        Some(reply_idx);
+                }
             }
         }
         let ep_ptr = match target {

@@ -153,8 +153,10 @@ pub fn send_ipc(
             // BlockedOnReply once the message is delivered.
             // Without a receiver waiting it still queues on Send;
             // the call-vs-send distinction is observed when the
-            // pair-up actually happens.
+            // pair-up actually happens — record it on the TCB so
+            // the receive-pop path can act on it.
             sched.block(sender, ThreadStateType::BlockedOnSend);
+            sched.slab.get_mut(sender).blocked_is_call = opts.do_call;
             queue_push(ep, sched, sender);
             ep.state = EpState::Send;
             IpcOutcome::Blocked
@@ -229,7 +231,32 @@ pub fn receive_ipc(
             let badge = sched.slab.get(sender).ipc_badge;
             transfer(sched, sender, receiver, badge);
             transfer_extra_caps(sched, sender, receiver);
-            sched.make_runnable(sender);
+            // Phase 43 — if the sender was blocked on a Call (not a
+            // plain Send), it must wait for an actual Reply: park it
+            // in BlockedOnReply, donate its SC, and bind the
+            // receiver's reply slot to it. Without this the sender
+            // resumes from `seL4_Call` reading stale `user_context`
+            // and the test sees garbage in MR(0).
+            let was_call = core::mem::replace(
+                &mut sched.slab.get_mut(sender).blocked_is_call, false);
+            if was_call {
+                sched.block(sender, ThreadStateType::BlockedOnReply);
+                sched.slab.get_mut(receiver).reply_to = Some(sender);
+                let donated = sched.slab.get(sender).sc;
+                if donated.is_some() {
+                    sched.slab.get_mut(receiver).active_sc = donated;
+                }
+                if let Some(reply_idx) =
+                    sched.slab.get_mut(receiver).pending_reply.take()
+                {
+                    unsafe {
+                        let s = crate::kernel::KERNEL.get();
+                        s.replies[reply_idx as usize].bound_tcb = Some(sender);
+                    }
+                }
+            } else {
+                sched.make_runnable(sender);
+            }
             if queue_is_empty(ep) {
                 ep.state = EpState::Idle;
             }
@@ -261,9 +288,17 @@ pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
         if queue_is_empty(ep) {
             ep.state = EpState::Idle;
         }
-        sched.slab.get_mut(thread).state = ThreadStateType::Inactive;
+        if sched.slab.try_get(thread).is_some() {
+            sched.slab.get_mut(thread).state = ThreadStateType::Inactive;
+        }
         return;
     }
+    // Phase 43 — also clear notification queues. cnode_delete on a
+    // TCB cap calls this to flush IPC references before freeing the
+    // slab entry; without the notification sweep, a sender blocked on
+    // a notification leaves a stale id in `ntfn.head/tail` and any
+    // later signal_or_wait dereferences a freed slot.
+    crate::notification::cancel_wait_anywhere(sched, thread);
 }
 
 fn ep_queue_contains(ep: &Endpoint, sched: &Scheduler, thread: TcbId) -> bool {

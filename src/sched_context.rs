@@ -202,8 +202,19 @@ pub fn mcs_tick(delta_ticks: Ticks) {
                 Some(t) => t,
                 None => continue,
             };
-            // Only consider TCBs that we previously parked.
-            let state = s.scheduler.slab.get(bound).state;
+            // Only consider TCBs that we previously parked. Use
+            // `try_get` — a stale `bound_tcb` (set before TCB
+            // destruction by a non-cap-delete code path) would otherwise
+            // panic the kernel here on every PIT tick.
+            let state = match s.scheduler.slab.try_get(bound) {
+                Some(t) => t.state,
+                None => {
+                    // Repair: clear the stale binding so we don't keep
+                    // tripping over it.
+                    s.sched_contexts[sc_idx].bound_tcb = None;
+                    continue;
+                }
+            };
             if state != crate::tcb::ThreadStateType::Inactive {
                 continue;
             }

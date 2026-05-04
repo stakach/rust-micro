@@ -146,6 +146,13 @@ pub fn signal(
             // never wakes for a notification while it's blocked
             // on an endpoint.
             if let Some(bt) = ntfn.bound_tcb {
+                // Defensive: if bound_tcb points at a freed slab slot
+                // (a code path freed the TCB without clearing this
+                // back-reference), repair the link and fall through
+                // to the normal queue path instead of panicking.
+                if sched.slab.try_get(bt).is_none() {
+                    ntfn.bound_tcb = None;
+                } else {
                 // Phase 43 — passive-server SC donation. If the
                 // bound TCB has no SC of its own (it was unbound) but
                 // the notification carries a bound_sc, donate it so
@@ -175,6 +182,7 @@ pub fn signal(
                     sched.make_runnable(bt);
                     return Some(bt);
                 }
+                } // end of else branch (bt slab slot was Some)
             }
             ntfn.state = NtfnState::Active;
             ntfn.pending_badge = badge;
@@ -267,6 +275,33 @@ pub fn cancel_wait(ntfn: &mut Notification, sched: &mut Scheduler, thread: TcbId
     sched.slab.get_mut(thread).state = ThreadStateType::Restart;
     if ntfn.head.is_none() {
         ntfn.state = NtfnState::Idle;
+    }
+}
+
+/// Phase 43 — walk every kernel notification queue, removing `thread`
+/// if found. Mirrors `endpoint::cancel_ipc_anywhere` for notifications;
+/// used by TCB destruction to flush stale ids before the slab slot
+/// is reclaimed.
+pub fn cancel_wait_anywhere(sched: &mut Scheduler, thread: TcbId) {
+    use crate::kernel::{KERNEL, KernelState};
+    let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
+    for i in 0..crate::kernel::MAX_NTFNS {
+        let ntfn = unsafe { &mut (*s_ptr).notifications[i] };
+        let mut found = false;
+        let mut cur = ntfn.head;
+        while let Some(c) = cur {
+            if c == thread { found = true; break; }
+            cur = sched.slab.try_get(c).and_then(|t| t.ep_next);
+        }
+        if !found { continue; }
+        queue_remove(ntfn, sched, thread);
+        if ntfn.head.is_none() {
+            ntfn.state = NtfnState::Idle;
+        }
+        if sched.slab.try_get(thread).is_some() {
+            sched.slab.get_mut(thread).state = ThreadStateType::Inactive;
+        }
+        return;
     }
 }
 

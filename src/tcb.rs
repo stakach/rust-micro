@@ -231,6 +231,15 @@ pub struct Tcb {
     /// receiver — no Reply available; fall back to the legacy
     /// `reply_to` stash". Cleared once a Call binds the Reply.
     pub pending_reply: Option<u16>,
+    /// Phase 43 — set on the sender side when the queued IPC is a
+    /// Call (vs plain Send). When a receiver later pops this sender
+    /// off the endpoint queue, it must transition the sender into
+    /// `BlockedOnReply` and bind the receiver's reply slot, instead
+    /// of just making the sender runnable. Without this flag the
+    /// sender resumes from `seL4_Call` reading stale `user_context`
+    /// registers — manifests as "GetMR(0) != ~msg" in
+    /// CANCEL_BADGED_SENDS_0001 etc.
+    pub blocked_is_call: bool,
 }
 
 impl Default for Tcb {
@@ -266,6 +275,7 @@ impl Default for Tcb {
             pending_extra_caps: [crate::cap::Cap::Null; 3],
             pending_extra_caps_count: 0,
             pending_reply: None,
+            blocked_is_call: false,
         }
     }
 }
@@ -311,6 +321,7 @@ impl TcbSlab {
         None
     }
 
+    #[track_caller]
     pub fn get(&self, id: TcbId) -> &Tcb {
         self.entries[id.0 as usize]
             .as_ref()
