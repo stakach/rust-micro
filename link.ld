@@ -69,8 +69,15 @@ SECTIONS
         *(.data*)
         . = ALIGN(4096);
         __data_end = .;
+    } :boot
+
+    /* BSS-equivalent. NOLOAD tells the linker not to take file
+     * space; the segment's MemSiz still covers the gap so BOOTBOOT
+     * zeroes the pages on load. Shrinks the kernel ELF on disk by
+     * the size of the zero-init statics rust emits as `.bss.*`. */
+    .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_OFFSET) {
         __bss_start = .;
-        *(.bss*)
+        *(.bss*) *(COMMON)
         . = ALIGN(4096);
         __bss_end = .;
     } :boot
