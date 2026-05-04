@@ -240,6 +240,11 @@ pub struct Tcb {
     /// registers — manifests as "GetMR(0) != ~msg" in
     /// CANCEL_BADGED_SENDS_0001 etc.
     pub blocked_is_call: bool,
+    /// Phase 43 — `seL4_TCBFlag_*` bitset (e.g. `fpuDisabled`).
+    /// Only stored / round-tripped today; the kernel doesn't enforce
+    /// any flag yet. FPU0003 / FPU0004 in sel4test verify the
+    /// SetFlags round-trip.
+    pub flags: u64,
 }
 
 impl Default for Tcb {
@@ -276,6 +281,7 @@ impl Default for Tcb {
             pending_extra_caps_count: 0,
             pending_reply: None,
             blocked_is_call: false,
+            flags: 0,
         }
     }
 }

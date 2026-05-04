@@ -3896,6 +3896,24 @@ fn decode_tcb(
                 }
                 Ok(())
             }
+            // Phase 43 — `seL4_TCB_SetFlags(_service, clear, set)`
+            // returns post-update flags via mr0 of the reply. The
+            // result struct contains {error, flags}; the libsel4 stub
+            // reads `flags = mr0`. Test FPU0003 verifies SetFlags is a
+            // round-trip.
+            InvocationLabel::TCBSetFlags => {
+                let clear = args.a2;
+                let set = args.a3;
+                let new_flags = {
+                    let t = s.scheduler.slab.get_mut(id);
+                    t.flags = (t.flags & !clear) | set;
+                    t.flags
+                };
+                let inv_t = s.scheduler.slab.get_mut(invoker);
+                inv_t.msg_regs[0] = new_flags;
+                inv_t.ipc_length = 1;
+                Ok(())
+            }
             _ => Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_IllegalOperation,
             ))),
