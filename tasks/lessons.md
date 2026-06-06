@@ -162,3 +162,20 @@ launch path must filter it out.
   before issuing it.
 - `#[unsafe(naked)]` functions cannot have a Rust prologue; every
   instruction is yours. Use `core::arch::naked_asm!`, not `asm!`.
+
+## Pattern: stale-binary runs after a failed build (recurred 2026-06)
+
+Symptom: a QEMU run shows behavior that contradicts the code just
+written (e.g. new log lines absent but the failure still present).
+Root cause: `build_kernel.sh` failed (compile error) but the
+follow-on `make_image.sh && run_specs.sh` still executed, booting
+the PREVIOUS kernel binary.
+
+Rules:
+- Chain build → stage → image → run with `&&`, never `;`. A failed
+  build must make the whole pipeline stop.
+- When a chain is backgrounded, the FIRST thing to check in its
+  output is the build's exit code, before interpreting any test
+  results.
+- If expected new log markers are missing from a run, assume stale
+  binary first — verify build success before debugging "the bug".

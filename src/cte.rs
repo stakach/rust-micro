@@ -85,42 +85,47 @@ impl Cte {
     // descendants and exactly that walk is what `Revoke` needs. Phase
     // 30+ can grow the encoding to use the rest of `mdb_words`.
     //
-    // Encoding: low 20 bits of `mdb_words[0]` = packed `MdbId`
-    // (8-bit cnode_idx + 12-bit slot, see `MdbId::pack`). Sentinel
+    // Encoding: low 25 bits of `mdb_words[0]` = packed `MdbId`
+    // (8-bit cnode_idx + 17-bit slot, see `MdbId::pack`; the slot
+    // width covers the XL pool's radix-17 pages). Sentinel
     // `MdbId::SENTINEL` = "no parent" (a root cap, or one that
     // pre-dates the MDB).
 
     pub fn parent(&self) -> Option<MdbId> {
-        let raw = (self.mdb_words[0] & 0xFFFFF) as u32;
+        let raw = (self.mdb_words[0] & 0x1FF_FFFF) as u32;
         if raw == MdbId::SENTINEL { None } else { Some(MdbId(raw)) }
     }
 
     pub fn set_parent(&mut self, parent: Option<MdbId>) {
         let raw = parent.map_or(MdbId::SENTINEL, |p| p.0);
-        self.mdb_words[0] = (self.mdb_words[0] & !0xFFFFFu64) | (raw as u64);
+        self.mdb_words[0] =
+            (self.mdb_words[0] & !0x1FF_FFFFu64) | (raw as u64);
     }
 }
 
 /// Packed (cnode_idx, slot) handle on a CTE somewhere in
-/// `KernelState`'s big or small CNode pool. 8 bits cnode_idx
-/// (0..256 — enough for MAX_CNODES=48 big + MAX_SMALL_CNODES up
-/// to ~200 small, virtually-indexed) + 12 bits slot (0..4096 —
-/// matches CNODE_SLOTS for the big pool; small pool uses fewer).
+/// `KernelState`'s big / small / XL CNode pools. 8 bits cnode_idx
+/// (virtual index across all three pools) + 17 bits slot (covers
+/// the XL pool's radix-17 pages). NOTE: `pack` still takes the
+/// slot as u16, so parent links can only name slots ≤ 65,535 —
+/// fine for sel4test's ~6k-slot peak; widen the parameter if a
+/// workload ever derives caps INTO higher XL slots.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct MdbId(pub u32);
 
 impl MdbId {
-    /// 20 all-ones means "no parent". Picked over (cnode=0xFF,
-    /// slot=0xFFF) so a real cap at the highest virtual cnode +
+    /// 25 all-ones means "no parent". Picked over (cnode=0xFF,
+    /// slot=0x1FFFF) so a real cap at the highest virtual cnode +
     /// last slot is still distinguishable.
-    pub const SENTINEL: u32 = 0xFFFFF;
+    pub const SENTINEL: u32 = 0x1FF_FFFF;
 
-    /// `cnode_idx`: 0..256, `slot`: 0..4096.
+    /// `cnode_idx`: 0..256 (virtual, across all pools), `slot`:
+    /// 0..65,536 (u16 param — see struct-level NOTE).
     pub const fn pack(cnode_idx: u8, slot: u16) -> Self {
-        Self(((cnode_idx as u32) << 12) | (slot as u32 & 0xFFF))
+        Self(((cnode_idx as u32) << 17) | (slot as u32 & 0x1FFFF))
     }
-    pub const fn cnode_idx(self) -> u8 { (self.0 >> 12) as u8 }
-    pub const fn slot(self) -> u16 { (self.0 & 0xFFF) as u16 }
+    pub const fn cnode_idx(self) -> u8 { (self.0 >> 17) as u8 }
+    pub const fn slot(self) -> u16 { (self.0 & 0x1FFFF) as u16 }
 }
 
 const _: () = assert!(core::mem::size_of::<Cte>() == Cte::SIZE_BYTES);

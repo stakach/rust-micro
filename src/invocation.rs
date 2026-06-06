@@ -2201,9 +2201,15 @@ fn decode_untyped_retype(
                         let alloc = if radix <= crate::kernel::SMALL_CNODE_RADIX {
                             (*s_ptr).alloc_small_cnode()
                                 .or_else(|| (*s_ptr).alloc_cnode())
-                        } else if radix <= crate::kernel::XL_CNODE_RADIX
-                            && radix > crate::kernel::CNODE_RADIX
+                        } else if radix > crate::kernel::CNODE_RADIX
+                            && radix <= crate::kernel::XL_CNODE_RADIX
                         {
+                            // Honest backing for big-radix CSpace
+                            // roots (sel4utils requests radix 17 for
+                            // test processes; SCHED0004 allocates
+                            // past slot 4095 and needs the real
+                            // storage). Falls back to the clamped
+                            // big-pool page if the XL entry is taken.
                             (*s_ptr).alloc_xl_cnode()
                                 .or_else(|| (*s_ptr).alloc_cnode())
                         } else {
@@ -3358,21 +3364,38 @@ fn cap_extent(cap: &Cap) -> (u64, u64) {
     }
 }
 
-/// Phase 43 — per-parent live-child counter. Indexed by
-/// `cnode_idx * CNODE_SLOTS + slot_index`. Maintained on Retype
-/// (increment per child emitted) and on cnode_delete (decrement).
-/// When a delete brings the count to 0 we reset the parent Untyped's
-/// `free_index` to 0 — no need for the O(N) reclaim walk in the
-/// common alloc-then-free-all pattern. ~128 KiB BSS.
-const CHILD_COUNT_LEN: usize = crate::kernel::MAX_CNODES * crate::kernel::CNODE_SLOTS;
+/// Phase 43 — per-parent live-child counter, keyed by the parent
+/// cap's slot position across ALL THREE cnode pools (big, small,
+/// XL — the same virtual-index scheme as `free_cnode_virt`).
+/// Maintained on Retype (increment per child emitted) and on
+/// cnode_delete (decrement). When a delete brings the count to 0 we
+/// reset the parent Untyped's `free_index` to 0 — no need for the
+/// O(N) reclaim walk in the common alloc-then-free-all pattern.
+/// Coverage of every pool matters: test-process cspace roots live in
+/// the XL pool, and the untypeds handed to a test process sit in
+/// that root — without counting them, churny tests (helper create/
+/// destroy loops) never reclaim and starve out with NotEnoughMemory.
+const BIG_COUNTS: usize = crate::kernel::MAX_CNODES * crate::kernel::CNODE_SLOTS;
+const SMALL_COUNTS: usize = crate::kernel::MAX_SMALL_CNODES * crate::kernel::SMALL_CNODE_SLOTS;
+const XL_COUNTS: usize = crate::kernel::MAX_XL_CNODES * crate::kernel::XL_CNODE_SLOTS;
+const CHILD_COUNT_LEN: usize = BIG_COUNTS + SMALL_COUNTS + XL_COUNTS;
 static mut CHILD_COUNTS: [u32; CHILD_COUNT_LEN] = [0; CHILD_COUNT_LEN];
 
 #[inline]
 fn child_count_idx(pid: crate::cte::MdbId) -> Option<usize> {
+    use crate::kernel::*;
     let ci = pid.cnode_idx() as usize;
     let si = pid.slot() as usize;
-    if ci < crate::kernel::MAX_CNODES && si < crate::kernel::CNODE_SLOTS {
-        Some(ci * crate::kernel::CNODE_SLOTS + si)
+    if ci < MAX_CNODES {
+        (si < CNODE_SLOTS).then(|| ci * CNODE_SLOTS + si)
+    } else if ci < MAX_CNODES + MAX_SMALL_CNODES {
+        (si < SMALL_CNODE_SLOTS)
+            .then(|| BIG_COUNTS + (ci - MAX_CNODES) * SMALL_CNODE_SLOTS + si)
+    } else if ci < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
+        (si < XL_CNODE_SLOTS).then(|| {
+            BIG_COUNTS + SMALL_COUNTS
+                + (ci - MAX_CNODES - MAX_SMALL_CNODES) * XL_CNODE_SLOTS + si
+        })
     } else {
         None
     }
@@ -3395,6 +3418,31 @@ unsafe fn child_count_dec(pid: crate::cte::MdbId) -> u32 {
     } else {
         u32::MAX
     }
+}
+
+/// Zero every child counter keyed by slots of cnode page `vi`.
+/// Called when a cnode page is freed wholesale (`free_cnode_virt`)
+/// so a recycled page starts with clean counters.
+pub unsafe fn child_counts_reset_page(vi: usize) {
+    use crate::kernel::*;
+    let (start, len) = if vi < MAX_CNODES {
+        (vi * CNODE_SLOTS, CNODE_SLOTS)
+    } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
+        (
+            BIG_COUNTS + (vi - MAX_CNODES) * SMALL_CNODE_SLOTS,
+            SMALL_CNODE_SLOTS,
+        )
+    } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
+        (
+            BIG_COUNTS + SMALL_COUNTS
+                + (vi - MAX_CNODES - MAX_SMALL_CNODES) * XL_CNODE_SLOTS,
+            XL_CNODE_SLOTS,
+        )
+    } else {
+        return;
+    };
+    let counts = &mut *core::ptr::addr_of_mut!(CHILD_COUNTS);
+    counts[start..start + len].fill(0);
 }
 
 unsafe fn child_count_reset(pid: crate::cte::MdbId) {

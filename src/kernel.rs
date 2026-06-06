@@ -95,9 +95,9 @@ impl Default for SmallCNodePage {
 /// 1 × 131,072 × 32 B = 4 MiB — BOOTBOOT caps the whole kernel at
 /// 16 MiB, so one entry is what fits; test processes are spawned
 /// strictly sequentially (teardown precedes the next configure).
-pub const XL_CNODE_RADIX: u8 = 14;
+pub const XL_CNODE_RADIX: u8 = 17;
 pub const XL_CNODE_SLOTS: usize = 1 << XL_CNODE_RADIX;
-pub const MAX_XL_CNODES: usize = 3;
+pub const MAX_XL_CNODES: usize = 1;
 /// Virtual cnode index space:
 ///   [0, MAX_CNODES)                      big (radix 12)
 ///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix ≤ 6)
@@ -319,6 +319,11 @@ impl KernelState {
         } else {
             self.free_xl_cnode(vi);
         }
+        // The page's slots are gone — zero any per-parent child
+        // counters keyed by them so a recycled page doesn't inherit
+        // stale counts (which would block free_index reclaim for
+        // whatever untyped cap lands on the same slot next).
+        unsafe { crate::invocation::child_counts_reset_page(vi) };
     }
 
     /// Claim a CNode index whose contents were populated by code
