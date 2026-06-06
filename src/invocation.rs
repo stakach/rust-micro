@@ -3644,6 +3644,14 @@ fn decode_tcb(
         let s = KERNEL.get();
         match label {
             InvocationLabel::TCBSuspend => {
+                // Upstream `suspend()` = cancelIPC + Inactive. A
+                // server blocked in an endpoint recv queue must be
+                // REMOVED from that queue — otherwise the next
+                // sender pops the suspended thread and the message
+                // vanishes into it (SCHED0009 suspends servers in
+                // reverse priority order and expects each Call to
+                // reach the next-highest remaining server).
+                crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
                 s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
                 Ok(())
             }
