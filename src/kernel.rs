@@ -670,6 +670,148 @@ impl KernelState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 44 — per-object cap refcounts.
+//
+// `same_obj_lives` used to answer "does any other cap reference this
+// pool object?" by sweeping EVERY slot of EVERY CNode pool page on
+// every cap delete — O(pool) per delete, and O(slots × pool) for a
+// CNode destroy. With honest radix-17 cspace backing (131k-slot
+// pages, needed by SCHED0004) those sweeps made the suite crawl.
+//
+// Instead: `Cte::set_cap` notes every cap overwrite in a per-object
+// refcount (gated on the slot actually living inside a kernel CNode
+// pool — stack-built `Cte` temporaries in specs don't count). Boot
+// and spec-era writes that predate or bypass the hook are absorbed
+// by one `recount_refcounts()` sweep at production start
+// (launch_rootserver). Decrements saturate at zero so pre-recount
+// noise can't underflow.
+// ---------------------------------------------------------------------------
+
+struct ObjRefCounts {
+    endpoints: [u16; MAX_ENDPOINTS],
+    ntfns: [u16; MAX_NTFNS],
+    scs: [u16; MAX_SCHED_CONTEXTS],
+    replies: [u16; MAX_REPLIES],
+    cnodes: [u16; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES],
+    tcbs: [u16; crate::tcb::MAX_TCBS],
+}
+
+static mut OBJ_REFCOUNTS: ObjRefCounts = ObjRefCounts {
+    endpoints: [0; MAX_ENDPOINTS],
+    ntfns: [0; MAX_NTFNS],
+    scs: [0; MAX_SCHED_CONTEXTS],
+    replies: [0; MAX_REPLIES],
+    cnodes: [0; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES],
+    tcbs: [0; crate::tcb::MAX_TCBS],
+};
+
+/// Map a cap to the refcount cell of the pool object it references.
+/// Non-pooled caps (Frame, Untyped, IRQ, ...) have no cell.
+fn refcount_cell(cap: &Cap) -> Option<*mut u16> {
+    let rc = core::ptr::addr_of_mut!(OBJ_REFCOUNTS);
+    unsafe {
+        Some(match cap {
+            Cap::Endpoint { ptr, .. } => {
+                let i = KernelState::endpoint_index(*ptr);
+                if i >= MAX_ENDPOINTS { return None; }
+                &mut (*rc).endpoints[i] as *mut u16
+            }
+            Cap::Notification { ptr, .. } => {
+                let i = KernelState::ntfn_index(*ptr);
+                if i >= MAX_NTFNS { return None; }
+                &mut (*rc).ntfns[i] as *mut u16
+            }
+            Cap::SchedContext { ptr, .. } => {
+                let i = KernelState::sched_context_index(*ptr);
+                if i >= MAX_SCHED_CONTEXTS { return None; }
+                &mut (*rc).scs[i] as *mut u16
+            }
+            Cap::Reply { ptr, .. } => {
+                let i = KernelState::reply_index(*ptr);
+                if i >= MAX_REPLIES { return None; }
+                &mut (*rc).replies[i] as *mut u16
+            }
+            Cap::CNode { ptr, .. } => {
+                let i = KernelState::cnode_index(*ptr);
+                if i >= KernelState::cnode_pool_count() { return None; }
+                &mut (*rc).cnodes[i] as *mut u16
+            }
+            Cap::Thread { tcb } => {
+                let i = tcb.addr() as usize;
+                if i >= crate::tcb::MAX_TCBS { return None; }
+                &mut (*rc).tcbs[i] as *mut u16
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// Live references to the pool object behind `cap` (0 for
+/// non-pooled caps).
+pub fn cap_refcount(cap: &Cap) -> u32 {
+    refcount_cell(cap).map(|p| unsafe { *p } as u32).unwrap_or(0)
+}
+
+/// Called by `Cte::set_cap` for slots inside the kernel CNode pools.
+pub(crate) fn note_cap_write(old: &Cap, new: &Cap) {
+    unsafe {
+        if let Some(p) = refcount_cell(old) {
+            *p = (*p).saturating_sub(1);
+        }
+        if let Some(p) = refcount_cell(new) {
+            *p = (*p).saturating_add(1);
+        }
+    }
+}
+
+/// Does `addr` point inside one of the kernel CNode pools? Filters
+/// `Cte::set_cap` calls on stack temporaries / spec-local arrays out
+/// of the refcounting.
+pub(crate) fn slot_in_pools(addr: usize) -> bool {
+    let s = unsafe { KERNEL.get() };
+    let within = |base: *const u8, len: usize| {
+        let b = base as usize;
+        addr >= b && addr < b + len
+    };
+    within(
+        s.cnodes.as_ptr() as *const u8,
+        core::mem::size_of_val(&s.cnodes),
+    ) || within(
+        s.small_cnodes.as_ptr() as *const u8,
+        core::mem::size_of_val(&s.small_cnodes),
+    ) || within(
+        s.xl_cnodes.as_ptr() as *const u8,
+        core::mem::size_of_val(&s.xl_cnodes),
+    )
+}
+
+/// Rebuild every refcount from the actual pool contents. Run once at
+/// production start (launch_rootserver) to absorb boot/spec-era
+/// writes that bypassed the `set_cap` hook.
+pub fn recount_refcounts() {
+    unsafe {
+        let rc = core::ptr::addr_of_mut!(OBJ_REFCOUNTS);
+        (*rc).endpoints = [0; MAX_ENDPOINTS];
+        (*rc).ntfns = [0; MAX_NTFNS];
+        (*rc).scs = [0; MAX_SCHED_CONTEXTS];
+        (*rc).replies = [0; MAX_REPLIES];
+        (*rc).cnodes = [0; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES];
+        (*rc).tcbs = [0; crate::tcb::MAX_TCBS];
+        let s = KERNEL.get();
+        for vi in 0..KernelState::cnode_pool_count() {
+            let n = s.cnode_slots_at(vi).map(|sl| sl.len()).unwrap_or(0);
+            for si in 0..n {
+                let cap = s.cnode_slot(vi, si)
+                    .map(|c| c.cap()).unwrap_or(Cap::Null);
+                if let Some(p) = refcount_cell(&cap) {
+                    *p = (*p).saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
 impl CSpace for KernelState {
     fn cnode_at(&self, ptr: PPtr<CNodeStorage>, count: usize) -> Option<&[Cte]> {
         let idx = Self::cnode_index(ptr);

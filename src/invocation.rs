@@ -2710,92 +2710,19 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 let cap_to_free = s.cnode_slot(ci, si)
                     .map(|c| c.cap())
                     .unwrap_or(Cap::Null);
-                // Phase 43 — only free the underlying object when
-                // no OTHER live cap points at the same pointer.
-                // Mint/Copy create derivative caps that share the
-                // object — freeing on every delete wipes the EP /
-                // Notification / etc. while the master cap still
-                // refers to it. CANCEL_BADGED_SENDS_0001 hit this:
-                // revoking a badged endpoint cap reset the master
-                // endpoint, dropping all 32 queued senders.
-                // `KernelState::*_ptr` use the same `(i+1)`
-                // encoding scheme across pools, so TCB id N
-                // collides with Endpoint index N-1, etc. Match
-                // discriminator + ptr to keep cross-type
-                // collisions out.
-                let same_obj_lives = |target: &Cap| -> bool {
-                    let (want_disc, want_ptr) = match target {
-                        Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
-                        Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
-                        Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
-                        Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
-                        Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
-                        Cap::Thread { tcb } => (6u8, tcb.addr()),
-                        _ => return false,
-                    };
-                    // For CNode caps: skip self-references inside
-                    // the CNode itself; they become unreachable
-                    // once the last external ref is gone.
-                    let target_self_cnode_idx = match target {
-                        Cap::CNode { ptr, .. } =>
-                            Some(KernelState::cnode_index(*ptr)),
-                        _ => None,
-                    };
-                    for ci2 in 0..crate::kernel::KernelState::cnode_pool_count() {
-                        if Some(ci2) == target_self_cnode_idx { continue; }
-                        let inner_count = s.cnode_slots_at(ci2)
-                            .map(|sl| sl.len()).unwrap_or(0);
-                        for si2 in 0..inner_count {
-                            if ci2 == ci && si2 == si { continue; }
-                            if is_revoked(ci2, si2) { continue; }
-                            let other_cap = s.cnode_slot(ci2, si2)
-                                .map(|c| c.cap())
-                                .unwrap_or(Cap::Null);
-                            let (other_disc, other_ptr) = match other_cap {
-                                Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
-                                Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
-                                Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
-                                Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
-                                Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
-                                Cap::Thread { tcb } => (6u8, tcb.addr()),
-                                _ => continue,
-                            };
-                            if other_disc == want_disc && other_ptr == want_ptr {
-                                return true;
-                            }
-                        }
-                    }
-                    false
-                };
-                if !same_obj_lives(&cap_to_free) {
-                    match cap_to_free {
-                        Cap::Thread { tcb } => {
-                            let id = crate::tcb::TcbId(tcb.addr() as u16);
-                            destroy_tcb(s, id);
-                        }
-                        Cap::Endpoint { ptr, .. } => {
-                            s.free_endpoint(KernelState::endpoint_index(ptr));
-                        }
-                        Cap::Notification { ptr, .. } => {
-                            s.free_notification(KernelState::ntfn_index(ptr));
-                        }
-                        Cap::SchedContext { ptr, .. } => {
-                            s.free_sched_context(
-                                KernelState::sched_context_index(ptr));
-                        }
-                        Cap::Reply { ptr, .. } => {
-                            s.free_reply(KernelState::reply_index(ptr));
-                        }
-                        Cap::CNode { ptr, .. } => {
-                            s.free_cnode_virt(KernelState::cnode_index(ptr));
-                        }
-                        _ => {}
-                    }
-                }
+                // Phase 44 — clear the slot FIRST (the set_cap hook
+                // drops the refcount), then release the object if
+                // that was its last reference. Replaces the
+                // whole-pool same_obj_lives sweep; the
+                // revoked-but-uncleared siblings still hold counts,
+                // so the object frees exactly when the LAST holder
+                // is cleared — same semantics as the old
+                // is_revoked-excluding sweep.
                 if let Some(slot) = s.cnode_slot_mut(ci, si) {
                     slot.set_cap(&Cap::Null);
                     slot.set_parent(None);
                 }
+                maybe_free_object(s, &cap_to_free, 0);
             }
         }
         // The source itself kept the cap but lost all its descendants.
@@ -3190,6 +3117,97 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     s.scheduler.slab.entries[id.0 as usize] = None;
 }
 
+/// Phase 44 — release the pool object behind `cap` if the last
+/// reference to it is gone (refcount already reflects the cleared
+/// slot — clear BEFORE calling). CNode pages release their contents
+/// recursively, preserving the per-inner-cap Untyped reclaim the old
+/// sweep-based destroy performed. Self-references inside a CNode
+/// don't pin it: the page is freed when its EXTERNAL refcount hits
+/// zero.
+unsafe fn maybe_free_object(
+    s: &mut crate::kernel::KernelState,
+    cap: &Cap,
+    depth: u8,
+) {
+    use crate::kernel::cap_refcount;
+    match cap {
+        Cap::Thread { tcb } => {
+            if cap_refcount(cap) == 0 {
+                destroy_tcb(s, crate::tcb::TcbId(tcb.addr() as u16));
+            }
+        }
+        Cap::Endpoint { ptr, .. } => {
+            if cap_refcount(cap) == 0 {
+                s.free_endpoint(KernelState::endpoint_index(*ptr));
+            }
+        }
+        Cap::Notification { ptr, .. } => {
+            if cap_refcount(cap) == 0 {
+                s.free_notification(KernelState::ntfn_index(*ptr));
+            }
+        }
+        Cap::SchedContext { ptr, .. } => {
+            if cap_refcount(cap) == 0 {
+                s.free_sched_context(KernelState::sched_context_index(*ptr));
+            }
+        }
+        Cap::Reply { ptr, .. } => {
+            if cap_refcount(cap) == 0 {
+                s.free_reply(KernelState::reply_index(*ptr));
+            }
+        }
+        Cap::CNode { ptr, .. } => {
+            let vi = KernelState::cnode_index(*ptr);
+            let n = s.cnode_slots_at(vi).map(|sl| sl.len()).unwrap_or(0);
+            // Count self-references (the canonical CSpace-root-in-
+            // slot-N pattern). They keep the refcount above zero but
+            // must not keep the page alive once all EXTERNAL refs
+            // are gone.
+            let mut self_refs = 0usize;
+            for si in 0..n {
+                let c = s.cnode_slot(vi, si).map(|c| c.cap()).unwrap_or(Cap::Null);
+                if matches!(c, Cap::CNode { ptr: ip, .. } if ip.addr() == ptr.addr()) {
+                    self_refs += 1;
+                }
+            }
+            if cap_refcount(cap) as usize != self_refs {
+                return; // external references remain
+            }
+            if depth >= 4 {
+                // Defensive recursion bound — just free the page.
+                s.free_cnode_virt(vi);
+                return;
+            }
+            for si in 0..n {
+                let (inner_cap, inner_parent) =
+                    match s.cnode_slot(vi, si) {
+                        Some(c) => (c.cap(), c.parent()),
+                        None => continue,
+                    };
+                if inner_cap.is_null() {
+                    continue;
+                }
+                if let Some(slot) = s.cnode_slot_mut(vi, si) {
+                    slot.set_cap(&Cap::Null);
+                    slot.set_parent(None);
+                }
+                // Self-refs were just cleared (refcount handled by
+                // the hook); their object IS this page — skip.
+                if matches!(inner_cap, Cap::CNode { ptr: ip, .. }
+                    if ip.addr() == ptr.addr())
+                {
+                    continue;
+                }
+                maybe_free_object(s, &inner_cap, depth + 1);
+                let (db, ds) = cap_extent(&inner_cap);
+                reclaim_untyped_chain_at_tail(inner_parent, db, ds);
+            }
+            s.free_cnode_virt(vi);
+        }
+        _ => {}
+    }
+}
+
 fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
     // Upstream `seL4_CNode_Delete` ABI:
     //   target   = the CNode cap containing the slot to clear
@@ -3253,53 +3271,6 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // Match by (discriminator, ptr) so cross-pool index collisions
         // (TCB id N == endpoint slot N+1 etc.) don't keep the object
         // pinned spuriously.
-        let same_obj_lives = |target: &Cap| -> bool {
-            let (want_disc, want_ptr) = match target {
-                Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
-                Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
-                Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
-                Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
-                Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
-                Cap::Thread { tcb } => (6u8, tcb.addr()),
-                _ => return false,
-            };
-            // For CNode caps: refs INSIDE the CNode itself (the
-            // canonical seL4_CapInitThreadCNode self-reference) don't
-            // count — once the last EXTERNAL ref is gone, those
-            // self-refs become unreachable. sel4test's
-            // sel4utils_destroy_process leaves a self-ref in the
-            // process's CSpace; without this skip, we'd never free
-            // the test process's CNode and the pool exhausts after
-            // ~MAX_CNODES tests.
-            let target_self_cnode_idx = match target {
-                Cap::CNode { ptr, .. } => Some(KernelState::cnode_index(*ptr)),
-                _ => None,
-            };
-            for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-                if Some(ci) == target_self_cnode_idx { continue; }
-                let inner_count = s.cnode_slots_at(ci)
-                    .map(|sl| sl.len())
-                    .unwrap_or(0);
-                for si in 0..inner_count {
-                    if ci == cnode_idx && si == res.slot_index { continue; }
-                    let other_cap = s.cnode_slot(ci, si)
-                        .map(|c| c.cap()).unwrap_or(Cap::Null);
-                    let (other_disc, other_ptr) = match other_cap {
-                        Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
-                        Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
-                        Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
-                        Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
-                        Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
-                        Cap::Thread { tcb } => (6u8, tcb.addr()),
-                        _ => continue,
-                    };
-                    if other_disc == want_disc && other_ptr == want_ptr {
-                        return true;
-                    }
-                }
-            }
-            false
-        };
         // Frame caps need PT-entry cleanup BEFORE the cap is gone:
         // FRAMEDIPC0003 deletes a mapped frame cap and expects later
         // user accesses to that vaddr to fault. Without this, the page
@@ -3329,138 +3300,12 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             }
             let _ = (ptr, asid, vaddr, size);
         }
-        if !same_obj_lives(&deleted_cap) {
-            match deleted_cap {
-                Cap::Thread { tcb } => {
-                    let id = crate::tcb::TcbId(tcb.addr() as u16);
-                    destroy_tcb(s, id);
-                }
-                Cap::Endpoint { ptr, .. } => {
-                    s.free_endpoint(KernelState::endpoint_index(ptr));
-                }
-                Cap::Notification { ptr, .. } => {
-                    s.free_notification(KernelState::ntfn_index(ptr));
-                }
-                Cap::SchedContext { ptr, .. } => {
-                    s.free_sched_context(
-                        KernelState::sched_context_index(ptr));
-                }
-                Cap::Reply { ptr, .. } => {
-                    s.free_reply(KernelState::reply_index(ptr));
-                }
-                Cap::CNode { ptr, .. } => {
-                    // Phase 43 — destroying the LAST cap to a CNode
-                    // means the contents become unreachable too;
-                    // walk the slots and destroy each one's underlying
-                    // object so the memory returns to the Untyped pool.
-                    // sel4utils_destroy_process relies on this: it
-                    // revokes the CSpace cap then deletes it; without
-                    // this recursive cleanup, all the test process's
-                    // TCBs/Endpoints/Frames leak and DOMAINS0001's
-                    // basic_set_up fails on Untyped exhaustion after
-                    // a handful of test processes.
-                    let inner_idx = KernelState::cnode_index(ptr);
-                    let inner_slot_count = s.cnode_slots_at(inner_idx)
-                        .map(|sl| sl.len())
-                        .unwrap_or(0);
-                    {
-                    if inner_slot_count > 0 {
-                        for slot_i in 0..inner_slot_count {
-                            let inner_slot = s.cnode_slot(inner_idx, slot_i);
-                            let (inner_cap, inner_parent) = match inner_slot {
-                                Some(c) => (c.cap(), c.parent()),
-                                None => continue,
-                            };
-                            // Skip Null and self-references (the CNode
-                            // having a cap to itself). Also skip caps
-                            // that have other live references — same
-                            // refcount-aware logic as the cap-delete
-                            // path above.
-                            if inner_cap.is_null() { continue; }
-                            if matches!(inner_cap, Cap::CNode { ptr: ip, .. }
-                                if ip.addr() == ptr.addr())
-                            {
-                                continue;
-                            }
-                            // Borrow re-check across the closure call.
-                            let mut other_ref = false;
-                            'scan: for ci2 in 0..crate::kernel::KernelState::cnode_pool_count() {
-                                let inner_count = s.cnode_slots_at(ci2)
-                                    .map(|sl| sl.len())
-                                    .unwrap_or(0);
-                                for si2 in 0..inner_count {
-                                    if ci2 == inner_idx && si2 == slot_i { continue; }
-                                    let want = match &inner_cap {
-                                        Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
-                                        Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
-                                        Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
-                                        Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
-                                        Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
-                                        Cap::Thread { tcb } => (6u8, tcb.addr()),
-                                        _ => break 'scan,
-                                    };
-                                    let other_cap = s.cnode_slot(ci2, si2)
-                                        .map(|c| c.cap()).unwrap_or(Cap::Null);
-                                    let (od, op) = match other_cap {
-                                        Cap::Endpoint { ptr, .. } => (1u8, ptr.addr()),
-                                        Cap::Notification { ptr, .. } => (2u8, ptr.addr()),
-                                        Cap::SchedContext { ptr, .. } => (3u8, ptr.addr()),
-                                        Cap::Reply { ptr, .. } => (4u8, ptr.addr()),
-                                        Cap::CNode { ptr, .. } => (5u8, ptr.addr()),
-                                        Cap::Thread { tcb } => (6u8, tcb.addr()),
-                                        _ => continue,
-                                    };
-                                    if od == want.0 && op == want.1 {
-                                        other_ref = true;
-                                        break 'scan;
-                                    }
-                                }
-                            }
-                            // Clear the slot first so a recursive call
-                            // that walks cnodes again sees it empty.
-                            if let Some(slot) = s.cnode_slot_mut(inner_idx, slot_i) {
-                                slot.set_cap(&Cap::Null);
-                                slot.set_parent(None);
-                            }
-                            if !other_ref {
-                                match inner_cap {
-                                    Cap::Thread { tcb } => {
-                                        let tid = crate::tcb::TcbId(tcb.addr() as u16);
-                                        destroy_tcb(s, tid);
-                                    }
-                                    Cap::Endpoint { ptr: p, .. } => {
-                                        s.free_endpoint(KernelState::endpoint_index(p));
-                                    }
-                                    Cap::Notification { ptr: p, .. } => {
-                                        s.free_notification(KernelState::ntfn_index(p));
-                                    }
-                                    Cap::SchedContext { ptr: p, .. } => {
-                                        s.free_sched_context(
-                                            KernelState::sched_context_index(p));
-                                    }
-                                    Cap::Reply { ptr: p, .. } => {
-                                        s.free_reply(KernelState::reply_index(p));
-                                    }
-                                    Cap::CNode { ptr: p, .. } => {
-                                        s.free_cnode_virt(KernelState::cnode_index(p));
-                                    }
-                                    _ => {}
-                                }
-                                // Roll back the cap's parent Untyped
-                                // free_index too — same as a regular
-                                // cnode_delete would.
-                                let (db, ds) = cap_extent(&inner_cap);
-                                reclaim_untyped_chain_at_tail(
-                                    inner_parent, db, ds);
-                            }
-                        }
-                    }
-                    }
-                    s.free_cnode_virt(inner_idx);
-                }
-                _ => {}
-            }
-        }
+        // Phase 44 — refcount-driven release replaces the old
+        // whole-pool same_obj_lives sweep (O(pool) per delete; the
+        // CNode arm nested ANOTHER full sweep per contained slot).
+        // The slot was cleared above, so the refcount already
+        // excludes it: zero means this was the last reference.
+        maybe_free_object(s, &deleted_cap, 0);
 
         // Phase 42 — Untyped reclaim. allocman's split allocator
         // calls CNode_Delete on bisect-ladder children and expects

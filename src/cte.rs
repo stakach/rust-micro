@@ -53,7 +53,18 @@ impl Cte {
     }
 
     /// Write a cap back to the bitfield words.
+    ///
+    /// Phase 44 — when this CTE lives inside a kernel CNode pool,
+    /// the overwrite is noted in the per-object refcounts (old cap
+    /// −1, new cap +1). Stack-built `Cte` temporaries (specs,
+    /// `with_cap`) fall outside the pool address ranges and are
+    /// not counted; boot-era writes are absorbed by the
+    /// `recount_refcounts()` sweep at production start.
     pub fn set_cap(&mut self, cap: &Cap) {
+        if crate::kernel::slot_in_pools(self as *const _ as usize) {
+            let old = self.cap();
+            crate::kernel::note_cap_write(&old, cap);
+        }
         self.cap_words = to_words(cap);
     }
 

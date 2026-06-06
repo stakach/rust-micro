@@ -647,6 +647,14 @@ pub unsafe fn launch_rootserver() -> ! {
     // Arm the dispatcher's exit hook.
     ROOTSERVER_DEMO_ACTIVE.store(true, Ordering::Relaxed);
 
+    // Phase 44 — initialize per-object cap refcounts from the
+    // actual pool contents. Everything written before this point
+    // (boot CNode planting, spec runs, the rootserver caps above)
+    // may have bypassed the `Cte::set_cap` hook; from here on the
+    // hook keeps counts exact and cap-delete liveness checks are
+    // O(1) instead of whole-pool sweeps.
+    crate::kernel::recount_refcounts();
+
     // LAPIC-timer migration — the kernel's preemption clock
     // (TICK_COUNT + scheduler.tick + mcs_tick) is the LAPIC timer,
     // calibrated against the PIT before anything else touches the
