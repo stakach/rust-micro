@@ -301,6 +301,65 @@ pub fn mcs_tick(delta_ticks: Ticks) {
     }
 }
 
+/// seL4_Yield under MCS — upstream `handleYield` charges the
+/// current thread's ENTIRE remaining head refill
+/// (`chargeBudget(refill_head->rAmount)`), so:
+///   * round-robin SC (budget == period) → rotate to the back of
+///     the ready queue with an instantly-whole budget;
+///   * sporadic SC → postpone (release queue / BlockedOnBudget)
+///     until the next refill matures.
+/// scConsumed is deliberately NOT increased by the unconsumed
+/// remainder — upstream restores it around the charge. Without the
+/// full-charge, a sporadic thread that yields inside its loop never
+/// exhausts its budget and runs every rotation — SCHED0011/13/14
+/// measured 3-55× the iteration counts their budgets allow.
+///
+/// Returns false if the current thread has no SC (caller falls back
+/// to a plain queue rotation).
+pub fn yield_current() -> bool {
+    unsafe {
+        let s = crate::kernel::KERNEL.get();
+        let cur = match s.scheduler.current() {
+            Some(c) => c,
+            None => return false,
+        };
+        let cur_tcb = s.scheduler.slab.get(cur);
+        let sc_idx = match cur_tcb.active_sc.or(cur_tcb.sc) {
+            Some(i) => i as usize,
+            None => return false,
+        };
+        if sc_idx >= s.sched_contexts.len() {
+            return false;
+        }
+        let now = current_time();
+        let round_robin = {
+            let sc = &mut s.sched_contexts[sc_idx];
+            let rr = sc.budget == sc.period;
+            // Charge the full remaining head refill (pops it).
+            let head = sc.head_amount();
+            let _ = refill_charge(sc, head);
+            if rr {
+                let _ = sc.push(Refill { release_time: now, amount: sc.budget });
+            } else {
+                let _ = refill_replenish(sc, now);
+            }
+            rr
+        };
+        if round_robin {
+            let cpu = s.scheduler.slab.get(cur).affinity as usize;
+            s.scheduler.nodes[cpu].queues.dequeue(&mut s.scheduler.slab, cur);
+            s.scheduler.nodes[cpu].queues.enqueue(&mut s.scheduler.slab, cur);
+            if s.scheduler.nodes[cpu].current == Some(cur) {
+                s.scheduler.nodes[cpu].current = None;
+            }
+        } else {
+            s.scheduler.block(
+                cur, crate::tcb::ThreadStateType::BlockedOnBudget);
+        }
+        true
+    }
+}
+
 /// Complete an outstanding YieldTo: write the consumed-report
 /// syscall return into the yielder's saved context, clear the
 /// yield links, and reset the SC's consumed counter. Mirrors

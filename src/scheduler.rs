@@ -83,6 +83,47 @@ pub struct ReadyQueues {
     tails: [Option<TcbId>; NUM_PRIORITIES],
 }
 
+impl ReadyQueues {
+    /// Diagnostic: walk a priority's queue, calling `f` per entry.
+    pub fn walk_prio<F: FnMut(TcbId)>(&self, slab: &TcbSlab, prio: u8, mut f: F) {
+        let mut cur = self.heads[prio as usize];
+        let mut guard = 0;
+        while let Some(c) = cur {
+            f(c);
+            guard += 1;
+            if guard > 16 { break; }
+            cur = slab.try_get(c).and_then(|t| t.sched_next);
+        }
+    }
+
+    /// Insert `tcb` at the HEAD of its priority's queue. Mirrors
+    /// upstream `tcbSchedEnqueue` (SCHED_ENQUEUE): threads woken by
+    /// IPC / signal / refill-maturity resume BEFORE round-robin
+    /// peers at the same priority. Tail-append (`enqueue`) is
+    /// upstream's SCHED_APPEND, reserved for end-of-timeslice
+    /// rotation. Without the distinction, an IPC-woken thread lands
+    /// behind an equal-priority spinner and waits a full budget per
+    /// RPC (SCHED0011 measured 2 extra 100 ms burns per loop
+    /// iteration).
+    pub fn enqueue_front(&mut self, slab: &mut TcbSlab, tcb: TcbId) {
+        let prio = slab.get(tcb).priority;
+        debug_assert!(prio <= MAX_PRIORITY);
+        let p = prio as usize;
+        let old_head = self.heads[p];
+        {
+            let t = slab.get_mut(tcb);
+            t.sched_prev = None;
+            t.sched_next = old_head;
+        }
+        match old_head {
+            Some(h) => slab.get_mut(h).sched_prev = Some(tcb),
+            None => self.tails[p] = Some(tcb),
+        }
+        self.heads[p] = Some(tcb);
+        self.bitmap.set(prio);
+    }
+}
+
 impl Default for ReadyQueues {
     fn default() -> Self { Self::new() }
 }
@@ -348,7 +389,10 @@ impl Scheduler {
         let prio = self.slab.get(id).priority;
         self.slab.get_mut(id).state = ThreadStateType::Running;
         if !was_runnable {
-            self.nodes[cpu].queues.enqueue(&mut self.slab, id);
+            // Upstream SCHED_ENQUEUE: woken threads insert at the
+            // HEAD of their priority class, ahead of round-robin
+            // peers (see enqueue_front).
+            self.nodes[cpu].queues.enqueue_front(&mut self.slab, id);
             // Phase 42 — if the woken thread's affinity is a peer
             // CPU and that CPU is currently idle (current = None),
             // send a Reschedule IPI so it picks up the work

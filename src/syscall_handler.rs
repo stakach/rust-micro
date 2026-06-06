@@ -219,15 +219,20 @@ pub fn handle_syscall(
             if crate::rootserver::ROOTSERVER_DEMO_ACTIVE
                 .load(core::sync::atomic::Ordering::Relaxed)
             {
-                unsafe {
-                    let s = crate::kernel::KERNEL.get();
-                    if let Some(cur) = s.scheduler.current() {
-                        let cpu = crate::arch::get_cpu_id() as usize;
-                        let q = &mut s.scheduler.nodes[cpu].queues;
-                        let slab = &mut s.scheduler.slab;
-                        q.dequeue(slab, cur);
-                        q.enqueue(slab, cur);
-                        s.scheduler.set_current(None);
+                // MCS yield: charge the full remaining budget
+                // (upstream handleYield). Falls back to a plain
+                // rotation for SC-less threads.
+                if !crate::sched_context::yield_current() {
+                    unsafe {
+                        let s = crate::kernel::KERNEL.get();
+                        if let Some(cur) = s.scheduler.current() {
+                            let cpu = crate::arch::get_cpu_id() as usize;
+                            let q = &mut s.scheduler.nodes[cpu].queues;
+                            let slab = &mut s.scheduler.slab;
+                            q.dequeue(slab, cur);
+                            q.enqueue(slab, cur);
+                            s.scheduler.set_current(None);
+                        }
                     }
                 }
             }

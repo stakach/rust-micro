@@ -271,6 +271,30 @@ const LAPIC_TIMER_DIVIDE_LOG2: u8 = 3; // ÷16
 /// hardware.
 static mut LAPIC_TIMER_INITIAL_COUNT: u32 = 0;
 
+/// TSC increments per millisecond, calibrated against the PIT in
+/// the same window as the LAPIC rate. The tick ISR charges time by
+/// MEASURED TSC delta, not by fire count: under TCG the guest
+/// virtual clock keeps running while the ISR executes, so "1 kHz"
+/// fires arrive every ~3 ms of virtual time — counting one tick per
+/// fire ran every budget 3× long (SCHED0011 measured 309 ms for a
+/// 100 ms period, constant to within jitter).
+static mut TSC_PER_MS: u64 = 0;
+/// TSC value up to which time has already been charged. Advanced by
+/// whole milliseconds only, so the sub-ms remainder carries to the
+/// next fire instead of being dropped.
+static mut LAST_CHARGED_TSC: u64 = 0;
+
+#[inline(always)]
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+            options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
 /// Measure the LAPIC timer frequency against the PIT and store the
 /// initial count for a 1 ms period. Runs once on the BSP, before
 /// the PIT is handed to its periodic kernel duty (and long before
@@ -289,6 +313,7 @@ pub fn calibrate_timer_with_pit() -> u32 {
     }
     // PIT one-shot, poll until the count expires. `read_count`
     // latches, so polling is race-free.
+    let tsc0 = rdtsc();
     pit::program(pit::Channel::Ch0, pit::Mode::OneShot, PIT_COUNT);
     loop {
         let c = pit::read_count(pit::Channel::Ch0);
@@ -296,10 +321,14 @@ pub fn calibrate_timer_with_pit() -> u32 {
             break;
         }
     }
+    let tsc1 = rdtsc();
     let elapsed = u32::MAX.wrapping_sub(timer_current_count());
     let per_ms = (elapsed / CAL_MS).max(1);
     unsafe {
         LAPIC_TIMER_INITIAL_COUNT = per_ms;
+        // TSC rate over the same window — used by the tick ISR to
+        // charge measured time rather than fire counts.
+        TSC_PER_MS = (tsc1.wrapping_sub(tsc0) / CAL_MS as u64).max(1);
         // Stop the calibration countdown.
         write_reg(TIMER_INITIAL_COUNT, 0);
     }
@@ -318,6 +347,7 @@ pub fn enable_periodic_kernel_timer() {
     unsafe {
         IDT[LAPIC_TIMER_VECTOR as usize] =
             IdtEntry::new(lapic_timer_irq_entry as u64, 0x08, 0, 0x8E);
+        LAST_CHARGED_TSC = rdtsc();
         timer_periodic(
             LAPIC_TIMER_VECTOR,
             LAPIC_TIMER_DIVIDE_LOG2,
@@ -386,16 +416,36 @@ extern "C" fn lapic_timer_irq_dispatch(
     }
     let _bkl = BklGuard;
 
-    super::pit::TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Charge MEASURED time, not fire counts: virtual time keeps
+    // advancing while this ISR executes under TCG, so consecutive
+    // fires arrive several ms apart even though the LVT is armed
+    // for 1 ms. Advance LAST_CHARGED_TSC by whole milliseconds only
+    // so the remainder carries instead of dropping.
+    let delta_ms = unsafe {
+        let now_tsc = rdtsc();
+        let per_ms = TSC_PER_MS.max(1);
+        let d = now_tsc.wrapping_sub(LAST_CHARGED_TSC) / per_ms;
+        // Clamp pathological jumps (TCG pause, debugger) so a
+        // single fire can't charge minutes of budget.
+        let d = d.min(1000);
+        LAST_CHARGED_TSC = LAST_CHARGED_TSC.wrapping_add(d * per_ms);
+        d
+    };
+
+    if delta_ms > 0 {
+        super::pit::TICK_COUNT.fetch_add(delta_ms, Ordering::Relaxed);
+    }
 
     let from_user = (ctx.cs & 3) == 3;
     let interrupted =
         unsafe { crate::kernel::KERNEL.get().scheduler.current() };
 
-    unsafe {
-        crate::kernel::KERNEL.get().scheduler.tick();
+    if delta_ms > 0 {
+        unsafe {
+            crate::kernel::KERNEL.get().scheduler.tick();
+        }
+        crate::sched_context::mcs_tick(delta_ms);
     }
-    crate::sched_context::mcs_tick(/* delta_ticks */ 1);
 
     eoi();
 
