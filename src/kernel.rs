@@ -464,6 +464,11 @@ impl KernelState {
     /// Phase 43 — release a SchedContext slot for reuse.
     pub fn free_sched_context(&mut self, i: usize) {
         if i < MAX_SCHED_CONTEXTS {
+            // SCHED0018 — a yielder waiting on this SC gets its
+            // consumed-report when the SC dies, not a dangling link.
+            if let Some(yielder) = self.sched_contexts[i].yield_from {
+                crate::sched_context::complete_yield_to(self, yielder, i);
+            }
             // SCHED0010 — if a TCB is bound to this SC, clear that
             // link so the scheduler sees `tcb.sc == None` and won't
             // consider the thread schedulable. Mirror on any
@@ -625,7 +630,12 @@ pub fn bootstrap_boot_thread() -> TcbId {
         let s = KERNEL.get();
         let mut t = Tcb::default();
         t.priority = 254; // top priority — kernel boot
-        t.mcp = 254;      // rootserver = authority for all spawned TCBs
+        // Upstream gives the root task tcbMCP = seL4_MaxPrio (255).
+        // sel4test-driver configures test processes with mcp=255;
+        // anything lower here makes that SetSchedParams hit the
+        // authority RangeError and the whole MCP chain (driver →
+        // test → helpers) silently collapses to 0.
+        t.mcp = 255;
         t.state = ThreadStateType::Running;
         let id = s.scheduler.admit(t);
         s.scheduler.set_current(Some(id));

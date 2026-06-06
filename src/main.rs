@@ -352,6 +352,9 @@ fn ap_scheduler_loop() -> ! {
                 if dispatchable {
                     let ctx_ptr = unsafe {
                         let s = crate::kernel::KERNEL.get();
+                        // activateThread — write a pending YieldTo
+                        // consumed-report before snapshotting ctx.
+                        crate::sched_context::complete_yield_if_pending(tcb_id);
                         let tcb = s.scheduler.slab.get(tcb_id);
 
                         let cur_cr3: u64;

@@ -729,6 +729,10 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // For non-IPC syscalls (or for the sender after its
             // SysSend completes), rax = result and the rest of
             // the user_context is left as the sender stored it.
+            // Upstream activateThread — if the resumed thread has a
+            // pending YieldTo, write its consumed-report syscall
+            // return BEFORE we snapshot user_context below.
+            crate::sched_context::complete_yield_if_pending(next);
             let tcb = s.scheduler.slab.get(next);
             let mut new_ctx = tcb.user_context;
             let was_recv_path = matches!(
@@ -826,6 +830,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 };
                 if let Some(next_id) = next {
                     s.scheduler.set_current(Some(next_id));
+                    crate::sched_context::complete_yield_if_pending(next_id);
                     let tcb = s.scheduler.slab.get(next_id);
                     let next_cr3 = tcb.cpu_context.cr3;
                     let next_fs_base = tcb.cpu_context.fs_base;

@@ -457,6 +457,7 @@ extern "C" fn handle_page_fault_typed(
             let s = crate::kernel::KERNEL.get();
             if let Some(next_id) = s.scheduler.choose_thread() {
                 s.scheduler.set_current(Some(next_id));
+                crate::sched_context::complete_yield_if_pending(next_id);
                 let tcb = s.scheduler.slab.get(next_id);
                 let next_cr3 = tcb.cpu_context.cr3;
                 let next_fs_base = tcb.cpu_context.fs_base;

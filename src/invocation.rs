@@ -1268,12 +1268,50 @@ fn decode_sched_context(
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_IllegalOperation)));
                 }
-                // Stamp consumed=0 in the reply. We don't track
-                // budget consumption without a timer; for the
-                // unrunnable-target case (SCHED0017 case 3) the
-                // contract is exactly 0.
+                // Upstream: a prior yielder against this SC gets its
+                // consumed-report completed before the new yield.
+                if let Some(prev) = s.sched_contexts[sc_id as usize].yield_from {
+                    crate::sched_context::complete_yield_to(
+                        s, prev, sc_id as usize);
+                }
+                // schedContext_resume-ish: a budget-parked target
+                // with a mature refill becomes runnable again.
+                let now = crate::sched_context::current_time();
+                if s.scheduler.slab.get(target_id).state
+                    == crate::tcb::ThreadStateType::BlockedOnBudget
+                    && crate::sched_context::refill_ready(
+                        &s.sched_contexts[sc_id as usize], now)
+                    && s.sched_contexts[sc_id as usize].count > 0
+                {
+                    s.scheduler.make_runnable(target_id);
+                }
+                let runnable = s.scheduler.slab.get(target_id).is_runnable();
+                let inv_prio = s.scheduler.slab.get(invoker).priority;
+                if runnable && target_prio >= inv_prio {
+                    // True yield (upstream invokeSchedContext_YieldTo
+                    // return_now = false): link yielder ↔ SC, force a
+                    // reschedule so the target gets the CPU, and DO
+                    // NOT write the consumed-report yet — it's
+                    // written by complete_yield_if_pending when the
+                    // yielder is next dispatched (activateThread
+                    // equivalent), capturing time the target consumed
+                    // in between.
+                    s.sched_contexts[sc_id as usize].yield_from = Some(invoker);
+                    s.scheduler.slab.get_mut(invoker).yield_to = Some(sc_id);
+                    let cpu = s.scheduler.slab.get(invoker).affinity as usize;
+                    if s.scheduler.nodes[cpu].current == Some(invoker) {
+                        s.scheduler.nodes[cpu].current = None;
+                    }
+                    return Ok(());
+                }
+                // Immediate-return paths (target unrunnable, or
+                // lower priority than us — it can't preempt, so the
+                // yield is a no-op): report consumed now.
+                let consumed_us = s.sched_contexts[sc_id as usize]
+                    .consumed.saturating_mul(1000);
+                s.sched_contexts[sc_id as usize].consumed = 0;
                 let inv = s.scheduler.slab.get_mut(invoker);
-                inv.msg_regs[0] = 0;
+                inv.msg_regs[0] = consumed_us;
                 inv.ipc_length = 1;
             }
             Ok(())
@@ -1329,7 +1367,18 @@ fn decode_sched_control(
                         Some(inv_tcb.pending_extra_caps[0])
                     } else { None };
                     inv_tcb.pending_extra_caps_count = 0;
-                    (cap, args.a2, args.a3)
+                    // Upstream ABI passes budget/period in
+                    // MICROSECONDS (decodeSchedControl_ConfigureFlags
+                    // runs usToTicks on them). Our tick is 1 ms.
+                    // Storing the raw value as ticks gave sel4test's
+                    // 500ms (= 500_000 µs) helper budgets a 500
+                    // SECOND rotation period — SCHED0019's yielder
+                    // starved behind the spinner until far past any
+                    // timeout. Integer division preserves
+                    // budget == period equality (the round-robin
+                    // property).
+                    let to_ticks = |us: u64| (us / 1000).max(1);
+                    (cap, to_ticks(args.a2), to_ticks(args.a3))
                 }
             } else {
                 unsafe {
@@ -1353,7 +1402,18 @@ fn decode_sched_control(
                         seL4_Error::seL4_RangeError)));
                 }
                 let sc = &mut s.sched_contexts[sc_idx];
+                // Upstream invokeSchedControl_ConfigureFlags only
+                // rebuilds the refill ring (refill_new /
+                // refill_update) — scTcb survives a reconfigure.
+                // Wiping the whole struct here detached the bound
+                // TCB: SCHED0018/19 call set_helper_sched_params on
+                // an already-bound helper, and the subsequent
+                // YieldTo saw an "unbound" SC.
+                let keep_bound = sc.bound_tcb;
+                let keep_yield = sc.yield_from;
                 *sc = crate::sched_context::SchedContext::new(period, budget);
+                sc.bound_tcb = keep_bound;
+                sc.yield_from = keep_yield;
                 // Seed one ready refill so a freshly-configured SC
                 // can be charged immediately.
                 sc.refills[0] = crate::sched_context::Refill {
@@ -3069,6 +3129,24 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
         return;
     }
     crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
+    // YieldTo bookkeeping (SCHED0018 delete phases):
+    //   * a yielder waiting on the dying thread's SC gets its
+    //     consumed-report now;
+    //   * if the dying thread itself has an outstanding yield,
+    //     unhook the SC's back-reference so it doesn't dangle.
+    if let Some(sc_idx) = s.scheduler.slab.get(id).sc {
+        if let Some(yielder) = s.sched_contexts[sc_idx as usize].yield_from {
+            if yielder != id {
+                crate::sched_context::complete_yield_to(
+                    s, yielder, sc_idx as usize);
+            }
+        }
+    }
+    if let Some(y_sc) = s.scheduler.slab.get(id).yield_to {
+        if (y_sc as usize) < s.sched_contexts.len() {
+            s.sched_contexts[y_sc as usize].yield_from = None;
+        }
+    }
     s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
     scrub_tcb_refs(s, id);
     s.scheduler.slab.entries[id.0 as usize] = None;
@@ -3652,6 +3730,18 @@ fn decode_tcb(
                 // reverse priority order and expects each Call to
                 // reach the next-highest remaining server).
                 crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
+                // Upstream suspend() also completes an outstanding
+                // YieldTo against this thread's SC — the yielder
+                // gets its consumed-report the moment the yielded-to
+                // thread stops running (SCHED0018 phase 1).
+                if let Some(sc_idx) = s.scheduler.slab.get(id).sc {
+                    if let Some(yielder) =
+                        s.sched_contexts[sc_idx as usize].yield_from
+                    {
+                        crate::sched_context::complete_yield_to(
+                            s, yielder, sc_idx as usize);
+                    }
+                }
                 s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
                 Ok(())
             }

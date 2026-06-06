@@ -56,6 +56,13 @@ pub struct SchedContext {
     /// Bound TCB. `None` while unbound. seL4 stores this as the
     /// `scTcb` cap pointer; we use a TcbId.
     pub bound_tcb: Option<TcbId>,
+    /// Ticks consumed by the bound thread since the last
+    /// `setConsumed`-style reset. seL4's `scConsumed`. Charged by
+    /// `mcs_tick`; read + reset when a YieldTo completes.
+    pub consumed: Ticks,
+    /// Thread waiting on a SchedContext_YieldTo against this SC.
+    /// seL4's `scYieldFrom`.
+    pub yield_from: Option<TcbId>,
 }
 
 impl Default for SchedContext {
@@ -71,6 +78,8 @@ impl SchedContext {
             head: 0,
             count: 0,
             bound_tcb: None,
+            consumed: 0,
+            yield_from: None,
         }
     }
 
@@ -246,6 +255,9 @@ pub fn mcs_tick(delta_ticks: Ticks) {
         }
         let sc = &mut s.sched_contexts[sc_idx];
         let round_robin = sc.budget == sc.period;
+        // scConsumed accounting — read + reset by YieldTo's
+        // consumed-report (setConsumed in upstream).
+        sc.consumed = sc.consumed.saturating_add(delta_ticks);
         let exhausted = refill_charge(sc, delta_ticks);
         if exhausted {
             if round_robin {
@@ -286,6 +298,60 @@ pub fn mcs_tick(delta_ticks: Ticks) {
                     cur, crate::tcb::ThreadStateType::BlockedOnBudget);
             }
         }
+    }
+}
+
+/// Complete an outstanding YieldTo: write the consumed-report
+/// syscall return into the yielder's saved context, clear the
+/// yield links, and reset the SC's consumed counter. Mirrors
+/// upstream `schedContext_completeYieldTo` + `setConsumed`.
+///
+/// The caller decides WHEN: either lazily right before the yielder
+/// is dispatched (`complete_yield_if_pending`, the activateThread
+/// equivalent) or eagerly when the yielded-to side is suspended /
+/// unbound / destroyed.
+pub fn complete_yield_to(
+    s: &mut crate::kernel::KernelState,
+    yielder: TcbId,
+    sc_idx: usize,
+) {
+    // Consumed is reported in microseconds (upstream ticksToUs);
+    // our ticks are milliseconds.
+    let consumed_us = s.sched_contexts[sc_idx].consumed.saturating_mul(1000);
+    s.sched_contexts[sc_idx].consumed = 0;
+    s.sched_contexts[sc_idx].yield_from = None;
+    if let Some(t) = s.scheduler.slab.try_get(yielder) {
+        let _ = t;
+        let t = s.scheduler.slab.get_mut(yielder);
+        t.yield_to = None;
+        // Syscall return: msginfo label 0 / length 1 in rsi, badge 0
+        // in rdi, mr0 = consumed in r10 (seL4_CallWithMRs register
+        // convention).
+        #[cfg(target_arch = "x86_64")]
+        {
+            t.user_context.rsi = 1;
+            t.user_context.rdi = 0;
+            t.user_context.r10 = consumed_us;
+        }
+        t.msg_regs[0] = consumed_us;
+        t.ipc_length = 1;
+        t.ipc_label = 0;
+    }
+}
+
+/// If `next` (about to be dispatched to user mode) has an
+/// outstanding YieldTo, complete it now so the syscall returns with
+/// the up-to-date consumed report. Upstream calls this from
+/// `activateThread` on every kernel exit; our equivalent hooks sit
+/// at each dispatch site.
+pub fn complete_yield_if_pending(next: TcbId) {
+    unsafe {
+        let s = crate::kernel::KERNEL.get();
+        let sc_idx = match s.scheduler.slab.try_get(next).and_then(|t| t.yield_to) {
+            Some(i) => i as usize,
+            None => return,
+        };
+        complete_yield_to(s, next, sc_idx);
     }
 }
 

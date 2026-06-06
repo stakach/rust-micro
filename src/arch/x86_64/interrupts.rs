@@ -368,6 +368,9 @@ pub(crate) fn swap_iretq_context_if_preempted(
             }
             f
         };
+        // activateThread — write a pending YieldTo consumed-report
+        // before snapshotting the context we're about to load.
+        crate::sched_context::complete_yield_if_pending(next);
         let next_ctx = s.scheduler.slab.get(next).user_context;
         ctx.rax = next_ctx.rax;
         ctx.rbx = next_ctx.rbx;
