@@ -256,13 +256,25 @@ impl Drop for BklGuard {
 ///   2. program the PIT for `hz` rate-generator
 ///   3. unmask IRQ 0 on the master PIC
 pub fn enable_periodic_irq(hz: u32) {
+    install_irq_handler();
+    program_periodic_hz(hz);
+}
+
+/// Install the PIT IRQ-0 handler and unmask the line — WITHOUT
+/// programming the chip. LAPIC-timer migration step 2: the kernel
+/// no longer ticks the PIT; the user-space ltimer driver programs
+/// it via its IOPort caps, and whatever it sets up fires through
+/// `pit_irq_dispatch` → user IRQ 2 notification. The unmask must
+/// happen AFTER kernel specs run — the PIT spec's `mask_all()`
+/// would otherwise leave IRQ 0 masked forever and the driver's
+/// firings would never deliver.
+pub fn install_irq_handler() {
     use super::interrupts::{IdtEntry, IDT};
     use super::pic;
     let vector = pic::PIC1_VECTOR_BASE as usize;
     unsafe {
         IDT[vector] = IdtEntry::new(pit_irq_entry as u64, 0x08, 0, 0x8E);
     }
-    program_periodic_hz(hz);
     pic::unmask_irq(0);
 }
 

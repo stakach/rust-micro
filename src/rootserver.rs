@@ -647,17 +647,19 @@ pub unsafe fn launch_rootserver() -> ! {
     // Arm the dispatcher's exit hook.
     ROOTSERVER_DEMO_ACTIVE.store(true, Ordering::Relaxed);
 
-    // LAPIC-timer migration step 1 — the kernel's preemption clock
+    // LAPIC-timer migration — the kernel's preemption clock
     // (TICK_COUNT + scheduler.tick + mcs_tick) is the LAPIC timer,
     // calibrated against the PIT before anything else touches the
-    // chip. The PIT stays kernel-programmed at 1000 Hz for now and
-    // its ISR only fans IRQs to the user IRQ 2 notification
-    // (sel4test's ltimer); freeing it for user space entirely is
-    // step 2.
+    // chip. The PIT itself belongs to user space: sel4test's
+    // ltimer driver programs it through IOPort caps and its IRQs
+    // fan through `pit_irq_dispatch` to the user IRQ 2
+    // notification. The kernel only installs the handler and
+    // unmasks the line (after specs — the PIT spec's mask_all()
+    // would otherwise leave IRQ 0 dead).
     crate::arch::x86_64::pic::init_pic();
     crate::arch::x86_64::lapic::calibrate_timer_with_pit();
     crate::arch::x86_64::lapic::enable_periodic_kernel_timer();
-    crate::arch::x86_64::pit::enable_periodic_irq(1000);
+    crate::arch::x86_64::pit::install_irq_handler();
 
     // Swap CR3 to the rootserver's PML4 (kernel half preserved).
     core::arch::asm!(
