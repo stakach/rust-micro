@@ -191,20 +191,7 @@ pub fn apic_base_paddr() -> u64 {
 /// `divide_log2` selects the divisor (0 = ÷2, 1 = ÷4, ...; 7 = ÷1).
 pub fn timer_one_shot(vector: u8, divide_log2: u8, initial_count: u32) {
     unsafe {
-        // Divide configuration register: encoding is non-trivial —
-        // bit 3 + bits 1..0 form the field. We support only the
-        // common values via a table.
-        let div_bits = match divide_log2 {
-            0 => 0b0000, // ÷2
-            1 => 0b0001, // ÷4
-            2 => 0b0010, // ÷8
-            3 => 0b0011, // ÷16
-            4 => 0b1000, // ÷32
-            5 => 0b1001, // ÷64
-            6 => 0b1010, // ÷128
-            _ => 0b1011, // ÷1
-        };
-        write_reg(TIMER_DIVIDE_CONFIG, div_bits);
+        write_reg(TIMER_DIVIDE_CONFIG, divide_bits(divide_log2));
         // LVT: vector + masked=0 + mode=0 (one-shot).
         write_reg(TIMER_LVT, vector as u32);
         // Writing the initial count starts the countdown.
@@ -212,8 +199,164 @@ pub fn timer_one_shot(vector: u8, divide_log2: u8, initial_count: u32) {
     }
 }
 
+/// Configure the LAPIC timer for periodic mode firing on `vector`.
+/// LVT bit 17 = 1 selects periodic — the timer auto-rearms with
+/// `initial_count` each time it fires.
+pub fn timer_periodic(vector: u8, divide_log2: u8, initial_count: u32) {
+    unsafe {
+        write_reg(TIMER_DIVIDE_CONFIG, divide_bits(divide_log2));
+        write_reg(TIMER_LVT, (vector as u32) | (1 << 17));
+        write_reg(TIMER_INITIAL_COUNT, initial_count);
+    }
+}
+
+/// Divide-configuration register encoding: bit 3 + bits 1..0 form
+/// the field. Table covers the canonical inputs.
+fn divide_bits(divide_log2: u8) -> u32 {
+    match divide_log2 {
+        0 => 0b0000, // ÷2
+        1 => 0b0001, // ÷4
+        2 => 0b0010, // ÷8
+        3 => 0b0011, // ÷16
+        4 => 0b1000, // ÷32
+        5 => 0b1001, // ÷64
+        6 => 0b1010, // ÷128
+        _ => 0b1011, // ÷1
+    }
+}
+
 pub fn timer_current_count() -> u32 {
     unsafe { read_reg(TIMER_CURRENT_COUNT) }
+}
+
+// ---------------------------------------------------------------------------
+// Periodic LAPIC kernel tick — drives `scheduler.tick` + `mcs_tick`.
+//
+// Step 1 of the LAPIC-timer migration: the LAPIC owns the KERNEL's
+// preemption clock, while the PIT (still kernel-programmed at
+// 1000 Hz for now) only fans its IRQ to the user-space IRQ 2
+// notification. Step 2 (freeing the PIT for the user-space ltimer
+// driver entirely) comes once this step soaks.
+// ---------------------------------------------------------------------------
+
+/// IDT vector for the LAPIC kernel tick. 0x41 sits just above the
+/// cross-CPU IPI vector (0x40), well clear of the PIC range
+/// (0x20..0x30) and the spurious vector (0xFF).
+pub const LAPIC_TIMER_VECTOR: u8 = 0x41;
+const LAPIC_TIMER_DIVIDE_LOG2: u8 = 3; // ÷16
+
+/// Calibrated initial count for a ~1 ms LAPIC timer period. Set by
+/// `calibrate_timer_with_pit` on the BSP before user space owns any
+/// hardware.
+static mut LAPIC_TIMER_INITIAL_COUNT: u32 = 0;
+
+/// Measure the LAPIC timer frequency against the PIT and store the
+/// initial count for a 1 ms period. Runs once on the BSP, before
+/// the PIT is handed to its periodic kernel duty (and long before
+/// user space can touch it). ~50 ms busy-wait.
+pub fn calibrate_timer_with_pit() -> u32 {
+    use super::pit;
+    const CAL_MS: u32 = 50;
+    const PIT_COUNT: u16 =
+        ((pit::PIT_INPUT_HZ as u64 * CAL_MS as u64) / 1000) as u16;
+    unsafe {
+        // Run the LAPIC timer masked at max count — we only read
+        // the current-count register, the LVT never fires.
+        write_reg(TIMER_DIVIDE_CONFIG, divide_bits(LAPIC_TIMER_DIVIDE_LOG2));
+        write_reg(TIMER_LVT, 1 << 16); // masked
+        write_reg(TIMER_INITIAL_COUNT, u32::MAX);
+    }
+    // PIT one-shot, poll until the count expires. `read_count`
+    // latches, so polling is race-free.
+    pit::program(pit::Channel::Ch0, pit::Mode::OneShot, PIT_COUNT);
+    loop {
+        let c = pit::read_count(pit::Channel::Ch0);
+        if c == 0 || c > PIT_COUNT {
+            break;
+        }
+    }
+    let elapsed = u32::MAX.wrapping_sub(timer_current_count());
+    let per_ms = (elapsed / CAL_MS).max(1);
+    unsafe {
+        LAPIC_TIMER_INITIAL_COUNT = per_ms;
+        // Stop the calibration countdown.
+        write_reg(TIMER_INITIAL_COUNT, 0);
+    }
+    per_ms
+}
+
+/// Install the LAPIC-tick IDT entry and start the periodic timer on
+/// the calling CPU at the calibrated ~1000 Hz rate. Requires
+/// `calibrate_timer_with_pit` to have run first.
+pub fn enable_periodic_kernel_timer() {
+    use super::interrupts::{IdtEntry, IDT};
+    unsafe {
+        IDT[LAPIC_TIMER_VECTOR as usize] =
+            IdtEntry::new(lapic_timer_irq_entry as u64, 0x08, 0, 0x8E);
+        timer_periodic(
+            LAPIC_TIMER_VECTOR,
+            LAPIC_TIMER_DIVIDE_LOG2,
+            LAPIC_TIMER_INITIAL_COUNT,
+        );
+    }
+}
+
+/// Naked LAPIC-tick entry — same 15-GPR frame shape as
+/// `pit_irq_entry` so the shared `IretqContext` swap tail works.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn lapic_timer_irq_entry() {
+    core::arch::naked_asm!(
+        "push rax", "push rbx", "push rcx", "push rdx",
+        "push rsi", "push rdi", "push rbp",
+        "push r8",  "push r9",  "push r10", "push r11",
+        "push r12", "push r13", "push r14", "push r15",
+        "mov rdi, rsp",
+        "call {handler}",
+        "pop r15", "pop r14", "pop r13", "pop r12",
+        "pop r11", "pop r10", "pop r9",  "pop r8",
+        "pop rbp", "pop rdi", "pop rsi", "pop rdx",
+        "pop rcx", "pop rbx", "pop rax",
+        "iretq",
+        handler = sym lapic_timer_irq_dispatch,
+    );
+}
+
+/// LAPIC kernel-tick ISR: advance the tick clock, charge the
+/// running thread's timeslice + SC budget, and context-switch if
+/// the tick parked it. EOI goes to the LAPIC (not the PIC — this
+/// vector never transits the 8259).
+#[no_mangle]
+extern "C" fn lapic_timer_irq_dispatch(
+    ctx: &mut super::interrupts::IretqContext,
+) {
+    use core::sync::atomic::Ordering;
+
+    crate::smp::bkl_acquire();
+    struct BklGuard;
+    impl Drop for BklGuard {
+        fn drop(&mut self) {
+            crate::smp::bkl_release();
+        }
+    }
+    let _bkl = BklGuard;
+
+    super::pit::TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let from_user = (ctx.cs & 3) == 3;
+    let interrupted =
+        unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+
+    unsafe {
+        crate::kernel::KERNEL.get().scheduler.tick();
+    }
+    crate::sched_context::mcs_tick(/* delta_ticks */ 1);
+
+    eoi();
+
+    super::interrupts::swap_iretq_context_if_preempted(
+        ctx, from_user, interrupted,
+    );
 }
 
 // ---------------------------------------------------------------------------

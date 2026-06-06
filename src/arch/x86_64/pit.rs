@@ -133,16 +133,20 @@ unsafe fn inb(port: u16) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Tick counter + IRQ 0 handler. The handler increments
-// `TICK_COUNT` and EOIs the PIC. Userspace will eventually drive
-// preemption from this; for now it's a smoke test that the PIT →
-// PIC → IDT path actually delivers interrupts.
+// Tick counter + IRQ 0 handler. `TICK_COUNT` is the kernel's tick
+// clock — advanced by the LAPIC timer ISR since the LAPIC-timer
+// migration (the PIT ISR only fans IRQs to user space now).
+// `PIT_IRQ_COUNT` counts raw PIT firings for specs + tracing.
 // ---------------------------------------------------------------------------
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[no_mangle]
 pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Raw count of PIT IRQ-0 firings reaching `pit_irq_dispatch`.
+#[no_mangle]
+pub static PIT_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 
 use super::interrupts::IretqContext;
 
@@ -199,10 +203,11 @@ pub unsafe extern "C" fn pit_irq_entry() {
     );
 }
 
-/// Rust dispatcher. Runs the original PIT ISR work (tick counter,
-/// scheduler.tick, mcs_tick), then — if `mcs_tick` parked the
-/// running thread — swaps the iretq context so we return to the
-/// new `current` instead of the now-blocked thread.
+/// Rust dispatcher. The kernel's preemption clock moved to the
+/// LAPIC timer (`lapic::lapic_timer_irq_dispatch` — it owns
+/// TICK_COUNT, scheduler.tick and mcs_tick); this ISR only fans
+/// the PIT IRQ to the user-space IRQ 2 notification, which is how
+/// sel4test's ltimer driver receives its timeout firings.
 #[no_mangle]
 extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
     // Phase 28b — BKL. The PIT interrupt fires on whichever CPU
@@ -212,18 +217,11 @@ extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
     crate::smp::bkl_acquire();
     let _bkl = BklGuard;
 
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    PIT_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let from_user = (ctx.cs & 3) == 3;
     let interrupted = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
 
-    // Phase 23: charge a timeslice tick to the current thread.
-    unsafe {
-        crate::kernel::KERNEL.get().scheduler.tick();
-    }
-    // Phase 32e — MCS: also debit the current thread's bound
-    // SchedContext. Threads with no SC bound are unaffected.
-    crate::sched_context::mcs_tick(/* delta_ticks */ 1);
     super::pic::eoi(0);
 
     // Phase 42 — fan to user IRQ 2 (PIT-via-IOAPIC GSI 2 binding)
@@ -238,9 +236,9 @@ extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
         );
     }
 
-    // Phase 33a — IRQ-driven preemption. If `mcs_tick` (or any
-    // other tick handler) cleared `current`, switch contexts here
-    // rather than `iretq`-ing back to the now-blocked thread.
+    // Phase 33a — IRQ-driven preemption: if the woken IRQ thread
+    // outranks the interrupted one, switch contexts here rather
+    // than `iretq`-ing back.
     super::interrupts::swap_iretq_context_if_preempted(
         ctx, from_user, interrupted,
     );
@@ -327,7 +325,7 @@ pub mod spec {
         // we call it again here to be safe.
         super::super::pic::init_pic();
 
-        let before = TICK_COUNT.load(Ordering::Relaxed);
+        let before = PIT_IRQ_COUNT.load(Ordering::Relaxed);
         // 1000 Hz → 1ms per tick. Burn ~10ms.
         enable_periodic_irq(1000);
         // Spin long enough for several ticks. The qemu boot is fast
@@ -336,13 +334,13 @@ pub mod spec {
         for _ in 0..50_000_000 {
             core::hint::spin_loop();
             // Bail early once we see ticks.
-            if TICK_COUNT.load(Ordering::Relaxed) > before + 5 {
+            if PIT_IRQ_COUNT.load(Ordering::Relaxed) > before + 5 {
                 break;
             }
         }
         // Mask IRQ 0 again so subsequent specs aren't perturbed.
         super::super::pic::mask_all();
-        let after = TICK_COUNT.load(Ordering::Relaxed);
+        let after = PIT_IRQ_COUNT.load(Ordering::Relaxed);
         assert!(
             after > before,
             "PIT IRQ should have fired at least once (before={before}, after={after})",

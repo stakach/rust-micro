@@ -647,12 +647,16 @@ pub unsafe fn launch_rootserver() -> ! {
     // Arm the dispatcher's exit hook.
     ROOTSERVER_DEMO_ACTIVE.store(true, Ordering::Relaxed);
 
-    // Phase 32g — enable the PIT before dispatch so mcs_tick fires
-    // periodically. Without this, the children would run cooperatively
-    // (1:1 split via yield) and the MCS budget split would never be
-    // visible. 1000 Hz lines up with the children's budgets in ticks
-    // (period=10, high=8, low=2 → ~10 ms refill window per child).
+    // LAPIC-timer migration step 1 — the kernel's preemption clock
+    // (TICK_COUNT + scheduler.tick + mcs_tick) is the LAPIC timer,
+    // calibrated against the PIT before anything else touches the
+    // chip. The PIT stays kernel-programmed at 1000 Hz for now and
+    // its ISR only fans IRQs to the user IRQ 2 notification
+    // (sel4test's ltimer); freeing it for user space entirely is
+    // step 2.
     crate::arch::x86_64::pic::init_pic();
+    crate::arch::x86_64::lapic::calibrate_timer_with_pit();
+    crate::arch::x86_64::lapic::enable_periodic_kernel_timer();
     crate::arch::x86_64::pit::enable_periodic_irq(1000);
 
     // Swap CR3 to the rootserver's PML4 (kernel half preserved).
