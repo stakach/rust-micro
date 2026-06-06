@@ -332,9 +332,17 @@ pub(crate) fn swap_iretq_context_if_preempted(
         }
         if let Some(prev) = interrupted {
             let prev_tcb = s.scheduler.slab.get_mut(prev);
+            // FULL context save. An IRQ can preempt any user
+            // instruction, so the true rcx / r11 GPRs must survive;
+            // RIP and RFLAGS go in their dedicated fields and the
+            // thread is flagged for iretq resume (sysretq would
+            // clobber rcx/r11 to restore RIP/RFLAGS). The old code
+            // overwrote rcx with RIP — invisible while user threads
+            // ran IF=0 (never preempted mid-computation), fatally
+            // corrupting once IF sanitization made preemption real.
             prev_tcb.user_context.rax = ctx.rax;
             prev_tcb.user_context.rbx = ctx.rbx;
-            prev_tcb.user_context.rcx = ctx.rip;
+            prev_tcb.user_context.rcx = ctx.rcx;
             prev_tcb.user_context.rdx = ctx.rdx;
             prev_tcb.user_context.rsi = ctx.rsi;
             prev_tcb.user_context.rdi = ctx.rdi;
@@ -342,17 +350,27 @@ pub(crate) fn swap_iretq_context_if_preempted(
             prev_tcb.user_context.r8 = ctx.r8;
             prev_tcb.user_context.r9 = ctx.r9;
             prev_tcb.user_context.r10 = ctx.r10;
-            prev_tcb.user_context.r11 = ctx.rflags;
+            prev_tcb.user_context.r11 = ctx.r11;
             prev_tcb.user_context.r12 = ctx.r12;
             prev_tcb.user_context.r13 = ctx.r13;
             prev_tcb.user_context.r14 = ctx.r14;
             prev_tcb.user_context.r15 = ctx.r15;
             prev_tcb.user_context.rsp = ctx.rsp;
+            prev_tcb.user_context.rip = ctx.rip;
+            prev_tcb.user_context.rflags = ctx.rflags;
+            prev_tcb.use_iretq_resume = true;
         }
+        let use_iretq = {
+            let next_tcb = s.scheduler.slab.get_mut(next);
+            let f = next_tcb.use_iretq_resume;
+            if f {
+                next_tcb.use_iretq_resume = false;
+            }
+            f
+        };
         let next_ctx = s.scheduler.slab.get(next).user_context;
         ctx.rax = next_ctx.rax;
         ctx.rbx = next_ctx.rbx;
-        ctx.rip = next_ctx.rcx;
         ctx.rdx = next_ctx.rdx;
         ctx.rsi = next_ctx.rsi;
         ctx.rdi = next_ctx.rdi;
@@ -360,12 +378,30 @@ pub(crate) fn swap_iretq_context_if_preempted(
         ctx.r8 = next_ctx.r8;
         ctx.r9 = next_ctx.r9;
         ctx.r10 = next_ctx.r10;
-        ctx.rflags = next_ctx.r11;
         ctx.r12 = next_ctx.r12;
         ctx.r13 = next_ctx.r13;
         ctx.r14 = next_ctx.r14;
         ctx.r15 = next_ctx.r15;
         ctx.rsp = next_ctx.rsp;
+        ctx.rcx = next_ctx.rcx;
+        ctx.r11 = next_ctx.r11;
+        if use_iretq {
+            // Thread was primed by WriteRegisters with rcx / r11
+            // carrying independent GPR values; its resume RIP and
+            // RFLAGS live in the dedicated fields. Loading the
+            // sysret-convention slots here would iretq to RIP=0
+            // with IF=0.
+            ctx.rip = next_ctx.rip;
+            ctx.rflags = next_ctx.rflags;
+        } else {
+            // sysret convention: rcx doubles as RIP, r11 as RFLAGS.
+            ctx.rip = next_ctx.rcx;
+            ctx.rflags = next_ctx.r11;
+        }
+        // Whatever the source, never iretq into user mode with IF
+        // clear — a spinning thread would shut the CPU off from
+        // every maskable interrupt (timer ticks included).
+        ctx.rflags = (ctx.rflags & 0xDD5) | 0x202;
         let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
         if next_cr3 != 0 {
             let cur_cr3: u64;
@@ -376,6 +412,16 @@ pub(crate) fn swap_iretq_context_if_preempted(
                     options(nostack, preserves_flags));
             }
         }
+        // Restore the incoming thread's TLS base. Every other
+        // dispatch site does this; missing it here meant an
+        // IRQ-driven switch left the PREVIOUS thread's FS_BASE
+        // live, so the new thread's %fs-relative reads (sel4runtime
+        // keeps the IPC buffer pointer in TLS) dereferenced the
+        // wrong thread's TLS block.
+        crate::arch::x86_64::msr::wrmsr(
+            crate::arch::x86_64::msr::IA32_FS_BASE,
+            s.scheduler.slab.get(next).cpu_context.fs_base,
+        );
         s.scheduler.set_current(Some(next));
     }
 }

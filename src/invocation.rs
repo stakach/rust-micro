@@ -3912,7 +3912,23 @@ fn decode_tcb(
                         // OTHER cases, leave rcx/r11 = rip/rflags so
                         // sysretq's tail sees a valid resume RIP.
                         let new_rip = if n > 0 { regs[0] } else { 0 };
-                        let new_rflags = if n > 2 { regs[2] } else { 0x202 };
+                        // Sanitize RFLAGS the way upstream's
+                        // Arch_sanitiseRegister does: keep only the
+                        // user-legal arithmetic/direction bits
+                        // (CF PF AF ZF SF TF DF OF = 0xDD5), force
+                        // bit 1 (always-one) and IF (bit 9).
+                        // sel4utils passes rflags=0 when starting
+                        // threads — storing that verbatim produced
+                        // user threads running with IF=0, which
+                        // starves the kernel of timer + device IRQs
+                        // whenever such a thread spins (SCHED0000's
+                        // hang; ticks died after the first
+                        // WriteRegisters-started thread ran).
+                        let new_rflags = if n > 2 {
+                            (regs[2] & 0xDD5) | 0x202
+                        } else {
+                            0x202
+                        };
                         if n > 0  { t.user_context.rip = new_rip; }
                         if n > 1  { t.user_context.rsp = regs[1]; }
                         if n > 2  { t.user_context.rflags = new_rflags; }

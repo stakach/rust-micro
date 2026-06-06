@@ -41,7 +41,7 @@ environment = 0xffffffffff801000;
  * concern for the BOOTBOOT loader. */
 initstack = 65536;
 
-KERNEL_OFFSET = 0xffffffffff802000;
+KERNEL_OFFSET = 0xfffffffffe002000;
 
 PHDRS
 {
@@ -49,7 +49,7 @@ PHDRS
 }
 SECTIONS
 {
-    . = 0xffffffffff802000;
+    . = 0xfffffffffe002000;
     .text . + SIZEOF_HEADERS : AT(ADDR(.text) - KERNEL_OFFSET + SIZEOF_HEADERS) {
         __text_start = .;
         KEEP(*(.text.boot)) *(.text .text.* .gnu.linkonce.t*)   /* code */

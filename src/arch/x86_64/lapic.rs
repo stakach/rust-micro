@@ -210,6 +210,27 @@ pub fn timer_periodic(vector: u8, divide_log2: u8, initial_count: u32) {
     }
 }
 
+/// Start a one-shot countdown with the LVT MASKED — counts but
+/// never interrupts. For calibration / specs that only read the
+/// current-count register. An unmasked one-shot with no real IDT
+/// vector is a trap: it eventually expires, the bogus vector gets
+/// no LAPIC EOI, and its priority class blocks every lower LAPIC
+/// vector (including the kernel tick) from then on.
+pub fn timer_one_shot_masked(divide_log2: u8, initial_count: u32) {
+    unsafe {
+        write_reg(TIMER_DIVIDE_CONFIG, divide_bits(divide_log2));
+        write_reg(TIMER_LVT, 1 << 16); // masked
+        write_reg(TIMER_INITIAL_COUNT, initial_count);
+    }
+}
+
+/// Stop the LAPIC timer (writing 0 to the initial count halts it).
+pub fn timer_stop() {
+    unsafe {
+        write_reg(TIMER_INITIAL_COUNT, 0);
+    }
+}
+
 /// Divide-configuration register encoding: bit 3 + bits 1..0 form
 /// the field. Table covers the canonical inputs.
 fn divide_bits(divide_log2: u8) -> u32 {
@@ -290,6 +311,10 @@ pub fn calibrate_timer_with_pit() -> u32 {
 /// `calibrate_timer_with_pit` to have run first.
 pub fn enable_periodic_kernel_timer() {
     use super::interrupts::{IdtEntry, IDT};
+    // Defensive: EOI any interrupt stuck in-service on this LAPIC.
+    // A vector that was taken but never EOI'd blocks every lower
+    // priority class from delivery — including our tick vector.
+    drain_in_service();
     unsafe {
         IDT[LAPIC_TIMER_VECTOR as usize] =
             IdtEntry::new(lapic_timer_irq_entry as u64, 0x08, 0, 0x8E);
@@ -298,6 +323,26 @@ pub fn enable_periodic_kernel_timer() {
             LAPIC_TIMER_DIVIDE_LOG2,
             LAPIC_TIMER_INITIAL_COUNT,
         );
+    }
+}
+
+/// In-Service Register: 8 × 32-bit registers at 0x100..0x180, one
+/// bit per vector. EOI clears the highest-priority set bit; loop
+/// until the whole ISR is clear (bounded — 256 vectors max).
+fn drain_in_service() {
+    for _ in 0..256 {
+        let mut any = false;
+        for i in 0..8usize {
+            let v = unsafe { read_reg(0x100 + i * 0x10) };
+            if v != 0 {
+                any = true;
+                break;
+            }
+        }
+        if !any {
+            return;
+        }
+        eoi();
     }
 }
 
@@ -438,15 +483,20 @@ pub mod spec {
 
     #[inline(never)]
     fn live_apic_timer_decrements() {
-        // Park the LAPIC timer with a generous one-shot count;
-        // verify the current-count register decreases.
-        const VEC: u8 = 0xEF;
-        timer_one_shot(VEC, 7 /* divide ÷1 */, 1_000_000);
+        // Park the LAPIC timer with a generous MASKED one-shot
+        // count; verify the current-count register decreases, then
+        // stop it. The LVT must stay masked: an unmasked bogus
+        // vector (the old 0xEF) eventually expired with no IDT
+        // entry and no EOI, leaving its priority class in-service
+        // forever — which silently blocked the kernel-tick vector
+        // for the rest of the boot.
+        timer_one_shot_masked(7 /* divide ÷1 */, 1_000_000);
         let a = timer_current_count();
         for _ in 0..200_000 {
             core::hint::spin_loop();
         }
         let b = timer_current_count();
+        timer_stop();
         assert!(b < a, "APIC timer should decrement (a={a} b={b})");
         arch::log("  ✓ APIC timer current count decrements\n");
     }

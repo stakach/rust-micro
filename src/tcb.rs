@@ -39,6 +39,13 @@ pub enum ThreadStateType {
     /// though we never enter this state without VT-x support.
     RunningVM = 7,
     Idle = 8,
+    /// Budget-exhausted, waiting for the next refill to mature.
+    /// Models upstream MCS's release queue. Distinct from
+    /// `Inactive` (= suspended): `mcs_tick`'s maturity scan revives
+    /// ONLY this state — a deliberately suspended thread must stay
+    /// down until an explicit Resume (SCHED0000 asserts exactly
+    /// that while the suspended spinner's SC keeps maturing).
+    BlockedOnBudget = 9,
 }
 
 impl ThreadStateType {
@@ -59,6 +66,7 @@ impl ThreadStateType {
             6 => Some(Self::BlockedOnNotification),
             7 => Some(Self::RunningVM),
             8 => Some(Self::Idle),
+            9 => Some(Self::BlockedOnBudget),
             _ => None,
         }
     }

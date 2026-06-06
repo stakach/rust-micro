@@ -22,7 +22,7 @@ pub const BOOTBOOT_MMIO: u64 = 0xfffffffff8000000;  /* memory mapped IO virtual 
 pub const BOOTBOOT_FB: u64 = 0xfffffffffc000000;  /* frame buffer virtual address */
 pub const BOOTBOOT_INFO: u64 = 0xffffffffff800000;  /* bootboot struct virtual address */
 pub const BOOTBOOT_ENV: u64 = 0xffffffffff801000;  /* environment string virtual address */
-pub const BOOTBOOT_CORE: u64 = 0xffffffffff802000;  /* core loadable segment start */
+pub const BOOTBOOT_CORE: u64 = 0xfffffffffe002000;  /* core loadable segment start */
 
 
 #[repr(C, packed)]

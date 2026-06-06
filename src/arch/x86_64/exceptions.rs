@@ -475,6 +475,14 @@ extern "C" fn handle_page_fault_typed(
                 let pcc = crate::arch::x86_64::syscall_entry
                     ::current_cpu_user_ctx_mut();
                 *pcc = next_ctx;
+                // IRQ-preempted threads carry true rcx/r11 GPRs and
+                // RIP/RFLAGS in dedicated fields — must iretq.
+                if s.scheduler.slab.get(next_id).use_iretq_resume {
+                    s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
+                    crate::smp::bkl_release();
+                    crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
+                        pcc as *const _);
+                }
                 crate::smp::bkl_release();
                 crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
                     pcc as *const _);

@@ -215,7 +215,12 @@ pub fn mcs_tick(delta_ticks: Ticks) {
                     continue;
                 }
             };
-            if state != crate::tcb::ThreadStateType::Inactive {
+            // Only revive threads parked BY THE BUDGET CHECK below
+            // (release-queue semantics). `Inactive` covers
+            // deliberate suspension (TCB_Suspend, fault parking) —
+            // reviving those on refill maturity made Suspend a
+            // no-op for any thread with an active SC (SCHED0000).
+            if state != crate::tcb::ThreadStateType::BlockedOnBudget {
                 continue;
             }
             if refill_ready(sc, now) && sc.count > 0 {
@@ -240,12 +245,46 @@ pub fn mcs_tick(delta_ticks: Ticks) {
             return;
         }
         let sc = &mut s.sched_contexts[sc_idx];
+        let round_robin = sc.budget == sc.period;
         let exhausted = refill_charge(sc, delta_ticks);
         if exhausted {
-            // Schedule the next refill one period from now so the
-            // thread can resume when it matures.
-            let _ = refill_replenish(sc, now);
-            s.scheduler.block(cur, crate::tcb::ThreadStateType::Inactive);
+            if round_robin {
+                // Upstream `chargeBudget` merges head+tail for
+                // round-robin SCs — the budget is instantly whole
+                // again. Replenish AT now, not now + period, so the
+                // rotated thread is immediately runnable.
+                let _ = sc.push(Refill { release_time: now, amount: sc.budget });
+            } else {
+                // Sporadic: next refill matures a period from now.
+                let _ = refill_replenish(sc, now);
+            }
+            // Upstream `endTimeslice` (seL4/src/kernel/thread.c):
+            //   * round-robin SC (budget == period; upstream stores
+            //     period=0 for these) → SCHED_APPEND_CURRENT_TCB —
+            //     the thread rotates to the BACK of its priority's
+            //     ready queue and keeps running. It never sleeps.
+            //   * otherwise → postpone() — release queue until the
+            //     next refill matures. We model the release queue
+            //     with block(Inactive) + the maturity scan above.
+            // Without the round-robin arm, a full-utilisation
+            // spinner (sel4test helpers default to budget==period)
+            // sleeps for a whole period on every exhaustion — a 50%
+            // duty cycle upstream doesn't have.
+            if round_robin {
+                let cpu = s.scheduler.slab.get(cur).affinity as usize;
+                s.scheduler.nodes[cpu].queues
+                    .dequeue(&mut s.scheduler.slab, cur);
+                s.scheduler.nodes[cpu].queues
+                    .enqueue(&mut s.scheduler.slab, cur);
+                // rescheduleRequired — let the dispatcher pick the
+                // (possibly different) head of the queue.
+                if s.scheduler.nodes[cpu].current == Some(cur) {
+                    s.scheduler.nodes[cpu].current = None;
+                }
+            } else {
+                s.scheduler.block(
+                    cur, crate::tcb::ThreadStateType::BlockedOnBudget);
+            }
         }
     }
 }
@@ -298,6 +337,7 @@ pub mod spec {
         refill_ready_threshold();
         ring_full_returns_error();
         mcs_tick_blocks_on_exhaustion();
+        mcs_tick_round_robin_rotates_not_blocks();
         mcs_tick_wakes_on_matured_refill();
         sc_donation_across_call_charges_callee_on_caller_sc();
         arch::log("MCS sched_context tests completed\n");
@@ -408,7 +448,7 @@ pub mod spec {
             // path replenishes a new refill at now+period=10.
             super::mcs_tick(1);
             assert_eq!(s.scheduler.slab.get(id).state,
-                crate::tcb::ThreadStateType::Inactive,
+                crate::tcb::ThreadStateType::BlockedOnBudget,
                 "thread should be parked when SC exhausts");
             // The new refill should sit in the ring with release_time=10.
             assert!(s.sched_contexts[sc_idx].count >= 1,
@@ -477,7 +517,7 @@ pub mod spec {
             // Tick again — budget 1 → 0, exhausted, thread parks.
             crate::sched_context::mcs_tick(1);
             assert_eq!(s.scheduler.slab.get(id).state,
-                crate::tcb::ThreadStateType::Inactive,
+                crate::tcb::ThreadStateType::BlockedOnBudget,
                 "thread should be parked when SC exhausts");
 
             // Cleanup: free the slot so subsequent specs aren't
@@ -488,6 +528,54 @@ pub mod spec {
             s.sched_contexts[sc_idx].bound_tcb = None;
         }
         arch::log("  ✓ mcs_tick blocks the current TCB on SC exhaustion\n");
+    }
+
+    /// Round-robin SC (budget == period, upstream's scPeriod == 0
+    /// encoding) — exhaustion rotates the thread to the back of its
+    /// ready queue and instantly re-arms the budget. It must NOT
+    /// park. Mirrors upstream chargeBudget + endTimeslice.
+    #[inline(never)]
+    fn mcs_tick_round_robin_rotates_not_blocks() {
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
+
+            let mut t = crate::tcb::Tcb::default();
+            t.priority = 50;
+            t.state = crate::tcb::ThreadStateType::Running;
+            let id = s.scheduler.admit(t);
+            let sc_idx = s.alloc_sched_context().expect("sc pool");
+            s.sched_contexts[sc_idx] =
+                SchedContext::new(/* period */ 2, /* budget */ 2);
+            s.sched_contexts[sc_idx]
+                .push(Refill { release_time: 0, amount: 2 }).unwrap();
+            s.sched_contexts[sc_idx].bound_tcb = Some(id);
+            s.scheduler.slab.get_mut(id).sc = Some(sc_idx as u16);
+            s.scheduler.set_current(Some(id));
+
+            // Exhaust the 2-tick budget in one charge.
+            crate::sched_context::mcs_tick(2);
+            // Still Running — rotated, not parked.
+            assert_eq!(s.scheduler.slab.get(id).state,
+                crate::tcb::ThreadStateType::Running,
+                "round-robin thread must stay runnable on exhaustion");
+            // Reschedule was requested (current cleared)...
+            assert_eq!(s.scheduler.current(), None);
+            // ...and the budget is instantly whole again at the new
+            // head refill, ready to spend now.
+            assert_eq!(s.sched_contexts[sc_idx].head_amount(), 2);
+            assert!(crate::sched_context::refill_ready(
+                &s.sched_contexts[sc_idx],
+                crate::sched_context::current_time()));
+
+            s.scheduler.set_current(None);
+            s.scheduler.nodes[crate::arch::get_cpu_id() as usize]
+                .queues.dequeue(&mut s.scheduler.slab, id);
+            s.scheduler.slab.free(id);
+            s.sched_contexts[sc_idx].bound_tcb = None;
+        }
+        arch::log("  ✓ round-robin SC rotates to queue tail on exhaustion\n");
     }
 
     #[inline(never)]

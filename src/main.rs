@@ -381,8 +381,24 @@ fn ap_scheduler_loop() -> ! {
                         pcc as *const crate::arch::x86_64::syscall_entry::UserContext
                     };
 
+                    // IRQ-preempted threads carry true rcx/r11 GPRs
+                    // and RIP/RFLAGS in dedicated fields — resume
+                    // via iretq, not sysretq.
+                    let use_iretq = unsafe {
+                        let s = crate::kernel::KERNEL.get();
+                        let f = s.scheduler.slab.get(tcb_id).use_iretq_resume;
+                        if f {
+                            s.scheduler.slab.get_mut(tcb_id)
+                                .use_iretq_resume = false;
+                        }
+                        f
+                    };
                     smp::bkl_release();
                     unsafe {
+                        if use_iretq {
+                            crate::arch::x86_64::syscall_entry
+                                ::enter_user_via_iretq(ctx_ptr);
+                        }
                         crate::arch::x86_64::syscall_entry::enter_user_via_sysret(ctx_ptr);
                     }
                     // unreachable
