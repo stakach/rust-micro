@@ -529,7 +529,16 @@ pub fn transfer_extra_caps(
     unsafe {
         let s = crate::kernel::KERNEL.get();
         let staged = s.scheduler.slab.get(sender).pending_extra_caps;
-        let slots = &mut s.cnodes[cnode_idx].0;
+        // Dispatch across all three CNode pools — the receiver's
+        // cspace root may be an XL page (test processes), not a
+        // big-pool entry.
+        let slots = match s.cnode_slots_at_mut(cnode_idx) {
+            Some(sl) => sl,
+            None => {
+                s.scheduler.slab.get_mut(sender).pending_extra_caps_count = 0;
+                return;
+            }
+        };
         for i in 0..count {
             let dest_idx = recv_index + i;
             if dest_idx >= slots.len() { break; }

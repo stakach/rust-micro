@@ -2201,7 +2201,24 @@ fn decode_untyped_retype(
                         let alloc = if radix <= crate::kernel::SMALL_CNODE_RADIX {
                             (*s_ptr).alloc_small_cnode()
                                 .or_else(|| (*s_ptr).alloc_cnode())
+                        } else if radix <= crate::kernel::XL_CNODE_RADIX
+                            && radix > crate::kernel::CNODE_RADIX
+                        {
+                            (*s_ptr).alloc_xl_cnode()
+                                .or_else(|| (*s_ptr).alloc_cnode())
                         } else {
+                            // radix ≤ 12, or BIGGER than the XL pool
+                            // can honestly back (sel4utils requests
+                            // radix 17 for test-process roots). The
+                            // big-pool fallback stamps the requested
+                            // radix over 4096-slot storage — a KNOWN
+                            // LIE that works until a test allocates
+                            // past slot 4095 (only SCHED0004 does;
+                            // it stays off-regex until cspace roots
+                            // get honest radix-17 backing plus
+                            // refcounted object-liveness so revoke
+                            // scans don't walk 131k slots per
+                            // delete).
                             (*s_ptr).alloc_cnode()
                         };
                         match alloc {
@@ -2576,6 +2593,10 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         static mut REVOKED_SMALL:
             [[bool; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES] =
             [[false; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES];
+        const XL_SLOTS: usize = crate::kernel::XL_CNODE_SLOTS;
+        static mut REVOKED_XL:
+            [[bool; XL_SLOTS]; crate::kernel::MAX_XL_CNODES] =
+            [[false; XL_SLOTS]; crate::kernel::MAX_XL_CNODES];
         // Reset both pool bitmaps. We touch the statics through raw
         // pointers below to keep the borrow checker out of the way —
         // the closures used by the marking + clearing phases need
@@ -2586,16 +2607,27 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         for row in (&mut *core::ptr::addr_of_mut!(REVOKED_SMALL)).iter_mut() {
             for v in row.iter_mut() { *v = false; }
         }
+        for row in (&mut *core::ptr::addr_of_mut!(REVOKED_XL)).iter_mut() {
+            for v in row.iter_mut() { *v = false; }
+        }
         // Helpers: dispatch on virtual cnode index.
         let is_revoked = |ci: usize, si: usize| -> bool {
             if ci < crate::kernel::MAX_CNODES {
                 if si < SLOTS_PER_NODE {
                     (*core::ptr::addr_of!(REVOKED_BIG))[ci][si]
                 } else { false }
-            } else if ci < crate::kernel::KernelState::cnode_pool_count() {
+            } else if ci < crate::kernel::MAX_CNODES
+                + crate::kernel::MAX_SMALL_CNODES
+            {
                 let small_i = ci - crate::kernel::MAX_CNODES;
                 if si < SMALL_SLOTS {
                     (*core::ptr::addr_of!(REVOKED_SMALL))[small_i][si]
+                } else { false }
+            } else if ci < crate::kernel::KernelState::cnode_pool_count() {
+                let xl_i = ci - crate::kernel::MAX_CNODES
+                    - crate::kernel::MAX_SMALL_CNODES;
+                if si < XL_SLOTS {
+                    (*core::ptr::addr_of!(REVOKED_XL))[xl_i][si]
                 } else { false }
             } else {
                 false
@@ -2606,10 +2638,18 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 if si < SLOTS_PER_NODE {
                     (*core::ptr::addr_of_mut!(REVOKED_BIG))[ci][si] = true;
                 }
-            } else if ci < crate::kernel::KernelState::cnode_pool_count() {
+            } else if ci < crate::kernel::MAX_CNODES
+                + crate::kernel::MAX_SMALL_CNODES
+            {
                 let small_i = ci - crate::kernel::MAX_CNODES;
                 if si < SMALL_SLOTS {
                     (*core::ptr::addr_of_mut!(REVOKED_SMALL))[small_i][si] = true;
+                }
+            } else if ci < crate::kernel::KernelState::cnode_pool_count() {
+                let xl_i = ci - crate::kernel::MAX_CNODES
+                    - crate::kernel::MAX_SMALL_CNODES;
+                if si < XL_SLOTS {
+                    (*core::ptr::addr_of_mut!(REVOKED_XL))[xl_i][si] = true;
                 }
             }
         };
@@ -2624,8 +2664,12 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
                 let slot_count = if ci < crate::kernel::MAX_CNODES {
                     s.cnodes[ci].0.len()
-                } else {
+                } else if ci < crate::kernel::MAX_CNODES
+                    + crate::kernel::MAX_SMALL_CNODES
+                {
                     SMALL_SLOTS
+                } else {
+                    XL_SLOTS
                 };
                 for si in 0..slot_count {
                     if is_revoked(ci, si) { continue; }
@@ -2647,11 +2691,8 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // (no longer holds anything that has children) and decrement
         // the parent's count (we just removed one of its children).
         for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-            let slot_count = if ci < crate::kernel::MAX_CNODES {
-                s.cnodes[ci].0.len()
-            } else {
-                SMALL_SLOTS
-            };
+            let slot_count = s.cnode_slots_at(ci)
+                .map(|sl| sl.len()).unwrap_or(0);
             for si in 0..slot_count {
                 if !is_revoked(ci, si)
                     || (ci == cnode_idx && si == src_index)
@@ -2702,11 +2743,8 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                     };
                     for ci2 in 0..crate::kernel::KernelState::cnode_pool_count() {
                         if Some(ci2) == target_self_cnode_idx { continue; }
-                        let inner_count = if ci2 < crate::kernel::MAX_CNODES {
-                            s.cnodes[ci2].0.len()
-                        } else {
-                            SMALL_SLOTS
-                        };
+                        let inner_count = s.cnode_slots_at(ci2)
+                            .map(|sl| sl.len()).unwrap_or(0);
                         for si2 in 0..inner_count {
                             if ci2 == ci && si2 == si { continue; }
                             if is_revoked(ci2, si2) { continue; }

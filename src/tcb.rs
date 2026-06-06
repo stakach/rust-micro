@@ -333,7 +333,7 @@ impl Tcb {
 /// raising this here costs ~128 bytes per TCB in BSS plus stack
 /// when a Scheduler is constructed in a spec, so we keep it modest
 /// until phases that actually need more.
-pub const MAX_TCBS: usize = 64;
+pub const MAX_TCBS: usize = 320;
 
 #[derive(Copy, Clone, Debug)]
 pub struct TcbSlab {

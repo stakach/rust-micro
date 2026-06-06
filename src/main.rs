@@ -159,10 +159,36 @@ fn _start() -> ! {
     }
 }
 
+/// BOOTBOOT clamps `initstack` to 16 KiB per core — far too small
+/// for kernel specs that build Scheduler/TcbSlab values on the
+/// stack (~170 KiB at MAX_TCBS = 320). The BSP hops onto this
+/// BSS-allocated stack first thing; the BOOTBOOT stack is only
+/// used for the jump itself.
+#[repr(C, align(16))]
+struct BspStack([u8; 1024 * 1024]);
+static mut BSP_BIG_STACK: BspStack = BspStack([0; 1024 * 1024]);
+
 /// BSP entry — runs all global init (serial, GDT contents, IDT
 /// contents, exception vectors), signals APs to come up, waits for
 /// the AP barrier, then runs spec runner / demo.
 fn bsp_main() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let top = (&raw const BSP_BIG_STACK as u64)
+            + core::mem::size_of::<BspStack>() as u64;
+        core::arch::asm!(
+            "mov rsp, {top}",
+            "jmp {cont}",
+            top = in(reg) top & !0xF,
+            cont = sym bsp_main_big_stack,
+            options(noreturn),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    bsp_main_big_stack()
+}
+
+fn bsp_main_big_stack() -> ! {
     arch::init_serial();
     arch::log("Serial initialized!\n");
 

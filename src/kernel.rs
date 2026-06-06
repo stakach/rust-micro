@@ -27,16 +27,16 @@ use crate::tcb::{Tcb, TcbId, ThreadStateType};
 /// Maximum endpoints in the in-kernel pool. Production seL4
 /// allocates them via Untyped retype with no fixed cap; the slab
 /// is just a convenience until we wire that path.
-pub const MAX_ENDPOINTS: usize = 256;
+pub const MAX_ENDPOINTS: usize = 384;
 
 /// Maximum notifications in the in-kernel pool.
-pub const MAX_NTFNS: usize = 128;
+pub const MAX_NTFNS: usize = 384;
 
 /// Maximum SchedContexts in the in-kernel pool (Phase 32c).
-pub const MAX_SCHED_CONTEXTS: usize = 128;
+pub const MAX_SCHED_CONTEXTS: usize = 384;
 
 /// Maximum Reply objects in the in-kernel pool (Phase 34e).
-pub const MAX_REPLIES: usize = 128;
+pub const MAX_REPLIES: usize = 384;
 
 /// CTEs per pre-allocated CNode in the in-kernel pool.
 ///
@@ -84,6 +84,30 @@ impl Default for SmallCNodePage {
     fn default() -> Self { Self([Cte::null(); SMALL_CNODE_SLOTS]) }
 }
 
+/// XL CNode pool — test-process CSpace roots. sel4test's
+/// TEST_PROCESS_CSPACE_SIZE_BITS is patched to 13 (8,192 slots —
+/// SCHED0004 peaks ~6k; the upstream 17 would mean 131k-slot pages
+/// that made every cap-delete pool-scan crawl). Before this pool
+/// existed, a radix-13+ cap was silently backed by a 4,096-slot
+/// big-pool page and the first cptr past 4095 resolved out of
+/// bounds. Four entries cover the live test process plus
+/// teardown/spawn overlap.
+/// 1 × 131,072 × 32 B = 4 MiB — BOOTBOOT caps the whole kernel at
+/// 16 MiB, so one entry is what fits; test processes are spawned
+/// strictly sequentially (teardown precedes the next configure).
+pub const XL_CNODE_RADIX: u8 = 14;
+pub const XL_CNODE_SLOTS: usize = 1 << XL_CNODE_RADIX;
+pub const MAX_XL_CNODES: usize = 3;
+/// Virtual cnode index space:
+///   [0, MAX_CNODES)                      big (radix 12)
+///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix ≤ 6)
+///   [.., +MAX_XL_CNODES)                 XL (radix ≤ 17)
+const _: () =
+    assert!(MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES <= 254);
+
+#[repr(C, align(32))]
+pub struct XlCNodePage(pub [Cte; XL_CNODE_SLOTS]);
+
 pub struct KernelState {
     pub scheduler: Scheduler,
     /// In-kernel endpoint pool. Entry `i` is reachable through a
@@ -110,6 +134,8 @@ pub struct KernelState {
     /// exhaust the big pool. Virtual cnode_idx range:
     /// MAX_CNODES..MAX_CNODES+MAX_SMALL_CNODES.
     pub small_cnodes: [SmallCNodePage; MAX_SMALL_CNODES],
+    /// XL CNode pool (radix up to 17) — test-process CSpace roots.
+    pub xl_cnodes: [XlCNodePage; MAX_XL_CNODES],
     /// Per-IRQ binding table.
     pub irqs: IrqTable,
 
@@ -124,6 +150,7 @@ pub struct KernelState {
     pub next_notification: usize,
     pub next_cnode: usize,
     pub next_small_cnode: usize,
+    pub next_xl_cnode: usize,
     pub next_sched_context: usize,
     pub next_reply: usize,
 }
@@ -136,6 +163,7 @@ struct PoolBitmaps {
     pub notifications: [u64; (MAX_NTFNS + 63) / 64],
     pub cnodes: [u64; (MAX_CNODES + 63) / 64],
     pub small_cnodes: [u64; (MAX_SMALL_CNODES + 63) / 64],
+    pub xl_cnodes: [u64; (MAX_XL_CNODES + 63) / 64],
     pub replies: [u64; (MAX_REPLIES + 63) / 64],
 }
 
@@ -144,6 +172,7 @@ static mut POOL_BITMAPS: PoolBitmaps = PoolBitmaps {
     notifications: [0; (MAX_NTFNS + 63) / 64],
     cnodes: [0; (MAX_CNODES + 63) / 64],
     small_cnodes: [0; (MAX_SMALL_CNODES + 63) / 64],
+    xl_cnodes: [0; (MAX_XL_CNODES + 63) / 64],
     replies: [0; (MAX_REPLIES + 63) / 64],
 };
 
@@ -154,6 +183,8 @@ impl KernelState {
         const EMPTY_CN: CNodePage = CNodePage([Cte::null(); CNODE_SLOTS]);
         const EMPTY_SCN: SmallCNodePage =
             SmallCNodePage([Cte::null(); SMALL_CNODE_SLOTS]);
+        const EMPTY_XL: XlCNodePage =
+            XlCNodePage([Cte::null(); XL_CNODE_SLOTS]);
         const EMPTY_SC: crate::sched_context::SchedContext =
             crate::sched_context::SchedContext::new(0, 0);
         const EMPTY_REPLY: crate::reply::Reply = crate::reply::Reply::new();
@@ -163,6 +194,7 @@ impl KernelState {
             notifications: [EMPTY_NT; MAX_NTFNS],
             cnodes: [EMPTY_CN; MAX_CNODES],
             small_cnodes: [EMPTY_SCN; MAX_SMALL_CNODES],
+            xl_cnodes: [EMPTY_XL; MAX_XL_CNODES],
             sched_contexts: [EMPTY_SC; MAX_SCHED_CONTEXTS],
             replies: [EMPTY_REPLY; MAX_REPLIES],
             irqs: IrqTable::new(),
@@ -174,6 +206,7 @@ impl KernelState {
             next_notification: 0,
             next_cnode: 4,
             next_small_cnode: 0,
+            next_xl_cnode: 0,
             next_sched_context: 0,
             next_reply: 0,
         }
@@ -283,6 +316,8 @@ impl KernelState {
             self.free_cnode(vi);
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
             self.free_small_cnode(vi);
+        } else {
+            self.free_xl_cnode(vi);
         }
     }
 
@@ -343,10 +378,59 @@ impl KernelState {
         }
     }
 
-    /// Total virtual cnode count = big + small. Used by revoke /
-    /// delete walks that need to scan both pools.
+    /// Allocate an XL CNode (radix up to 17 — test-process CSpace
+    /// roots). Returns the VIRTUAL index past both other pools.
+    pub fn alloc_xl_cnode(&mut self) -> Option<usize> {
+        const BASE: usize = MAX_CNODES + MAX_SMALL_CNODES;
+        for i in 0..self.next_xl_cnode.min(MAX_XL_CNODES) {
+            if !self.xl_cnode_in_use(i) {
+                for slot in self.xl_cnodes[i].0.iter_mut() {
+                    slot.set_cap(&Cap::Null);
+                    slot.set_parent(None);
+                }
+                self.set_xl_cnode_in_use(i, true);
+                return Some(BASE + i);
+            }
+        }
+        if self.next_xl_cnode < MAX_XL_CNODES {
+            let i = self.next_xl_cnode;
+            self.next_xl_cnode += 1;
+            for slot in self.xl_cnodes[i].0.iter_mut() {
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+            }
+            self.set_xl_cnode_in_use(i, true);
+            return Some(BASE + i);
+        }
+        None
+    }
+
+    pub fn free_xl_cnode(&mut self, virt_idx: usize) {
+        const BASE: usize = MAX_CNODES + MAX_SMALL_CNODES;
+        if virt_idx >= BASE && virt_idx < BASE + MAX_XL_CNODES {
+            let i = virt_idx - BASE;
+            for slot in self.xl_cnodes[i].0.iter_mut() {
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+            }
+            self.set_xl_cnode_in_use(i, false);
+        }
+    }
+
+    fn xl_cnode_in_use(&self, i: usize) -> bool {
+        unsafe { (POOL_BITMAPS.xl_cnodes[i / 64] >> (i % 64)) & 1 == 1 }
+    }
+    fn set_xl_cnode_in_use(&self, i: usize, v: bool) {
+        unsafe {
+            let w = &mut POOL_BITMAPS.xl_cnodes[i / 64];
+            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+        }
+    }
+
+    /// Total virtual cnode count = big + small + XL. Used by revoke /
+    /// delete walks that need to scan all pools.
     pub const fn cnode_pool_count() -> usize {
-        MAX_CNODES + MAX_SMALL_CNODES
+        MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES
     }
 
     /// Backing slot slice for virtual cnode index `vi`.
@@ -357,6 +441,10 @@ impl KernelState {
             self.cnodes.get(vi).map(|p| &p.0[..])
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
             self.small_cnodes.get(vi - MAX_CNODES).map(|p| &p.0[..])
+        } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
+            self.xl_cnodes
+                .get(vi - MAX_CNODES - MAX_SMALL_CNODES)
+                .map(|p| &p.0[..])
         } else {
             None
         }
@@ -368,6 +456,10 @@ impl KernelState {
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
             self.small_cnodes
                 .get_mut(vi - MAX_CNODES)
+                .map(|p| &mut p.0[..])
+        } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
+            self.xl_cnodes
+                .get_mut(vi - MAX_CNODES - MAX_SMALL_CNODES)
                 .map(|p| &mut p.0[..])
         } else {
             None

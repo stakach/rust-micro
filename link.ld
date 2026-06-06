@@ -34,12 +34,12 @@ mmio        = 0xfffffffff8000000;              /* these are configurable for lev
 fb          = 0xfffffffffc000000;
 bootboot    = 0xffffffffff800000;
 environment = 0xffffffffff801000;
-/* Bumped from BOOTBOOT's default 4 KiB to 64 KiB. Kernel data
- * structures (Scheduler, TcbSlab, ready queues) easily exceed 4 KiB
- * once we hold them on the stack inside specs. 64 KiB is comfortable
- * for the foreseeable future and small enough to remain a one-page
- * concern for the BOOTBOOT loader. */
-initstack = 65536;
+/* Bumped from BOOTBOOT's default 4 KiB. Kernel data structures
+ * (Scheduler, TcbSlab, ready queues) live on the stack inside
+ * specs; with MAX_TCBS = 320 (SCHED0004 needs ~250 helper
+ * threads) a stack-built Scheduler is ~170+ KiB, and several
+ * specs hold two. 512 KiB per core gives that headroom. */
+initstack = 524288;
 
 KERNEL_OFFSET = 0xfffffffffe002000;
 

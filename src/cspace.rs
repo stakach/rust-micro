@@ -120,11 +120,32 @@ pub fn resolve_address_bits<C: CSpace>(
         let radix_mask = mask(radix);
         let offset = ((cptr >> offset_shift) & radix_mask) as usize;
 
+        fn log_dec_cs(mut v: u64) {
+            let mut b = [b'0'; 8];
+            let mut i = 8;
+            if v == 0 { crate::arch::log("0"); return; }
+            while v > 0 && i > 0 { i -= 1; b[i] = b'0' + (v % 10) as u8; v /= 10; }
+            if let Ok(st) = core::str::from_utf8(&b[i..]) { crate::arch::log(st); }
+        }
         let slot_count = 1usize << radix;
         let slots = cspace
             .cnode_at(node_ptr, slot_count)
             .ok_or(LookupFault::InvalidRoot)?;
         debug_assert_eq!(slots.len(), slot_count);
+        if offset >= slots.len() {
+            // A cap claiming a radix larger than its CNode's actual
+            // storage (e.g. a small-pool 64-slot CNode behind a
+            // radix-12 cap). Surface as a lookup fault instead of
+            // an out-of-bounds panic.
+            crate::arch::log("[cspace: offset ");
+            log_dec_cs(offset as u64);
+            crate::arch::log(" >= storage ");
+            log_dec_cs(slots.len() as u64);
+            crate::arch::log(" (radix ");
+            log_dec_cs(radix as u64);
+            crate::arch::log(")]\n");
+            return Err(LookupFault::InvalidRoot);
+        }
         let slot = &slots[offset];
 
         if level_bits == n_bits {
