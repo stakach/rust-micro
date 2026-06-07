@@ -1045,6 +1045,24 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             let me = s.scheduler.slab.get(invoker);
             (me.ipc_label, me.ipc_length, me.msg_regs)
         };
+        // Fault replies bypass the normal message transfer: the
+        // caller is blocked on a FAULT (not a syscall), so the IPC
+        // fan-out below would stomp its live registers. Apply
+        // upstream handleFaultReply semantics instead.
+        if s.scheduler.slab.get(caller).pending_fault != 0 {
+            let restart = crate::fault::apply_fault_reply(
+                s, caller, label, length as usize, &regs);
+            s.scheduler.slab.get_mut(invoker).active_sc = None;
+            s.replies[idx].bound_tcb = None;
+            s.scheduler.slab.get_mut(invoker).reply_to = None;
+            if restart {
+                s.scheduler.make_runnable(caller);
+            } else {
+                s.scheduler.block(
+                    caller, crate::tcb::ThreadStateType::Inactive);
+            }
+            return Ok(());
+        }
         {
             let r = s.scheduler.slab.get_mut(caller);
             r.ipc_label = label;
@@ -3998,6 +4016,12 @@ fn decode_tcb(
                         }
                         // fs_base / gs_base (slots 18, 19) ignored.
                         if resume {
+                            // Upstream `restart()` cancels any
+                            // in-flight fault — the thread is being
+                            // forcibly re-pointed, so a later reply
+                            // to its old fault must not rewrite the
+                            // registers we just set.
+                            s.scheduler.slab.get_mut(id).pending_fault = 0;
                             s.scheduler.make_runnable(id);
                         }
                     }
@@ -4027,7 +4051,7 @@ fn decode_tcb(
                     let t = s.scheduler.slab.get(id);
                     if length == 0 {
                         let (rip, rsp, rax) = (
-                            t.user_context.rcx,
+                            crate::fault::resume_ip(t),
                             t.user_context.rsp,
                             t.user_context.rax,
                         );
@@ -4037,13 +4061,21 @@ fn decode_tcb(
                         inv.msg_regs[2] = rax;
                         inv.ipc_length = 3;
                     } else {
+                        // Exception-captured threads (#PF/#UD —
+                        // `use_iretq_resume`) carry RIP/RFLAGS in
+                        // the dedicated iretq slots and TRUE rcx/
+                        // r11 in the GPR slots; sysret-flavor
+                        // threads use rcx/r11 as RIP/RFLAGS stand-
+                        // ins (real rcx/r11 destroyed by SYSCALL —
+                        // report 0 like before).
+                        let iq = t.use_iretq_resume;
                         let regs: [u64; 20] = [
-                            t.user_context.rcx,    // 0  rip
-                            t.user_context.rsp,    // 1  rsp
-                            t.user_context.r11,    // 2  rflags
+                            crate::fault::resume_ip(t),     // 0 rip
+                            t.user_context.rsp,             // 1 rsp
+                            crate::fault::resume_flags(t),  // 2 rflags
                             t.user_context.rax,    // 3  rax
                             t.user_context.rbx,    // 4  rbx
-                            0,                     // 5  rcx (held by iretq)
+                            if iq { t.user_context.rcx } else { 0 }, // 5 rcx
                             t.user_context.rdx,    // 6  rdx
                             t.user_context.rsi,    // 7  rsi
                             t.user_context.rdi,    // 8  rdi
@@ -4051,7 +4083,7 @@ fn decode_tcb(
                             t.user_context.r8,     // 10 r8
                             t.user_context.r9,     // 11 r9
                             t.user_context.r10,    // 12 r10
-                            0,                     // 13 r11 (held by iretq)
+                            if iq { t.user_context.r11 } else { 0 }, // 13 r11
                             t.user_context.r12,    // 14 r12
                             t.user_context.r13,    // 15 r13
                             t.user_context.r14,    // 16 r14
@@ -4141,11 +4173,24 @@ fn decode_tcb(
                         { 0 }
                     } else { 0 };
                     let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    // MCS semantics: the fault EP cap is resolved
+                    // HERE, in the invoker's cspace (extraCaps[0]
+                    // was staged as a resolved Cap). Inter-AS fault
+                    // handling (PAGEFAULT1001+) depends on this —
+                    // the cptr is meaningless in the faulter's own
+                    // cspace.
+                    let fault_cap = if count > 0 {
+                        inv_tcb.pending_extra_caps[0]
+                    } else {
+                        Cap::Null
+                    };
                     let cnode = if count > 1 { Some(inv_tcb.pending_extra_caps[1]) } else { None };
                     let vspace = if count > 2 { Some(inv_tcb.pending_extra_caps[2]) } else { None };
                     inv_tcb.pending_extra_caps_count = 0;
-                    // Stash the fault EP cptr on the target TCB.
+                    // Stash both the resolved cap (preferred) and
+                    // the cptr (legacy fallback) on the target TCB.
                     s.scheduler.slab.get_mut(id).fault_handler = fault_cptr;
+                    s.scheduler.slab.get_mut(id).fault_handler_cap = fault_cap;
                     (cnode, vspace)
                 } else {
                     let cnode = if args.a3 != 0 {

@@ -42,7 +42,11 @@ pub fn init_exceptions() {
         IDT[3] = IdtEntry::new(breakpoint_handler as u64, 0x08, 0, 0x8E);
         IDT[4] = IdtEntry::new(overflow_handler as u64, 0x08, 0, 0x8E);
         IDT[5] = IdtEntry::new(bound_range_handler as u64, 0x08, 0, 0x8E);
-        IDT[6] = IdtEntry::new(invalid_opcode_handler as u64, 0x08, 0, 0x8E);
+        // PAGEFAULT0005 — #UD from user mode becomes a UserException
+        // fault to the thread's fault handler (upstream
+        // handleUserLevelFault). The custom entry captures the full
+        // fault-time register state like the #PF / #NM entries.
+        IDT[6] = IdtEntry::new(invalid_opcode_entry as u64, 0x08, 0, 0x8E);
         // FPU0004 — replace the macro stub with `device_not_available_entry`,
         // which captures saved CS so the handler can distinguish user-mode
         // (CPL=3 → check `tcbFlags & seL4_TCBFlag_fpuDisabled`) from
@@ -296,6 +300,161 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
     }
 }
 
+/// Dispatch the next runnable thread or idle in HLT. Shared tail
+/// for exception handlers that just blocked the current thread
+/// (fault delivery): returning via iretq would re-execute the
+/// faulting instruction, so we sysret/iretq into the next thread
+/// instead. Caller must hold the BKL — released here just before
+/// user entry / idle.
+pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
+    let s = crate::kernel::KERNEL.get();
+    if let Some(next_id) = s.scheduler.choose_thread() {
+        s.scheduler.set_current(Some(next_id));
+        crate::sched_context::complete_yield_if_pending(next_id);
+        let tcb = s.scheduler.slab.get(next_id);
+        let next_cr3 = tcb.cpu_context.cr3;
+        let next_fs_base = tcb.cpu_context.fs_base;
+        let next_ctx = tcb.user_context;
+        if next_cr3 != 0 {
+            let cur_cr3: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+                options(nomem, nostack, preserves_flags));
+            if next_cr3 != cur_cr3 {
+                core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
+                    options(nostack, preserves_flags));
+            }
+        }
+        crate::arch::x86_64::msr::wrmsr(
+            crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+        crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
+            s.scheduler.slab.get(next_id));
+        let pcc = crate::arch::x86_64::syscall_entry
+            ::current_cpu_user_ctx_mut();
+        *pcc = next_ctx;
+        if s.scheduler.slab.get(next_id).use_iretq_resume {
+            s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
+            crate::smp::bkl_release();
+            crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
+                pcc as *const _);
+        }
+        crate::smp::bkl_release();
+        crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
+            pcc as *const _);
+    }
+    crate::arch::log(idle_tag);
+    crate::smp::bkl_release();
+    loop { core::arch::asm!("sti", "hlt"); }
+}
+
+/// Custom #UD (Invalid Opcode, vector 6) entry. No error code.
+/// Same full fault-time capture as the #PF entry: TRUE rcx/r11 in
+/// the GPR slots, frame RIP/RFLAGS/RSP in the dedicated iretq
+/// slots. PAGEFAULT0005's `ud2` relies on the handler reading the
+/// exact fault-time SP (the test points RSP at a magic variable).
+///
+/// Stack on entry (no error code from CPU):
+///   [rsp+0]  = saved RIP
+///   [rsp+8]  = saved CS
+///   [rsp+16] = saved RFLAGS
+///   [rsp+24] = saved RSP
+///   [rsp+32] = saved SS
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn invalid_opcode_entry() {
+    core::arch::naked_asm!(
+        "test byte ptr [rsp + 8], 3",
+        "jz 2f",
+        // -------- user-mode #UD: full save --------
+        "swapgs",
+        "mov gs:[16 + 0],   rax",
+        "mov gs:[16 + 8],   rbx",
+        "mov gs:[16 + 16],  rcx",   // TRUE rcx
+        "mov gs:[16 + 24],  rdx",
+        "mov gs:[16 + 32],  rsi",
+        "mov gs:[16 + 40],  rdi",
+        "mov gs:[16 + 48],  rbp",
+        "mov gs:[16 + 56],  r8",
+        "mov gs:[16 + 64],  r9",
+        "mov gs:[16 + 72],  r10",
+        "mov gs:[16 + 80],  r11",   // TRUE r11
+        "mov gs:[16 + 88],  r12",
+        "mov gs:[16 + 96],  r13",
+        "mov gs:[16 + 104], r14",
+        "mov gs:[16 + 112], r15",
+        "mov rax, [rsp + 0]",
+        "mov gs:[16 + 128], rax",   // user_ctx.rip    = saved RIP
+        "mov rax, [rsp + 16]",
+        "mov gs:[16 + 136], rax",   // user_ctx.rflags = saved RFLAGS
+        "mov rax, [rsp + 24]",
+        "mov gs:[16 + 120], rax",   // user_ctx.rsp    = saved RSP
+        "mov rdi, [rsp + 0]",
+        "mov rsi, [rsp + 8]",
+        "call {handler}",
+        // Unreachable for user faults; defensive restore + return.
+        "mov rax, gs:[16 + 0]",
+        "mov rbx, gs:[16 + 8]",
+        "mov rcx, gs:[16 + 16]",
+        "mov rdx, gs:[16 + 24]",
+        "mov rsi, gs:[16 + 32]",
+        "mov rdi, gs:[16 + 40]",
+        "mov rbp, gs:[16 + 48]",
+        "mov r8,  gs:[16 + 56]",
+        "mov r9,  gs:[16 + 64]",
+        "mov r10, gs:[16 + 72]",
+        "mov r11, gs:[16 + 80]",
+        "mov r12, gs:[16 + 88]",
+        "mov r13, gs:[16 + 96]",
+        "mov r14, gs:[16 + 104]",
+        "mov r15, gs:[16 + 112]",
+        "swapgs",
+        "iretq",
+        // -------- kernel-mode #UD: fatal --------
+        "2:",
+        "mov rdi, [rsp + 0]",
+        "mov rsi, [rsp + 8]",
+        "call {handler}",
+        "iretq",
+        handler = sym handle_invalid_opcode_typed,
+    );
+}
+
+extern "C" fn handle_invalid_opcode_typed(saved_rip: u64, saved_cs: u64) {
+    let from_user = (saved_cs & 3) == 3;
+    if !from_user {
+        crate::arch::log("FATAL: kernel #UD @ rip=0x");
+        log_hex64(saved_rip);
+        crate::arch::log("\n");
+        fatal_exception(6, 0);
+    }
+    crate::smp::bkl_acquire();
+    let current = crate::kernel::current_thread();
+    let Some(faulter) = current else {
+        // Same race as the #PF no-current path: another CPU blocked
+        // us mid-flight. Dispatch whatever is runnable.
+        unsafe { dispatch_next_or_idle("[#UD: no current, idling CPU]\n") }
+    };
+    unsafe {
+        // Mirror the per-CPU snapshot (full fault-time state) into
+        // the faulter and mark iretq resume.
+        let snapshot = *crate::arch::x86_64::syscall_entry
+            ::current_cpu_user_ctx_mut();
+        let s = crate::kernel::KERNEL.get();
+        let t = s.scheduler.slab.get_mut(faulter);
+        t.user_context = snapshot;
+        t.use_iretq_resume = true;
+        // UserException(number=6 (#UD vector), code=0) — mirrors
+        // upstream handleUserLevelFault for int_invalid_op.
+        if crate::fault::deliver_fault(
+            faulter,
+            crate::fault::FaultMessage::UserException { number: 6, code: 0 },
+        ).is_err() {
+            crate::arch::log("[#UD: no fault handler — suspending thread]\n");
+            s.scheduler.block(faulter, crate::tcb::ThreadStateType::Inactive);
+        }
+        dispatch_next_or_idle("[#UD: no next thread, idling CPU]\n")
+    }
+}
+
 extern "C" fn handle_double_fault(error_code: u64, exception_num: u64) {
     crate::arch::log("FATAL: Double fault - system is in an unrecoverable state\n");
     fatal_exception(exception_num, error_code);
@@ -385,19 +544,77 @@ pub unsafe extern "C" fn page_fault_entry() {
         //   [rsp+32] = saved RSP
         //   [rsp+40] = saved SS
         //
+        // For USER-mode faults (CPL=3 in saved CS) we capture the
+        // complete fault-time register state into the per-CPU
+        // UserContext — the PAGEFAULT tests' handler thread does
+        // seL4_TCB_ReadRegisters on the fault-blocked thread and
+        // expects fault-time rax (BAD_MAGIC check), and the faulter
+        // must be resumable at the exact fault point. Unlike the
+        // SYSCALL path, rcx/r11 here are REAL user registers (not
+        // RIP/RFLAGS stand-ins): the saved RIP/RFLAGS go to the
+        // dedicated .rip/.rflags iretq slots and the typed handler
+        // marks the faulter `use_iretq_resume`.
+        "test byte ptr [rsp + 16], 3",
+        "jz 2f",
+        // -------- user-mode fault: full save --------
+        "swapgs",
+        "mov gs:[16 + 0],   rax",
+        "mov gs:[16 + 8],   rbx",
+        "mov gs:[16 + 16],  rcx",   // TRUE rcx
+        "mov gs:[16 + 24],  rdx",
+        "mov gs:[16 + 32],  rsi",
+        "mov gs:[16 + 40],  rdi",
+        "mov gs:[16 + 48],  rbp",
+        "mov gs:[16 + 56],  r8",
+        "mov gs:[16 + 64],  r9",
+        "mov gs:[16 + 72],  r10",
+        "mov gs:[16 + 80],  r11",   // TRUE r11
+        "mov gs:[16 + 88],  r12",
+        "mov gs:[16 + 96],  r13",
+        "mov gs:[16 + 104], r14",
+        "mov gs:[16 + 112], r15",
+        "mov rax, [rsp + 8]",
+        "mov gs:[16 + 128], rax",   // user_ctx.rip    = saved RIP
+        "mov rax, [rsp + 24]",
+        "mov gs:[16 + 136], rax",   // user_ctx.rflags = saved RFLAGS
+        "mov rax, [rsp + 32]",
+        "mov gs:[16 + 120], rax",   // user_ctx.rsp    = saved RSP
         // System V ABI for the Rust handler:
-        //   rdi = first arg (CR2)
-        //   rsi = second arg (error code)
-        //   rdx = third arg (saved CS)
-        //   rcx = fourth arg (saved RIP — useful for fault msgs)
+        //   rdi = CR2, rsi = error code, rdx = saved CS,
+        //   rcx = saved RIP (for fault msgs / logging)
         "mov rdi, cr2",
         "mov rsi, [rsp]",
         "mov rdx, [rsp + 16]",
         "mov rcx, [rsp + 8]",
         "call {handler}",
-        // Rust handler returned (e.g. fault delivered, ready to
-        // sysret to a different thread). Pop the error code and
-        // iretq.
+        // The handler never returns for user faults (it sysrets /
+        // iretqs into the next thread or idles). Defensive tail:
+        // restore the snapshot and iretq back.
+        "mov rax, gs:[16 + 0]",
+        "mov rbx, gs:[16 + 8]",
+        "mov rcx, gs:[16 + 16]",
+        "mov rdx, gs:[16 + 24]",
+        "mov rsi, gs:[16 + 32]",
+        "mov rdi, gs:[16 + 40]",
+        "mov rbp, gs:[16 + 48]",
+        "mov r8,  gs:[16 + 56]",
+        "mov r9,  gs:[16 + 64]",
+        "mov r10, gs:[16 + 72]",
+        "mov r11, gs:[16 + 80]",
+        "mov r12, gs:[16 + 88]",
+        "mov r13, gs:[16 + 96]",
+        "mov r14, gs:[16 + 104]",
+        "mov r15, gs:[16 + 112]",
+        "swapgs",
+        "add rsp, 8",
+        "iretq",
+        // -------- kernel-mode fault: fatal path, no gs swap --------
+        "2:",
+        "mov rdi, cr2",
+        "mov rsi, [rsp]",
+        "mov rdx, [rsp + 16]",
+        "mov rcx, [rsp + 8]",
+        "call {handler}",
         "add rsp, 8",
         "iretq",
         handler = sym handle_page_fault_typed,
@@ -450,95 +667,28 @@ extern "C" fn handle_page_fault_typed(
         // `block()` cleared the per-CPU `current` everywhere
         // before we trapped, so by the time we acquired the BKL
         // and looked, the slot was empty. Don't refault forever;
-        // try to dispatch the next runnable thread, falling back
-        // to a HLT loop if none is available. SYSRET into the new
-        // thread bypasses the iretq path entirely.
+        // dispatch the next runnable thread or idle.
         unsafe {
-            let s = crate::kernel::KERNEL.get();
-            if let Some(next_id) = s.scheduler.choose_thread() {
-                s.scheduler.set_current(Some(next_id));
-                crate::sched_context::complete_yield_if_pending(next_id);
-                let tcb = s.scheduler.slab.get(next_id);
-                let next_cr3 = tcb.cpu_context.cr3;
-                let next_fs_base = tcb.cpu_context.fs_base;
-                let next_ctx = tcb.user_context;
-                if next_cr3 != 0 {
-                    let cur_cr3: u64;
-                    core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
-                        options(nomem, nostack, preserves_flags));
-                    if next_cr3 != cur_cr3 {
-                        core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                            options(nostack, preserves_flags));
-                    }
-                }
-                crate::arch::x86_64::msr::wrmsr(
-                    crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
-                let pcc = crate::arch::x86_64::syscall_entry
-                    ::current_cpu_user_ctx_mut();
-                *pcc = next_ctx;
-                // IRQ-preempted threads carry true rcx/r11 GPRs and
-                // RIP/RFLAGS in dedicated fields — must iretq.
-                if s.scheduler.slab.get(next_id).use_iretq_resume {
-                    s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
-                    crate::smp::bkl_release();
-                    crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
-                        pcc as *const _);
-                }
-                crate::smp::bkl_release();
-                crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
-                    pcc as *const _);
-                // unreachable
-            }
+            dispatch_next_or_idle("[USER #PF no current, no runnable — idle]\n")
         }
-        // Dump per-CPU highest-priority hint to confirm whether
-        // other CPUs have work to steal.
-        unsafe {
-            let s = crate::kernel::KERNEL.get();
-            crate::arch::log("[peek per-CPU:");
-            for (cpu_i, node) in s.scheduler.nodes.iter().enumerate() {
-                crate::arch::log(" cpu");
-                let mut buf = [b'0'; 4]; let mut v = cpu_i as u64; let mut i = 4;
-                if v == 0 { crate::arch::log("0"); }
-                while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
-                if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
-                crate::arch::log("=");
-                match node.queues.peek_highest() {
-                    None => crate::arch::log("-"),
-                    Some(p) => {
-                        let mut buf = [b'0'; 4]; let mut v = p as u64; let mut i = 4;
-                        if v == 0 { crate::arch::log("0"); }
-                        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
-                        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
-                    }
-                }
-            }
-            crate::arch::log("]\n");
-        }
-        crate::arch::log("[USER #PF no current, no runnable cs=0x");
-        log_hex64(saved_cs);
-        crate::arch::log(" rip=0x");
-        log_hex64(saved_rip);
-        crate::arch::log(" cr2=0x");
-        log_hex64(cr2);
-        crate::arch::log(" — idle cpu=");
-        let cpu = crate::arch::get_cpu_id();
-        let mut buf = [b'0'; 4]; let mut v = cpu as u64; let mut i = 4;
-        if v == 0 { crate::arch::log("0"); }
-        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
-        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
-        crate::arch::log("]\n");
-        crate::smp::bkl_release();
-        loop { unsafe { core::arch::asm!("sti", "hlt"); } }
     }
     let faulter = current.unwrap();
-    // Stamp the saved RIP into the faulter's user_context before
-    // deliver_fault so the VMFault message's seL4_VMFault_IP slot
-    // (= ctx.rcx in encode_for_arch) carries the actual faulting
-    // PC, not whatever was in rcx at the last syscall.
+    // The entry stub captured the complete fault-time register
+    // state (true rcx/r11; RIP/RFLAGS/RSP in the dedicated iretq
+    // slots) into the per-CPU UserContext. Mirror it into the
+    // faulter's TCB and flag iretq resume so:
+    //   * ReadRegisters returns fault-time registers (the fault
+    //     tests assert rax == BAD_MAGIC),
+    //   * a later resume (fault reply / WriteRegisters) re-enters
+    //     at the exact fault point with all GPRs intact.
     unsafe {
-        crate::kernel::KERNEL.get().scheduler.slab
-            .get_mut(faulter).user_context.rcx = saved_rip;
+        let snapshot = *crate::arch::x86_64::syscall_entry
+            ::current_cpu_user_ctx_mut();
+        let t = crate::kernel::KERNEL.get().scheduler.slab.get_mut(faulter);
+        t.user_context = snapshot;
+        t.use_iretq_resume = true;
     }
+    let _ = saved_rip; // captured in the snapshot's .rip slot
     let fault = crate::fault::FaultMessage::VMFault {
         addr: cr2,
         fsr: error_code,
@@ -577,51 +727,11 @@ extern "C" fn handle_page_fault_typed(
     // If we just blocked the faulter, iretq would dump us back
     // into its now-unmapped page and refault forever (and on the
     // refault `current` would be None → the no-current path
-    // halts this CPU). Pick the next runnable thread and SYSRET
-    // into it directly, bypassing iretq.
+    // halts this CPU). Pick the next runnable thread and enter it
+    // directly, bypassing iretq.
     if suspended {
         unsafe {
-            let s = crate::kernel::KERNEL.get();
-            let next = s.scheduler.choose_thread();
-            if let Some(next_id) = next {
-                s.scheduler.set_current(Some(next_id));
-                let tcb = s.scheduler.slab.get(next_id);
-                let next_cr3 = tcb.cpu_context.cr3;
-                let next_ctx = tcb.user_context;
-                if next_cr3 != 0 {
-                    let cur_cr3: u64;
-                    core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
-                        options(nomem, nostack, preserves_flags));
-                    if next_cr3 != cur_cr3 {
-                        core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                            options(nostack, preserves_flags));
-                    }
-                }
-                // Stage in the per-CPU UserContext save slot so the
-                // dispatcher tail can restore registers correctly,
-                // then sysret directly — never returns to iretq.
-                let pcc = crate::arch::x86_64::syscall_entry
-                    ::current_cpu_user_ctx_mut();
-                *pcc = next_ctx;
-                crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
-                    s.scheduler.slab.get(next_id));
-                if s.scheduler.slab.get(next_id).use_iretq_resume {
-                    s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
-                    crate::smp::bkl_release();
-                    crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
-                        pcc as *const _);
-                }
-                crate::smp::bkl_release();
-                crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
-                    pcc as *const _);
-                // unreachable
-            }
-            // No runnable thread on this CPU: stall in HLT until
-            // an IRQ wakes us. Don't iretq. Release the BKL first
-            // so other CPUs can keep making progress.
-            crate::arch::log("[user #PF: no next thread, idling CPU]\n");
-            crate::smp::bkl_release();
-            loop { core::arch::asm!("sti", "hlt"); }
+            dispatch_next_or_idle("[user #PF: no next thread, idling CPU]\n")
         }
     }
     // (suspended is always true above; this branch is dead but kept

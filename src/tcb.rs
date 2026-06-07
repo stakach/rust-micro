@@ -98,13 +98,18 @@ pub const NUM_PRIORITIES: usize = 256;
 pub const MAX_PRIORITY: u8 = (NUM_PRIORITIES - 1) as u8;
 
 /// Maximum number of message-register words we stage on the TCB.
-/// Kept at 8 to bound TCB size — `seL4_MsgMaxLength` is 120 words
+/// Sized to bound TCB size — `seL4_MsgMaxLength` is 120 words
 /// (960 B), but only the first 4 ride in registers; the rest live
 /// in the per-TCB IPC buffer page already. Long-IPC paths copy
-/// words 8..length directly from sender's IPC buffer to receiver's
-/// at handoff time so we don't need 120 words on every TCB. See
-/// `endpoint::transfer_long_msg`.
-pub const SCRATCH_MSG_LEN: usize = 8;
+/// words past the scratch area directly from sender's IPC buffer
+/// to receiver's at handoff time so we don't need 120 words on
+/// every TCB. See `endpoint::transfer_long_msg`.
+///
+/// 20 (was 8) so kernel-synthesized fault messages fit entirely in
+/// the staging area: x86_64 `seL4_UnknownSyscall_Msg` is 19 words
+/// (RAX..R15, FaultIP, SP, FLAGS, Syscall) and a faulter has no
+/// sender-side IPC buffer copy to long-copy from.
+pub const SCRATCH_MSG_LEN: usize = 20;
 
 /// Per-TCB kernel stack size. seL4 uses 4 KiB; we match that.
 pub const KERNEL_STACK_BYTES: usize = 4096;
@@ -272,6 +277,28 @@ pub struct Tcb {
     /// any flag yet. FPU0003 / FPU0004 in sel4test verify the
     /// SetFlags round-trip.
     pub flags: u64,
+    /// MCS-resolved fault-handler endpoint cap. Upstream MCS
+    /// resolves the fault EP at `TCB_SetSpace` time in the
+    /// INVOKER's cspace and stores the derived cap in the TCB —
+    /// the cptr in `fault_handler` is only meaningful in whatever
+    /// cspace the setter used, which for inter-AS setups (PAGEFAULT
+    /// 1001+) is NOT the faulter's. When this is an Endpoint cap,
+    /// `deliver_fault` uses it directly; `Cap::Null` falls back to
+    /// the legacy resolve-cptr-in-faulter's-cspace path.
+    /// NOTE: not revoke-tracked (a copy, not a CTE) — deleting the
+    /// EP leaves a dangling handler cap until SetSpace is re-run;
+    /// upstream invalidates via the MDB. Acceptable for sel4test.
+    pub fault_handler_cap: crate::cap::Cap,
+    /// Fault-type of the in-flight fault this thread is blocked on
+    /// (0 = none; otherwise a `seL4_Fault_*` discriminant: 2 =
+    /// UnknownSyscall, 3 = UserException, 6 = VMFault). Replying to
+    /// a faulter follows upstream `handleFaultReply` semantics —
+    /// per-type register writeback + restart-vs-Inactive — instead
+    /// of the normal IPC message fan-out (which would stomp the
+    /// faulter's registers). Cleared on fault reply and on
+    /// `WriteRegisters(resume=true)` (upstream `restart()` cancels
+    /// the fault).
+    pub pending_fault: u8,
 }
 
 impl Default for Tcb {
@@ -312,6 +339,8 @@ impl Default for Tcb {
             blocked_can_grant: false,
             use_iretq_resume: false,
             flags: 0,
+            fault_handler_cap: crate::cap::Cap::Null,
+            pending_fault: 0,
         }
     }
 }

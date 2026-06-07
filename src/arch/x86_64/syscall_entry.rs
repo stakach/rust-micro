@@ -574,6 +574,31 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 }
             }
             arch::log("]\n");
+            // PAGEFAULT0004 — out-of-range numbers become a
+            // seL4_Fault_UnknownSyscall to the thread's fault
+            // handler (upstream handleUnknownSyscall). The faulter
+            // blocks; enter the next runnable thread. With no
+            // handler, suspend it (upstream prints + suspends).
+            unsafe {
+                let s = KERNEL.get();
+                if let Some(cur) = s.scheduler.current() {
+                    if crate::fault::deliver_fault(
+                        cur,
+                        crate::fault::FaultMessage::UnknownSyscall {
+                            number: number as u64,
+                        },
+                    ).is_err() {
+                        arch::log("[unknown syscall: no fault handler — suspending]\n");
+                        s.scheduler.block(
+                            cur, crate::tcb::ThreadStateType::Inactive);
+                    }
+                    // Never returns; releases the BKL itself (the
+                    // BklGuard's Drop won't run, same as the other
+                    // enter_user_* paths below).
+                    crate::arch::x86_64::exceptions::dispatch_next_or_idle(
+                        "[unknown syscall: no next thread, idling CPU]\n");
+                }
+            }
             return;
         }
     };

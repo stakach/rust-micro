@@ -390,6 +390,21 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             let me = s.scheduler.slab.get(current);
             (me.ipc_label, me.ipc_length, me.msg_regs, me.ipc_buffer_paddr)
         };
+        // Fault replies bypass the normal message transfer — see
+        // `fault::apply_fault_reply` (the fan-out below would stomp
+        // the faulter's live registers).
+        if s.scheduler.slab.get(caller).pending_fault != 0 {
+            let restart = crate::fault::apply_fault_reply(
+                s, caller, label, length as usize, &regs);
+            s.scheduler.slab.get_mut(current).active_sc = None;
+            if restart {
+                s.scheduler.make_runnable(caller);
+            } else {
+                s.scheduler.block(
+                    caller, crate::tcb::ThreadStateType::Inactive);
+            }
+            return Ok(());
+        }
         {
             let r = s.scheduler.slab.get_mut(caller);
             r.ipc_label = label;

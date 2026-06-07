@@ -1,3 +1,75 @@
+# PAGEFAULT family (faults.c) — kernel work plan (2026-06-07)
+
+Goal: PAGEFAULT0001-0005 (intra-AS) green, then 1001-1005 (inter-AS).
+
+## Root causes found (run .tmp/run_pf.log)
+1. `page_fault_entry` saves NO GPRs — faulter's `user_context` is stale
+   (last-syscall state). ReadRegisters returns garbage rax (observed:
+   "Error: (int)ctx.rax == BAD_MAGIC"); WriteRegisters' rip is ignored.
+2. Reply paths (`decode_reply`, `handle_reply`) treat a fault reply as a
+   normal IPC reply: fan MRs into rsi/rdi/r10/r8/r9/r15 — stomps the
+   faulter's callee-saved r15 etc. (observed stray cr2=0xfff...ff0 crash).
+3. UnknownSyscall fault message truncated to 8 words (needs 19:
+   RAX..R15, FaultIP, SP, FLAGS, Syscall) — SCRATCH_MSG_LEN=8.
+4. No #UD (vector 6) user-fault path — ud2 is fatal_exception.
+5. MCS fidelity: fault EP should be resolved at TCBSetSpace time in the
+   INVOKER's cspace (matters for inter-AS 1001+ only).
+
+## Plan
+- [x] A. Tcb.pending_fault: u8 (0=none, 2=UnknownSyscall, 3=UserException,
+      6=VMFault). Set in deliver_fault; cleared on fault reply,
+      WriteRegisters(resume=true), destroy_tcb.
+- [x] B. #PF entry: full GPR save (TRUE rcx/r11 kept), stamp frame
+      RIP→.rip, RFLAGS→.rflags, RSP→.rsp in per-CPU ctx; typed handler
+      copies snapshot into faulter TCB + use_iretq_resume=true.
+      encode_for_arch FaultIP slot reads .rip when use_iretq_resume.
+      ReadRegisters: slots 0/2/5/13 accurate when use_iretq_resume.
+- [x] C. Fault-aware reply: shared apply_fault_reply in both reply
+      paths. VMFault → restart always, no reg transfer. UnknownSyscall →
+      copy MRs to regs (FaultIP→resume rip, SP, FLAGS sanitized; skip
+      RCX/R11 slots), restart iff label==0. UserException → MR0→rip,
+      MR1→rsp, MR2→flags, restart iff label==0. No restart → Inactive.
+- [x] D. SCRATCH_MSG_LEN 8 → 20; UnknownSyscall encodes the full
+      19-word layout.
+- [x] E. #UD entry (vector 6) modeled on #NM: full save, deliver
+      UserException{number:6, code:0}, dispatch next.
+- [x] F. WriteRegisters(resume=true) clears pending_fault.
+- [x] G. Inter-AS (1001+): resolved fault-EP Cap stored at TCBSetSpace
+      time (MCS semantics); deliver_fault prefers it over the legacy
+      cptr-in-faulter's-cspace lookup.
+
+## Verify
+- [x] PAGEFAULT isolation run → 0001-0005 PASS (run_pf3.log; badge fix
+      for queued fault sends closed the badged rounds).
+- [x] PAGEFAULT1001-1004 PASS with G fix (run_pf4.log; suite line:
+      "11 tests passed, 1 disabled" — 1005 disabled upstream).
+- [x] Full gate green: 78 tests passed, 7 disabled (run_79.log).
+
+## Review
+- Full fault-frame capture for #PF and new #UD entries (true rcx/r11
+  preserved; RIP/RFLAGS/RSP in the dedicated iretq slots;
+  use_iretq_resume marks the faulter). ReadRegisters serves accurate
+  rip/rflags/rcx/r11 for exception-captured threads.
+- Fault replies now follow upstream handleFaultReply: per-type register
+  writeback (UnknownSyscall full set with FLAGS sanitize; UserException
+  FaultIP/SP/FLAGS; VMFault none), restart-vs-Inactive on label, and NO
+  IPC fan-out into the faulter's registers (that stomp was the stray
+  cr2=0xfff...ff0 crash).
+- UnknownSyscall faults: full 19-word message (SCRATCH_MSG_LEN 8→20),
+  FaultIP = NextIP - 2 (upstream c_traps.c), delivery wired into the
+  unknown-syscall dispatcher arm.
+- Badge stamped on deferred (queued-sender) fault sends — badged fault
+  EPs were arriving with stale badges when faulter prio ≥ handler prio.
+- MCS fault-EP semantics: resolved cap stored at TCBSetSpace, preferred
+  by deliver_fault (inter-AS PAGEFAULT1001+).
+- Shared dispatch_next_or_idle replaces three hand-rolled dispatch
+  blobs (also fixes missed fs_base restore / FPU gate inconsistencies
+  in the old #PF paths).
+- Full 70-test gate stays green.
+
+
+---
+
 # Phase 37: smaller audit follow-ups — DONE (37a–37d)
 
 - 37a — pre-allocated `Cap::AsidPool` at slot 6.

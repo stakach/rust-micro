@@ -180,6 +180,15 @@ pub fn send_ipc(
             sched.block(sender, ThreadStateType::BlockedOnSend);
             sched.slab.get_mut(sender).blocked_is_call = opts.do_call;
             sched.slab.get_mut(sender).blocked_can_grant = opts.can_grant;
+            // Stamp the badge for the deferred pair-up: receive_ipc
+            // reads `sender.ipc_badge` when it pops us. The syscall
+            // send path pre-stages it, but kernel-synthesized sends
+            // (fault delivery) only pass it via `opts` — without
+            // this, a queued fault to a BADGED fault EP arrives with
+            // a stale badge (PAGEFAULT badged rounds, faulter prio >
+            // handler so the fault queues before the handler's
+            // recv).
+            sched.slab.get_mut(sender).ipc_badge = opts.badge;
             queue_push(ep, sched, sender);
             ep.state = EpState::Send;
             IpcOutcome::Blocked
