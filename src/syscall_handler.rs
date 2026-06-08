@@ -370,30 +370,41 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             }
         };
         // Stage the reply message onto the current TCB so the
-        // common transfer machinery picks it up.
+        // common transfer machinery picks it up. Words 0..3 ride in
+        // registers (args.a2..a5); words 4..min(length,SCRATCH) come
+        // from the replier's IPC buffer (the tail is handled
+        // buffer-to-buffer by `deliver_message`).
         let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+        let length = info.length() as u32;
         {
             let me = s.scheduler.slab.get_mut(current);
             me.ipc_label = info.label();
-            me.ipc_length = info.length() as u32;
+            me.ipc_length = length;
             me.msg_regs[0] = args.a2;
             me.msg_regs[1] = args.a3;
             me.msg_regs[2] = args.a4;
             me.msg_regs[3] = args.a5;
             me.reply_to = None; // consume the reply slot
+            if length > 4 && me.ipc_buffer_paddr != 0 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    let buf = (crate::arch::x86_64::paging::phys_to_lin(
+                        me.ipc_buffer_paddr) as *const u64).wrapping_add(1);
+                    let max = (length as usize).min(me.msg_regs.len());
+                    for i in 4..max {
+                        me.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
+                    }
+                }
+            }
         }
-        // Copy from current → caller. We can reuse endpoint's
-        // transfer if we expose it; for clarity we inline the
-        // minimal copy here.
-        let (label, length, regs, snd_buf_paddr):
-            (Word, u32, [Word; crate::tcb::SCRATCH_MSG_LEN], u64) = {
-            let me = s.scheduler.slab.get(current);
-            (me.ipc_label, me.ipc_length, me.msg_regs, me.ipc_buffer_paddr)
-        };
         // Fault replies bypass the normal message transfer — see
-        // `fault::apply_fault_reply` (the fan-out below would stomp
-        // the faulter's live registers).
+        // `fault::apply_fault_reply` (the fan-out would stomp the
+        // faulter's live registers).
         if s.scheduler.slab.get(caller).pending_fault != 0 {
+            let (label, regs) = {
+                let me = s.scheduler.slab.get(current);
+                (me.ipc_label, me.msg_regs)
+            };
             let restart = crate::fault::apply_fault_reply(
                 s, caller, label, length as usize, &regs);
             s.scheduler.slab.get_mut(current).active_sc = None;
@@ -405,58 +416,9 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             }
             return Ok(());
         }
-        {
-            let r = s.scheduler.slab.get_mut(caller);
-            r.ipc_label = label;
-            r.ipc_length = length;
-            r.ipc_badge = 0; // reply has no badge
-            let n = (length as usize).min(r.msg_regs.len());
-            r.msg_regs[..n].copy_from_slice(&regs[..n]);
-            // Phase 43 — fan the reply payload into the caller's
-            // saved user_context so its blocked SysCall returns with
-            // the right register values. Without this, the caller
-            // wakes up but its r10/r8/r9/r15 still hold whatever it
-            // had at SysCall entry, so user-mode `seL4_GetMR(0)`
-            // reads stale data and tests like
-            // CANCEL_BADGED_SENDS_0001 fail with "GetMR(0) == ~msg".
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mi = (label << 12) | (length as Word & 0x7F);
-                r.user_context.rsi = mi;
-                r.user_context.rdi = 0; // reply has no badge
-                r.user_context.r10 = r.msg_regs[0];
-                r.user_context.r8  = r.msg_regs[1];
-                r.user_context.r9  = r.msg_regs[2];
-                r.user_context.r15 = r.msg_regs[3];
-            }
-            // Mirror words 4..length into the caller's IPC buffer.
-            // Words SCRATCH_MSG_LEN..length come straight from the
-            // replier's IPC buffer (bypassing the on-TCB staging,
-            // which is bounded). Mirrors the long-msg path in
-            // `endpoint::transfer`.
-            let recv_buf_paddr = r.ipc_buffer_paddr;
-            if length > 4 && recv_buf_paddr != 0 {
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    let buf = (crate::arch::x86_64::paging::phys_to_lin(
-                        recv_buf_paddr) as *mut u64).wrapping_add(1);
-                    let staged_max = (length as usize).min(regs.len());
-                    for i in 4..staged_max {
-                        core::ptr::write_volatile(buf.add(i), regs[i]);
-                    }
-                    if length as usize > regs.len() && snd_buf_paddr != 0 {
-                        let snd_buf = (crate::arch::x86_64::paging::phys_to_lin(
-                            snd_buf_paddr) as *const u64).wrapping_add(1);
-                        for i in regs.len()..(length as usize)
-                            .min(crate::types::seL4_MsgMaxLength)
-                        {
-                            let w = core::ptr::read_volatile(snd_buf.add(i));
-                            core::ptr::write_volatile(buf.add(i), w);
-                        }
-                    }
-                }
-            }
-        }
+        // Normal reply: full message transfer (register range +
+        // long tail) + IPC-return fan-in, shared with endpoint IPC.
+        crate::endpoint::deliver_message(&mut s.scheduler, current, caller, 0);
         // Wake the caller from BlockedOnReply.
         debug_assert_eq!(
             s.scheduler.slab.get(caller).state,

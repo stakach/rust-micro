@@ -197,7 +197,7 @@ pub fn send_ipc(
         EpState::Recv => {
             let receiver = queue_pop_head(ep, sched)
                 .expect("Recv state must have at least one waiter");
-            transfer(sched, sender, receiver, opts.badge);
+            deliver_message(sched, sender, receiver, opts.badge);
             // Cap transfer requires the sender's cap to carry grant
             // rights (or grant-reply for Reply paths). Without this
             // gate, sel4test IPCRIGHTS0003 sees a cap arrive at the
@@ -276,7 +276,7 @@ pub fn receive_ipc(
             // doesn't smuggle stale state.
             let sender_can_grant = core::mem::replace(
                 &mut sched.slab.get_mut(sender).blocked_can_grant, false);
-            transfer(sched, sender, receiver, badge);
+            deliver_message(sched, sender, receiver, badge);
             if sender_can_grant {
                 transfer_extra_caps(sched, sender, receiver);
             } else {
@@ -408,7 +408,20 @@ pub fn cancel_ipc(ep: &mut Endpoint, sched: &mut Scheduler, thread: TcbId) {
 // register copy this is the whole story.
 // ---------------------------------------------------------------------------
 
-fn transfer(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) {
+/// Copy a fully-staged message from `sender` to `receiver`: the
+/// first 4 words ride in registers (already in `sender.msg_regs[0..4]`),
+/// words 4..min(length, SCRATCH) come from `sender.msg_regs`, and the
+/// tail (SCRATCH..length) is copied buffer-to-buffer. Also fans the
+/// payload into `receiver`'s saved user_context per the IPC return
+/// ABI. `sender.msg_regs[4..]` must already be loaded from its IPC
+/// buffer by the caller (handle_send / the reply paths do this).
+///
+/// Shared by endpoint IPC and the Reply-cap / ReplyRecv paths so
+/// long messages (>SCRATCH words) round-trip in BOTH directions —
+/// IPC0002 / IPC0003 reply with up to seL4_MsgMaxLength words.
+pub(crate) fn deliver_message(
+    sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word,
+) {
     // We need both TCBs mutable simultaneously. Borrow each entry
     // separately by index — the Slab guarantees they're distinct
     // memory because TcbIds are unique.

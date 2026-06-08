@@ -1063,41 +1063,11 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             }
             return Ok(());
         }
-        {
-            let r = s.scheduler.slab.get_mut(caller);
-            r.ipc_label = label;
-            r.ipc_length = length;
-            r.ipc_badge = 0;
-            let n = (length as usize).min(r.msg_regs.len());
-            r.msg_regs[..n].copy_from_slice(&regs[..n]);
-            // Mirror words 4..length into the caller's IPC buffer.
-            if length > 4 && r.ipc_buffer_paddr != 0 {
-                let buf = (crate::arch::x86_64::paging::phys_to_lin(
-                    r.ipc_buffer_paddr) as *mut u64).wrapping_add(1);
-                let max = (length as usize).min(regs.len());
-                for i in 4..max {
-                    core::ptr::write_volatile(buf.add(i), regs[i]);
-                }
-            }
-            // Fan the reply into the caller's saved user_context
-            // so its blocked SysCall returns with the right
-            // register values. Mirrors the receive-side fan-in
-            // that `endpoint::transfer` does for SysRecv.
-            #[cfg(target_arch = "x86_64")]
-            {
-                let mi = (label << 12) | (length as crate::types::seL4_Word & 0x7F);
-                // Phase 38c-followup — rax is preserved across
-                // SYSCALL (matches upstream). Reply success is
-                // signalled via the IPC label, not via rax.
-                r.user_context.rsi = mi;
-                r.user_context.rdi = 0;
-                // Upstream seL4 IPC return ABI: msg_regs -> r10/r8/r9/r15.
-                r.user_context.r10 = r.msg_regs[0];
-                r.user_context.r8  = r.msg_regs[1];
-                r.user_context.r9  = r.msg_regs[2];
-                r.user_context.r15 = r.msg_regs[3];
-            }
-        }
+        let _ = (label, length, regs);
+        // Full message transfer (register range + long tail) +
+        // IPC-return fan-in, shared with endpoint IPC so long
+        // replies (IPC0002/0003, up to seL4_MsgMaxLength) work.
+        crate::endpoint::deliver_message(&mut s.scheduler, invoker, caller, 0);
         debug_assert!(matches!(
             s.scheduler.slab.get(caller).state,
             crate::tcb::ThreadStateType::BlockedOnReply
