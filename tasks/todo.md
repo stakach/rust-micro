@@ -16,6 +16,18 @@ Baseline: 89/89 (commit 60debca).
       return_donated_sc on reply (decode_reply + handle_reply);
       Tcb.donated_sc. SchedContextBind on_sc_gained / Unbind on_sc_lost.
       Gate = 89/89 + IPC0016/0017/0018 (single-hop) pass.
-- [ ] 4. Multi-hop chains (IPC0011-0015) + SC-deletion (0019-0024,0027).
+- [x] 4. Multi-hop chains (IPC0011-0015) + SC-deletion (0019-0024,0027).
 
 Reference: tasks/sc-donation-wip.patch (the all-at-once attempt).
+
+## Step 4 — donation family results (2026-06-08)
+PASS (12, all on committed step-3 code): IPC0011,0012,0013,0014,0015
+(multi-hop inheritance chains), 0016,0017,0018 (single-hop), 0019,0020
+(delete SC while client sending/waiting), 0024 (delete reply cap in SC),
+0027 (sched donation to low-prio server).
+Remaining hard tail (NOT done):
+- IPC0021 — fault handler on donated SC (fault×donation combo): HANGS.
+- IPC0022 — stack-spawning server with SC donation: HANGS.
+- IPC0023 — delete SC tracked in a reply cap: FAILS (state==2 vs 1,
+  line 1173) — reply-cap SC-deletion semantics not modelled.
+- IPC0028 — disabled upstream (false).
