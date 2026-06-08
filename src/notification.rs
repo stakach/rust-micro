@@ -245,6 +245,18 @@ pub fn signal(
                     tcb.user_context.rsi = 0;
                 }
             }
+            // Passive-server SC donation (mirrors the bound-TCB
+            // branch above): if the woken waiter has no SC of its own
+            // but the notification carries a bound SC, donate it so
+            // the wake is schedulable. INTERRUPT0002 — the handler
+            // waits on an IRQ notification that carries a bound SC;
+            // without this the woken handler has no SC and
+            // make_runnable (is_schedulable) won't enqueue it.
+            if sched.slab.get(t).sc.is_none() {
+                if let Some(sc_idx) = ntfn.bound_sc {
+                    sched.slab.get_mut(t).sc = Some(sc_idx);
+                }
+            }
             sched.make_runnable(t);
             if ntfn.head.is_none() {
                 ntfn.state = NtfnState::Idle;
@@ -385,6 +397,9 @@ pub mod spec {
         let mut t = Tcb::default();
         t.priority = prio;
         t.state = ThreadStateType::Running;
+        // MCS is_schedulable needs an SC; placeholder index so
+        // these specs' threads stay schedulable/enqueued.
+        t.sc = Some(0);
         t
     }
 

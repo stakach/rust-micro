@@ -452,6 +452,10 @@ pub unsafe fn launch_rootserver() -> ! {
         sc.bound_tcb = Some(id);
     }
     s.scheduler.slab.get_mut(id).sc = Some(init_sc_idx as u16);
+    // The rootserver was admitted before its SC existed, so `admit`
+    // (which enqueues only schedulable threads) left it off the ready
+    // queue. Now that it has an SC, enqueue it.
+    s.scheduler.on_sc_gained(id);
 
     // Populate the rootserver's CNode with the canonical initial
     // cap layout (subset of seL4's seL4_RootCNodeCapSlots). The

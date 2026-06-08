@@ -591,6 +591,9 @@ pub mod spec {
         let mut t = Tcb::default();
         t.priority = prio;
         t.state = ThreadStateType::Running;
+        // MCS is_schedulable needs an SC; placeholder index (never
+        // dereferenced) so these IPC specs' threads stay enqueued.
+        t.sc = Some(0);
         t
     }
 

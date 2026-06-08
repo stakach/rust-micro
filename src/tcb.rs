@@ -357,6 +357,19 @@ impl Tcb {
     pub const fn is_runnable(&self) -> bool {
         self.state.is_runnable()
     }
+
+    /// Upstream MCS `isSchedulable`: eligible to be picked by the
+    /// scheduler only if runnable AND holding a scheduling context.
+    /// A *passive* thread (no SC — a server whose SC was unbound, or
+    /// one that donated its SC away on a reply) stays runnable so it
+    /// can pair in IPC, but is never enqueued or chosen — it runs
+    /// only on a donated SC received via a Call. Mirrors
+    /// `seL4/include/kernel/thread.h::isSchedulable` (budget
+    /// exhaustion already parks threads as BlockedOnBudget, which is
+    /// not runnable, so we don't model release-queue membership here).
+    pub const fn is_schedulable(&self) -> bool {
+        self.state.is_runnable() && self.sc.is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------

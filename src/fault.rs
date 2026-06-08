@@ -376,6 +376,11 @@ pub mod spec {
             let mut t = Tcb::default();
             t.priority = prio;
             t.state = ThreadStateType::Running;
+            // MCS is_schedulable needs an SC; placeholder index so
+            // admit enqueues and block dequeues consistently (these
+            // run against the global scheduler — a stale queue entry
+            // would corrupt later boot).
+            t.sc = Some(0);
             KERNEL.get().scheduler.admit(t)
         }
     }

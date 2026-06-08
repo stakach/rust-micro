@@ -171,6 +171,9 @@ pub mod spec {
         let mut t = Tcb::default();
         t.priority = prio;
         t.state = ThreadStateType::Running;
+        // MCS is_schedulable needs an SC; placeholder index so
+        // these specs' threads stay schedulable/enqueued.
+        t.sc = Some(0);
         t
     }
 

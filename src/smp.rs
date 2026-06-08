@@ -477,6 +477,10 @@ pub mod spec {
             t.priority = 200;
             t.state = crate::tcb::ThreadStateType::Running;
             t.affinity = 1;
+            // MCS is_schedulable needs an SC for admit to enqueue;
+            // placeholder index (never dereferenced) so AP1's
+            // choose_thread picks it.
+            t.sc = Some(0);
             let id = s.scheduler.admit(t);
             bkl_release();
             id

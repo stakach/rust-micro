@@ -8,7 +8,7 @@ Baseline: 89/89 (commit 60debca).
 - [x] 1. `enqueued` flag — queue-membership source of truth. NO behavior
       change: keep is_runnable gating; dequeue self-guards on flag;
       enqueue/enqueue_front set it; reset_queues clears it. Gate = 89/89.
-- [ ] 2. is_schedulable gating (runnable && sc). admit/make_runnable/
+- [x] 2. is_schedulable gating (runnable && sc). admit/make_runnable/
       block/on_sc_gained/on_sc_lost. Fix rootserver (on_sc_gained after
       sc set), bootstrap_boot_thread + spec threads (placeholder sc).
       free_sched_context via on_sc_lost. Gate = 89/89 (watch INTERRUPT0002).

@@ -390,6 +390,14 @@ impl Scheduler {
     /// Allocate a TCB and (if it's runnable) enqueue it on its
     /// affinity CPU's queue.
     pub fn admit(&mut self, tcb: Tcb) -> TcbId {
+        // Enqueue if runnable. (We deliberately do NOT gate on
+        // is_schedulable here: the rootserver is admitted runnable
+        // before its SC is bound, and the `enqueued` flag keeps the
+        // queue consistent regardless. The is_schedulable gating that
+        // matters for passive servers lives in `make_runnable` — a
+        // passive thread is created Inactive and only made runnable
+        // via IPC, where make_runnable correctly declines to enqueue
+        // it.)
         let runnable = tcb.is_runnable();
         let cpu = tcb.affinity as usize;
         let id = self.slab.alloc(tcb).expect("TcbSlab full");
@@ -402,11 +410,16 @@ impl Scheduler {
     /// Mark a thread as runnable and (re-)add it to its affinity
     /// CPU's queue.
     pub fn make_runnable(&mut self, id: TcbId) {
-        let was_runnable = self.slab.get(id).is_runnable();
         let cpu = self.slab.get(id).affinity as usize;
         let prio = self.slab.get(id).priority;
         self.slab.get_mut(id).state = ThreadStateType::Running;
-        if !was_runnable {
+        // Passive threads (no SC) become runnable so they can pair in
+        // IPC, but are NOT enqueued and cannot preempt — they run only
+        // on a donated SC. Mirrors upstream `isSchedulable`. The
+        // `enqueued` flag prevents a double-enqueue if already queued.
+        let schedulable = self.slab.get(id).is_schedulable();
+        let already = self.slab.get(id).enqueued;
+        if schedulable && !already {
             // Upstream SCHED_ENQUEUE: woken threads insert at the
             // HEAD of their priority class, ahead of round-robin
             // peers (see enqueue_front).
@@ -434,19 +447,60 @@ impl Scheduler {
         // priority N-1 and signals the bound TCB at N; without
         // preemption sender keeps the CPU and merges 10 signals into
         // one Active state, so the receiver only sees one badge.
-        if let Some(cur) = self.nodes[cpu].current {
-            if cur != id {
-                let cur_prio = self.slab.get(cur).priority;
-                if prio > cur_prio {
-                    self.nodes[cpu].current = None;
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let my_cpu = crate::arch::get_cpu_id() as usize;
-                        if cpu != my_cpu {
-                            crate::smp::kick_cpu(cpu as u32);
+        // Only a schedulable (SC-backed) thread can preempt.
+        if schedulable {
+            if let Some(cur) = self.nodes[cpu].current {
+                if cur != id {
+                    let cur_prio = self.slab.get(cur).priority;
+                    if prio > cur_prio {
+                        self.nodes[cpu].current = None;
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            let my_cpu = crate::arch::get_cpu_id() as usize;
+                            if cpu != my_cpu {
+                                crate::smp::kick_cpu(cpu as u32);
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Call after a thread GAINS a scheduling context (SchedContext
+    /// bind, donation, or rootserver init) while already runnable but
+    /// not yet enqueued — enqueues it and runs possibleSwitchTo.
+    /// No-op if not schedulable or already enqueued.
+    pub fn on_sc_gained(&mut self, id: TcbId) {
+        if !self.slab.get(id).is_schedulable() || self.slab.get(id).enqueued {
+            return;
+        }
+        let cpu = self.slab.get(id).affinity as usize;
+        let prio = self.slab.get(id).priority;
+        self.nodes[cpu].queues.enqueue_front(&mut self.slab, id);
+        if let Some(cur) = self.nodes[cpu].current {
+            if cur != id && prio > self.slab.get(cur).priority {
+                self.nodes[cpu].current = None;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let my_cpu = crate::arch::get_cpu_id() as usize;
+                    if cpu != my_cpu {
+                        crate::smp::kick_cpu(cpu as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Call before a thread LOSES its scheduling context (SchedContext
+    /// unbind / SC free / donation away) so it is removed from its
+    /// ready queue (dequeue self-guards) and surrenders the CPU.
+    pub fn on_sc_lost(&mut self, id: TcbId) {
+        let cpu = self.slab.get(id).affinity as usize;
+        self.nodes[cpu].queues.dequeue(&mut self.slab, id);
+        for node in self.nodes.iter_mut() {
+            if node.current == Some(id) {
+                node.current = None;
             }
         }
     }
@@ -456,11 +510,11 @@ impl Scheduler {
     /// current on any node.
     pub fn block(&mut self, id: TcbId, new_state: ThreadStateType) {
         debug_assert!(!new_state.is_runnable());
-        let was_runnable = self.slab.get(id).is_runnable();
+        // `dequeue` self-guards on the `enqueued` flag, so this is safe
+        // whether or not the thread was actually in a ready queue
+        // (a passive thread never is).
         let cpu = self.slab.get(id).affinity as usize;
-        if was_runnable {
-            self.nodes[cpu].queues.dequeue(&mut self.slab, id);
-        }
+        self.nodes[cpu].queues.dequeue(&mut self.slab, id);
         self.slab.get_mut(id).state = new_state;
         // If the blocked thread was current on any CPU, clear it
         // there. Today only the affinity CPU could have it as
@@ -593,6 +647,11 @@ pub mod spec {
         let mut t = Tcb::default();
         t.priority = prio;
         t.state = ThreadStateType::Running;
+        // Schedulable under the MCS model needs an SC. These
+        // queue-mechanics specs predate SC modelling; give them a
+        // placeholder SC index (never dereferenced) so admit/
+        // make_runnable/block treat them as enqueued.
+        t.sc = Some(0);
         t
     }
 

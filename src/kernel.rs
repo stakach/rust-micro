@@ -572,6 +572,10 @@ impl KernelState {
             // notification holding the SC for passive-server use.
             if let Some(tcb_id) = self.sched_contexts[i].bound_tcb {
                 if self.scheduler.slab.try_get(tcb_id).is_some() {
+                    // Remove from the ready queue / surrender the CPU
+                    // before clearing the SC so a runnable thread that
+                    // loses its SC can't keep being scheduled.
+                    self.scheduler.on_sc_lost(tcb_id);
                     self.scheduler.slab.get_mut(tcb_id).sc = None;
                 }
             }
@@ -876,6 +880,11 @@ pub fn bootstrap_boot_thread() -> TcbId {
         // test → helpers) silently collapses to 0.
         t.mcp = 255;
         t.state = ThreadStateType::Running;
+        // Placeholder SC so the boot thread is schedulable under the
+        // MCS is_schedulable model (admit enqueues only SC-backed
+        // threads). Spec-only path; the index isn't dereferenced by
+        // the scheduler.
+        t.sc = Some(0);
         let id = s.scheduler.admit(t);
         s.scheduler.set_current(Some(id));
         id
