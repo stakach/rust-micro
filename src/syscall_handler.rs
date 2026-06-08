@@ -147,9 +147,12 @@ pub fn handle_syscall(
         // non-blocking-send-then-blocking-recv — if the send has no
         // queued receiver it just drops, and the Recv proceeds.
         Syscall::SysNBSendRecv => {
+            let invoker = unsafe {
+                crate::kernel::KERNEL.get().scheduler.current()
+            };
             let dest_cptr = {
                 let s = unsafe { crate::kernel::KERNEL.get() };
-                let cur = s.scheduler.current().ok_or_else(|| {
+                let cur = invoker.ok_or_else(|| {
                     crate::error::KException::SyscallError(
                         crate::error::SyscallError::new(
                             crate::types::seL4_Error::seL4_InvalidCapability,
@@ -171,6 +174,19 @@ pub fn handle_syscall(
             // exactly what NBSend should do.
             let _ = handle_send(&send_args, /* blocking */ false,
                 /* call */ false);
+            // The NB-send may have woken a higher-priority receiver,
+            // which `possibleSwitchTo` signals by clearing `current`.
+            // The Recv half still needs `current` to identify the
+            // receiver, so restore the invoker (same workaround as
+            // SysReplyRecv). The real reschedule happens at the
+            // dispatcher tail once handle_recv is done.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let s = crate::kernel::KERNEL.get();
+                if s.scheduler.current().is_none() {
+                    s.scheduler.set_current(invoker);
+                }
+            }
             handle_recv(args, /* blocking */ true)
         }
         // SysNBSendWait — same as NBSendRecv but the Recv side is a
@@ -178,9 +194,12 @@ pub fn handle_syscall(
         // treat it the same since handle_recv falls back to
         // notification handling when the target is a Notification cap.
         Syscall::SysNBSendWait => {
+            let invoker = unsafe {
+                crate::kernel::KERNEL.get().scheduler.current()
+            };
             let dest_cptr = {
                 let s = unsafe { crate::kernel::KERNEL.get() };
-                let cur = s.scheduler.current().ok_or_else(|| {
+                let cur = invoker.ok_or_else(|| {
                     crate::error::KException::SyscallError(
                         crate::error::SyscallError::new(
                             crate::types::seL4_Error::seL4_InvalidCapability,
@@ -198,6 +217,13 @@ pub fn handle_syscall(
                 a5: args.a5,
             };
             let _ = handle_send(&send_args, false, false);
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let s = crate::kernel::KERNEL.get();
+                if s.scheduler.current().is_none() {
+                    s.scheduler.set_current(invoker);
+                }
+            }
             handle_recv(args, true)
         }
         Syscall::SysYield => {
@@ -431,6 +457,9 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
         // it here means future `mcs_tick` charges fall back to the
         // server's own bound SC (or no SC if it has none).
         s.scheduler.slab.get_mut(current).active_sc = None;
+        // Passive-server reply: move the donated SC back to the caller
+        // (upstream reply_pop) so it's schedulable again.
+        crate::sched_context::return_donated_sc(s, caller);
         s.scheduler.make_runnable(caller);
         Ok(())
     }

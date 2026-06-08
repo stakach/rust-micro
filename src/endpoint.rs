@@ -158,6 +158,41 @@ pub enum IpcOutcome {
     Skipped,
 }
 
+/// Common tail when a Call pairs with its receiver: park the caller
+/// `BlockedOnReply`, point the receiver's reply at it, bind the reply
+/// object, and — if the receiver is a PASSIVE server (no SC of its
+/// own) — donate the caller's scheduling context so the server can
+/// run (upstream `reply_push` -> `schedContext_donate`). The donated
+/// SC is remembered on the caller (`donated_sc`) and returned on
+/// reply. Non-passive receivers keep the legacy `active_sc` charge
+/// attribution unchanged.
+fn finish_call(sched: &mut Scheduler, sender: TcbId, receiver: TcbId) {
+    sched.block(sender, ThreadStateType::BlockedOnReply);
+    sched.slab.get_mut(receiver).reply_to = Some(sender);
+    // Bind the reply object (if the receiver registered one via
+    // Recv(ep, reply=cptr)) so Send-on-Cap::Reply can find the caller.
+    let reply_idx = sched.slab.get_mut(receiver).pending_reply.take();
+    unsafe {
+        let s = crate::kernel::KERNEL.get();
+        if let Some(ridx) = reply_idx {
+            s.replies[ridx as usize].bound_tcb = Some(sender);
+        }
+        let caller_sc = s.scheduler.slab.get(sender).sc;
+        let callee_passive = s.scheduler.slab.get(receiver).sc.is_none();
+        if let (Some(sc), true) = (caller_sc, callee_passive) {
+            // Passive server: MOVE the SC so the receiver becomes
+            // schedulable. The caller is BlockedOnReply (passive
+            // itself for now) and gets the SC back on reply.
+            crate::sched_context::sc_donate(s, sc as usize, receiver);
+            s.scheduler.slab.get_mut(sender).donated_sc = Some(sc);
+        } else if caller_sc.is_some() {
+            // Non-passive callee runs on its own SC; keep the legacy
+            // active_sc charge attribution for the call's duration.
+            s.scheduler.slab.get_mut(receiver).active_sc = caller_sc;
+        }
+    }
+}
+
 pub fn send_ipc(
     ep: &mut Endpoint,
     sched: &mut Scheduler,
@@ -211,33 +246,7 @@ pub fn send_ipc(
                 sched.slab.get_mut(sender).pending_extra_caps_count = 0;
             }
             if opts.do_call {
-                // Call: block sender BlockedOnReply, set the
-                // receiver's reply_to to the caller.
-                sched.block(sender, ThreadStateType::BlockedOnReply);
-                sched.slab.get_mut(receiver).reply_to = Some(sender);
-                // Phase 33c — donate the caller's SchedContext to
-                // the callee for the duration of the call. The
-                // callee runs on the caller's budget; the receiver
-                // restores its own SC on `seL4_Reply`.
-                let donated = sched.slab.get(sender).sc;
-                if donated.is_some() {
-                    sched.slab.get_mut(receiver).active_sc = donated;
-                }
-                // Phase 36d — if the receiver registered a Reply
-                // slot via `Recv(ep, reply=cptr)`, bind that Reply
-                // object to the caller. Send-on-Cap::Reply later
-                // looks up `bound_tcb` to wake the caller. The
-                // legacy `reply_to` path stays in place for
-                // backward compat with kernel specs that don't
-                // wire a Reply cap.
-                if let Some(reply_idx) =
-                    sched.slab.get_mut(receiver).pending_reply.take()
-                {
-                    unsafe {
-                        let s = crate::kernel::KERNEL.get();
-                        s.replies[reply_idx as usize].bound_tcb = Some(sender);
-                    }
-                }
+                finish_call(sched, sender, receiver);
             }
             sched.make_runnable(receiver);
             if queue_is_empty(ep) {
@@ -291,20 +300,7 @@ pub fn receive_ipc(
             let was_call = core::mem::replace(
                 &mut sched.slab.get_mut(sender).blocked_is_call, false);
             if was_call {
-                sched.block(sender, ThreadStateType::BlockedOnReply);
-                sched.slab.get_mut(receiver).reply_to = Some(sender);
-                let donated = sched.slab.get(sender).sc;
-                if donated.is_some() {
-                    sched.slab.get_mut(receiver).active_sc = donated;
-                }
-                if let Some(reply_idx) =
-                    sched.slab.get_mut(receiver).pending_reply.take()
-                {
-                    unsafe {
-                        let s = crate::kernel::KERNEL.get();
-                        s.replies[reply_idx as usize].bound_tcb = Some(sender);
-                    }
-                }
+                finish_call(sched, sender, receiver);
             } else {
                 sched.make_runnable(sender);
             }

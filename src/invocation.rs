@@ -1074,6 +1074,10 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         ));
         // Phase 33c — return the donated SC.
         s.scheduler.slab.get_mut(invoker).active_sc = None;
+        // Passive-server reply: move the donated SC back to the caller
+        // (upstream reply_pop), making the server passive again and
+        // the caller schedulable.
+        crate::sched_context::return_donated_sc(s, caller);
         s.scheduler.make_runnable(caller);
         // Clear the reply binding — the slot is reusable for the
         // next Call once the receiver Recv's on the same Reply
@@ -1150,6 +1154,8 @@ fn decode_sched_context(
                             return Err(KException::SyscallError(SyscallError::new(
                                 seL4_Error::seL4_DeleteFirst)));
                         }
+                        let was_runnable =
+                            s.scheduler.slab.get(tcb_id).is_runnable();
                         s.scheduler.slab.get_mut(tcb_id).sc = Some(sc_id);
                         s.sched_contexts[sc_id as usize].bound_tcb = Some(tcb_id);
                         // Phase 43 — BIND005 deferred wake. If a
@@ -1159,6 +1165,7 @@ fn decode_sched_context(
                         // TCB has an SC again, drain the pending
                         // badge into the TCB and wake it.
                         let bn = s.scheduler.slab.get(tcb_id).bound_notification;
+                        let mut woke_for_badge = false;
                         if let Some(bn_idx) = bn {
                             let ntfn = &mut s.notifications[bn_idx as usize];
                             if matches!(ntfn.state,
@@ -1183,7 +1190,16 @@ fn decode_sched_context(
                                     tcb_t.user_context.rsi = 0;
                                 }
                                 s.scheduler.make_runnable(tcb_id);
+                                woke_for_badge = true;
                             }
+                        }
+                        // IPC0017 — binding an SC to a server that was
+                        // already runnable but passive (it popped a
+                        // message while SC-less and is now Running but
+                        // unscheduled) makes it schedulable: enqueue it.
+                        // Skip if the badge path already (re)enqueued it.
+                        if was_runnable && !woke_for_badge {
+                            s.scheduler.on_sc_gained(tcb_id);
                         }
                     }
                     Cap::Notification { ptr, .. } => {
@@ -1215,6 +1231,12 @@ fn decode_sched_context(
             unsafe {
                 let s = KERNEL.get();
                 if let Some(tcb_id) = s.sched_contexts[sc_id as usize].bound_tcb {
+                    // Remove from the ready queue / surrender the CPU
+                    // before clearing the SC so a runnable thread that
+                    // loses its SC can't keep being scheduled. IPC0017
+                    // unbinds a server's SC so it can't run while
+                    // clients block waiting for it.
+                    s.scheduler.on_sc_lost(tcb_id);
                     s.scheduler.slab.get_mut(tcb_id).sc = None;
                     s.sched_contexts[sc_id as usize].bound_tcb = None;
                 }

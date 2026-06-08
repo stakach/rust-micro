@@ -414,6 +414,48 @@ pub fn complete_yield_if_pending(next: TcbId) {
     }
 }
 
+/// Move scheduling context `sc_idx` to thread `to` (upstream
+/// `schedContext_donate`). The previous owner becomes passive — it
+/// is removed from its ready queue (dequeue self-guards on the
+/// `enqueued` flag) and gives up the CPU if current — then `to`
+/// becomes the new owner. The caller (re)schedules `to` afterwards
+/// (e.g. via make_runnable / on_sc_gained, which enqueue only once
+/// `to.sc` is set). Used for Call-time donation to a passive server
+/// and to return the SC to the caller on reply.
+pub fn sc_donate(s: &mut crate::kernel::KernelState, sc_idx: usize, to: TcbId) {
+    let prev = s.sched_contexts[sc_idx].bound_tcb;
+    if let Some(from) = prev {
+        if from == to {
+            return;
+        }
+        let cpu = s.scheduler.slab.get(from).affinity as usize;
+        s.scheduler.nodes[cpu].queues.dequeue(&mut s.scheduler.slab, from);
+        s.scheduler.slab.get_mut(from).sc = None;
+        for node in s.scheduler.nodes.iter_mut() {
+            if node.current == Some(from) {
+                node.current = None;
+            }
+        }
+    }
+    s.sched_contexts[sc_idx].bound_tcb = Some(to);
+    s.scheduler.slab.get_mut(to).sc = Some(sc_idx as u16);
+}
+
+/// On reply to a caller that donated its SC to a passive server,
+/// move the SC back to the caller (upstream `reply_pop`). `sc_donate`
+/// takes it off the server (now passive, dequeued, no longer current)
+/// and gives it to `caller`, which the reply path then make_runnable's.
+/// No-op if the caller didn't donate, or already acquired another SC
+/// while blocked (upstream keeps the donated one with the server then).
+pub fn return_donated_sc(s: &mut crate::kernel::KernelState, caller: TcbId) {
+    let donated = s.scheduler.slab.get_mut(caller).donated_sc.take();
+    if let Some(sc) = donated {
+        if s.scheduler.slab.get(caller).sc.is_none() {
+            sc_donate(s, sc as usize, caller);
+        }
+    }
+}
+
 /// "Now" in the same ticks the SC schedule uses. Driven by the
 /// PIT (`pit::TICK_COUNT`) on x86; specs override via
 /// `set_test_time` in spec mode.

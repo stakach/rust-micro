@@ -284,6 +284,14 @@ pub struct Tcb {
     /// enqueued can't corrupt the intrusive list. (SC-donation
     /// rework step 1 — pure plumbing, no scheduling-policy change.)
     pub enqueued: bool,
+    /// Scheduling context this thread donated to a passive server on
+    /// its current outgoing Call (it is `BlockedOnReply`). On reply
+    /// the SC is moved back to this thread. `None` when the thread
+    /// has no in-flight donating Call, or called a server that had
+    /// its own SC (no donation). Upstream tracks this via the reply
+    /// call-stack's SC link; we store it on the caller for our flat
+    /// reply model. (SC-donation rework step 3.)
+    pub donated_sc: Option<u16>,
     /// MCS-resolved fault-handler endpoint cap. Upstream MCS
     /// resolves the fault EP at `TCB_SetSpace` time in the
     /// INVOKER's cspace and stores the derived cap in the TCB —
@@ -347,6 +355,7 @@ impl Default for Tcb {
             use_iretq_resume: false,
             flags: 0,
             enqueued: false,
+            donated_sc: None,
             fault_handler_cap: crate::cap::Cap::Null,
             pending_fault: 0,
         }
