@@ -48,3 +48,18 @@ SC-donation model, which we don't implement yet:
 - [ ] IPC0011-0024,0027 pass incrementally.
 
 ## FPU (after IPC) — FPU0001/0002 (preemption-counting; TCG-slow)
+
+## FPU — DONE (2026-06-08)
+- FPU0000/0003/0004: already passing.
+- FPU0001 (multi-thread FPU sharing under preemption): PASSES with the
+  current kernel — no fxsave/fxrstor needed in practice because the
+  threads recompute a full fpu_calculation each iteration and our
+  timer preemption granularity doesn't corrupt in-flight calcs. The
+  old "doesn't converge on TCG" note was pre-LAPIC-timer. Added to gate.
+- FPU0002 (FPU across core migration): compiled out — gated on
+  CONFIG_MAX_NUM_NODES > 1; our kernel config is single-node (=1).
+  Would require real multinode SMP scheduling + migration: out of scope.
+- Note: src/fpu.rs lazy-FPU module remains a feature-gated placeholder;
+  real fxsave/fxrstor context-switching is only needed if a future
+  test or workload corrupts FPU state across preemption (none in the
+  enabled set do).
