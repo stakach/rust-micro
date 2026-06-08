@@ -434,6 +434,11 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             let restart = crate::fault::apply_fault_reply(
                 s, caller, label, length as usize, &regs);
             s.scheduler.slab.get_mut(current).active_sc = None;
+            // IPC0021 — a page fault donates the FAULTER's SC to a
+            // passive fault handler (deliver_fault is a Call). On the
+            // fault reply, move it back so the restarted faulter is
+            // schedulable again (the handler goes passive).
+            crate::sched_context::return_donated_sc(s, caller);
             if restart {
                 s.scheduler.make_runnable(caller);
             } else {

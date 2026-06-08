@@ -584,6 +584,21 @@ impl KernelState {
                     ntfn.bound_sc = None;
                 }
             }
+            // IPC0023 — if this SC was donated to a passive server on
+            // an in-flight Call, the donor TCB (BlockedOnReply) still
+            // records it in `donated_sc` so a reply would move it back.
+            // Once the SC is deleted, that link must go too, otherwise
+            // the reply returns a freed SC and the donor wrongly
+            // becomes schedulable ("client should not run as it has no
+            // scheduling context"). Mirrors upstream removing the SC
+            // from the reply call-stack on schedContext deletion.
+            for e in self.scheduler.slab.entries.iter_mut() {
+                if let Some(t) = e.as_mut() {
+                    if t.donated_sc == Some(i as u16) {
+                        t.donated_sc = None;
+                    }
+                }
+            }
             self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
         }
     }

@@ -1055,6 +1055,10 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             s.scheduler.slab.get_mut(invoker).active_sc = None;
             s.replies[idx].bound_tcb = None;
             s.scheduler.slab.get_mut(invoker).reply_to = None;
+            // IPC0021 — return the SC the faulter donated to a passive
+            // fault handler (fault delivery is a Call) so the restarted
+            // faulter is schedulable again.
+            crate::sched_context::return_donated_sc(s, caller);
             if restart {
                 s.scheduler.make_runnable(caller);
             } else {
