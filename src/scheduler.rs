@@ -120,6 +120,7 @@ impl ReadyQueues {
             None => self.tails[p] = Some(tcb),
         }
         self.heads[p] = Some(tcb);
+        slab.get_mut(tcb).enqueued = true;
         self.bitmap.set(prio);
     }
 }
@@ -155,6 +156,7 @@ impl ReadyQueues {
             None => self.heads[p] = Some(tcb),
         }
         self.tails[p] = Some(tcb);
+        slab.get_mut(tcb).enqueued = true;
         self.bitmap.set(prio);
     }
 
@@ -162,6 +164,11 @@ impl ReadyQueues {
     /// currently be enqueued at that priority — debug_assert fires
     /// otherwise.
     pub fn dequeue(&mut self, slab: &mut TcbSlab, tcb: TcbId) {
+        // No-op if not actually linked — keeps blocking/freeing a
+        // not-enqueued thread from corrupting the list.
+        if !slab.get(tcb).enqueued {
+            return;
+        }
         let prio = slab.get(tcb).priority;
         let p = prio as usize;
         let (prev, next) = {
@@ -181,6 +188,7 @@ impl ReadyQueues {
         let t = slab.get_mut(tcb);
         t.sched_prev = None;
         t.sched_next = None;
+        t.enqueued = false;
 
         // If that was the last thread at this priority, drop the
         // bitmap bit.
@@ -352,6 +360,16 @@ impl Scheduler {
     pub fn reset_queues(&mut self) {
         for node in self.nodes.iter_mut() {
             node.queues = ReadyQueues::new();
+        }
+        // Clear the per-TCB `enqueued` flags too, otherwise a thread
+        // that was enqueued before the wipe would later refuse re-
+        // enqueue or attempt to unlink from the now-empty queue.
+        for e in self.slab.entries.iter_mut() {
+            if let Some(t) = e.as_mut() {
+                t.enqueued = false;
+                t.sched_next = None;
+                t.sched_prev = None;
+            }
         }
     }
 

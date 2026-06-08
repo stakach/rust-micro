@@ -277,6 +277,13 @@ pub struct Tcb {
     /// any flag yet. FPU0003 / FPU0004 in sel4test verify the
     /// SetFlags round-trip.
     pub flags: u64,
+    /// Whether this thread is currently linked into a ready queue.
+    /// The single source of truth for queue membership — maintained
+    /// ONLY by `ReadyQueues::enqueue*`/`dequeue`. `dequeue` is a
+    /// no-op when false, so blocking or freeing a thread that isn't
+    /// enqueued can't corrupt the intrusive list. (SC-donation
+    /// rework step 1 — pure plumbing, no scheduling-policy change.)
+    pub enqueued: bool,
     /// MCS-resolved fault-handler endpoint cap. Upstream MCS
     /// resolves the fault EP at `TCB_SetSpace` time in the
     /// INVOKER's cspace and stores the derived cap in the TCB —
@@ -339,6 +346,7 @@ impl Default for Tcb {
             blocked_can_grant: false,
             use_iretq_resume: false,
             flags: 0,
+            enqueued: false,
             fault_handler_cap: crate::cap::Cap::Null,
             pending_fault: 0,
         }
