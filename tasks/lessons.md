@@ -179,3 +179,31 @@ Rules:
   results.
 - If expected new log markers are missing from a run, assume stale
   binary first — verify build success before debugging "the bug".
+
+## Pattern: SC-donation passive-server rework is a deep, coupled change (2026-06-08)
+
+Attempted the MCS passive-server / SC-donation rework to unblock
+IPC0011-0024,0027 (saved as tasks/sc-donation-wip.patch). Findings:
+- The model is right: schedulable = runnable && sc != NULL; donation
+  MOVES the sc (caller->sc = None, callee->sc = sc) via a
+  schedContext_donate equivalent; reply returns it. An explicit
+  per-TCB `enqueued` flag (queue membership source of truth) cleanly
+  fixes the "infer enqueued from state+sc" fragility that otherwise
+  corrupts the intrusive ready-queue when blocking/freeing passive
+  threads.
+- BUT it's broadly coupled: changing make_runnable/block to gate on
+  schedulability touches EVERY thread lifecycle path, including the
+  notification-bound SC-donation path used by INTERRUPT0002 (which
+  REGRESSED to a hang). And IPC0016 (simplest donation test) still
+  hung in setup — the client's Call never reached finish_call, root
+  cause not isolated (needs make_runnable/choose_thread/Send-block
+  tracing under a live run).
+- Lesson: land this behind a verified, incremental sequence — first
+  the `enqueued` flag alone (prove 88/88 still green), THEN
+  is_schedulable gating, THEN donation, re-running the FULL gate after
+  each step. Don't stack all of it before the first gate run. Also:
+  any change to make_runnable/block MUST be validated against
+  INTERRUPT0002 (notification SC donation) and the full gate, not just
+  the target IPC tests.
+- Reverted to keep the verified 88/88 (commit 75964a0); WIP patch
+  retained for a future focused attempt.
