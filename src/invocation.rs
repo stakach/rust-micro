@@ -1201,7 +1201,14 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
                 s, caller, label, length as usize, &regs);
             s.scheduler.slab.get_mut(invoker).active_sc = None;
             s.replies[idx].bound_tcb = None;
-            s.scheduler.slab.get_mut(invoker).reply_to = None;
+            // Only clear the legacy reply_to stash if it names THIS
+            // caller — the replier may hold a SECOND outstanding reply
+            // (TIMEOUTFAULT0002: a handler replies to the client via
+            // one reply cap while still owing a TimeoutReply to the
+            // server, whose caller lives in reply_to).
+            if s.scheduler.slab.get(invoker).reply_to == Some(caller) {
+                s.scheduler.slab.get_mut(invoker).reply_to = None;
+            }
             // IPC0021 — return the SC the faulter donated to a passive
             // fault handler (fault delivery is a Call) so the restarted
             // faulter is schedulable again.
@@ -1234,9 +1241,13 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         // next Call once the receiver Recv's on the same Reply
         // cap (or a different one).
         s.replies[idx].bound_tcb = None;
-        // Also clear the legacy stash so a stale `reply_to`
-        // doesn't double-wake.
-        s.scheduler.slab.get_mut(invoker).reply_to = None;
+        // Also clear the legacy stash so a stale `reply_to` doesn't
+        // double-wake — but only when it names THIS caller (the
+        // replier may owe a second, unrelated reply; see the fault
+        // branch above, TIMEOUTFAULT0002).
+        if s.scheduler.slab.get(invoker).reply_to == Some(caller) {
+            s.scheduler.slab.get_mut(invoker).reply_to = None;
+        }
         Ok(())
     }
 }
