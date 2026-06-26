@@ -94,3 +94,32 @@ Full VSPACE family: 0000,0002,0003,0004,0005,0006 all pass.
 - Config-gated/compiled-out (need kernel configs + major features):
   BENCHMARK, BREAKPOINT, SINGLESTEP, IOPT(IOMMU), MULTICORE(SMP),
   VCPU(VT-x), CACHEFLUSH, TIMEOUTFAULT, SERSERV, FPU0002. Out of scope.
+
+## IPC0022 status (2026-06-26) — PARTIAL, groundwork committed
+DONE (committed d1ef346, verified regression-free 111/111):
+- SC donation on non-Call send to a passive receiver (upstream
+  sendIPC `canDonate && dest->tcbSchedContext == NULL`). canDonate
+  threaded per-syscall: Send/NBSend=false (IPC0017 must block),
+  Call/NBSendRecv/NBSendWait/Reply=true. This is the spawner->worker
+  SC handoff IPC0022 needs.
+
+STILL HANGS. Valid fresh-build tracing (verified binary freshness):
+- ZC (client->spawner Call-donation, finish_call) fires exactly ONCE.
+- ZS (spawner->worker Send-donation, maybe_donate_on_send) fires ZERO
+  times. So the spawner gets client0's SC but never reaches iteration
+  1's NBSend(init_ep) to the (passive) worker.
+- => The spawner stalls in iteration 0 AFTER receiving client0's
+  donation: either it isn't scheduled on the donated SC, or it blocks
+  at seL4_Wait(init_ep) and worker0 never wakes it (worker0 not
+  schedulable / start_helper didn't fully take). Only 1 of 10 client
+  rounds makes any progress, then the whole choreography deadlocks.
+NEXT STEP for IPC0022: trace the scheduler's blocked-state at the hang
+(which TcbId is blocked on which object + has-SC) right when the system
+goes idle. Need to label thread creation so spawner vs test-main vs
+worker0 TcbIds are identifiable. Deferred to focus on compiled-out
+families per request.
+
+WORKFLOW LESSON (also in lessons.md): build_kernel.sh can leave a STALE
+kernel if cargo fails (broken trace edit) — always verify binary mtime
+> source mtime (or grep a >=4-char marker via `strings`) before
+trusting a traced run.

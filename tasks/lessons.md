@@ -218,3 +218,21 @@ Rule: finish or kill the running gate before invoking build_kernel.sh,
 or do code edits + builds first and only launch the gate once no other
 QEMU is running. When iterating on a fix while a long gate runs, edit
 source freely but DON'T rebuild until the gate is done.
+
+## Stale-kernel trap (2026-06-26)
+SYMPTOM: trace edits produced ZERO output even when present in source;
+kernel binary mtime was OLDER than the edited source.
+CAUSE: a compile error (e.g. E0425 from a sloppy trace edit) made the
+cargo build inside build_kernel.sh fail. build_kernel.sh exits before
+its make_image step, but my run commands chained with `;` (not `&&`)
+then ran `cp rootserver.elf && make_image && run`, re-bundling the
+STALE kernel with a fresh driver. Result: hours of meaningless traces
+on an old kernel.
+RULES:
+- After build_kernel.sh, VERIFY freshness before trusting a run:
+  `stat -f %m target/mykernel-x86/release/mykernel-rust` must be NEWER
+  than your edited source, OR grep a unique trace marker in the binary:
+  `strings target/.../mykernel-rust | grep -c "<my-marker>"`.
+- Chain build+run with `&&`, and gate on build_kernel rc explicitly.
+- Keep trace edits COMPILABLE (watch variable scopes); a broken trace
+  build silently runs the previous kernel.
