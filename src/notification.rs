@@ -291,6 +291,24 @@ pub fn wait(
             WaitOutcome::Got { badge }
         }
         NtfnState::Idle | NtfnState::Waiting => {
+            // Lazy unbind (upstream `maybeReturnSchedContext`): if the
+            // waiting thread's SC is this notification's bound SC,
+            // return the SC to the notification. The thread becomes
+            // passive and blocks; the SC stays bound to the
+            // notification for the next signal to re-donate
+            // (SCHED_CONTEXT_0007). block() clears it as current so it
+            // stops running.
+            let thread_sc = sched.slab.get(thread).sc;
+            if let (Some(bsc), Some(tsc)) = (ntfn.bound_sc, thread_sc) {
+                if bsc == tsc {
+                    sched.slab.get_mut(thread).sc = None;
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        crate::kernel::KERNEL.get()
+                            .sched_contexts[bsc as usize].bound_tcb = None;
+                    }
+                }
+            }
             sched.block(thread, ThreadStateType::BlockedOnNotification);
             queue_push(ntfn, sched, thread);
             ntfn.state = NtfnState::Waiting;
