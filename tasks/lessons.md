@@ -207,3 +207,14 @@ IPC0011-0024,0027 (saved as tasks/sc-donation-wip.patch). Findings:
   the target IPC tests.
 - Reverted to keep the verified 88/88 (commit 75964a0); WIP patch
   retained for a future focused attempt.
+
+## Pattern: build_kernel.sh rewrites disk.img — never run it during a live gate (2026-06-08)
+
+build_kernel.sh compiles the kernel AND regenerates .tmp/disk.img.
+Running it while a gate QEMU is still executing rewrites the image the
+gate booted from; the in-flight run wedges (observed: a full gate
+stalled mid-suite at SCHED0014 with two qemu processes alive).
+Rule: finish or kill the running gate before invoking build_kernel.sh,
+or do code edits + builds first and only launch the gate once no other
+QEMU is running. When iterating on a fix while a long gate runs, edit
+source freely but DON'T rebuild until the gate is done.

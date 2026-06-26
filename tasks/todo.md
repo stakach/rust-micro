@@ -45,3 +45,30 @@ Remaining hard tail (NOT done):
       worker's reply cap and hands off connections via those reply caps;
       needs deeper reply-cap/donation handoff modelling. Deferred.
 - IPC0028 disabled upstream.
+
+## Remaining test families (2026-06-08)
+NEW PASSES (kernel fixes this round):
+- IOPORTS1000 — user-mode #GP (unprivileged in/out without IO cap) now
+  delivered as a UserException fault to the handler (was: fatal kernel
+  halt). Reworked the #GP entry/handler like the #UD path (full
+  fault-frame capture, deliver UserException{13}, dispatch next).
+- PREEMPT_REVOKE — passed as-is once enabled.
+- VSPACE0000 (inter-AS diff cspace) — passed as-is.
+- VSPACE0002/0003/0004/0006 — ASID pool tests. Fixes:
+  * ASIDControl_MakePool: upstream extraCaps ABI (untyped=cap[0],
+    root=cap[1], index=mr0, depth=mr1); MAX_ASID_POOLS=8 exhaustion
+    (-> DeleteFirst); decrement the pool count when an AsidPool cap is
+    deleted (maybe_free_object) so it doesn't leak across tests.
+  * ASIDPool_Assign: already-assigned PML4 -> InvalidCapability
+    (was DeleteFirst; matches upstream + VSPACE0002). Kernel spec
+    updated to match.
+
+REMAINING (off-regex):
+- IPC0022 (stack-spawning acceptor): HANGS — needs reply-object SC
+  call-stacks (the worker replies while passive via a reply cap whose
+  SC lives on the reply object, not the donor TCB). Deep.
+- VSPACE0005 (overassign ASID pool): needs per-pool ASID allocation
+  with 512-ASID exhaustion -> DeleteFirst (we use a global offset).
+- VSPACE0001/0010 not present in this single-node build.
+- Config-gated/compiled-out: BENCHMARK, BREAKPOINT, SINGLESTEP, IOPT,
+  MULTICORE, VCPU, CACHEFLUSH(no x86), TIMEOUTFAULT, SERSERV, FPU0002.

@@ -795,6 +795,15 @@ fn decode_pdpt_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
 static NEXT_ASID_BASE: core::sync::atomic::AtomicU16 =
     core::sync::atomic::AtomicU16::new(512);
 
+/// Number of ASID pools handed out so far. x86_64 has
+/// `seL4_NumASIDPoolsBits = 3` → 8 pools total; pool 0 is the
+/// rootserver's pre-allocated `InitThreadASIDPool`, so `MakePool`
+/// can carve 7 more before returning `seL4_DeleteFirst`
+/// (VSPACE0004 "running out of ASID pools").
+const MAX_ASID_POOLS: u16 = 1 << 3;
+static ASID_POOLS_MADE: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(1);
+
 fn decode_asid_control(
     label: InvocationLabel,
     args: &SyscallArgs,
@@ -803,33 +812,70 @@ fn decode_asid_control(
     use core::sync::atomic::Ordering;
     match label {
         InvocationLabel::X86ASIDControlMakePool => {
-            // ABI:
-            //   a2 = Untyped cap_ptr (source of pool storage)
-            //   a3 = dest CNode cap_ptr (in invoker's CSpace)
-            //   a4 = dest slot index in that CNode
-            // We don't yet support per-cap-target CNode selection
-            // (the rootserver always retypes into its own CNode);
-            // a3 is currently ignored — we use the invoker's CSpace.
-            let untyped_cptr = args.a2;
-            let _ = args.a3;
-            let dest_offset = args.a4 as usize;
+            // Two ABI shapes coexist:
+            //   * Upstream (libsel4 `seL4_X86_ASIDControl_MakePool`):
+            //       extraCaps[0] = Untyped (pool storage)
+            //       extraCaps[1] = dest CNode (root)
+            //       mr0 (a2)     = dest slot index
+            //       mr1 (a3)     = depth
+            //   * Legacy (kernel spec): a2 = Untyped cap_ptr,
+            //       a3 = dest CNode cptr (ignored → invoker CSpace),
+            //       a4 = dest slot index.
+            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+            let upstream = info.extra_caps() >= 2;
 
             unsafe {
                 let s = KERNEL.get();
                 let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let untyped = crate::cspace::lookup_cap(s, &invoker_cspace, untyped_cptr)?;
+
+                let (untyped, dest_cnode_cap, dest_index, depth) = if upstream {
+                    let inv = s.scheduler.slab.get(invoker);
+                    if inv.pending_extra_caps_count < 2 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    let untyped = inv.pending_extra_caps[0];
+                    let root = inv.pending_extra_caps[1];
+                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+                    (untyped, root, args.a2 as usize, args.a3 as u32)
+                } else {
+                    let untyped = crate::cspace::lookup_cap(
+                        s, &invoker_cspace, args.a2)?;
+                    (untyped, invoker_cspace, args.a4 as usize, 0u32)
+                };
+
+                // Exhaustion: only MAX_ASID_POOLS pools exist
+                // (VSPACE0004). Check before consuming the untyped.
+                if ASID_POOLS_MADE.load(Ordering::Relaxed) >= MAX_ASID_POOLS {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_DeleteFirst)));
+                }
+
                 let mut state = match crate::untyped::UntypedState::from_cap(&untyped) {
                     Some(s) => s,
                     None => return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability))),
                 };
 
-                let cnode_ptr = match invoker_cspace {
+                // Resolve the dest slot within the dest CNode cap at
+                // `depth` (upstream) or directly (legacy depth==0).
+                let cnode_ptr = match dest_cnode_cap {
                     Cap::CNode { ptr, .. } => ptr,
                     _ => return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability))),
                 };
-                let cnode_idx = KernelState::cnode_index(cnode_ptr);
+                let (cnode_idx, dest_offset) = if upstream && depth != 0 {
+                    let res = crate::cspace::resolve_address_bits(
+                        s, &dest_cnode_cap, dest_index as u64, depth)?;
+                    if res.bits_remaining != 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_FailedLookup)));
+                    }
+                    (KernelState::cnode_index(res.slot_ptr), res.slot_index)
+                } else {
+                    (KernelState::cnode_index(cnode_ptr), dest_index)
+                };
+
                 let slots = match s.cnode_slots_at_mut(cnode_idx) {
                     Some(s) => s,
                     None => return Err(KException::SyscallError(SyscallError::new(
@@ -860,24 +906,30 @@ fn decode_asid_control(
                     asid_base,
                 };
                 slots[dest_offset].set_cap(&pool_cap);
-                // Phase 30 — record the new pool's MDB parent as
-                // the source Untyped's slot.
-                let parent_id = crate::cte::MdbId::pack(
-                    cnode_idx as u8,
-                    untyped_cptr as u16,
-                );
-                slots[dest_offset].set_parent(Some(parent_id));
-                child_count_inc(parent_id, 1);
-
-                // Commit the bumped Untyped state back into its slot.
-                for slot in slots.iter_mut() {
+                // Locate the source Untyped's slot in this CNode (the
+                // upstream extraCap resolves into the rootserver's flat
+                // cspace, same CNode as the dest). Used for the MDB
+                // parent link and to commit the bumped free_index.
+                let mut untyped_slot = None;
+                for (i, slot) in slots.iter().enumerate() {
                     if let Cap::Untyped { ptr, .. } = slot.cap() {
                         if ptr.addr() == state.base {
-                            slot.set_cap(&state.to_cap());
+                            untyped_slot = Some(i);
                             break;
                         }
                     }
                 }
+                if let Some(usl) = untyped_slot {
+                    // Phase 30 — record the new pool's MDB parent as
+                    // the source Untyped's slot.
+                    let parent_id = crate::cte::MdbId::pack(
+                        cnode_idx as u8, usl as u16);
+                    slots[dest_offset].set_parent(Some(parent_id));
+                    child_count_inc(parent_id, 1);
+                    // Commit the bumped Untyped state back into its slot.
+                    slots[usl].set_cap(&state.to_cap());
+                }
+                ASID_POOLS_MADE.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
         }
@@ -956,8 +1008,12 @@ fn decode_asid_pool(
                 };
                 let (ptr, mapped) = match vspace_cap {
                     Cap::PML4 { ptr, mapped, asid: 0 } => (ptr, mapped),
+                    // Already assigned to an ASID — upstream
+                    // decodeX86ASIDPoolAssign returns InvalidCapability
+                    // (VSPACE0002 assigns the already-mapped
+                    // page_directory and expects exactly that).
                     Cap::PML4 { .. } => return Err(KException::SyscallError(
-                        SyscallError::new(seL4_Error::seL4_DeleteFirst))),
+                        SyscallError::new(seL4_Error::seL4_InvalidCapability))),
                     _ => return Err(KException::SyscallError(
                         SyscallError::new(seL4_Error::seL4_InvalidCapability))),
                 };
@@ -3176,6 +3232,19 @@ unsafe fn maybe_free_object(
                 s.free_reply(KernelState::reply_index(*ptr));
             }
         }
+        Cap::AsidPool { .. } => {
+            // VSPACE0003/0004 — ASID pools are a fixed resource
+            // (MAX_ASID_POOLS). Hand one back when its cap is deleted
+            // so the global count doesn't leak across sel4test runs
+            // that create pools and then clean them up. AsidPool caps
+            // aren't copied by these tests, so a plain decrement is
+            // safe; guard keeps the rootserver's init pool (#0) intact.
+            let _ = s;
+            if ASID_POOLS_MADE.load(core::sync::atomic::Ordering::Relaxed) > 1 {
+                ASID_POOLS_MADE.fetch_sub(
+                    1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
         Cap::CNode { ptr, .. } => {
             let vi = KernelState::cnode_index(*ptr);
             let n = s.cnode_slots_at(vi).map(|sl| sl.len()).unwrap_or(0);
@@ -4561,12 +4630,14 @@ pub mod spec {
         }
 
         // Re-assigning a PML4 that already has an ASID surfaces
-        // DeleteFirst.
+        // InvalidCapability (upstream decodeX86ASIDPoolAssign;
+        // VSPACE0002 asserts exactly this for the already-mapped
+        // page_directory).
         let r = decode_invocation(pool, &args, invoker);
         assert!(matches!(r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_DeleteFirst }))),
-            "second Assign on a non-zero-ASID PML4 should DeleteFirst");
+                code: seL4_Error::seL4_InvalidCapability }))),
+            "second Assign on a non-zero-ASID PML4 should InvalidCapability");
 
         teardown_invoker(invoker);
         arch::log("  ✓ AsidControl::MakePool + AsidPool::Assign\n");

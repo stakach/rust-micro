@@ -475,21 +475,75 @@ extern "C" fn handle_stack_segment_fault(error_code: u64, exception_num: u64) {
     fatal_exception(exception_num, error_code);
 }
 
+/// #GP (General Protection, vector 13) entry. The CPU pushes an
+/// error code, so the frame is offset by 8 vs the #UD entry:
+///   [rsp+0]  = error_code
+///   [rsp+8]  = saved RIP
+///   [rsp+16] = saved CS
+///   [rsp+24] = saved RFLAGS
+///   [rsp+32] = saved RSP
+///   [rsp+40] = saved SS
+///
+/// A user-mode #GP (e.g. an unprivileged `in`/`out` without an IO-port
+/// cap — IOPORTS1000) is delivered to the thread's fault handler as a
+/// UserException, the same way #UD is. Kernel-mode #GP stays fatal.
+/// Same full fault-time capture as #UD/#PF (true rcx/r11 in the GPR
+/// slots; RIP/RFLAGS/RSP in the iretq slots).
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn general_protection_fault_handler() {
     core::arch::naked_asm!(
-        // Stack on entry from a #GP (vector 13):
-        //   [rsp+0]  = error_code   (CPU pushed)
-        //   [rsp+8]  = saved RIP
-        //   [rsp+16] = saved CS
-        //   [rsp+24] = saved RFLAGS
-        //   [rsp+32] = saved RSP
-        //   [rsp+40] = saved SS
-        "mov rdi, [rsp]",
-        "mov rsi, [rsp + 8]",
-        "mov rdx, [rsp + 16]",
-        "mov rcx, [rsp + 32]",
+        "test byte ptr [rsp + 16], 3",
+        "jz 2f",
+        // -------- user-mode #GP: full save --------
+        "swapgs",
+        "mov gs:[16 + 0],   rax",
+        "mov gs:[16 + 8],   rbx",
+        "mov gs:[16 + 16],  rcx",
+        "mov gs:[16 + 24],  rdx",
+        "mov gs:[16 + 32],  rsi",
+        "mov gs:[16 + 40],  rdi",
+        "mov gs:[16 + 48],  rbp",
+        "mov gs:[16 + 56],  r8",
+        "mov gs:[16 + 64],  r9",
+        "mov gs:[16 + 72],  r10",
+        "mov gs:[16 + 80],  r11",
+        "mov gs:[16 + 88],  r12",
+        "mov gs:[16 + 96],  r13",
+        "mov gs:[16 + 104], r14",
+        "mov gs:[16 + 112], r15",
+        "mov rax, [rsp + 8]",
+        "mov gs:[16 + 128], rax",   // user_ctx.rip    = saved RIP
+        "mov rax, [rsp + 24]",
+        "mov gs:[16 + 136], rax",   // user_ctx.rflags = saved RFLAGS
+        "mov rax, [rsp + 32]",
+        "mov gs:[16 + 120], rax",   // user_ctx.rsp    = saved RSP
+        "mov rdi, [rsp + 0]",       // error_code
+        "mov rsi, [rsp + 16]",      // saved CS
+        "call {handler}",
+        // Unreachable for user faults; defensive restore + return.
+        "mov rax, gs:[16 + 0]",
+        "mov rbx, gs:[16 + 8]",
+        "mov rcx, gs:[16 + 16]",
+        "mov rdx, gs:[16 + 24]",
+        "mov rsi, gs:[16 + 32]",
+        "mov rdi, gs:[16 + 40]",
+        "mov rbp, gs:[16 + 48]",
+        "mov r8,  gs:[16 + 56]",
+        "mov r9,  gs:[16 + 64]",
+        "mov r10, gs:[16 + 72]",
+        "mov r11, gs:[16 + 80]",
+        "mov r12, gs:[16 + 88]",
+        "mov r13, gs:[16 + 96]",
+        "mov r14, gs:[16 + 104]",
+        "mov r15, gs:[16 + 112]",
+        "swapgs",
+        "add rsp, 8",               // pop error code
+        "iretq",
+        // -------- kernel-mode #GP: fatal --------
+        "2:",
+        "mov rdi, [rsp + 0]",       // error_code
+        "mov rsi, [rsp + 16]",      // saved CS
         "call {handler}",
         "add rsp, 8",
         "iretq",
@@ -499,18 +553,43 @@ pub unsafe extern "C" fn general_protection_fault_handler() {
 
 extern "C" fn handle_general_protection_fault_typed(
     error_code: u64,
-    saved_rip: u64,
     saved_cs: u64,
-    saved_rsp: u64,
 ) {
-    crate::arch::log("EXCEPTION: General protection fault @ rip=0x");
-    log_hex64(saved_rip);
-    crate::arch::log(", cs=0x");
-    log_hex64(saved_cs);
-    crate::arch::log(", rsp=0x");
-    log_hex64(saved_rsp);
-    crate::arch::log("\n");
-    fatal_exception(13, error_code);
+    let from_user = (saved_cs & 3) == 3;
+    if !from_user {
+        crate::arch::log("EXCEPTION: kernel general protection fault, err=0x");
+        log_hex64(error_code);
+        crate::arch::log("\n");
+        fatal_exception(13, error_code);
+    }
+    crate::smp::bkl_acquire();
+    let current = crate::kernel::current_thread();
+    let Some(faulter) = current else {
+        unsafe { dispatch_next_or_idle("[#GP: no current, idling CPU]\n") }
+    };
+    unsafe {
+        let snapshot = *crate::arch::x86_64::syscall_entry
+            ::current_cpu_user_ctx_mut();
+        let s = crate::kernel::KERNEL.get();
+        let t = s.scheduler.slab.get_mut(faulter);
+        t.user_context = snapshot;
+        t.use_iretq_resume = true;
+        // UserException(number = 13 = #GP vector, code = error_code) —
+        // mirrors upstream handleUserLevelFault for a user GP fault.
+        // IOPORTS1000's handler only checks the label is UserException,
+        // advances RIP past the faulting `in`, and resumes.
+        if crate::fault::deliver_fault(
+            faulter,
+            crate::fault::FaultMessage::UserException {
+                number: 13,
+                code: error_code as u32,
+            },
+        ).is_err() {
+            crate::arch::log("[#GP: no fault handler — suspending thread]\n");
+            s.scheduler.block(faulter, crate::tcb::ThreadStateType::Inactive);
+        }
+        dispatch_next_or_idle("[#GP: no next thread, idling CPU]\n")
+    }
 }
 
 extern "C" fn handle_page_fault(error_code: u64, exception_num: u64) {
