@@ -63,6 +63,11 @@ pub struct SchedContext {
     /// Thread waiting on a SchedContext_YieldTo against this SC.
     /// seL4's `scYieldFrom`.
     pub yield_from: Option<TcbId>,
+    /// seL4's `scBadge` — user-supplied identifier set by
+    /// SchedControl_Configure. Delivered as `seL4_Timeout_Data` in a
+    /// timeout fault (TIMEOUTFAULT) so the handler can identify which
+    /// thread/SC overran.
+    pub badge: u64,
 }
 
 impl Default for SchedContext {
@@ -80,6 +85,7 @@ impl SchedContext {
             bound_tcb: None,
             consumed: 0,
             yield_from: None,
+            badge: 0,
         }
     }
 
@@ -294,8 +300,19 @@ pub fn mcs_tick(delta_ticks: Ticks) {
                     s.scheduler.nodes[cpu].current = None;
                 }
             } else {
-                s.scheduler.block(
-                    cur, crate::tcb::ThreadStateType::BlockedOnBudget);
+                // Upstream `endTimeslice`: if the thread has a timeout
+                // -fault handler, raise a Timeout fault (TIMEOUTFAULT)
+                // instead of postponing — the handler decides what to
+                // do (e.g. reset the thread). Otherwise park on the
+                // release queue until the next refill matures.
+                #[cfg(target_arch = "x86_64")]
+                let delivered = crate::fault::deliver_timeout_fault(cur);
+                #[cfg(not(target_arch = "x86_64"))]
+                let delivered = false;
+                if !delivered {
+                    s.scheduler.block(
+                        cur, crate::tcb::ThreadStateType::BlockedOnBudget);
+                }
             }
         }
     }

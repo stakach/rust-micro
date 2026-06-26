@@ -146,3 +146,23 @@ donated_sc-per-caller + reply.bound_tcb model + return_donated_sc
 unwinds chains correctly. Full SCHED_CONTEXT family (minus 0007) green.
 Remaining runnable: SCHED_CONTEXT_0007 (lazy SC-unbind on Wait),
 SERSERV (component RPC), TIMEOUTFAULT (timeout-fault delivery).
+
+## TIMEOUTFAULT (2026-06-27)
+TIMEOUTFAULT0001 PASSES — implemented timeout-fault delivery:
+- FaultMessage::Timeout{data,consumed} (seL4_Fault_Timeout=5, len 2:
+  MR0=SC badge, MR1=consumed).
+- SchedContext.badge (set from SchedControl_Configure mr3=a5).
+- Tcb.timeout_endpoint_cap + TCBSetTimeoutEndpoint stores extraCaps[0].
+- fault::deliver_timeout_fault — on sporadic budget exhaustion in
+  mcs_tick, if the thread has a valid timeout EP, raise a Timeout fault
+  (upstream endTimeslice/handleTimeout) instead of parking BlockedOnBudget.
+- apply_fault_reply type 5: optional full seL4_UserContext restore
+  (seL4_TimeoutReply) + resume(=!label); length-0 reply resumes in place.
+
+TIMEOUTFAULT0002/0003 STILL HANG. The fault IS delivered (traced: 1
+deliver, 0 reply), but the handler never reaches its TimeoutReply. These
+are nested-donation scenarios: the server runs on the CLIENT's donated
+SC; on timeout the handler must (1) reply -1 to the CLIENT via the
+server's reply cap, (2) rebind the server's OWN SC, (3) TimeoutReply to
+reset the server. The multi-reply + nested SC-donation choreography
+needs careful handling — deferred.

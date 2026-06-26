@@ -24,6 +24,11 @@ pub enum FaultMessage {
     UnknownSyscall { number: Word },
     UserException { number: u32, code: u32 },
     VMFault { addr: Word, fsr: Word, instruction: bool },
+    /// MCS timeout fault — raised when a thread with a timeout-fault
+    /// endpoint exhausts its scheduling-context budget. `data` is the
+    /// SC's badge (`seL4_Timeout_Data`); `consumed` is ticks consumed
+    /// (`seL4_Timeout_Consumed`). Length 2.
+    Timeout { data: u64, consumed: u64 },
 }
 
 impl FaultMessage {
@@ -41,6 +46,7 @@ impl FaultMessage {
             // mismatch, surfacing as the test's
             // `(uintptr_t)res(18446744073709551615) == dest` failure.
             FaultMessage::VMFault { .. } => 6,
+            FaultMessage::Timeout { .. } => 5,
         }
     }
 
@@ -70,6 +76,11 @@ impl FaultMessage {
                 regs[2] = fsr;
                 regs[3] = instruction as Word;
                 4
+            }
+            FaultMessage::Timeout { data, consumed } => {
+                regs[1] = data;
+                regs[2] = consumed;
+                3
             }
         }
     }
@@ -148,6 +159,58 @@ pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
             can_donate: true,
         });
         Ok(())
+    }
+}
+
+/// Deliver an MCS timeout fault to `faulter`'s timeout-fault endpoint
+/// (set via TCB_SetTimeoutEndpoint). Returns `true` if a fault was
+/// delivered — i.e. the thread has a valid, sendable timeout EP and no
+/// in-flight fault. Mirrors upstream `handleTimeout`/`validTimeoutHandler`.
+/// The `seL4_Timeout_Data` MR carries the SC's badge so the handler can
+/// identify the overrunning thread.
+#[cfg(target_arch = "x86_64")]
+pub fn deliver_timeout_fault(faulter: TcbId) -> bool {
+    unsafe {
+        let s = KERNEL.get();
+        // Only one fault in flight at a time.
+        if s.scheduler.slab.get(faulter).pending_fault != 0 {
+            return false;
+        }
+        let target = s.scheduler.slab.get(faulter).timeout_endpoint_cap;
+        let (ep_ptr, badge) = match target {
+            Cap::Endpoint { ptr, badge, rights } if rights.can_send => {
+                (ptr, badge.0)
+            }
+            _ => return false,
+        };
+        // seL4_Timeout_Data = the SC's badge; Consumed = ticks used.
+        let (data, consumed) = match s.scheduler.slab.get(faulter).sc {
+            Some(sc_idx) => {
+                let sc = &s.sched_contexts[sc_idx as usize];
+                (sc.badge, sc.consumed)
+            }
+            None => (0, 0),
+        };
+        let fault = FaultMessage::Timeout { data, consumed };
+        {
+            let f = s.scheduler.slab.get_mut(faulter);
+            let n = encode_for_arch(&fault, f);
+            f.ipc_label = fault.type_word();
+            f.ipc_length = n as u32;
+            f.pending_fault = fault.type_word() as u8;
+        }
+        let idx = KernelState::endpoint_index(ep_ptr);
+        let s_ptr: *mut KernelState = s;
+        let ep = &mut (*s_ptr).endpoints[idx];
+        let sched = &mut (*s_ptr).scheduler;
+        send_ipc(ep, sched, faulter, SendOptions {
+            blocking: true,
+            do_call: true,
+            badge,
+            can_grant: true,
+            can_donate: true,
+        });
+        true
     }
 }
 
@@ -269,6 +332,38 @@ pub unsafe fn apply_fault_reply(
             if n > 2 { set_resume_flags(t, (regs[2] & 0xDD5) | 0x202); }
             label == 0
         }
+        5 => {
+            // Timeout reply (seL4_TimeoutReply_new): label = !resume,
+            // MRs = a full seL4_UserContext when the handler wants to
+            // RESET the faulter to a checkpoint (TIMEOUTFAULT0002/0003).
+            // A length-0 reply (TIMEOUTFAULT0001) just resumes in place.
+            // seL4_UserContext order: 0 rip, 1 rsp, 2 rflags, 3 rax,
+            // 4 rbx, 5 rcx, 6 rdx, 7 rsi, 8 rdi, 9 rbp, 10..17 r8..r15,
+            // 18 fs_base, 19 gs_base. rcx(5)/r11(13) are skipped — the
+            // faulter resumes via sysret which rebuilds them from
+            // RIP/FLAGS.
+            let n = length.min(regs.len());
+            if n >= 18 {
+                set_resume_ip(t, regs[0]);
+                t.user_context.rsp = regs[1];
+                set_resume_flags(t, (regs[2] & 0xDD5) | 0x202);
+                t.user_context.rax = regs[3];
+                t.user_context.rbx = regs[4];
+                t.user_context.rdx = regs[6];
+                t.user_context.rsi = regs[7];
+                t.user_context.rdi = regs[8];
+                t.user_context.rbp = regs[9];
+                t.user_context.r8  = regs[10];
+                t.user_context.r9  = regs[11];
+                t.user_context.r10 = regs[12];
+                t.user_context.r12 = regs[14];
+                t.user_context.r13 = regs[15];
+                t.user_context.r14 = regs[16];
+                t.user_context.r15 = regs[17];
+            }
+            // resume = !label.
+            label == 0
+        }
         // CapFault (1), VMFault (6), anything else: no register
         // transfer, restart unconditionally.
         _ => true,
@@ -346,6 +441,12 @@ fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
             regs[2] = instruction as u64;
             regs[3] = fsr;
             4
+        }
+        FaultMessage::Timeout { data, consumed } => {
+            // x86_64 seL4_Timeout_Msg: Data, Consumed → length 2.
+            regs[0] = data;
+            regs[1] = consumed;
+            2
         }
     }
 }

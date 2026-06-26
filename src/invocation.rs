@@ -1657,6 +1657,10 @@ fn decode_sched_control(
                 *sc = crate::sched_context::SchedContext::new(period, budget);
                 sc.bound_tcb = keep_bound;
                 sc.yield_from = keep_yield;
+                // scBadge — mr3 (= a5) in ConfigureFlags; surfaced as
+                // seL4_Timeout_Data in a timeout fault (TIMEOUTFAULT).
+                // Legacy/spec callers leave a5 = 0.
+                sc.badge = args.a5;
                 // Seed one ready refill so a freshly-configured SC
                 // can be charged immediately.
                 sc.refills[0] = crate::sched_context::Refill {
@@ -4601,11 +4605,25 @@ fn decode_tcb(
                 }
                 Ok(())
             }
-            // MCS api_tcb_configure calls SetTimeoutEndpoint with the
-            // timeout-handler endpoint cap (often seL4_CapNull). We
-            // don't model timeout faults yet — accept the call as a
-            // no-op so process spawn-up can proceed.
-            InvocationLabel::TCBSetTimeoutEndpoint => Ok(()),
+            // MCS SetTimeoutEndpoint — store the timeout-fault EP cap
+            // (extraCaps[0]) on the target TCB so budget exhaustion
+            // delivers a Timeout fault there (TIMEOUTFAULT). A Null
+            // cap clears it (api_tcb_configure passes seL4_CapNull).
+            InvocationLabel::TCBSetTimeoutEndpoint => {
+                unsafe {
+                    let s = KERNEL.get();
+                    let inv = s.scheduler.slab.get_mut(invoker);
+                    let cap = if inv.pending_extra_caps_count > 0 {
+                        let c = inv.pending_extra_caps[0];
+                        inv.pending_extra_caps_count = 0;
+                        c
+                    } else {
+                        Cap::Null
+                    };
+                    s.scheduler.slab.get_mut(id).timeout_endpoint_cap = cap;
+                }
+                Ok(())
+            }
             // SetMCPriority sets the maximum-controllable-priority
             // bound. mr0 = mcp; extraCaps[0] = authority TCB.
             // SCHED0005 — new MCP must not exceed authority's MCP.

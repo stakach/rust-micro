@@ -304,6 +304,11 @@ pub struct Tcb {
     /// EP leaves a dangling handler cap until SetSpace is re-run;
     /// upstream invalidates via the MDB. Acceptable for sel4test.
     pub fault_handler_cap: crate::cap::Cap,
+    /// MCS timeout-fault endpoint cap (seL4_TCB_SetTimeoutEndpoint).
+    /// When this thread exhausts its SC budget and this is a valid
+    /// Endpoint, a `Timeout` fault is delivered here instead of the
+    /// thread being parked (TIMEOUTFAULT). Null = no handler.
+    pub timeout_endpoint_cap: crate::cap::Cap,
     /// Fault-type of the in-flight fault this thread is blocked on
     /// (0 = none; otherwise a `seL4_Fault_*` discriminant: 2 =
     /// UnknownSyscall, 3 = UserException, 6 = VMFault). Replying to
@@ -357,6 +362,7 @@ impl Default for Tcb {
             enqueued: false,
             donated_sc: None,
             fault_handler_cap: crate::cap::Cap::Null,
+            timeout_endpoint_cap: crate::cap::Cap::Null,
             pending_fault: 0,
         }
     }
