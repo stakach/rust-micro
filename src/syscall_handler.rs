@@ -92,9 +92,9 @@ pub fn handle_syscall(
     sink: &mut dyn DebugSink,
 ) -> KResult<()> {
     match syscall {
-        Syscall::SysSend => handle_send(args, /* blocking */ true, /* call */ false),
-        Syscall::SysNBSend => handle_send(args, /* blocking */ false, /* call */ false),
-        Syscall::SysCall => handle_send(args, /* blocking */ true, /* call */ true),
+        Syscall::SysSend => handle_send(args, /* blocking */ true, /* call */ false, /* donate */ false),
+        Syscall::SysNBSend => handle_send(args, /* blocking */ false, /* call */ false, /* donate */ false),
+        Syscall::SysCall => handle_send(args, /* blocking */ true, /* call */ true, /* donate */ true),
         Syscall::SysRecv => handle_recv(args, /* blocking */ true),
         Syscall::SysNBRecv => handle_recv(args, /* blocking */ false),
         // Phase 36b — under MCS there's no standalone Reply syscall;
@@ -173,7 +173,7 @@ pub fn handle_syscall(
             // intentionally swallowed — send drops if no receiver,
             // exactly what NBSend should do.
             let _ = handle_send(&send_args, /* blocking */ false,
-                /* call */ false);
+                /* call */ false, /* donate */ true);
             // The NB-send may have woken a higher-priority receiver,
             // which `possibleSwitchTo` signals by clearing `current`.
             // The Recv half still needs `current` to identify the
@@ -216,7 +216,7 @@ pub fn handle_syscall(
                 a4: args.a4,
                 a5: args.a5,
             };
-            let _ = handle_send(&send_args, false, false);
+            let _ = handle_send(&send_args, false, false, /* donate */ true);
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 let s = crate::kernel::KERNEL.get();
@@ -480,7 +480,9 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
 ///
 /// Looks up the cap in the current thread's CSpace, requires it to
 /// be a `Cap::Endpoint`, then drives `endpoint::send_ipc`.
-fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
+fn handle_send(
+    args: &SyscallArgs, blocking: bool, call: bool, can_donate: bool,
+) -> KResult<()> {
     use crate::cap::Cap;
     use crate::cspace::lookup_cap;
     use crate::endpoint::{send_ipc, SendOptions};
@@ -689,6 +691,7 @@ fn handle_send(args: &SyscallArgs, blocking: bool, call: bool) -> KResult<()> {
             do_call: call,
             badge,
             can_grant: ep_can_grant,
+            can_donate,
         };
         // Split borrows: we need &mut endpoint AND &mut scheduler at
         // once. Take them through indexing on the same struct.

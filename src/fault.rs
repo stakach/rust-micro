@@ -143,6 +143,9 @@ pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
             // fault handler — grant rights so the handler can install
             // a reply cap and send caps back if it wants to.
             can_grant: true,
+            // do_call path handles donation via finish_call; this is
+            // moot but matches the Call canDonate=true convention.
+            can_donate: true,
         });
         Ok(())
     }

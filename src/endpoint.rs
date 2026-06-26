@@ -129,11 +129,22 @@ pub struct SendOptions {
     pub do_call: bool,
     pub badge: Word,
     pub can_grant: bool,
+    /// Mirrors upstream `sendIPC`'s `canDonate`. True for Call,
+    /// NBSendRecv, NBSendWait (and reply); false for plain Send /
+    /// NBSend. When true and a plain (non-Call) send pairs with a
+    /// PASSIVE receiver (no SC), the sender's SC is donated so the
+    /// receiver can run — the stack-spawning handoff in IPC0022.
+    /// Plain Send keeps it false so IPC0017 (Send to a no-SC server)
+    /// correctly blocks the sender instead of donating.
+    pub can_donate: bool,
 }
 
 impl SendOptions {
     pub const fn blocking(badge: Word) -> Self {
-        Self { blocking: true, do_call: false, badge, can_grant: true }
+        Self {
+            blocking: true, do_call: false, badge,
+            can_grant: true, can_donate: false,
+        }
     }
 }
 
@@ -247,12 +258,35 @@ pub fn send_ipc(
             }
             if opts.do_call {
                 finish_call(sched, sender, receiver);
+            } else if opts.can_donate {
+                // Plain (non-Call) send to a PASSIVE receiver donates
+                // the sender's SC so it can run (upstream sendIPC's
+                // `canDonate && dest->tcbSchedContext == NULL` arm).
+                // NBSendRecv/NBSendWait set can_donate; this is the
+                // stack-spawning handoff (IPC0022) where the spawner
+                // hands its (donated) SC to the worker it just woke.
+                maybe_donate_on_send(sched, sender, receiver);
             }
             sched.make_runnable(receiver);
             if queue_is_empty(ep) {
                 ep.state = EpState::Idle;
             }
             IpcOutcome::Transferred { peer: receiver }
+        }
+    }
+}
+
+/// Upstream sendIPC's passive-receiver donation for a plain (non-Call)
+/// send: if `receiver` has no SC of its own but `sender` does, MOVE
+/// the sender's SC to the receiver (the sender becomes passive). Used
+/// only when the send carries `can_donate` (NBSendRecv/NBSendWait).
+fn maybe_donate_on_send(sched: &mut Scheduler, sender: TcbId, receiver: TcbId) {
+    let sender_sc = sched.slab.get(sender).sc;
+    let receiver_passive = sched.slab.get(receiver).sc.is_none();
+    if let (Some(sc), true) = (sender_sc, receiver_passive) {
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            crate::sched_context::sc_donate(s, sc as usize, receiver);
         }
     }
 }
@@ -841,7 +875,7 @@ pub mod spec {
             s.ipc_badge = 0xABCD;
         }
         let r = send_ipc(&mut ep, &mut sched, sender, SendOptions {
-            blocking: true, do_call: false, badge: 0xABCD, can_grant: true,
+            blocking: true, do_call: false, badge: 0xABCD, can_grant: true, can_donate: false,
         });
         assert_eq!(r, IpcOutcome::Blocked);
         assert_eq!(ep.state, EpState::Send);
@@ -883,7 +917,7 @@ pub mod spec {
         let mut ep = Endpoint::new();
         let sender = sched.admit(runnable(50));
         let r = send_ipc(&mut ep, &mut sched, sender, SendOptions {
-            blocking: false, do_call: false, badge: 0, can_grant: true,
+            blocking: false, do_call: false, badge: 0, can_grant: true, can_donate: false,
         });
         assert_eq!(r, IpcOutcome::Skipped);
         assert_eq!(ep.state, EpState::Idle);
