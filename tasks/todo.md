@@ -166,3 +166,21 @@ SC; on timeout the handler must (1) reply -1 to the CLIENT via the
 server's reply cap, (2) rebind the server's OWN SC, (3) TimeoutReply to
 reset the server. The multi-reply + nested SC-donation choreography
 needs careful handling — deferred.
+
+## TIMEOUTFAULT0002 DONE, 0003 deferred (2026-06-27, 129/129)
+0002 PASSES: fixed decode_reply to clear the legacy reply_to stash only
+when it names the caller being replied to (a timeout-fault handler owes
+TWO replies: -1 to the client via the server's reply cap, AND a
+TimeoutReply to the server via reply_to).
+
+0003 (nested client->proxy->server) STILL FAILS. Traced: both faults
+are the SERVER (tcb 5, badge 2); the PROXY never faults. After the
+server resets, the proxy inherits the donated SC but with a REPLENISHED
+budget, so it relays the next call without exhausting. Upstream raises
+a timeout fault at DISPATCH time when a thread with a timeout handler
+is scheduled with no matured refill (checkBudget/checkBudgetRestart) —
+the proxy inherits the EXHAUSTED budget and faults (badge 3) before
+relaying. We only raise timeout faults on exhaustion-while-running in
+mcs_tick. Can't just skip the replenish (handler-less threads need it
+to ever run again). NEXT: add a dispatch-time budget check that raises
+a timeout fault for a timeout-handler thread with no ready refill.
