@@ -206,7 +206,15 @@ pub fn handle_syscall(
                         ),
                     )
                 })?;
-                s.scheduler.slab.get(cur).user_context.r13
+                // NBSendWait's libsel4 stub puts the send destination in
+                // the REPLY register (r12), NOT the NBSendRecv dest
+                // register (r13, which it sets to 0):
+                //   x64_sys_nbsend_recv(SysNBSendWait, /*dest*/0, src,
+                //                       ..., /*reply*/dest)
+                // Reading r13 here gave a null cptr, so the send-half
+                // was silently dropped — e.g. IPC0022's worker
+                // nbsend_wait failed to wake the stack spawner.
+                s.scheduler.slab.get(cur).user_context.r12
             };
             let send_args = SyscallArgs {
                 a0: dest_cptr,
