@@ -1297,13 +1297,17 @@ fn decode_sched_context(
                 match tcb_cap {
                     Cap::Thread { tcb } => {
                         let tcb_id = crate::tcb::TcbId(tcb.addr() as u16);
+                        // Upstream decodeSchedContext_Bind: binding a
+                        // TCB when the TCB already has an SC, or this SC
+                        // already has a bound TCB, is IllegalOperation
+                        // (SCHED_CONTEXT_0003), not DeleteFirst.
                         if s.scheduler.slab.get(tcb_id).sc.is_some() {
                             return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_DeleteFirst)));
+                                seL4_Error::seL4_IllegalOperation)));
                         }
                         if s.sched_contexts[sc_id as usize].bound_tcb.is_some() {
                             return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_DeleteFirst)));
+                                seL4_Error::seL4_IllegalOperation)));
                         }
                         let was_runnable =
                             s.scheduler.slab.get(tcb_id).is_runnable();
@@ -1355,6 +1359,18 @@ fn decode_sched_context(
                     }
                     Cap::Notification { ptr, .. } => {
                         let ntfn_idx = KernelState::ntfn_index(ptr);
+                        // Upstream: binding when this SC already has a
+                        // notification bound is IllegalOperation
+                        // (SCHED_CONTEXT_0003). We track the SC->ntfn
+                        // link on the notification (bound_sc), so scan
+                        // for an existing binding of this SC.
+                        if s.notifications.iter().enumerate().any(|(i, n)|
+                            i != ntfn_idx && n.bound_sc == Some(sc_id))
+                            || s.notifications[ntfn_idx].bound_sc == Some(sc_id)
+                        {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_IllegalOperation)));
+                        }
                         let ntfn = &mut s.notifications[ntfn_idx];
                         // Bind SC to this notification so future
                         // signal()s donate budget to the bound TCB.
@@ -1397,6 +1413,58 @@ fn decode_sched_context(
                     if ntfn.bound_sc == Some(sc_id) {
                         ntfn.bound_sc = None;
                     }
+                }
+            }
+            Ok(())
+        }
+        // SchedContext_UnbindObject — unbind ONE specific object (a
+        // TCB or a notification) from this SC (SCHED_CONTEXT_0003).
+        // Object via extraCaps[0] (upstream) or a2 (legacy). Non
+        // TCB/ntfn → InvalidCapability; an object not currently bound
+        // to this SC → IllegalOperation.
+        InvocationLabel::SchedContextUnbindObject => {
+            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+            let upstream = info.extra_caps() > 0;
+            unsafe {
+                let s = KERNEL.get();
+                let obj_cap = if upstream {
+                    let inv = s.scheduler.slab.get_mut(invoker);
+                    if inv.pending_extra_caps_count == 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability)));
+                    }
+                    let c = inv.pending_extra_caps[0];
+                    inv.pending_extra_caps_count = 0;
+                    c
+                } else {
+                    let cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    crate::cspace::lookup_cap(s, &cspace, args.a2)?
+                };
+                match obj_cap {
+                    Cap::Thread { tcb } => {
+                        let tcb_id = crate::tcb::TcbId(tcb.addr() as u16);
+                        if s.sched_contexts[sc_id as usize].bound_tcb
+                            != Some(tcb_id)
+                        {
+                            return Err(KException::SyscallError(
+                                SyscallError::new(
+                                    seL4_Error::seL4_IllegalOperation)));
+                        }
+                        s.scheduler.on_sc_lost(tcb_id);
+                        s.scheduler.slab.get_mut(tcb_id).sc = None;
+                        s.sched_contexts[sc_id as usize].bound_tcb = None;
+                    }
+                    Cap::Notification { ptr, .. } => {
+                        let ntfn_idx = KernelState::ntfn_index(ptr);
+                        if s.notifications[ntfn_idx].bound_sc != Some(sc_id) {
+                            return Err(KException::SyscallError(
+                                SyscallError::new(
+                                    seL4_Error::seL4_IllegalOperation)));
+                        }
+                        s.notifications[ntfn_idx].bound_sc = None;
+                    }
+                    _ => return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability))),
                 }
             }
             Ok(())
@@ -1521,25 +1589,19 @@ fn decode_sched_control(
             //       a2 = SC cap_ptr, a3 = budget, a4 = period.
             let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
             let upstream = info.extra_caps() > 0;
-            let (sc_cap_opt, budget, period) = if upstream {
+            // The upstream ABI carries budget/period in MICROSECONDS
+            // (decodeSchedControl_ConfigureFlags runs usToTicks); the
+            // legacy/spec ABI passes raw ticks. Keep the raw values
+            // for branch-appropriate validation and convert µs->ticks
+            // (our tick = 1 ms) only for the upstream path.
+            let (sc_cap_opt, raw_budget, raw_period) = if upstream {
                 unsafe {
                     let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
                     let cap = if inv_tcb.pending_extra_caps_count > 0 {
                         Some(inv_tcb.pending_extra_caps[0])
                     } else { None };
                     inv_tcb.pending_extra_caps_count = 0;
-                    // Upstream ABI passes budget/period in
-                    // MICROSECONDS (decodeSchedControl_ConfigureFlags
-                    // runs usToTicks on them). Our tick is 1 ms.
-                    // Storing the raw value as ticks gave sel4test's
-                    // 500ms (= 500_000 µs) helper budgets a 500
-                    // SECOND rotation period — SCHED0019's yielder
-                    // starved behind the spinner until far past any
-                    // timeout. Integer division preserves
-                    // budget == period equality (the round-robin
-                    // property).
-                    let to_ticks = |us: u64| (us / 1000).max(1);
-                    (cap, to_ticks(args.a2), to_ticks(args.a3))
+                    (cap, args.a2, args.a3)
                 }
             } else {
                 unsafe {
@@ -1551,6 +1613,9 @@ fn decode_sched_control(
             };
             unsafe {
                 let s = KERNEL.get();
+                // Cap-type check first (matches upstream order):
+                // SCHED_CONTEXT_0001 expects InvalidCapability before
+                // any RangeError.
                 let sc_idx = match sc_cap_opt {
                     Some(Cap::SchedContext { ptr, .. }) => {
                         KernelState::sched_context_index(ptr)
@@ -1558,10 +1623,27 @@ fn decode_sched_control(
                     _ => return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability))),
                 };
-                if budget == 0 || period == 0 || budget > period {
+                // Validate budget/period (SCHED_CONTEXT_0001). Upstream
+                // checks the raw µs against MIN_BUDGET_US (= 2*10 on
+                // x86/non-TK1); the legacy/spec ABI is already in ticks.
+                let bad = if upstream {
+                    const MIN_BUDGET_US: u64 = 2 * 10;
+                    raw_budget < MIN_BUDGET_US
+                        || raw_period == 0
+                        || raw_budget > raw_period
+                } else {
+                    raw_budget == 0 || raw_period == 0 || raw_budget > raw_period
+                };
+                if bad {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_RangeError)));
                 }
+                let (budget, period) = if upstream {
+                    let to_ticks = |us: u64| (us / 1000).max(1);
+                    (to_ticks(raw_budget), to_ticks(raw_period))
+                } else {
+                    (raw_budget, raw_period)
+                };
                 let sc = &mut s.sched_contexts[sc_idx];
                 // Upstream invokeSchedControl_ConfigureFlags only
                 // rebuilds the refill ring (refill_new /
@@ -5883,11 +5965,13 @@ pub mod spec {
             assert_eq!(s.sched_contexts[sc_idx].bound_tcb, Some(target_tcb));
         }
 
-        // Re-binding the SC (or another SC to this TCB) → DeleteFirst.
+        // Re-binding the SC (or another SC to this TCB) →
+        // IllegalOperation (upstream decodeSchedContext_Bind;
+        // SCHED_CONTEXT_0003).
         let r = decode_invocation(sc_cap, &args, invoker);
         assert!(matches!(r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_DeleteFirst }))));
+                code: seL4_Error::seL4_IllegalOperation }))));
 
         // Unbind clears both sides.
         let args = SyscallArgs {
