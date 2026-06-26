@@ -658,6 +658,12 @@ pub unsafe fn launch_rootserver() -> ! {
     // hook keeps counts exact and cap-delete liveness checks are
     // O(1) instead of whole-pool sweeps.
     crate::kernel::recount_refcounts();
+    // Spec-phase MakePool/Assign runs pollute the ASID allocator
+    // statics (NEXT_ASID_BASE, ASID_POOLS_MADE, per-pool used counts);
+    // reset them so the real test suite starts from a clean slate
+    // (VSPACE0005 overassigns a freshly-made pool and counts exactly
+    // 512 ASIDs).
+    crate::invocation::reset_asid_state();
 
     // LAPIC-timer migration — the kernel's preemption clock
     // (TICK_COUNT + scheduler.tick + mcs_tick) is the LAPIC timer,

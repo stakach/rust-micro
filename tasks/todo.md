@@ -72,3 +72,25 @@ REMAINING (off-regex):
 - VSPACE0001/0010 not present in this single-node build.
 - Config-gated/compiled-out: BENCHMARK, BREAKPOINT, SINGLESTEP, IOPT,
   MULTICORE, VCPU, CACHEFLUSH(no x86), TIMEOUTFAULT, SERSERV, FPU0002.
+
+## VSPACE0005 — DONE (2026-06-08)
+Per-pool ASID exhaustion (512 ASIDs/pool -> DeleteFirst). Reworked the
+ASID-pool allocator to bitmap-based bounded pool indices:
+- ASID_POOL_INUSE bitmap (8 bits) allocates/recycles pool indices 1..8
+  (init pool = index 0). asid_base = index * 512 — stable + bounded
+  (replaces the ever-growing NEXT_ASID_BASE that pushed indices out of
+  the per-pool used array).
+- ASID_POOL_USED[index] counts assigns; Assign -> DeleteFirst at 512.
+- AsidPool cap delete recycles the index (free_asid_pool_index).
+- reset_asid_state() at rootserver launch clears spec-phase pollution.
+- Init pool (asid_base 0) keeps the global wrapping offset -> all
+  inter-AS tests unaffected (zero regression risk).
+Full VSPACE family: 0000,0002,0003,0004,0005,0006 all pass.
+
+## Truly remaining runnable tail
+- IPC0022 (stack-spawning) — needs reply-object SC call-stacks (the SC
+  must migrate to the reply-cap holder so a passive worker can run to
+  reply). Deep; not attempted (regression risk to donation tests).
+- Config-gated/compiled-out (need kernel configs + major features):
+  BENCHMARK, BREAKPOINT, SINGLESTEP, IOPT(IOMMU), MULTICORE(SMP),
+  VCPU(VT-x), CACHEFLUSH, TIMEOUTFAULT, SERSERV, FPU0002. Out of scope.

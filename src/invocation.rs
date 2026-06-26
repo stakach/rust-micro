@@ -788,21 +788,73 @@ fn decode_pdpt_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
 // of CR3) is a follow-up.
 // ---------------------------------------------------------------------------
 
-/// Counter for the next pool's `asid_base`. Each MakePool bumps
-/// by 512 (one pool's worth of ASIDs). Phase 37a reserves bases
-/// 0..511 for the rootserver's pre-allocated `InitThreadASIDPool`
-/// at slot 6, so the first runtime MakePool returns base 512.
-static NEXT_ASID_BASE: core::sync::atomic::AtomicU16 =
-    core::sync::atomic::AtomicU16::new(512);
+/// x86_64 has `seL4_NumASIDPoolsBits = 3` → 8 ASID pools total.
+/// Pool index 0 is the rootserver's pre-allocated
+/// `InitThreadASIDPool` (asid_base 0); MakePool carves indices
+/// 1..8, so `asid_base = index * 512`. Bounded + recyclable pool
+/// indices keep the per-pool bookkeeping arrays small and stable
+/// across create/free cycles (vs an ever-growing base counter).
+const MAX_ASID_POOLS: usize = 1 << 3;
 
-/// Number of ASID pools handed out so far. x86_64 has
-/// `seL4_NumASIDPoolsBits = 3` → 8 pools total; pool 0 is the
-/// rootserver's pre-allocated `InitThreadASIDPool`, so `MakePool`
-/// can carve 7 more before returning `seL4_DeleteFirst`
-/// (VSPACE0004 "running out of ASID pools").
-const MAX_ASID_POOLS: u16 = 1 << 3;
-static ASID_POOLS_MADE: core::sync::atomic::AtomicU16 =
+/// Bitmap of in-use pool indices (bit i = index i). Bit 0 (the init
+/// pool) is permanently set. MakePool allocates the lowest clear bit
+/// in 1..8 (→ DeleteFirst when full, VSPACE0004); freeing an AsidPool
+/// cap clears its bit (so the index recycles).
+static ASID_POOL_INUSE: core::sync::atomic::AtomicU16 =
     core::sync::atomic::AtomicU16::new(1);
+
+/// Per-pool count of ASIDs handed out, indexed by pool index
+/// (`asid_base / 512`, always 0..8). Assign returns `seL4_DeleteFirst`
+/// once a pool's count hits 512 (`seL4_ASIDPoolIndexBits = 9` →
+/// VSPACE0005 "overassigning ASID pool"). Only consulted for
+/// MakePool'd pools (asid_base != 0); the init pool keeps the global
+/// wrapping offset.
+#[allow(clippy::declare_interior_mutable_const)]
+static ASID_POOL_USED: [core::sync::atomic::AtomicU16; MAX_ASID_POOLS] = {
+    const Z: core::sync::atomic::AtomicU16 =
+        core::sync::atomic::AtomicU16::new(0);
+    [Z; MAX_ASID_POOLS]
+};
+
+/// Allocate the lowest free pool index in 1..MAX_ASID_POOLS, or
+/// `None` if all are in use. Resets that pool's used-count.
+fn alloc_asid_pool_index() -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    let mut bits = ASID_POOL_INUSE.load(Ordering::Relaxed);
+    for idx in 1..MAX_ASID_POOLS {
+        let mask = 1u16 << idx;
+        if bits & mask == 0 {
+            ASID_POOL_INUSE.store(bits | mask, Ordering::Relaxed);
+            ASID_POOL_USED[idx].store(0, Ordering::Relaxed);
+            return Some(idx);
+        }
+        let _ = &mut bits;
+    }
+    None
+}
+
+/// Release a pool index (called when its AsidPool cap is deleted).
+fn free_asid_pool_index(idx: usize) {
+    use core::sync::atomic::Ordering;
+    if idx == 0 || idx >= MAX_ASID_POOLS {
+        return;
+    }
+    let bits = ASID_POOL_INUSE.load(Ordering::Relaxed);
+    ASID_POOL_INUSE.store(bits & !(1u16 << idx), Ordering::Relaxed);
+    ASID_POOL_USED[idx].store(0, Ordering::Relaxed);
+}
+
+/// Reset the ASID-allocator statics to their post-boot defaults.
+/// Called once at rootserver launch so spec-phase MakePool/Assign
+/// runs don't leak into the real test suite's pool accounting.
+pub fn reset_asid_state() {
+    use core::sync::atomic::Ordering;
+    ASID_POOL_INUSE.store(1, Ordering::Relaxed);
+    for u in ASID_POOL_USED.iter() {
+        u.store(0, Ordering::Relaxed);
+    }
+    NEXT_ASID_OFFSET.store(2, Ordering::Relaxed);
+}
 
 fn decode_asid_control(
     label: InvocationLabel,
@@ -844,9 +896,14 @@ fn decode_asid_control(
                     (untyped, invoker_cspace, args.a4 as usize, 0u32)
                 };
 
-                // Exhaustion: only MAX_ASID_POOLS pools exist
-                // (VSPACE0004). Check before consuming the untyped.
-                if ASID_POOLS_MADE.load(Ordering::Relaxed) >= MAX_ASID_POOLS {
+                // Pools are limited (MAX_ASID_POOLS); the 8th MakePool
+                // must fail (VSPACE0004). Check up front so we don't
+                // consume the untyped on a doomed call; the index is
+                // actually claimed below once all validation passes.
+                if (ASID_POOL_INUSE.load(Ordering::Relaxed)
+                    & ((1u16 << MAX_ASID_POOLS) - 1))
+                    == ((1u16 << MAX_ASID_POOLS) - 1)
+                {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_DeleteFirst)));
                 }
@@ -897,7 +954,16 @@ fn decode_asid_control(
                 }
                 let pool_paddr = state.base + aligned;
                 state.free_index_bytes = aligned + 0x1000;
-                let asid_base = NEXT_ASID_BASE.fetch_add(512, Ordering::Relaxed);
+                // Claim a bounded pool index (validation has passed).
+                // `alloc_asid_pool_index` also zeroes this pool's
+                // per-pool ASID-used counter so Assign can enforce the
+                // 512-ASID limit (VSPACE0005). asid_base = index * 512.
+                let pool_index = match alloc_asid_pool_index() {
+                    Some(i) => i,
+                    None => return Err(KException::SyscallError(
+                        SyscallError::new(seL4_Error::seL4_DeleteFirst))),
+                };
+                let asid_base = (pool_index as u16) * 512;
 
                 let pool_cap = Cap::AsidPool {
                     ptr: PPtr::<crate::cap::AsidPoolStorage>::new(pool_paddr)
@@ -929,7 +995,7 @@ fn decode_asid_control(
                     // Commit the bumped Untyped state back into its slot.
                     slots[usl].set_cap(&state.to_cap());
                 }
-                ASID_POOLS_MADE.fetch_add(1, Ordering::Relaxed);
+                let _ = pool_index; // index claimed above
             }
             Ok(())
         }
@@ -945,8 +1011,9 @@ fn decode_asid_pool(
     args: &SyscallArgs,
     invoker: TcbId,
 ) -> KResult<()> {
-    let asid_base = match target {
-        Cap::AsidPool { asid_base, .. } => asid_base,
+    use core::sync::atomic::Ordering;
+    let (asid_base, pool_paddr) = match target {
+        Cap::AsidPool { asid_base, ptr } => (asid_base, ptr.addr()),
         _ => unreachable!(),
     };
     match label {
@@ -1017,15 +1084,39 @@ fn decode_asid_pool(
                     _ => return Err(KException::SyscallError(
                         SyscallError::new(seL4_Error::seL4_InvalidCapability))),
                 };
-                // Allocate the next ASID in this pool. Phase 31 is a
-                // coarse first cut — proper allocation tracking lives
-                // in the AsidPool storage page (asid_map[]) once we
-                // plumb it.
-                let assigned = asid_base.saturating_add(
-                    (NEXT_ASID_OFFSET.fetch_add(
-                        1, core::sync::atomic::Ordering::Relaxed,
-                    ) & 0x1FF) as u16,
-                );
+                // Allocate the next ASID in this pool.
+                //   * MakePool'd pools (asid_base != 0): use a per-pool
+                //     used-counter in the storage page so the pool
+                //     enforces its 512-ASID limit (VSPACE0005 assigns
+                //     512 then expects DeleteFirst). These pools don't
+                //     unassign mid-test, so a counter (not a bitmap)
+                //     is sufficient.
+                //   * Init pool (asid_base == 0): the rootserver pool
+                //     that every inter-AS test process draws from —
+                //     keep the existing global wrapping offset (never
+                //     exhausts), so its many assign/teardown cycles
+                //     across the suite stay unaffected.
+                let _ = pool_paddr;
+                let assigned = if asid_base != 0 {
+                    let idx = (asid_base / 512) as usize;
+                    let used = ASID_POOL_USED.get(idx)
+                        .map(|u| u.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    if used >= 512 {
+                        return Err(KException::SyscallError(
+                            SyscallError::new(seL4_Error::seL4_DeleteFirst)));
+                    }
+                    if let Some(u) = ASID_POOL_USED.get(idx) {
+                        u.store(used + 1, Ordering::Relaxed);
+                    }
+                    asid_base.saturating_add(used)
+                } else {
+                    asid_base.saturating_add(
+                        (NEXT_ASID_OFFSET.fetch_add(
+                            1, core::sync::atomic::Ordering::Relaxed,
+                        ) & 0x1FF) as u16,
+                    )
+                };
                 if let Some(slot) = s.cnode_slot_mut(slot_cnode_idx, slot_idx) {
                     slot.set_cap(&Cap::PML4 { ptr, mapped, asid: assigned });
                 }
@@ -3232,18 +3323,16 @@ unsafe fn maybe_free_object(
                 s.free_reply(KernelState::reply_index(*ptr));
             }
         }
-        Cap::AsidPool { .. } => {
+        Cap::AsidPool { asid_base, .. } => {
             // VSPACE0003/0004 — ASID pools are a fixed resource
-            // (MAX_ASID_POOLS). Hand one back when its cap is deleted
-            // so the global count doesn't leak across sel4test runs
-            // that create pools and then clean them up. AsidPool caps
-            // aren't copied by these tests, so a plain decrement is
-            // safe; guard keeps the rootserver's init pool (#0) intact.
+            // (MAX_ASID_POOLS). Recycle the pool's index when its cap
+            // is deleted so it doesn't leak across sel4test runs that
+            // create pools and clean them up. AsidPool caps aren't
+            // copied by these tests, so freeing on delete is safe; the
+            // init pool (index 0, asid_base 0) is guarded inside
+            // `free_asid_pool_index`.
             let _ = s;
-            if ASID_POOLS_MADE.load(core::sync::atomic::Ordering::Relaxed) > 1 {
-                ASID_POOLS_MADE.fetch_sub(
-                    1, core::sync::atomic::Ordering::Relaxed);
-            }
+            free_asid_pool_index((*asid_base / 512) as usize);
         }
         Cap::CNode { ptr, .. } => {
             let vi = KernelState::cnode_index(*ptr);
