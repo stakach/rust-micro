@@ -138,3 +138,11 @@ REMAINING: 0011/0012/0013 (multi-hop client->proxy->server reply
 chains), 0007 (lazy SC-unbind on Wait). Re-test 0011-0013 — the
 reply-delete-return + restart fixes may already help since each reply
 tracks its caller.
+
+## SC call-chain COMPLETE (2026-06-27) — 126/126
+SCHED_CONTEXT_0011/0012/0013 (multi-hop client->proxy->server reply
+chains) pass with NO extra code beyond the 0008-0010 fixes — the
+donated_sc-per-caller + reply.bound_tcb model + return_donated_sc
+unwinds chains correctly. Full SCHED_CONTEXT family (minus 0007) green.
+Remaining runnable: SCHED_CONTEXT_0007 (lazy SC-unbind on Wait),
+SERSERV (component RPC), TIMEOUTFAULT (timeout-fault delivery).
