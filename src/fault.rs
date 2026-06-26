@@ -161,6 +161,28 @@ pub fn resume_ip(f: &crate::tcb::Tcb) -> Word {
     if f.use_iretq_resume { f.user_context.rip } else { f.user_context.rcx }
 }
 
+/// IP to REPORT from TCB_ReadRegisters (the "fault IP"). For a thread
+/// blocked in an IPC syscall, the saved IP is the SYSCALL *return*
+/// address; report the syscall instruction itself (2 bytes earlier on
+/// x86_64) so userspace `restart_after_syscall` — which adds
+/// `ARCH_SYSCALL_INSTRUCTION_SIZE` and writes it back — lands exactly
+/// on the return address (SCHED_CONTEXT_0009/0010). Exception-captured
+/// threads (`use_iretq_resume`) already hold the faulting instruction.
+#[cfg(target_arch = "x86_64")]
+pub fn reported_ip(f: &crate::tcb::Tcb) -> Word {
+    use crate::tcb::ThreadStateType::*;
+    let ip = resume_ip(f);
+    if !f.use_iretq_resume
+        && matches!(f.state,
+            BlockedOnReceive | BlockedOnSend | BlockedOnReply
+                | BlockedOnNotification)
+    {
+        ip.wrapping_sub(2)
+    } else {
+        ip
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn resume_flags(f: &crate::tcb::Tcb) -> Word {
     if f.use_iretq_resume { f.user_context.rflags } else { f.user_context.r11 }

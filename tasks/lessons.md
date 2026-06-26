@@ -236,3 +236,15 @@ RULES:
 - Chain build+run with `&&`, and gate on build_kernel rc explicitly.
 - Keep trace edits COMPILABLE (watch variable scopes); a broken trace
   build silently runs the previous kernel.
+
+## gen_config.h regex edits need a forced driver recompile (2026-06-27)
+Editing vendor/sel4test/build/.../gen_config/sel4test/gen_config.h
+(CONFIG_TESTPRINTER_REGEX) then running ninja does NOT reliably
+recompile sel4test-driver/src/main.c (which #includes it) — ninja's
+dep tracking sometimes misses the header change, so the OLD regex
+stays baked into the driver binary and the wrong tests run.
+RULE: after editing the regex, `touch
+vendor/sel4test/projects/sel4test/apps/sel4test-driver/src/main.c`
+before ninja, and VERIFY the new regex is in the binary:
+  strings vendor/sel4test/build/apps/sel4test-driver/sel4test-driver \
+    | grep TESTPRINTER-or-your-regex

@@ -3402,7 +3402,22 @@ unsafe fn maybe_free_object(
         }
         Cap::Reply { ptr, .. } => {
             if cap_refcount(cap) == 0 {
-                s.free_reply(KernelState::reply_index(*ptr));
+                let idx = KernelState::reply_index(*ptr);
+                // If a caller is still parked BlockedOnReply on this
+                // reply (its Call never got a reply), deleting the reply
+                // returns the donated scheduling context to that caller
+                // and, via sc_donate's on_sc_lost, stops whoever was
+                // running on it (SCHED_CONTEXT_0009). Guard on
+                // BlockedOnReply so we don't disturb SC loans unrelated
+                // to an in-flight Call (INTERRUPT0005).
+                if let Some(caller) = s.replies[idx].bound_tcb {
+                    if matches!(s.scheduler.slab.get(caller).state,
+                        crate::tcb::ThreadStateType::BlockedOnReply)
+                    {
+                        crate::sched_context::return_donated_sc(s, caller);
+                    }
+                }
+                s.free_reply(idx);
             }
         }
         Cap::AsidPool { asid_base, .. } => {
@@ -4287,7 +4302,7 @@ fn decode_tcb(
                     let t = s.scheduler.slab.get(id);
                     if length == 0 {
                         let (rip, rsp, rax) = (
-                            crate::fault::resume_ip(t),
+                            crate::fault::reported_ip(t),
                             t.user_context.rsp,
                             t.user_context.rax,
                         );
@@ -4306,7 +4321,7 @@ fn decode_tcb(
                         // report 0 like before).
                         let iq = t.use_iretq_resume;
                         let regs: [u64; 20] = [
-                            crate::fault::resume_ip(t),     // 0 rip
+                            crate::fault::reported_ip(t),   // 0 rip
                             t.user_context.rsp,             // 1 rsp
                             crate::fault::resume_flags(t),  // 2 rflags
                             t.user_context.rax,    // 3  rax

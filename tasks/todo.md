@@ -123,3 +123,18 @@ WORKFLOW LESSON (also in lessons.md): build_kernel.sh can leave a STALE
 kernel if cargo fails (broken trace edit) — always verify binary mtime
 > source mtime (or grep a >=4-char marker via `strings`) before
 trusting a traced run.
+
+## SC call-chain progress (2026-06-27)
+After the NBSendWait r12 fix (IPC0022):
+- SCHED_CONTEXT_0008 PASSES as-is (NBSendWait fix unblocked it).
+- SCHED_CONTEXT_0010 PASSES: needed `reported_ip` (TCB_ReadRegisters
+  returns the syscall FaultIP = saved-IP - 2 for IPC-syscall-blocked
+  threads, so restart_after_syscall's +ARCH_SYSCALL_INSTRUCTION_SIZE
+  lands on the return address) + the existing UnbindObject.
+- SCHED_CONTEXT_0009 PASSES: reply-cap delete (maybe_free_object
+  Cap::Reply) returns the donated SC to the still-parked caller via
+  return_donated_sc, stopping the server. + reported_ip restart.
+REMAINING: 0011/0012/0013 (multi-hop client->proxy->server reply
+chains), 0007 (lazy SC-unbind on Wait). Re-test 0011-0013 — the
+reply-delete-return + restart fixes may already help since each reply
+tracks its caller.
