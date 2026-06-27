@@ -210,3 +210,11 @@ trace of the proxy's OWN SC refill state through the rebind+TimeoutReply
 reset path. The dispatch_budget_check + syscall-path hook approach is
 sound (it produced the right first-fault order); the gap is purely the
 reset-path refill readiness.
+
+## TIMEOUTFAULT0003 DONE (2026-06-27, 130/130)
+The dispatch-check approach worked — the missing piece was postponing
+the HANDLER-LESS client (not just faulting timeout-handler threads).
+dispatch_budget_check now: unready sporadic SC + has timeout handler ->
+Timeout fault; unready + no handler -> postpone BlockedOnBudget (was
+running and re-donating the over-spent SC, re-triggering the cascade).
+Complete TIMEOUTFAULT family passes. Only SERSERV remains runnable.
