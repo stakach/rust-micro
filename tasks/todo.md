@@ -227,3 +227,15 @@ packing (both recv-return sites) + proper receive-slot resolution
 (resolve_address_bits w/ depth) + unmapped frame derivation. Entire
 SERSERV family (CLIENT/CLI_PROC/PARENT, ~20 tests) passes, no
 regressions. No known runnable tests remain off-gate.
+
+## Stragglers enabled (2026-06-28, 153/153)
++3 net: SCHED0012 (periodic thread), SCHED0016 (resume can't exceed budget),
+STACK_ALIGNMENT_001 (x86 stack alignment) — all passed with ZERO kernel
+changes (just gate-regex enablement). THREADS0004/0005 were already gated
+via bare "THREADS". N/A on x86_64+QEMU: VSPACE0001 (AARCH-only), VSPACE0010
+(IA32/32-bit only), SCHED0021 (disabled under CONFIG_SIMULATION=1).
+
+## NEXT: DOMAINS suite (Tier 2)
+DOMAINS0001-0004 already pass (DomainSet_Set validation). Tier 2 needs
+KernelNumDomains>1 (CMake DOMAINS=ON) + domain scheduler + ScheduleConfigure
+/ScheduleSetStart invocations. Targets: DOMAINS0000/0004/0005/9999.
