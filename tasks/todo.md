@@ -218,3 +218,12 @@ dispatch_budget_check now: unready sporadic SC + has timeout handler ->
 Timeout fault; unready + no handler -> postpone BlockedOnBudget (was
 running and re-donating the over-spent SC, re-triggering the cascade).
 Complete TIMEOUTFAULT family passes. Only SERSERV remains runnable.
+
+## SERSERV DONE (2026-06-27, 150/150)
+Root cause: receiver's return msginfo lacked the extraCaps field, so
+the serial server's connect handler (server.c:263) saw 0 caps and
+returned InvalidCapability before even moving the cap. Fixed extraCaps
+packing (both recv-return sites) + proper receive-slot resolution
+(resolve_address_bits w/ depth) + unmapped frame derivation. Entire
+SERSERV family (CLIENT/CLI_PROC/PARENT, ~20 tests) passes, no
+regressions. No known runnable tests remain off-gate.
