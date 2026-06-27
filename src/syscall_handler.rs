@@ -727,6 +727,10 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 seL4_Error::seL4_InvalidCapability,
             ))
         })?;
+        // Fresh Recv: clear the count of caps transferred into our
+        // receive slots so it reflects only THIS receive (a sender's
+        // transfer_extra_caps sets it before we return).
+        s.scheduler.slab.get_mut(current).received_extra_caps = 0;
         let cspace_root = s.scheduler.slab.get(current).cspace_root;
         let target = lookup_cap(s, &cspace_root, args.a0)?;
         // Phase 36d / 43 — MCS reply cap is in `replyRegister = R12`

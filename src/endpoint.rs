@@ -542,13 +542,14 @@ pub fn transfer_extra_caps(
     }
 
     // Read receive descriptor from receiver's IPC buffer.
-    let (recv_cnode_cptr, recv_index) = unsafe {
+    let (recv_cnode_cptr, recv_index, recv_depth) = unsafe {
         let buf = crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr)
             as *const u64;
         (
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET)),
-            core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET))
-                as usize,
+            core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET)),
+            core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_DEPTH_OFFSET))
+                as u32,
         )
     };
 
@@ -567,15 +568,26 @@ pub fn transfer_extra_caps(
             }
         }
     };
-    let cnode_ptr = match target_cnode_cap {
-        crate::cap::Cap::CNode { ptr, .. } => ptr,
-        _ => {
-            sched.slab.get_mut(sender).pending_extra_caps_count = 0;
-            return;
+    // Resolve the actual receive slot through the receive path
+    // (CNode cap + index at `recv_depth`), mirroring seL4's
+    // getReceiveSlots -> lookupTargetSlot. Using `recv_index` as a
+    // direct slot offset is wrong whenever the CNode has a guard or
+    // the path is multi-level — the serial server's receive path uses
+    // depth 64, so the index must be resolved, not indexed raw.
+    let (base_cnode_idx, base_slot) = unsafe {
+        let s = crate::kernel::KERNEL.get();
+        match crate::cspace::resolve_address_bits(
+            s, &target_cnode_cap, recv_index, recv_depth)
+        {
+            Ok(res) if res.bits_remaining == 0 => (
+                crate::kernel::KernelState::cnode_index(res.slot_ptr),
+                res.slot_index,
+            ),
+            _ => {
+                s.scheduler.slab.get_mut(sender).pending_extra_caps_count = 0;
+                return;
+            }
         }
-    };
-    let cnode_idx = unsafe {
-        crate::kernel::KernelState::cnode_index(cnode_ptr)
     };
 
     unsafe {
@@ -584,24 +596,53 @@ pub fn transfer_extra_caps(
         // Dispatch across all three CNode pools — the receiver's
         // cspace root may be an XL page (test processes), not a
         // big-pool entry.
-        let slots = match s.cnode_slots_at_mut(cnode_idx) {
+        let slots = match s.cnode_slots_at_mut(base_cnode_idx) {
             Some(sl) => sl,
             None => {
                 s.scheduler.slab.get_mut(sender).pending_extra_caps_count = 0;
                 return;
             }
         };
+        let mut placed = 0u8;
         for i in 0..count {
-            let dest_idx = recv_index + i;
+            let dest_idx = base_slot + i;
             if dest_idx >= slots.len() { break; }
             // Don't clobber an existing cap.
             if !slots[dest_idx].cap().is_null() { continue; }
-            slots[dest_idx].set_cap(&staged[i]);
+            // A Frame cap transferred over IPC is DERIVED as an
+            // UNMAPPED copy: seL4 frame caps record their mapping
+            // (asid + vaddr), and X86PageMap rejects mapping a frame
+            // that is already mapped in a different vspace. The
+            // receiver (e.g. the serial server establishing shared
+            // memory, SERSERV) must be able to map it into ITS own
+            // vspace, so the transferred copy starts unmapped.
+            let mut cap = staged[i];
+            if let crate::cap::Cap::Frame { mapped, asid, .. } = &mut cap {
+                *mapped = None;
+                *asid = 0;
+            }
+            slots[dest_idx].set_cap(&cap);
             // MDB: the new cap is derived from… we have no source
             // CTE id (the cap was looked up by cptr through the
             // sender's CSpace, not retyped). For now record None;
             // proper provenance tracking is a follow-up.
             slots[dest_idx].set_parent(None);
+            placed += 1;
+        }
+        // Report how many caps landed so the receiver's Recv return
+        // message-info carries the right `extraCaps` count (the serial
+        // server's connect handler asserts on it).
+        s.scheduler.slab.get_mut(receiver).received_extra_caps = placed;
+        // deliver_message already wrote the receiver's return msginfo
+        // into rsi (label|length) BEFORE we ran, so fold the extraCaps
+        // count (bits 7..8) in now — covers the receiver-blocked-first
+        // path, where the dispatcher's recv-return tail doesn't re-pack
+        // rsi (next != invoker).
+        #[cfg(target_arch = "x86_64")]
+        {
+            let r = s.scheduler.slab.get_mut(receiver);
+            r.user_context.rsi = (r.user_context.rsi & !(0x3 << 7))
+                | (((placed as u64) & 0x3) << 7);
         }
     }
     sched.slab.get_mut(sender).pending_extra_caps_count = 0;
@@ -689,6 +730,10 @@ pub mod spec {
                 buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET), 0);
             core::ptr::write_volatile(
                 buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET), 5);
+            // Full-word depth: the cspace_root below is radix 5 +
+            // guard 59 = 64, so index 5 resolves to slot 5.
+            core::ptr::write_volatile(
+                buf.add(crate::ipc_buffer::RECEIVE_DEPTH_OFFSET), 64);
         }
 
         // Sender stages a fake Endpoint cap. We don't go through

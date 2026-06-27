@@ -782,9 +782,13 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // thread that just issued the syscall.
             let invoker = current_in_flight_invoker();
             if was_recv_path && Some(next) == invoker {
-                // Pack MessageInfo back into rsi: bits 0..7 length,
+                // Pack MessageInfo back into rsi: bits 0..6 length,
+                // bits 7..8 extraCaps (caps transferred into the recv
+                // slots — SERSERV's connect handler asserts on this),
                 // top bits label.
-                let mi = (tcb.ipc_label << 12) | (tcb.ipc_length as u64 & 0x7F);
+                let mi = (tcb.ipc_label << 12)
+                    | (((tcb.received_extra_caps as u64) & 0x3) << 7)
+                    | (tcb.ipc_length as u64 & 0x7F);
                 new_ctx.rsi = mi;
                 new_ctx.rdi = tcb.ipc_badge;
                 new_ctx.r10 = tcb.msg_regs[0];

@@ -243,6 +243,12 @@ pub struct Tcb {
     /// the receiver named in `receiveIndex`.
     pub pending_extra_caps: [crate::cap::Cap; 3],
     pub pending_extra_caps_count: u8,
+    /// Number of extra caps the kernel transferred INTO this thread's
+    /// receive slots on its last successful Recv. Surfaced in the
+    /// `extraCaps` field of the message-info the Recv returns so
+    /// userspace (e.g. the serial server's connect handler) can verify
+    /// it received the frame caps it expects.
+    pub received_extra_caps: u8,
     /// Phase 36d — reply slot the thread offered when it issued
     /// `Recv` (or `Wait`) and is happy to receive Call IPCs. The
     /// pool index points at a `Reply` object that the kernel will
@@ -354,6 +360,7 @@ impl Default for Tcb {
             yield_to: None,
             pending_extra_caps: [crate::cap::Cap::Null; 3],
             pending_extra_caps_count: 0,
+            received_extra_caps: 0,
             pending_reply: None,
             blocked_is_call: false,
             blocked_can_grant: false,
