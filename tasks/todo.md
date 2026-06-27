@@ -184,3 +184,29 @@ relaying. We only raise timeout faults on exhaustion-while-running in
 mcs_tick. Can't just skip the replenish (handler-less threads need it
 to ever run again). NEXT: add a dispatch-time budget check that raises
 a timeout fault for a timeout-handler thread with no ready refill.
+
+## TIMEOUTFAULT0003 — dispatch-check attempt analysed, reverted (2026-06-27)
+Implemented upstream's dispatch-time checkBudget: in the syscall-return
+next-thread pick (syscall_entry.rs rust_syscall_dispatch — NOT the main
+loop, which is only the hlt/IRQ path), call dispatch_budget_check(t):
+for a thread WITH a timeout handler whose SC head refill isn't matured
+(head_ready_time > now), raise a Timeout fault instead of running it.
+Gated to timeout-handler threads so the other 129 tests are untouched.
+
+Result: 0001/0002 still pass; 0003 progressed (server fault badge 2
+delivered FIRST, then proxy fault badge 3 — correct order!) but then
+the PROXY RE-FAULTS REPEATEDLY (badge 3 over and over). Traced
+(ZDLVf/ZDBKt): after the handler resets the proxy (rebind proxy's OWN
+SC + TimeoutReply), the proxy's SC is STILL unready (head_ready_time
+941 > now 840), so the dispatch-check immediately re-faults it →
+floods tfep with badge-3 faults → later iterations' server/proxy badge
+alternation breaks. Reverted to keep 129/129 clean.
+
+REMAINING for 0003: the proxy's reset must yield a READY SC. Either the
+proxy's own SC (rebound by the handler) needs a matured head refill on
+resume (refill_unblock_check / refill_reset semantics), or the
+dispatch-check needs to not re-fault a freshly-reset thread. Needs a
+trace of the proxy's OWN SC refill state through the rebind+TimeoutReply
+reset path. The dispatch_budget_check + syscall-path hook approach is
+sound (it produced the right first-fault order); the gap is purely the
+reset-path refill readiness.
