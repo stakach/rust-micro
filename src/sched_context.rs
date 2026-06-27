@@ -318,6 +318,48 @@ pub fn mcs_tick(delta_ticks: Ticks) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn dispatch_budget_check(tcb_id: TcbId) -> bool {
+    unsafe {
+        let s = crate::kernel::KERNEL.get();
+        let sc_idx = match s.scheduler.slab.get(tcb_id).sc {
+            Some(i) => i as usize,
+            None => return true,
+        };
+        if s.scheduler.slab.get(tcb_id).pending_fault != 0 {
+            return true;
+        }
+        let now = current_time();
+        let sc = &s.sched_contexts[sc_idx];
+        // Round-robin SCs (budget >= period) are always runnable.
+        if sc.budget >= sc.period {
+            return true;
+        }
+        // Ready sporadic SC — its head refill has matured.
+        if sc.count > 0 && refill_ready(sc, now) {
+            return true;
+        }
+        // Head refill not matured. Upstream checkBudget: a thread with
+        // a timeout-fault handler raises a Timeout fault instead of
+        // running on budget it doesn't have (TIMEOUTFAULT0003 — a
+        // proxy that inherits an exhausted donated SC). Any other
+        // thread is postponed onto the release queue (BlockedOnBudget)
+        // until the refill matures (mcs_tick's maturity scan revives
+        // it) — without this, a thread that inherits an unready donated
+        // SC (e.g. the client re-receiving its over-spent SC) would run
+        // and immediately re-trigger the fault cascade.
+        if matches!(s.scheduler.slab.get(tcb_id).timeout_endpoint_cap,
+                    crate::cap::Cap::Endpoint { .. })
+        {
+            let _ = crate::fault::deliver_timeout_fault(tcb_id);
+        } else {
+            s.scheduler.block(
+                tcb_id, crate::tcb::ThreadStateType::BlockedOnBudget);
+        }
+        false
+    }
+}
+
 /// seL4_Yield under MCS — upstream `handleYield` charges the
 /// current thread's ENTIRE remaining head refill
 /// (`chargeBudget(refill_head->rAmount)`), so:

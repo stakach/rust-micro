@@ -716,10 +716,17 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // that don't end up parking the caller.
     unsafe {
         let s = KERNEL.get();
-        let next = match s.scheduler.current() {
-            Some(t) => Some(t),
-            None => s.scheduler.choose_thread(),
-        };
+        let mut next;
+        loop {
+            next = match s.scheduler.current() {
+                Some(t) => Some(t),
+                None => s.scheduler.choose_thread(),
+            };
+            match next {
+                Some(t) if !crate::sched_context::dispatch_budget_check(t) => continue,
+                _ => break,
+            }
+        }
         if let Some(next) = next {
             s.scheduler.set_current(Some(next));
             // Phase 24: if next thread runs in a different vspace,
