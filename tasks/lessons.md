@@ -248,3 +248,14 @@ vendor/sel4test/projects/sel4test/apps/sel4test-driver/src/main.c`
 before ninja, and VERIFY the new regex is in the binary:
   strings vendor/sel4test/build/apps/sel4test-driver/sel4test-driver \
     | grep TESTPRINTER-or-your-regex
+
+## Viability-gate before big subsystem work (2026-06-28)
+Before implementing a feature whose payoff depends on the emulator, write a
+cheap boot probe FIRST. Settled two calls this session:
+- HW-debug: boot probe set a DR + confirmed QEMU 11 TCG delivers #DB → built it (now 8 tests pass).
+- PCID (to fix DOMAINS CR3-flush slowness): probe + QEMU stderr showed "TCG doesn't
+  support requested feature: ...pcid" → CPUID.PCID=0 even with -cpu max. Skipped it
+  (would be dead code). Saved a multi-hour implementation.
+TCG perf reality: cross-AS IPC = CR3 reload = full softmmu TLB flush (no PCID under
+TCG) → DOMAINS0004/0005 busy-wait tests are ~40x slow + host-variance. Correct, not
+buggy. Real kernel win found anyway: shootdown_tlb skips idle cores (510cf06).
