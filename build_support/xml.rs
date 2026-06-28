@@ -32,7 +32,7 @@ pub fn default_config() -> HashMap<&'static str, bool> {
         // the generated InvocationLabel enum includes
         // SchedContextBind / SchedControlConfigure / etc.
         ("CONFIG_KERNEL_MCS", true),
-        ("CONFIG_ENABLE_SMP_SUPPORT", false),
+        ("CONFIG_ENABLE_SMP_SUPPORT", true),
         // Hardware-debug API enabled (BREAKPOINT/SINGLESTEP tests). This
         // inserts TCBSetBreakpoint/Get/Unset/ConfigureSingleStepping at
         // labels 16-19, shifting TCBSetTLSBase onward — must match the

@@ -214,6 +214,110 @@ pub fn kick_cpu(target_cpu: u32) {
     send_ipi(target_cpu, IpiKind::Reschedule);
 }
 
+// ---------------------------------------------------------------------------
+// Blocking remote-TCB stall (mirrors seL4 `remoteTCBStall` +
+// `IpiRemoteCall_Stall` / `ipiStallCoreCallback`).
+//
+// Before a controlling core (e.g. core 0 running SchedControl_Configure,
+// TCB_Suspend, or a TCB delete) mutates / frees a TCB that is currently
+// RUNNING on another core, it must make that core switch off the thread —
+// otherwise the remote core keeps executing it (use-after-free /
+// double-run). Our IPIs are async, so we synthesise the blocking
+// handshake with two per-core flags:
+//   * `STALL_REQUESTED[target]` — set by the controlling core; the
+//     target's IPI handler keys off it to park itself.
+//   * `STALL_ACK[target]`       — set by the target once it is off the
+//     thread; the controlling core spins on it.
+// `AtomicBool` isn't `Copy`, so the arrays are hand-listed (like
+// `SYSCALL_COUNT_PER_CPU`).
+// ---------------------------------------------------------------------------
+
+pub static STALL_REQUESTED: [AtomicBool; MAX_CPUS] = [
+    AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false),
+];
+pub static STALL_ACK: [AtomicBool; MAX_CPUS] = [
+    AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false),
+];
+
+/// Per-core "went idle since last dispatch" flag. Set just before a
+/// core HLTs in an idle loop; checked + cleared when it next dispatches
+/// a thread. While a core is idle, `shootdown_tlb` skips it (current ==
+/// None), so its TLB can hold stale translations once another core
+/// mutates the shared page tables. The idle core therefore must reload
+/// CR3 (full TLB flush) on its NEXT dispatch — but ONLY then, not on
+/// every dispatch: flushing on every context switch makes the yield-
+/// stress test (MULTICORE0004) crawl under TCG (a full TLB flush per
+/// re-dispatch on every core). This flag scopes the flush to exactly
+/// the idle→running transition that needs it (MULTICORE0002). Hand-
+/// listed because `AtomicBool` isn't `Copy`.
+pub static WENT_IDLE: [AtomicBool; MAX_CPUS] = [
+    AtomicBool::new(true), AtomicBool::new(true),
+    AtomicBool::new(true), AtomicBool::new(true),
+];
+
+/// Mark the calling core as having gone idle (call right before HLT in
+/// an idle loop).
+#[inline]
+pub fn mark_went_idle() {
+    WENT_IDLE[crate::arch::get_cpu_id() as usize].store(true, Ordering::Release);
+}
+
+/// Check-and-clear the calling core's went-idle flag. Returns true if
+/// the core had gone idle since its last dispatch (so the caller should
+/// flush the TLB by reloading CR3).
+#[inline]
+pub fn take_went_idle() -> bool {
+    WENT_IDLE[crate::arch::get_cpu_id() as usize].swap(false, Ordering::AcqRel)
+}
+
+/// seL4 `remoteTCBStall`: if `tcb` is currently the running thread on a
+/// *remote* core, make that core switch off it (to idle) before the
+/// caller mutates or frees it. Caller MUST hold the BKL; this routine
+/// releases + re-acquires it internally while spinning, and the BKL is
+/// held again on return. Returns `true` if a stall was performed.
+///
+/// On return the remote core is parked (spinning on `bkl_acquire`) and
+/// will not run `tcb` again — by the time it re-acquires the BKL the
+/// caller will have dequeued / freed the thread.
+#[cfg(target_arch = "x86_64")]
+pub fn remote_tcb_stall(tcb: TcbId) -> bool {
+    let me = crate::arch::get_cpu_id();
+    let (aff, running_there) = unsafe {
+        let s = crate::kernel::KERNEL.get();
+        let aff = s.scheduler.slab.get(tcb).affinity;
+        (aff, s.scheduler.current_for_cpu(aff) == Some(tcb))
+    };
+    if aff == me || !running_there {
+        return false;
+    }
+    let a = aff as usize;
+    STALL_ACK[a].store(false, Ordering::Release);
+    STALL_REQUESTED[a].store(true, Ordering::Release);
+    // Kick the remote core into its IPI handler (registers the cause +
+    // fires the LAPIC vector).
+    send_ipi(aff, IpiKind::Reschedule);
+    // Drop the BKL so the remote core can enter the kernel, park itself,
+    // and acknowledge; spin until it does.
+    bkl_release();
+    let mut spins: u64 = 0;
+    while !STALL_ACK[a].load(Ordering::Acquire) {
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 10_000_000_000 {
+            break; // safety valve — never wedge the controlling core.
+        }
+    }
+    bkl_acquire();
+    // The remote core is now parked on `bkl_acquire` (inside its stall
+    // wait-loop). Clear the request: it can't observe this until it
+    // re-acquires the BKL, which it cannot do until we finish our
+    // mutation and release. Safe to clear now.
+    STALL_REQUESTED[a].store(false, Ordering::Release);
+    true
+}
+
 /// Fan a TLB-shootdown for `vaddr` to every CPU other than the
 /// caller. Used by vspace ops (Frame::Unmap, etc.) after they
 /// clear a PTE locally; remote CPUs need to invalidate their

@@ -441,6 +441,12 @@ pub(crate) fn swap_iretq_context_if_preempted(
         ctx.rflags = (ctx.rflags & 0xDD5) | 0x202;
         let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
         if next_cr3 != 0 {
+            // This is a preemption of a *running* user thread (from_user
+            // was true), so this core was active and received any TLB
+            // shootdown IPIs — its TLB is coherent. Only reload CR3 on an
+            // actual vspace change. (The stale-TLB-after-idle flush lives
+            // in the from-idle dispatch paths: dispatch_next_or_idle and
+            // the AP scheduler loop.)
             let cur_cr3: u64;
             core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                 options(nomem, nostack, preserves_flags));

@@ -89,32 +89,56 @@ pub fn version() -> u32 {
 }
 
 /// Naked-asm IPI entry stub. Vectored from the IDT at `IPI_VECTOR`.
-/// Pushes a dummy error code + vector marker (matching the
-/// `interrupt!` macro shape) and tail-calls the typed handler.
+/// BYTE-IDENTICAL frame shape to `lapic_timer_irq_entry`: pushes all
+/// 15 GPRs, hands `&mut IretqContext` to the dispatcher, and on return
+/// pops them + `iretq`. This lets the Reschedule IPI actually switch
+/// the target core to a newly-chosen thread (via the shared
+/// `swap_iretq_context_if_preempted` tail) rather than blindly
+/// `iretq`-ing back to whatever it was running.
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn ipi_irq_entry() {
     core::arch::naked_asm!(
-        "push 0",
-        "push 0",
+        "push rax", "push rbx", "push rcx", "push rdx",
+        "push rsi", "push rdi", "push rbp",
+        "push r8",  "push r9",  "push r10", "push r11",
+        "push r12", "push r13", "push r14", "push r15",
+        "mov rdi, rsp",
         "call {handler}",
-        "add rsp, 16",
+        "pop r15", "pop r14", "pop r13", "pop r12",
+        "pop r11", "pop r10", "pop r9",  "pop r8",
+        "pop rbp", "pop rdi", "pop rsi", "pop rdx",
+        "pop rcx", "pop rbx", "pop rax",
         "iretq",
         handler = sym ipi_isr,
     );
 }
 
-extern "C" fn ipi_isr() {
+#[no_mangle]
+extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
     use core::sync::atomic::Ordering;
     use crate::smp::IpiKind;
 
     crate::smp::bkl_acquire();
+    struct BklGuard;
+    impl Drop for BklGuard {
+        fn drop(&mut self) {
+            crate::smp::bkl_release();
+        }
+    }
+    let _bkl = BklGuard;
+
+    // Capture the interrupted context up front — mirrors the LAPIC
+    // tick path so the swap tail can save the preempted thread.
+    let from_user = (ctx.cs & 3) == 3;
+    let interrupted =
+        unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+    let me = crate::arch::get_cpu_id();
 
     // Drain pending IPIs and dispatch by kind. We snapshot the
     // requested actions out of the per-CPU NodeState while holding
     // BKL, then act on them with the same lock still held — the
     // KERNEL state mutations all live under BKL.
-    let me = crate::arch::get_cpu_id();
     let nodes = crate::smp::nodes_mut();
     let mut want_reschedule = false;
     crate::smp::handle_ipis(nodes, me, |_from, kind| match kind {
@@ -140,10 +164,72 @@ extern "C" fn ipi_isr() {
         }
     });
 
-    // Phase 28e — Reschedule IPI runs choose_thread on the target.
-    // Updates per-CPU `current` so the next ap_scheduler_loop
-    // iteration sees the new pick.
-    if want_reschedule {
+    crate::smp::IPI_HANDLED_COUNT.fetch_add(1, Ordering::SeqCst);
+
+    // Blocking-stall handshake (seL4 `ipiStallCoreCallback`): a
+    // controlling core asked us to get off whatever we're running so it
+    // can migrate / delete it. Switch to idle, acknowledge, and park on
+    // the BKL until it finishes — by then the thread is gone from our
+    // queue, so the dispatcher picks up whatever legitimately belongs
+    // here (usually nothing → HLT).
+    if crate::smp::STALL_REQUESTED[me as usize].load(Ordering::Acquire) {
+        unsafe {
+            let s = crate::kernel::KERNEL.get();
+            // Save the interrupted user thread's full register context
+            // so it resumes correctly on its new core / state. Mirrors
+            // the full save in `swap_iretq_context_if_preempted`.
+            if from_user {
+                if let Some(prev) = interrupted {
+                    let p = s.scheduler.slab.get_mut(prev);
+                    p.user_context.rax = ctx.rax;
+                    p.user_context.rbx = ctx.rbx;
+                    p.user_context.rcx = ctx.rcx;
+                    p.user_context.rdx = ctx.rdx;
+                    p.user_context.rsi = ctx.rsi;
+                    p.user_context.rdi = ctx.rdi;
+                    p.user_context.rbp = ctx.rbp;
+                    p.user_context.r8 = ctx.r8;
+                    p.user_context.r9 = ctx.r9;
+                    p.user_context.r10 = ctx.r10;
+                    p.user_context.r11 = ctx.r11;
+                    p.user_context.r12 = ctx.r12;
+                    p.user_context.r13 = ctx.r13;
+                    p.user_context.r14 = ctx.r14;
+                    p.user_context.r15 = ctx.r15;
+                    p.user_context.rsp = ctx.rsp;
+                    p.user_context.rip = ctx.rip;
+                    p.user_context.rflags = ctx.rflags;
+                    p.use_iretq_resume = true;
+                }
+            }
+            s.scheduler.set_current(None);
+        }
+        eoi();
+        // Acknowledge: we are now off the thread.
+        crate::smp::STALL_ACK[me as usize].store(true, Ordering::Release);
+        // Drop the BKL so the controlling core can grab it and perform
+        // its mutation, then spin on the request flag WITHOUT touching
+        // the BKL. Bouncing the lock here would starve the controlling
+        // core (it needs the BKL to clear the flag) → livelock under the
+        // stall-stress test (MULTICORE0004). Re-acquire exactly once,
+        // after the flag clears.
+        crate::smp::bkl_release();
+        while crate::smp::STALL_REQUESTED[me as usize].load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        crate::smp::bkl_acquire();
+        // We hold the BKL; hand off to the dispatcher (never returns —
+        // it manages the BKL + the idle HLT loop itself).
+        core::mem::forget(_bkl);
+        unsafe {
+            super::exceptions::dispatch_next_or_idle("");
+        }
+    }
+
+    // Idle-core wakeup: the IPI hit this core while it was parked in the
+    // AP scheduler loop's `sti; hlt` (kernel CS ⇒ `from_user` false).
+    // Pick a thread now so the loop dispatches it on the next iteration.
+    if want_reschedule && !from_user {
         unsafe {
             let s = crate::kernel::KERNEL.get();
             let next = s.scheduler.choose_thread();
@@ -151,10 +237,17 @@ extern "C" fn ipi_isr() {
         }
     }
 
-    crate::smp::IPI_HANDLED_COUNT.fetch_add(1, Ordering::SeqCst);
-
     eoi();
-    crate::smp::bkl_release();
+
+    // Context-switch tail: if the IPI preempted a *running* user thread
+    // and `current` changed (a migrate / possibleSwitchTo cleared it),
+    // save the interrupted thread + load the next one into `ctx` so the
+    // stub's pops + `iretq` resume the new thread. A no-op when nothing
+    // changed (`next == interrupted`) or when we interrupted the idle
+    // loop (`from_user` false).
+    super::interrupts::swap_iretq_context_if_preempted(
+        ctx, from_user, interrupted,
+    );
 }
 
 /// Send a fixed-mode IPI to a specific physical APIC ID. Mirrors

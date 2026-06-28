@@ -45,7 +45,7 @@ pub fn default_config() -> HashMap<String, bool> {
     // depends on the non-MCS layout.
     [
         ("CONFIG_KERNEL_MCS", true),
-        ("ENABLE_SMP_SUPPORT", false),
+        ("ENABLE_SMP_SUPPORT", true),
         ("CONFIG_HARDWARE_DEBUG_API", false),
         ("CONFIG_SET_TLS_BASE_SELF", false),
         // Phase 44 — VT-d IOMMU. Enables the io_space_cap (tag 15)

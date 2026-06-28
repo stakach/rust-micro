@@ -318,10 +318,19 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         let next_fs_base = tcb.cpu_context.fs_base;
         let next_ctx = tcb.user_context;
         if next_cr3 != 0 {
+            // SMP: if this core went idle since its last dispatch, reload
+            // CR3 unconditionally to flush a possibly-stale TLB. While
+            // idle, `shootdown_tlb` skipped this core, so another core
+            // may have mutated the shared page tables underneath it
+            // (MULTICORE0002 — a migrated thread saw stale code/stack
+            // pages and ran wild). When NOT coming from idle, only reload
+            // on an actual vspace change — flushing every dispatch makes
+            // the yield-stress test crawl (MULTICORE0004).
+            let was_idle = crate::smp::take_went_idle();
             let cur_cr3: u64;
             core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                 options(nomem, nostack, preserves_flags));
-            if next_cr3 != cur_cr3 {
+            if was_idle || next_cr3 != cur_cr3 {
                 core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
                     options(nostack, preserves_flags));
             }
@@ -348,6 +357,8 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
     if !logged { crate::arch::log(idle_tag); logged = true; }
     // Idle: drop the lock so the timer ISR can run, halt until an
     // interrupt, then re-acquire and loop back to choose_thread.
+    // Mark went-idle so the next dispatch flushes a possibly-stale TLB.
+    crate::smp::mark_went_idle();
     crate::smp::bkl_release();
     core::arch::asm!("sti", "hlt");
     crate::smp::bkl_acquire();

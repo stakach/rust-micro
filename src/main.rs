@@ -390,13 +390,20 @@ fn ap_scheduler_loop() -> ! {
                         crate::sched_context::complete_yield_if_pending(tcb_id);
                         let tcb = s.scheduler.slab.get(tcb_id);
 
+                        // SMP: if this AP went idle since its last
+                        // dispatch, reload CR3 to flush a possibly-stale
+                        // TLB (shootdown_tlb skips idle cores, expecting
+                        // this flush — MULTICORE0002). Otherwise only
+                        // reload on a vspace change so the yield-stress
+                        // test doesn't crawl (MULTICORE0004).
+                        let was_idle = crate::smp::take_went_idle();
                         let cur_cr3: u64;
                         core::arch::asm!(
                             "mov {}, cr3",
                             out(reg) cur_cr3,
                             options(nomem, nostack, preserves_flags),
                         );
-                        if cur_cr3 != tcb.cpu_context.cr3 {
+                        if was_idle || cur_cr3 != tcb.cpu_context.cr3 {
                             core::arch::asm!(
                                 "mov cr3, {}",
                                 in(reg) tcb.cpu_context.cr3,
@@ -442,6 +449,9 @@ fn ap_scheduler_loop() -> ! {
             }
         }
 
+        // Mark went-idle so the next dispatch flushes a possibly-stale
+        // TLB (this AP misses shootdowns while idle).
+        smp::mark_went_idle();
         smp::bkl_release();
 
         // Wait for next IPI / IRQ.

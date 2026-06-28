@@ -199,7 +199,7 @@ pub fn decode_invocation(
         Cap::AsidControl => decode_asid_control(label, args, invoker),
         Cap::AsidPool { .. } => decode_asid_pool(target, label, args, invoker),
         Cap::SchedContext { .. } => decode_sched_context(target, label, args, invoker),
-        Cap::SchedControl { .. } => decode_sched_control(label, args, invoker),
+        Cap::SchedControl { core } => decode_sched_control(core, label, args, invoker),
         Cap::Reply { .. } => decode_reply(target, args, invoker),
         Cap::Domain => decode_domain(label, args, invoker),
         Cap::IOPort { first_port, last_port } => {
@@ -1934,6 +1934,7 @@ fn decode_sched_context(
 // ---------------------------------------------------------------------------
 
 fn decode_sched_control(
+    sched_control_core: u32,
     label: InvocationLabel,
     args: &SyscallArgs,
     invoker: TcbId,
@@ -2028,6 +2029,31 @@ fn decode_sched_control(
                 };
                 sc.head = 0;
                 sc.count = 1;
+                // SMP: the per-core SchedControl cap names the core this
+                // SC (and its bound thread) should run on. Migrate the
+                // bound thread there. seL4 binds the core to the SC; we
+                // drive the bound TCB's affinity directly. MULTICORE0002
+                // /0003/0005 need the helper to actually run on `core`.
+                // Gated behind the `smp` cargo feature. The default
+                // (DOMAINS / single-node) build reports numNodes=4 but
+                // must IGNORE per-core affinity, exactly as it did
+                // before SMP landed — otherwise the cross-core IPC tests
+                // (IPC0001/0003 "SMP Send+Recv", which loop over
+                // env->cores) migrate threads onto APs and hit the
+                // unfinished inter-AS-process-on-AP path and hang. The
+                // MULTICORE build (`build_kernel.sh smp`) enables it.
+                #[cfg(feature = "smp")]
+                if let Some(tcb) = keep_bound {
+                    // seL4 `remoteTCBStall` precedes `migrateTCB`: if the
+                    // bound thread is currently running on another core,
+                    // stall that core off it before moving it, so it can't
+                    // run on two cores at once (MULTICORE0002/0003).
+                    #[cfg(target_arch = "x86_64")]
+                    crate::smp::remote_tcb_stall(tcb);
+                    s.scheduler.migrate_tcb(tcb, sched_control_core);
+                }
+                #[cfg(not(feature = "smp"))]
+                let _ = (keep_bound, sched_control_core);
             }
             Ok(())
         }
@@ -3785,6 +3811,12 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     if s.scheduler.slab.entries[id.0 as usize].is_none() {
         return;
     }
+    // seL4 `remoteTCBStall`: if this thread is running on a remote core,
+    // make that core switch off it before we free the slab entry —
+    // otherwise the remote core keeps executing a freed TCB
+    // (MULTICORE0005 remote-delete).
+    #[cfg(target_arch = "x86_64")]
+    crate::smp::remote_tcb_stall(id);
     crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
     // YieldTo bookkeeping (SCHED0018 delete phases):
     //   * a yielder waiting on the dying thread's SC gets its
@@ -4394,6 +4426,11 @@ fn decode_tcb(
                 // vanishes into it (SCHED0009 suspends servers in
                 // reverse priority order and expects each Call to
                 // reach the next-highest remaining server).
+                // seL4 `remoteTCBStall`: if the thread is running on a
+                // remote core, stall that core off it before suspending
+                // so the counter freezes immediately (MULTICORE0001).
+                #[cfg(target_arch = "x86_64")]
+                crate::smp::remote_tcb_stall(id);
                 crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
                 // Upstream suspend() also completes an outstanding
                 // YieldTo against this thread's SC — the yielder

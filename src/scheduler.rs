@@ -434,6 +434,45 @@ impl Scheduler {
         }
     }
 
+    /// Move a thread to a different CPU (affinity), keeping ready-queue
+    /// placement consistent. Mirrors seL4 `migrateTCB` +
+    /// `invokeTCB_SetAffinity`. Under MCS the destination is named by
+    /// the per-core `SchedControl` cap used in `SchedControl_Configure`
+    /// — MULTICORE0002/0003/0005 need the bound helper to actually run
+    /// on `new_core`. If the thread was running on the old core (which
+    /// may be a remote CPU), surrender that core + kick it so it stops
+    /// running a thread that now belongs elsewhere; kick the new core
+    /// if it's idle so it picks the thread up.
+    pub fn migrate_tcb(&mut self, id: TcbId, new_core: u32) {
+        let new_core = new_core as usize;
+        let old = self.slab.get(id).affinity as usize;
+        if old == new_core {
+            return;
+        }
+        let dom = self.slab.get(id).domain as usize;
+        if self.slab.get(id).enqueued {
+            self.nodes[old].queues[dom].dequeue(&mut self.slab, id);
+        }
+        let was_current = self.nodes[old].current == Some(id);
+        if was_current {
+            self.nodes[old].current = None;
+        }
+        self.slab.get_mut(id).affinity = new_core as u32;
+        if self.slab.get(id).is_schedulable() {
+            self.nodes[new_core].queues[dom].enqueue(&mut self.slab, id);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let my = crate::arch::get_cpu_id() as usize;
+            if was_current && old != my {
+                crate::smp::kick_cpu(old as u32);
+            }
+            if new_core != my && self.nodes[new_core].current.is_none() {
+                crate::smp::kick_cpu(new_core as u32);
+            }
+        }
+    }
+
     // -- per-CPU accessors ---------------------------------------------------
 
     /// Read this CPU's `current` thread. Convenience for the common
