@@ -261,7 +261,8 @@ pub fn handle_syscall(
                         let s = crate::kernel::KERNEL.get();
                         if let Some(cur) = s.scheduler.current() {
                             let cpu = crate::arch::get_cpu_id() as usize;
-                            let q = &mut s.scheduler.nodes[cpu].queues;
+                            let dom = s.scheduler.slab.get(cur).domain as usize;
+                            let q = &mut s.scheduler.nodes[cpu].queues[dom];
                             let slab = &mut s.scheduler.slab;
                             q.dequeue(slab, cur);
                             q.enqueue(slab, cur);

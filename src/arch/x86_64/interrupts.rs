@@ -324,7 +324,41 @@ pub(crate) fn swap_iretq_context_if_preempted(
         };
         let next = match next {
             Some(t) => t,
-            None => return,
+            None => {
+                // No runnable thread in the current domain. We must
+                // NOT resume the interrupted user thread: it belongs
+                // to a domain that isn't currently scheduled, and
+                // resuming it would also leave `current` desynced from
+                // the actually-running thread (the next preemption
+                // would then load a stale context and fault — the
+                // DOMAINS teardown #PF). Save its live registers so it
+                // resumes correctly when its domain comes round again,
+                // then idle until the next tick advances the schedule.
+                if let Some(prev) = interrupted {
+                    let prev_tcb = s.scheduler.slab.get_mut(prev);
+                    prev_tcb.user_context.rax = ctx.rax;
+                    prev_tcb.user_context.rbx = ctx.rbx;
+                    prev_tcb.user_context.rcx = ctx.rcx;
+                    prev_tcb.user_context.rdx = ctx.rdx;
+                    prev_tcb.user_context.rsi = ctx.rsi;
+                    prev_tcb.user_context.rdi = ctx.rdi;
+                    prev_tcb.user_context.rbp = ctx.rbp;
+                    prev_tcb.user_context.r8 = ctx.r8;
+                    prev_tcb.user_context.r9 = ctx.r9;
+                    prev_tcb.user_context.r10 = ctx.r10;
+                    prev_tcb.user_context.r11 = ctx.r11;
+                    prev_tcb.user_context.r12 = ctx.r12;
+                    prev_tcb.user_context.r13 = ctx.r13;
+                    prev_tcb.user_context.r14 = ctx.r14;
+                    prev_tcb.user_context.r15 = ctx.r15;
+                    prev_tcb.user_context.rsp = ctx.rsp;
+                    prev_tcb.user_context.rip = ctx.rip;
+                    prev_tcb.user_context.rflags = ctx.rflags;
+                    prev_tcb.use_iretq_resume = true;
+                }
+                s.scheduler.set_current(None);
+                crate::arch::x86_64::exceptions::dispatch_next_or_idle("");
+            }
         };
         if Some(next) == interrupted {
             s.scheduler.set_current(Some(next));

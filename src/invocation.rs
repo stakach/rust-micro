@@ -1964,46 +1964,104 @@ fn decode_io_port(
     Ok(())
 }
 
-/// `seL4_DomainSet_Set(target=DomainSet, domain, thread)` — assigns
-/// a TCB to a scheduling domain. We model a single domain (CONFIG_NUM
-/// _DOMAINS=1 in the matched libsel4), so any non-zero domain is
-/// rejected with InvalidArgument; domain=0 just stamps the field on
-/// the target TCB. DOMAINS0001/0002/0003 in sel4test verify exactly
-/// this contract.
+/// Domain-cap invocations. Mirrors seL4 `decodeDomainInvocation`
+/// (src/object/domain.c):
+///   * `DomainSet_Set(domain, thread)` — assign a TCB to a domain.
+///   * `DomainSet_ScheduleConfigure(index, domain, duration)` — write
+///     one entry of the domain schedule table.
+///   * `DomainSet_ScheduleSetStart(index)` — set the schedule start
+///     index and force an immediate switch.
+/// CONFIG_NUM_DOMAINS=4 / CONFIG_NUM_DOMAIN_SCHEDULES=100 in the matched
+/// libsel4 (DOMAINS=ON). DOMAINS0000-0005,9999 exercise these.
 fn decode_domain(
     label: InvocationLabel,
     args: &SyscallArgs,
     invoker: TcbId,
 ) -> KResult<()> {
-    if !matches!(label, InvocationLabel::DomainSetSet) {
-        return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_IllegalOperation)));
-    }
-    let domain = (args.a2 & 0xff) as u8;
-    // Sel4test's matched config compiles libsel4 with NUM_DOMAINS=1,
-    // so the only valid domain is 0.
-    const NUM_DOMAINS: u8 = 1;
-    if domain >= NUM_DOMAINS {
-        return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_InvalidArgument)));
-    }
-    unsafe {
-        let s = KERNEL.get();
-        let inv_tcb = s.scheduler.slab.get_mut(invoker);
-        if inv_tcb.pending_extra_caps_count == 0 {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_TruncatedMessage)));
+    use crate::scheduler::{NUM_DOMAINS, NUM_DOM_SCHEDULES, DSCHED_MAX_DURATION};
+    let err = |e| Err(KException::SyscallError(SyscallError::new(e)));
+    match label {
+        InvocationLabel::DomainSetSet => {
+            let domain = args.a2;
+            // getSyscallArg(0) = domain; domain >= numDomains is an
+            // InvalidArgument (note: ScheduleConfigure uses RangeError).
+            if domain >= NUM_DOMAINS as u64 {
+                return err(seL4_Error::seL4_InvalidArgument);
+            }
+            unsafe {
+                let s = KERNEL.get();
+                let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                if inv_tcb.pending_extra_caps_count == 0 {
+                    return err(seL4_Error::seL4_TruncatedMessage);
+                }
+                let tcb_cap = inv_tcb.pending_extra_caps[0];
+                inv_tcb.pending_extra_caps_count = 0;
+                let tcb_id = match tcb_cap {
+                    Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
+                    _ => return err(seL4_Error::seL4_InvalidArgument),
+                };
+                // setDomain: re-queues the thread under the new domain.
+                s.scheduler.set_domain(tcb_id, domain as u8);
+            }
+            Ok(())
         }
-        let tcb_cap = inv_tcb.pending_extra_caps[0];
-        inv_tcb.pending_extra_caps_count = 0;
-        let tcb_id = match tcb_cap {
-            Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
-            _ => return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability))),
-        };
-        s.scheduler.slab.get_mut(tcb_id).domain = domain;
+        InvocationLabel::DomainScheduleConfigure => {
+            // args: index, domain, duration.
+            let index = args.a2;
+            let domain = args.a3;
+            let duration = args.a4;
+            // Last entry stays an end marker, hence the -1.
+            if index >= (NUM_DOM_SCHEDULES as u64) - 1 {
+                return err(seL4_Error::seL4_RangeError);
+            }
+            if domain >= NUM_DOMAINS as u64 {
+                return err(seL4_Error::seL4_RangeError);
+            }
+            if duration > DSCHED_MAX_DURATION {
+                return err(seL4_Error::seL4_InvalidArgument);
+            }
+            // Both domain and duration must be zero for end markers.
+            if duration == 0 && domain != 0 {
+                return err(seL4_Error::seL4_InvalidArgument);
+            }
+            unsafe {
+                let s = KERNEL.get();
+                // The starting schedule's duration must not be zero.
+                if index as usize == s.scheduler.dom_sched_start && duration == 0 {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
+                s.scheduler.dom_sched[index as usize] =
+                    crate::scheduler::DomScheduleEntry {
+                        domain: domain as u8,
+                        duration,
+                    };
+            }
+            Ok(())
+        }
+        InvocationLabel::DomainScheduleSetStart => {
+            let index = args.a2;
+            if index >= NUM_DOM_SCHEDULES as u64 {
+                return err(seL4_Error::seL4_RangeError);
+            }
+            unsafe {
+                let s = KERNEL.get();
+                // The starting schedule must not be an end marker.
+                if s.scheduler.dom_sched[index as usize].duration == 0 {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
+                // Force an immediate switch to the new starting index:
+                // end the current slice and park the cursor just before
+                // the (reserved) end marker so the next choose_thread
+                // wraps to `start`. Mirrors invokeDomainScheduleSetStart.
+                s.scheduler.dom_sched_start = index as usize;
+                s.scheduler.domain_time = 0;
+                s.scheduler.dom_sched_idx = NUM_DOM_SCHEDULES - 2;
+                s.scheduler.set_current(None);
+            }
+            Ok(())
+        }
+        _ => err(seL4_Error::seL4_IllegalOperation),
     }
-    Ok(())
 }
 
 fn decode_io_port_control(
@@ -4095,21 +4153,22 @@ fn decode_tcb(
                 // without re-queue, the driver stays in the 255
                 // bucket and the helper is starved.
                 let cpu = s.scheduler.slab.get(id).affinity as usize;
+                let dom = s.scheduler.slab.get(id).domain as usize;
                 let was_runnable = s.scheduler.slab.get(id).is_runnable();
                 if was_runnable {
-                    s.scheduler.nodes[cpu].queues
+                    s.scheduler.nodes[cpu].queues[dom]
                         .dequeue(&mut s.scheduler.slab, id);
                 }
                 s.scheduler.slab.get_mut(id).priority = prio;
                 if was_runnable {
-                    s.scheduler.nodes[cpu].queues
+                    s.scheduler.nodes[cpu].queues[dom]
                         .enqueue(&mut s.scheduler.slab, id);
                     // If we just demoted the current thread on this
                     // CPU and a higher-priority thread is waiting,
                     // force a reschedule.
                     if s.scheduler.nodes[cpu].current == Some(id) {
                         if let Some(top) = s.scheduler.nodes[cpu]
-                            .queues.peek_highest()
+                            .queues[dom].peek_highest()
                         {
                             if top > prio {
                                 s.scheduler.nodes[cpu].current = None;

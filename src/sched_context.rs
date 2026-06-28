@@ -208,6 +208,14 @@ pub fn mcs_tick(delta_ticks: Ticks) {
         let s = crate::kernel::KERNEL.get();
         let now = current_time();
 
+        // Charge the current domain slice. When it expires, surrender
+        // the CPU so the dispatcher (choose_thread) advances to the
+        // next domain and runs a thread that belongs to it. Mirrors
+        // seL4's per-tick `ksDomainTime--` + rescheduleRequired.
+        if s.scheduler.domain_tick(delta_ticks) {
+            s.scheduler.set_current(None);
+        }
+
         // Phase 32f — first, wake any TCB whose SC's head refill
         // has matured. The scan is O(MAX_SCHED_CONTEXTS) per
         // tick; we keep the pool small (16 today).
@@ -290,9 +298,10 @@ pub fn mcs_tick(delta_ticks: Ticks) {
             // duty cycle upstream doesn't have.
             if round_robin {
                 let cpu = s.scheduler.slab.get(cur).affinity as usize;
-                s.scheduler.nodes[cpu].queues
+                let dom = s.scheduler.slab.get(cur).domain as usize;
+                s.scheduler.nodes[cpu].queues[dom]
                     .dequeue(&mut s.scheduler.slab, cur);
-                s.scheduler.nodes[cpu].queues
+                s.scheduler.nodes[cpu].queues[dom]
                     .enqueue(&mut s.scheduler.slab, cur);
                 // rescheduleRequired — let the dispatcher pick the
                 // (possibly different) head of the queue.
@@ -406,8 +415,9 @@ pub fn yield_current() -> bool {
         };
         if round_robin {
             let cpu = s.scheduler.slab.get(cur).affinity as usize;
-            s.scheduler.nodes[cpu].queues.dequeue(&mut s.scheduler.slab, cur);
-            s.scheduler.nodes[cpu].queues.enqueue(&mut s.scheduler.slab, cur);
+            let dom = s.scheduler.slab.get(cur).domain as usize;
+            s.scheduler.nodes[cpu].queues[dom].dequeue(&mut s.scheduler.slab, cur);
+            s.scheduler.nodes[cpu].queues[dom].enqueue(&mut s.scheduler.slab, cur);
             if s.scheduler.nodes[cpu].current == Some(cur) {
                 s.scheduler.nodes[cpu].current = None;
             }
@@ -488,7 +498,8 @@ pub fn sc_donate(s: &mut crate::kernel::KernelState, sc_idx: usize, to: TcbId) {
             return;
         }
         let cpu = s.scheduler.slab.get(from).affinity as usize;
-        s.scheduler.nodes[cpu].queues.dequeue(&mut s.scheduler.slab, from);
+        let dom = s.scheduler.slab.get(from).domain as usize;
+        s.scheduler.nodes[cpu].queues[dom].dequeue(&mut s.scheduler.slab, from);
         s.scheduler.slab.get_mut(from).sc = None;
         for node in s.scheduler.nodes.iter_mut() {
             if node.current == Some(from) {
@@ -796,8 +807,9 @@ pub mod spec {
                 crate::sched_context::current_time()));
 
             s.scheduler.set_current(None);
+            let dom = s.scheduler.slab.get(id).domain as usize;
             s.scheduler.nodes[crate::arch::get_cpu_id() as usize]
-                .queues.dequeue(&mut s.scheduler.slab, id);
+                .queues[dom].dequeue(&mut s.scheduler.slab, id);
             s.scheduler.slab.free(id);
             s.sched_contexts[sc_idx].bound_tcb = None;
         }

@@ -308,6 +308,14 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
 /// user entry / idle.
 pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
     let s = crate::kernel::KERNEL.get();
+    // Re-dispatch after every idle wake. Under the domain scheduler
+    // the CPU idles whenever the current domain has no runnable
+    // thread; the next timer tick advances `ksDomScheduleIdx` and a
+    // thread in the new domain becomes eligible, so we must re-run
+    // choose_thread rather than hlt forever (which would strand every
+    // thread once the schedule rotated away from a non-empty domain).
+    let mut logged = false;
+    loop {
     if let Some(next_id) = s.scheduler.choose_thread() {
         s.scheduler.set_current(Some(next_id));
         crate::sched_context::complete_yield_if_pending(next_id);
@@ -341,9 +349,13 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
             pcc as *const _);
     }
-    crate::arch::log(idle_tag);
+    if !logged { crate::arch::log(idle_tag); logged = true; }
+    // Idle: drop the lock so the timer ISR can run, halt until an
+    // interrupt, then re-acquire and loop back to choose_thread.
     crate::smp::bkl_release();
-    loop { core::arch::asm!("sti", "hlt"); }
+    core::arch::asm!("sti", "hlt");
+    crate::smp::bkl_acquire();
+    }
 }
 
 /// Custom #UD (Invalid Opcode, vector 6) entry. No error code.

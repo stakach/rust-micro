@@ -279,11 +279,49 @@ impl ReadyQueues {
 // (affinity decides which queue they land in via `admit`).
 // ---------------------------------------------------------------------------
 
+/// Number of scheduling domains. Matches `CONFIG_NUM_DOMAINS` in the
+/// sel4test build (4 when built with `DOMAINS=ON`, otherwise threads
+/// just stay in domain 0 and nothing below ever switches). seL4
+/// time-partitions the CPU between domains: only threads in the
+/// current domain are eligible to run.
+pub const NUM_DOMAINS: usize = 4;
+/// Length of the domain-schedule table. Matches
+/// `CONFIG_NUM_DOMAIN_SCHEDULES`. The last entry is reserved as an
+/// end marker and cannot be reconfigured.
+pub const NUM_DOM_SCHEDULES: usize = 100;
+/// Largest domain-slice duration — 56 bits (seL4 `DSCHED_MAX_DURATION`).
+pub const DSCHED_MAX_DURATION: u64 = 0x00ff_ffff_ffff_ffff;
+/// Domain-schedule durations are in CONFIG_TIMER_FREQUENCY ticks
+/// (PC99 = 1 GHz → nanoseconds). One scheduler tick is a millisecond,
+/// so a millisecond is this many duration units.
+pub const NS_PER_MS: u64 = 1_000_000;
+
+/// One entry of the domain schedule: run `domain` for `duration`
+/// ticks. `duration == 0` marks the end of the active schedule
+/// (`dschedule_is_end_marker`).
 #[derive(Copy, Clone, Debug, Default)]
+pub struct DomScheduleEntry {
+    pub domain: u8,
+    pub duration: u64,
+}
+
+#[derive(Copy, Clone, Debug)]
 pub struct SchedulerNode {
-    pub queues: ReadyQueues,
+    /// One ready-queue set per domain — a thread is only eligible to
+    /// run while its domain is current (`Scheduler::cur_domain`).
+    pub queues: [ReadyQueues; NUM_DOMAINS],
     pub current: Option<TcbId>,
     pub idle: Option<TcbId>,
+}
+
+impl Default for SchedulerNode {
+    fn default() -> Self {
+        Self {
+            queues: [ReadyQueues::new(); NUM_DOMAINS],
+            current: None,
+            idle: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +333,18 @@ pub struct SchedulerNode {
 pub struct Scheduler {
     pub slab: TcbSlab,
     pub nodes: [SchedulerNode; crate::smp::MAX_CPUS],
+    /// Domain currently scheduled (`ksCurDomain`).
+    pub cur_domain: u8,
+    /// Ticks remaining in the current domain slice (`ksDomainTime`).
+    pub domain_time: u64,
+    /// The domain schedule (`ksDomSchedule`). Configured at runtime
+    /// via DomainSet_ScheduleConfigure; boot default is a single
+    /// domain-0 slice that never expires.
+    pub dom_sched: [DomScheduleEntry; NUM_DOM_SCHEDULES],
+    /// Cursor into `dom_sched` (`ksDomScheduleIdx`).
+    pub dom_sched_idx: usize,
+    /// Index the schedule restarts from on wrap (`ksDomScheduleStart`).
+    pub dom_sched_start: usize,
 }
 
 impl Default for Scheduler {
@@ -304,13 +354,83 @@ impl Default for Scheduler {
 impl Scheduler {
     pub const fn new() -> Self {
         const NODE: SchedulerNode = SchedulerNode {
-            queues: ReadyQueues::new(),
+            queues: [ReadyQueues::new(); NUM_DOMAINS],
             current: None,
             idle: None,
         };
+        // Boot default domain schedule: entry 0 runs domain 0 for the
+        // maximum duration, entry 1 is the end marker. With a single
+        // never-expiring slice the kernel behaves as single-domain
+        // until userspace reconfigures the schedule (DOMAINS0000).
+        let mut dom_sched = [DomScheduleEntry { domain: 0, duration: 0 };
+            NUM_DOM_SCHEDULES];
+        dom_sched[0] = DomScheduleEntry { domain: 0, duration: DSCHED_MAX_DURATION };
         Self {
             slab: TcbSlab::new(),
             nodes: [NODE; crate::smp::MAX_CPUS],
+            cur_domain: 0,
+            domain_time: DSCHED_MAX_DURATION,
+            dom_sched,
+            dom_sched_idx: 0,
+            dom_sched_start: 0,
+        }
+    }
+
+    // -- domain scheduling ---------------------------------------------------
+
+    /// Advance to the next domain-schedule entry, wrapping back to the
+    /// start index on an end marker. Loads the new current domain and
+    /// its slice duration. Mirrors seL4 `nextDomain`.
+    pub fn next_domain(&mut self) {
+        if NUM_DOMAINS <= 1 { return; }
+        let mut idx = self.dom_sched_idx + 1;
+        if idx >= NUM_DOM_SCHEDULES || self.dom_sched[idx].duration == 0 {
+            idx = self.dom_sched_start;
+        }
+        self.dom_sched_idx = idx;
+        self.cur_domain = self.dom_sched[idx].domain;
+        self.domain_time = self.dom_sched[idx].duration;
+    }
+
+    /// Charge `delta` ticks against the current domain slice. Returns
+    /// true when the slice is exhausted, so the caller forces a
+    /// reschedule into the next domain (seL4 `ksDomainTime--` +
+    /// rescheduleRequired in the timer tick).
+    pub fn domain_tick(&mut self, delta_ms: u64) -> bool {
+        if NUM_DOMAINS <= 1 { return false; }
+        // Domain-schedule durations are expressed in
+        // CONFIG_TIMER_FREQUENCY ticks (1 GHz on PC99, i.e.
+        // nanoseconds), but our scheduler tick `delta_ms` is in
+        // milliseconds. Convert before charging so a 10 ms slice
+        // (10_000_000 ns) lasts ~10 ms instead of effectively never
+        // expiring.
+        let consumed = delta_ms.saturating_mul(NS_PER_MS);
+        self.domain_time = self.domain_time.saturating_sub(consumed);
+        self.domain_time == 0
+    }
+
+    /// Move a thread to a different domain, keeping its ready-queue
+    /// placement consistent (dequeue from the old domain queue, set
+    /// the field, re-enqueue under the new one if runnable). Mirrors
+    /// seL4 `setDomain`.
+    pub fn set_domain(&mut self, id: TcbId, domain: u8) {
+        let cpu = self.slab.get(id).affinity as usize;
+        let old = self.slab.get(id).domain as usize;
+        let was_enqueued = self.slab.get(id).enqueued;
+        if was_enqueued {
+            self.nodes[cpu].queues[old].dequeue(&mut self.slab, id);
+        }
+        self.slab.get_mut(id).domain = domain;
+        if was_enqueued && self.slab.get(id).is_schedulable() {
+            self.nodes[cpu].queues[domain as usize]
+                .enqueue(&mut self.slab, id);
+        }
+        // If we just moved the running thread out of the current
+        // domain, surrender the CPU so a same-domain thread is picked.
+        if self.nodes[cpu].current == Some(id)
+            && domain != self.cur_domain
+        {
+            self.nodes[cpu].current = None;
         }
     }
 
@@ -342,16 +462,18 @@ impl Scheduler {
         self.nodes[cpu as usize].current = val;
     }
 
-    /// Borrow this CPU's ready queues (read-only).
+    /// Borrow this CPU's current-domain ready queues (read-only).
     #[inline]
     pub fn queues(&self) -> &ReadyQueues {
-        &self.nodes[crate::arch::get_cpu_id() as usize].queues
+        let cpu = crate::arch::get_cpu_id() as usize;
+        &self.nodes[cpu].queues[self.cur_domain as usize]
     }
 
-    /// Borrow this CPU's ready queues mutably.
+    /// Borrow this CPU's current-domain ready queues mutably.
     #[inline]
     pub fn queues_mut(&mut self) -> &mut ReadyQueues {
-        &mut self.nodes[crate::arch::get_cpu_id() as usize].queues
+        let cpu = crate::arch::get_cpu_id() as usize;
+        &mut self.nodes[cpu].queues[self.cur_domain as usize]
     }
 
     /// Reset every CPU's queues — used by spec teardowns to scrub
@@ -359,7 +481,7 @@ impl Scheduler {
     /// that dequeues on free.
     pub fn reset_queues(&mut self) {
         for node in self.nodes.iter_mut() {
-            node.queues = ReadyQueues::new();
+            node.queues = [ReadyQueues::new(); NUM_DOMAINS];
         }
         // Clear the per-TCB `enqueued` flags too, otherwise a thread
         // that was enqueued before the wipe would later refuse re-
@@ -400,9 +522,10 @@ impl Scheduler {
         // it.)
         let runnable = tcb.is_runnable();
         let cpu = tcb.affinity as usize;
+        let dom = tcb.domain as usize;
         let id = self.slab.alloc(tcb).expect("TcbSlab full");
         if runnable {
-            self.nodes[cpu].queues.enqueue(&mut self.slab, id);
+            self.nodes[cpu].queues[dom].enqueue(&mut self.slab, id);
         }
         id
     }
@@ -411,6 +534,7 @@ impl Scheduler {
     /// CPU's queue.
     pub fn make_runnable(&mut self, id: TcbId) {
         let cpu = self.slab.get(id).affinity as usize;
+        let dom = self.slab.get(id).domain as usize;
         let prio = self.slab.get(id).priority;
         self.slab.get_mut(id).state = ThreadStateType::Running;
         // Passive threads (no SC) become runnable so they can pair in
@@ -423,7 +547,7 @@ impl Scheduler {
             // Upstream SCHED_ENQUEUE: woken threads insert at the
             // HEAD of their priority class, ahead of round-robin
             // peers (see enqueue_front).
-            self.nodes[cpu].queues.enqueue_front(&mut self.slab, id);
+            self.nodes[cpu].queues[dom].enqueue_front(&mut self.slab, id);
             // Phase 42 — if the woken thread's affinity is a peer
             // CPU and that CPU is currently idle (current = None),
             // send a Reschedule IPI so it picks up the work
@@ -476,8 +600,9 @@ impl Scheduler {
             return;
         }
         let cpu = self.slab.get(id).affinity as usize;
+        let dom = self.slab.get(id).domain as usize;
         let prio = self.slab.get(id).priority;
-        self.nodes[cpu].queues.enqueue_front(&mut self.slab, id);
+        self.nodes[cpu].queues[dom].enqueue_front(&mut self.slab, id);
         if let Some(cur) = self.nodes[cpu].current {
             if cur != id && prio > self.slab.get(cur).priority {
                 self.nodes[cpu].current = None;
@@ -497,7 +622,8 @@ impl Scheduler {
     /// ready queue (dequeue self-guards) and surrenders the CPU.
     pub fn on_sc_lost(&mut self, id: TcbId) {
         let cpu = self.slab.get(id).affinity as usize;
-        self.nodes[cpu].queues.dequeue(&mut self.slab, id);
+        let dom = self.slab.get(id).domain as usize;
+        self.nodes[cpu].queues[dom].dequeue(&mut self.slab, id);
         for node in self.nodes.iter_mut() {
             if node.current == Some(id) {
                 node.current = None;
@@ -514,7 +640,8 @@ impl Scheduler {
         // whether or not the thread was actually in a ready queue
         // (a passive thread never is).
         let cpu = self.slab.get(id).affinity as usize;
-        self.nodes[cpu].queues.dequeue(&mut self.slab, id);
+        let dom = self.slab.get(id).domain as usize;
+        self.nodes[cpu].queues[dom].dequeue(&mut self.slab, id);
         self.slab.get_mut(id).state = new_state;
         // If the blocked thread was current on any CPU, clear it
         // there. Today only the affinity CPU could have it as
@@ -537,24 +664,29 @@ impl Scheduler {
     /// don't migrate mid-test.
     pub fn choose_thread(&mut self) -> Option<TcbId> {
         let cpu = crate::arch::get_cpu_id() as usize;
-        if let Some(id) = self.nodes[cpu].queues.pop_highest(&mut self.slab) {
-            // Re-enqueue at the tail so equal-priority threads
-            // round-robin.
-            self.nodes[cpu].queues.enqueue(&mut self.slab, id);
+        // seL4 scheduleChooseNewThread: if the current domain slice is
+        // spent, advance to the next domain before picking.
+        if NUM_DOMAINS > 1 && self.domain_time == 0 {
+            self.next_domain();
+        }
+        let dom = self.cur_domain as usize;
+        if let Some(id) = self.nodes[cpu].queues[dom].pop_highest(&mut self.slab) {
+            self.nodes[cpu].queues[dom].enqueue(&mut self.slab, id);
             return Some(id);
         }
 
         // Local queue empty — look for an affinity-mismatched
         // thread on a peer queue (i.e. a thread pinned to *us* that
         // somehow ended up over there). We do NOT migrate threads
-        // whose affinity already matches their queue's CPU.
+        // whose affinity already matches their queue's CPU. Only the
+        // current domain is eligible.
         for i in 0..self.nodes.len() {
             if i == cpu { continue; }
-            if let Some(id) = self.nodes[i].queues.peek_top_with_affinity(
+            if let Some(id) = self.nodes[i].queues[dom].peek_top_with_affinity(
                 &self.slab, cpu as u32)
             {
-                self.nodes[i].queues.dequeue(&mut self.slab, id);
-                self.nodes[cpu].queues.enqueue(&mut self.slab, id);
+                self.nodes[i].queues[dom].dequeue(&mut self.slab, id);
+                self.nodes[cpu].queues[dom].enqueue(&mut self.slab, id);
                 return Some(id);
             }
         }
@@ -566,7 +698,7 @@ impl Scheduler {
     pub fn should_preempt(&self) -> Option<u8> {
         let cpu = crate::arch::get_cpu_id() as usize;
         let node = &self.nodes[cpu];
-        match (node.current, node.queues.peek_highest()) {
+        match (node.current, node.queues[self.cur_domain as usize].peek_highest()) {
             (Some(cur), Some(top)) => {
                 let cur_prio = self.slab.get(cur).priority;
                 if top > cur_prio { Some(top) } else { None }
@@ -632,9 +764,9 @@ pub mod spec {
         let _ = s.admit(b);
         let _ = s.admit(c);
         // CPU 0's queue holds 1 thread at prio 60.
-        assert_eq!(s.nodes[0].queues.len_at(&s.slab, 60), 1);
+        assert_eq!(s.nodes[0].queues[0].len_at(&s.slab, 60), 1);
         // CPU 1's queue holds 2 threads at prio 60.
-        assert_eq!(s.nodes[1].queues.len_at(&s.slab, 60), 2);
+        assert_eq!(s.nodes[1].queues[0].len_at(&s.slab, 60), 2);
         // Setting current per-CPU is independent.
         s.set_current_for_cpu(0, Some(crate::tcb::TcbId(0)));
         s.set_current_for_cpu(1, Some(crate::tcb::TcbId(1)));
