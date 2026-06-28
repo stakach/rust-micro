@@ -452,6 +452,12 @@ fn ap_scheduler_loop() -> ! {
             }
         }
 
+        // Park on the kernel root page table before idling: a user
+        // vspace left in CR3 can be freed by another core's process
+        // teardown, after which our next interrupt reads an unmapped
+        // IDT and triple-faults (MULTICORE0003 cross-AS teardown).
+        #[cfg(all(target_arch = "x86_64", feature = "smp"))]
+        crate::arch::x86_64::paging::park_on_kernel_root();
         // Mark went-idle so the next dispatch flushes a possibly-stale
         // TLB (this AP misses shootdowns while idle).
         smp::mark_went_idle();

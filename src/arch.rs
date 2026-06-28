@@ -38,6 +38,28 @@ pub use aarch64::{
     get_cpu_id, halt_cpu, init_interrupts, init_exceptions,
 };
 
+/// Debug helper: log a tag followed by a decimal number + space.
+#[allow(dead_code)]
+pub fn log_n(tag: &str, n: u32) {
+    log(tag);
+    let mut b = [0u8; 10];
+    let mut i = b.len();
+    let mut v = n;
+    if v == 0 {
+        log("0");
+    } else {
+        while v > 0 && i > 0 {
+            i -= 1;
+            b[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        if let Ok(z) = core::str::from_utf8(&b[i..]) {
+            log(z);
+        }
+    }
+    log(" ");
+}
+
 /// aarch64 doesn't have IA32 MSRs. Stub so portable bootstrap can
 /// call this unconditionally.
 #[cfg(all(target_arch = "aarch64"))]

@@ -214,6 +214,44 @@ pub fn read_cr3() -> u64 {
     v
 }
 
+/// The kernel's own page-table root (the BOOTBOOT PML4 we patch in
+/// `install_kernel_page_tables`). It maps the full kernel half —
+/// linear map, LAPIC, IDT/GDT/TSS, kernel code/data, and every CPU's
+/// BOOTBOOT stack — and is NEVER freed. Idle cores switch to it (see
+/// `kernel_root_cr3`) so they don't keep a soon-to-be-freed USER vspace
+/// loaded: a user PML4 root reclaimed by process teardown on another
+/// core would otherwise leave the idling core reading an unmapped IDT
+/// on its next interrupt → triple fault (MULTICORE0003 cross-AS teardown).
+pub static KERNEL_ROOT_CR3: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Physical CR3 value of the kernel root, or 0 if not yet captured.
+#[inline]
+pub fn kernel_root_cr3() -> u64 {
+    KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Switch this CPU to the kernel root page table if it isn't already on
+/// it. Called from the idle paths right before halting so an idling core
+/// never holds a user vspace that another core may free. Safe because the
+/// kernel root maps everything kernel-mode touches; the next dispatch
+/// reloads the chosen thread's CR3.
+#[inline]
+#[allow(dead_code)]
+pub fn park_on_kernel_root() {
+    let root = kernel_root_cr3();
+    if root == 0 {
+        return;
+    }
+    unsafe {
+        let cur: u64;
+        asm!("mov {}, cr3", out(reg) cur, options(nomem, nostack, preserves_flags));
+        if cur & 0x000F_FFFF_FFFF_F000 != root {
+            asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+        }
+    }
+}
+
 /// Read PML4[`idx`] from the live page table.
 pub fn read_pml4_entry(idx: usize) -> u64 {
     let pml4 = (read_cr3() & 0xFFFF_F000) as *const u64;
@@ -304,7 +342,15 @@ pub fn install_kernel_page_tables() {
         // BOOTBOOT's tables already cover the kernel; we just add
         // entries for the linear map, the LAPIC, and (in later
         // phases) user-mode pages.
-        let pml4 = (read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        let root_cr3 = read_cr3();
+        // Remember the kernel root so idle cores can park on it instead
+        // of a user vspace that may be freed under them.
+        if KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+            KERNEL_ROOT_CR3.store(
+                root_cr3 & 0x000F_FFFF_FFFF_F000,
+                core::sync::atomic::Ordering::Relaxed);
+        }
+        let pml4 = (root_cr3 & 0x000F_FFFF_FFFF_F000) as *mut u64;
 
         // Linear map first, so subsequent paddr-as-vaddr accesses
         // (in this function and elsewhere) can use `phys_to_lin`.

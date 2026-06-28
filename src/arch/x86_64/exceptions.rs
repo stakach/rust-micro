@@ -366,6 +366,13 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
     // Idle: drop the lock so the timer ISR can run, halt until an
     // interrupt, then re-acquire and loop back to choose_thread.
     // Mark went-idle so the next dispatch flushes a possibly-stale TLB.
+    // Park on the kernel root page table first — a user vspace left in
+    // CR3 here can be freed by another core's teardown, after which our
+    // next interrupt would read an unmapped IDT and triple-fault. Only a
+    // concern under real SMP; the default single-node build can't have a
+    // peer free the vspace under an idling core.
+    #[cfg(feature = "smp")]
+    crate::arch::x86_64::paging::park_on_kernel_root();
     crate::smp::mark_went_idle();
     crate::smp::bkl_release();
     core::arch::asm!("sti", "hlt");

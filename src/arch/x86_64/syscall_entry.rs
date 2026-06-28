@@ -870,6 +870,20 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             let _ = result;
             crate::smp::bkl_release();
             loop {
+                // SMP: this core is about to go idle (no runnable
+                // thread). `shootdown_tlb` SKIPS idle cores, so any
+                // page-table mutation that happens while we're HLT'd
+                // won't IPI us — we must reload CR3 (full TLB flush) on
+                // our next dispatch instead. Mark went-idle so the
+                // redispatch below honors that, exactly like the AP
+                // scheduler loop (src/main.rs) and dispatch_next_or_idle.
+                // Park on the kernel root first: the blocked caller's
+                // user vspace can be freed by another core's teardown,
+                // and our next interrupt would then read an unmapped IDT
+                // and triple-fault (MULTICORE0003). SMP-only concern.
+                #[cfg(feature = "smp")]
+                crate::arch::x86_64::paging::park_on_kernel_root();
+                crate::smp::mark_went_idle();
                 core::arch::asm!("sti", "hlt",
                     options(nostack, preserves_flags));
                 // After waking, re-evaluate. If something is now
@@ -887,11 +901,19 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     let next_cr3 = tcb.cpu_context.cr3;
                     let next_fs_base = tcb.cpu_context.fs_base;
                     let next_ctx = tcb.user_context;
+                    // Reload CR3 if we went idle since the last dispatch
+                    // (missed shootdowns — MULTICORE0003) OR the vspace
+                    // changed. Gated on the `smp` feature so single-node
+                    // builds keep the cheap vspace-change-only check.
+                    #[cfg(feature = "smp")]
+                    let was_idle = crate::smp::take_went_idle();
+                    #[cfg(not(feature = "smp"))]
+                    let was_idle = false;
                     if next_cr3 != 0 {
                         let cur_cr3: u64;
                         core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                             options(nomem, nostack, preserves_flags));
-                        if next_cr3 != cur_cr3 {
+                        if was_idle || next_cr3 != cur_cr3 {
                             core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
                                 options(nostack, preserves_flags));
                         }
