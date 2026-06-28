@@ -315,6 +315,9 @@ pub struct Tcb {
     /// Endpoint, a `Timeout` fault is delivered here instead of the
     /// thread being parked (TIMEOUTFAULT). Null = no handler.
     pub timeout_endpoint_cap: crate::cap::Cap,
+    /// Per-thread hardware-debug state (CONFIG_HARDWARE_DEBUG_API).
+    /// Mirrors seL4's `user_breakpoint_state_t`.
+    pub debug: crate::arch::x86_64::debug::DebugState,
     /// Fault-type of the in-flight fault this thread is blocked on
     /// (0 = none; otherwise a `seL4_Fault_*` discriminant: 2 =
     /// UnknownSyscall, 3 = UserException, 6 = VMFault). Replying to
@@ -370,6 +373,7 @@ impl Default for Tcb {
             donated_sc: None,
             fault_handler_cap: crate::cap::Cap::Null,
             timeout_endpoint_cap: crate::cap::Cap::Null,
+            debug: crate::arch::x86_64::debug::DebugState::new(),
             pending_fault: 0,
         }
     }

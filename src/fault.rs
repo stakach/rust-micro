@@ -29,6 +29,12 @@ pub enum FaultMessage {
     /// SC's badge (`seL4_Timeout_Data`); `consumed` is ticks consumed
     /// (`seL4_Timeout_Consumed`). Length 2.
     Timeout { data: u64, consumed: u64 },
+    /// Hardware debug exception (CONFIG_HARDWARE_DEBUG_API). `reason`:
+    /// 0 = Data / 1 = Instruction (a HW breakpoint hit), 2 = SingleStep,
+    /// 3 = SoftwareBreakRequest (INT3). HW-breakpoint faults also carry
+    /// `trigger_addr` + `bp_num` (MR length 4); single-step / INT3 carry
+    /// only `fault_ip` + `reason` (length 2).
+    DebugException { fault_ip: u64, reason: u64, trigger_addr: u64, bp_num: u64 },
 }
 
 impl FaultMessage {
@@ -47,6 +53,7 @@ impl FaultMessage {
             // `(uintptr_t)res(18446744073709551615) == dest` failure.
             FaultMessage::VMFault { .. } => 6,
             FaultMessage::Timeout { .. } => 5,
+            FaultMessage::DebugException { .. } => 4,
         }
     }
 
@@ -81,6 +88,13 @@ impl FaultMessage {
                 regs[1] = data;
                 regs[2] = consumed;
                 3
+            }
+            FaultMessage::DebugException { fault_ip, reason, trigger_addr, bp_num } => {
+                regs[1] = fault_ip;
+                regs[2] = reason;
+                regs[3] = trigger_addr;
+                regs[4] = bp_num;
+                5
             }
         }
     }
@@ -364,6 +378,25 @@ pub unsafe fn apply_fault_reply(
             // resume = !label.
             label == 0
         }
+        4 => {
+            // DebugException reply. For a single-step fault the handler
+            // re-arms stepping via MR0 = n_instructions (default 1);
+            // for a HW breakpoint it just resumes. Mirrors seL4
+            // copyMRsFaultReply -> configureSingleStepping.
+            #[cfg(target_arch = "x86_64")]
+            if t.debug.single_step_enabled {
+                use crate::arch::x86_64::debug;
+                let n = if length >= 1 { regs[0] } else { 1 };
+                debug::configure_single_stepping(&mut t.debug, n);
+                if n == 0 {
+                    t.user_context.rflags &= !debug::FLAGS_TF;
+                } else {
+                    t.user_context.rflags |= debug::FLAGS_TF;
+                    t.use_iretq_resume = true;
+                }
+            }
+            true
+        }
         // CapFault (1), VMFault (6), anything else: no register
         // transfer, restart unconditionally.
         _ => true,
@@ -447,6 +480,21 @@ fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
             regs[0] = data;
             regs[1] = consumed;
             2
+        }
+        FaultMessage::DebugException { fault_ip, reason, trigger_addr, bp_num } => {
+            // seL4_DebugException_Msg: FaultIP, ExceptionReason, then
+            // (HW breakpoint only) TriggerAddress, BreakpointNumber.
+            // Single-step (2) / software-break (3) deliver 2 MRs;
+            // a HW breakpoint/watchpoint hit delivers 4.
+            regs[0] = fault_ip;
+            regs[1] = reason;
+            if reason != 2 && reason != 3 {
+                regs[2] = trigger_addr;
+                regs[3] = bp_num;
+                4
+            } else {
+                2
+            }
         }
     }
 }

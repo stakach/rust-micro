@@ -13,9 +13,9 @@ impl Drop for BklGuard {
 
 // Define all exception handlers using macros
 interrupt!(divide_error_handler, handle_divide_error);
-interrupt!(debug_handler, handle_debug);
+// #DB (1) and INT3 (3) are handled by debug_exception_entry / int3_entry
+// (CONFIG_HARDWARE_DEBUG_API), defined below.
 interrupt!(nmi_handler, handle_nmi);
-interrupt!(breakpoint_handler, handle_breakpoint);
 interrupt!(overflow_handler, handle_overflow);
 interrupt!(bound_range_handler, handle_bound_range);
 interrupt!(invalid_opcode_handler, handle_invalid_opcode);
@@ -37,9 +37,11 @@ interrupt!(virtualization_handler, handle_virtualization);
 pub fn init_exceptions() {
     unsafe {
         IDT[0] = IdtEntry::new(divide_error_handler as u64, 0x08, 0, 0x8E);
-        IDT[1] = IdtEntry::new(debug_handler as u64, 0x08, 0, 0x8E);
+        IDT[1] = IdtEntry::new(debug_exception_entry as u64, 0x08, 0, 0x8E);
         IDT[2] = IdtEntry::new(nmi_handler as u64, 0x08, 0, 0x8E);
-        IDT[3] = IdtEntry::new(breakpoint_handler as u64, 0x08, 0, 0x8E);
+        // INT3 (#BP) gate needs DPL=3 so a user-mode `int3` traps here
+        // instead of #GP'ing (BREAK_REQUEST_001).
+        IDT[3] = IdtEntry::new(int3_entry as u64, 0x08, 0, 0xEE);
         IDT[4] = IdtEntry::new(overflow_handler as u64, 0x08, 0, 0x8E);
         IDT[5] = IdtEntry::new(bound_range_handler as u64, 0x08, 0, 0x8E);
         // PAGEFAULT0005 — #UD from user mode becomes a UserException
@@ -75,18 +77,8 @@ extern "C" fn handle_divide_error(error_code: u64, exception_num: u64) {
     fatal_exception(exception_num, error_code);
 }
 
-extern "C" fn handle_debug(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Debug exception\n");
-    fatal_exception(exception_num, error_code);
-}
-
 extern "C" fn handle_nmi(error_code: u64, exception_num: u64) {
     crate::arch::log("EXCEPTION: Non-maskable interrupt\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_breakpoint(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Breakpoint\n");
     fatal_exception(exception_num, error_code);
 }
 
@@ -277,6 +269,8 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
                 crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
             crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
                 s.scheduler.slab.get(next_id));
+            crate::arch::x86_64::syscall_entry::apply_debug_state_for(
+                s.scheduler.slab.get(next_id));
             let pcc = crate::arch::x86_64::syscall_entry
                 ::current_cpu_user_ctx_mut();
             *pcc = next_ctx;
@@ -335,6 +329,8 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         crate::arch::x86_64::msr::wrmsr(
             crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
         crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
+            s.scheduler.slab.get(next_id));
+        crate::arch::x86_64::syscall_entry::apply_debug_state_for(
             s.scheduler.slab.get(next_id));
         let pcc = crate::arch::x86_64::syscall_entry
             ::current_cpu_user_ctx_mut();
@@ -827,6 +823,190 @@ extern "C" fn handle_page_fault_typed(
     }
     // (suspended is always true above; this branch is dead but kept
     // for clarity should the deliver_fault path change.)
+}
+
+// ---------------------------------------------------------------------------
+// Hardware-debug exceptions (CONFIG_HARDWARE_DEBUG_API).
+//
+// #DB (vector 1) and INT3/#BP (vector 3) push NO error code. Like the
+// #PF path we capture the full user register state (a #DB can preempt
+// any instruction) into the per-CPU UserContext so the debug-fault
+// handler can ReadRegisters and the thread is resumable.
+// ---------------------------------------------------------------------------
+
+macro_rules! debug_entry_asm {
+    ($handler:path) => {
+        core::arch::naked_asm!(
+            // Stack (no error code):
+            //   [rsp+0]=RIP [rsp+8]=CS [rsp+16]=RFLAGS [rsp+24]=RSP
+            "test byte ptr [rsp + 8], 3",
+            "jz 2f",
+            "swapgs",
+            "mov gs:[16 + 0],   rax",
+            "mov gs:[16 + 8],   rbx",
+            "mov gs:[16 + 16],  rcx",
+            "mov gs:[16 + 24],  rdx",
+            "mov gs:[16 + 32],  rsi",
+            "mov gs:[16 + 40],  rdi",
+            "mov gs:[16 + 48],  rbp",
+            "mov gs:[16 + 56],  r8",
+            "mov gs:[16 + 64],  r9",
+            "mov gs:[16 + 72],  r10",
+            "mov gs:[16 + 80],  r11",
+            "mov gs:[16 + 88],  r12",
+            "mov gs:[16 + 96],  r13",
+            "mov gs:[16 + 104], r14",
+            "mov gs:[16 + 112], r15",
+            "mov rax, [rsp + 0]",
+            "mov gs:[16 + 128], rax",   // rip
+            "mov rax, [rsp + 16]",
+            "mov gs:[16 + 136], rax",   // rflags
+            "mov rax, [rsp + 24]",
+            "mov gs:[16 + 120], rax",   // rsp
+            "mov rdi, [rsp + 8]",       // saved CS
+            "mov rsi, [rsp + 0]",       // saved RIP
+            "call {handler}",
+            // Defensive tail (handler normally dispatches away).
+            "mov rax, gs:[16 + 0]",
+            "mov rbx, gs:[16 + 8]",
+            "mov rcx, gs:[16 + 16]",
+            "mov rdx, gs:[16 + 24]",
+            "mov rsi, gs:[16 + 32]",
+            "mov rdi, gs:[16 + 40]",
+            "mov rbp, gs:[16 + 48]",
+            "mov r8,  gs:[16 + 56]",
+            "mov r9,  gs:[16 + 64]",
+            "mov r10, gs:[16 + 72]",
+            "mov r11, gs:[16 + 80]",
+            "mov r12, gs:[16 + 88]",
+            "mov r13, gs:[16 + 96]",
+            "mov r14, gs:[16 + 104]",
+            "mov r15, gs:[16 + 112]",
+            "swapgs",
+            "iretq",
+            // kernel-mode debug exception: just hand to the typed
+            // handler (it clears DR6 and returns) then iretq.
+            "2:",
+            "mov rdi, [rsp + 8]",
+            "mov rsi, [rsp + 0]",
+            "call {handler}",
+            "iretq",
+            handler = sym $handler,
+        )
+    };
+}
+
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn debug_exception_entry() {
+    debug_entry_asm!(handle_debug_typed);
+}
+
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn int3_entry() {
+    debug_entry_asm!(handle_int3_typed);
+}
+
+/// Snapshot the captured user context into the faulting thread's TCB so
+/// ReadRegisters sees the debug-time state and the thread resumes at the
+/// exact point. Mirrors the #PF path.
+unsafe fn snapshot_into_tcb(faulter: crate::tcb::TcbId) {
+    let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
+    let t = crate::kernel::KERNEL.get().scheduler.slab.get_mut(faulter);
+    t.user_context = snapshot;
+    t.use_iretq_resume = true;
+}
+
+/// Deliver a debug fault; suspend the thread if it has no handler.
+unsafe fn deliver_debug_fault(faulter: crate::tcb::TcbId, fault: crate::fault::FaultMessage) {
+    if crate::fault::deliver_fault(faulter, fault).is_err() {
+        crate::arch::log("[debug fault — no handler, suspending]\n");
+        crate::kernel::KERNEL.get().scheduler.block(
+            faulter, crate::tcb::ThreadStateType::Inactive);
+    }
+}
+
+#[no_mangle]
+extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
+    use crate::arch::x86_64::debug;
+    crate::smp::bkl_acquire();
+    if (saved_cs & 3) != 3 {
+        // Kernel-mode #DB — clear status and resume.
+        unsafe { debug::write_dr6(0xFFFF_0FF0); }
+        crate::smp::bkl_release();
+        return;
+    }
+    let faulter = match crate::kernel::current_thread() {
+        Some(t) => t,
+        None => unsafe { dispatch_next_or_idle("[#DB no current]\n") },
+    };
+    unsafe { snapshot_into_tcb(faulter); }
+    let dr6 = unsafe { debug::read_dr6() };
+    let s = unsafe { crate::kernel::KERNEL.get() };
+
+    // Active hardware breakpoint? (B0..B3 = DR6 bits 0..3)
+    let active = (0..4).find(|&b| dr6 & (1 << b) != 0);
+    if let Some(bp) = active {
+        unsafe { debug::write_dr6(dr6 & !(1u64 << bp)); }
+        let (vaddr, reason) = {
+            let st = &s.scheduler.slab.get(faulter).debug;
+            (st.dr[bp], debug::breakpoint_reason(st, bp))
+        };
+        unsafe {
+            deliver_debug_fault(faulter, crate::fault::FaultMessage::DebugException {
+                fault_ip: saved_rip, reason, trigger_addr: vaddr, bp_num: bp as u64,
+            });
+            dispatch_next_or_idle("[#DB hw bp]\n")
+        }
+    } else if dr6 & debug::DR6_SINGLE_STEP != 0 {
+        unsafe { debug::write_dr6(dr6 & !debug::DR6_SINGLE_STEP); }
+        // Set RF so an instruction breakpoint at the resume IP isn't
+        // re-raised (auto-cleared by the CPU after one instruction).
+        s.scheduler.slab.get_mut(faulter).user_context.rflags |= debug::FLAGS_RF;
+        let ready = debug::single_step_counter_ready(
+            &mut s.scheduler.slab.get_mut(faulter).debug);
+        if ready {
+            unsafe {
+                deliver_debug_fault(faulter, crate::fault::FaultMessage::DebugException {
+                    fault_ip: saved_rip, reason: debug::SEL4_SINGLE_STEP,
+                    trigger_addr: 0, bp_num: 0,
+                });
+                dispatch_next_or_idle("[#DB single-step]\n")
+            }
+        } else {
+            // Counter not yet zero — keep stepping (TF stays set).
+            unsafe { dispatch_next_or_idle("[#DB step]\n") }
+        }
+    } else {
+        // Spurious — clear and resume.
+        unsafe { debug::write_dr6(0xFFFF_0FF0); }
+        unsafe { dispatch_next_or_idle("[#DB spurious]\n") }
+    }
+}
+
+#[no_mangle]
+extern "C" fn handle_int3_typed(saved_cs: u64, saved_rip: u64) {
+    use crate::arch::x86_64::debug;
+    crate::smp::bkl_acquire();
+    if (saved_cs & 3) != 3 {
+        crate::arch::log("KERNEL INT3\n");
+        crate::smp::bkl_release();
+        return;
+    }
+    let faulter = match crate::kernel::current_thread() {
+        Some(t) => t,
+        None => unsafe { dispatch_next_or_idle("[INT3 no current]\n") },
+    };
+    unsafe { snapshot_into_tcb(faulter); }
+    unsafe {
+        deliver_debug_fault(faulter, crate::fault::FaultMessage::DebugException {
+            fault_ip: saved_rip,
+            reason: debug::SEL4_SOFTWARE_BREAK_REQUEST,
+            trigger_addr: 0, bp_num: 0,
+        });
+        dispatch_next_or_idle("[INT3]\n")
+    }
 }
 
 fn log_hex64(v: u64) {

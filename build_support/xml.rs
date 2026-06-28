@@ -33,7 +33,11 @@ pub fn default_config() -> HashMap<&'static str, bool> {
         // SchedContextBind / SchedControlConfigure / etc.
         ("CONFIG_KERNEL_MCS", true),
         ("CONFIG_ENABLE_SMP_SUPPORT", false),
-        ("CONFIG_HARDWARE_DEBUG_API", false),
+        // Hardware-debug API enabled (BREAKPOINT/SINGLESTEP tests). This
+        // inserts TCBSetBreakpoint/Get/Unset/ConfigureSingleStepping at
+        // labels 16-19, shifting TCBSetTLSBase onward — must match the
+        // libsel4 the tests are built against.
+        ("CONFIG_HARDWARE_DEBUG_API", true),
         ("CONFIG_VTX", false),
         ("CONFIG_IOMMU", false),
         ("CONFIG_ENABLE_BENCHMARKS", false),

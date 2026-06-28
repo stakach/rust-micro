@@ -4789,6 +4789,112 @@ fn decode_tcb(
                 inv_t.ipc_length = 1;
                 Ok(())
             }
+            // --- Hardware debug API (CONFIG_HARDWARE_DEBUG_API) ----------
+            InvocationLabel::TCBSetBreakpoint => {
+                use crate::arch::x86_64::debug as dbg;
+                let bp_num = args.a2;
+                let vaddr = args.a3;
+                let ty = args.a4;
+                let size = args.a5;
+                // MR4 (rw) is in the invoker's IPC buffer (only 4 message
+                // registers ride in CPU regs).
+                let rw = {
+                    let paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                    if paddr == 0 { 0 } else {
+                        let buf = (crate::arch::x86_64::paging::phys_to_lin(paddr)
+                            as *const u64).wrapping_add(1);
+                        core::ptr::read_volatile(buf.add(4))
+                    }
+                };
+                let err = |e| Err(KException::SyscallError(SyscallError::new(e)));
+                // Validation order mirrors seL4 decodeSetBreakpoint.
+                if vaddr >= 0x0000_8000_0000_0000 {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
+                if ty != dbg::SEL4_INSTRUCTION_BREAKPOINT
+                    && ty != dbg::SEL4_DATA_BREAKPOINT
+                {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
+                if ty == dbg::SEL4_INSTRUCTION_BREAKPOINT {
+                    if size != 0 { return err(seL4_Error::seL4_InvalidArgument); }
+                    if rw != dbg::SEL4_BREAK_ON_READ {
+                        return err(seL4_Error::seL4_InvalidArgument);
+                    }
+                } else if size == 0 {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
+                if rw > dbg::SEL4_BREAK_ON_READWRITE {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
+                if !matches!(size, 0 | 1 | 2 | 4 | 8) {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
+                if size > 0 && (vaddr & (size - 1)) != 0 {
+                    return err(seL4_Error::seL4_AlignmentError);
+                }
+                if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
+                    return err(seL4_Error::seL4_RangeError);
+                }
+                dbg::set_breakpoint(
+                    &mut s.scheduler.slab.get_mut(id).debug,
+                    bp_num as usize, vaddr, ty, size, rw);
+                Ok(())
+            }
+            InvocationLabel::TCBGetBreakpoint => {
+                use crate::arch::x86_64::debug as dbg;
+                let bp_num = args.a2;
+                if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_RangeError)));
+                }
+                let (vaddr, ty, size, rw, enabled) = dbg::get_breakpoint(
+                    &s.scheduler.slab.get(id).debug, bp_num as usize);
+                let inv = s.scheduler.slab.get_mut(invoker);
+                inv.msg_regs[0] = vaddr;
+                inv.msg_regs[1] = ty;
+                inv.msg_regs[2] = size;
+                inv.msg_regs[3] = rw;
+                // MR4 (is_enabled) — the SysCall return fans
+                // msg_regs[0..length] into the IPC buffer, so set it
+                // here rather than writing the buffer directly.
+                inv.msg_regs[4] = enabled;
+                inv.ipc_length = 5;
+                Ok(())
+            }
+            InvocationLabel::TCBUnsetBreakpoint => {
+                use crate::arch::x86_64::debug as dbg;
+                let bp_num = args.a2;
+                if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_RangeError)));
+                }
+                dbg::unset_breakpoint(
+                    &mut s.scheduler.slab.get_mut(id).debug, bp_num as usize);
+                Ok(())
+            }
+            InvocationLabel::TCBConfigureSingleStepping => {
+                use crate::arch::x86_64::debug as dbg;
+                let _bp_num = args.a2; // ignored on x86 (TF-based)
+                let n_instr = args.a3;
+                let consumed = dbg::configure_single_stepping(
+                    &mut s.scheduler.slab.get_mut(id).debug, n_instr);
+                let t = s.scheduler.slab.get_mut(id);
+                if n_instr == 0 {
+                    // Disable: clear TF on the target's saved RFLAGS.
+                    t.user_context.rflags &= !dbg::FLAGS_TF;
+                } else {
+                    // Enable: set TF so the thread single-steps when it
+                    // next runs; force iretq resume so the rflags slot
+                    // (not the sysret r11 path) carries it.
+                    t.user_context.rflags |= dbg::FLAGS_TF;
+                    t.use_iretq_resume = true;
+                }
+                let inv = s.scheduler.slab.get_mut(invoker);
+                inv.msg_regs[0] = consumed as u64;
+                inv.ipc_length = 1;
+                Ok(())
+            }
             _ => Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_IllegalOperation,
             ))),

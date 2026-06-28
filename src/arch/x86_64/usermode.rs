@@ -339,6 +339,8 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         let _ = receiver; // suppress unused if receiver isn't reached on first hop
         crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
             s.scheduler.slab.get(sender));
+        crate::arch::x86_64::syscall_entry::apply_debug_state_for(
+            s.scheduler.slab.get(sender));
         enter_user_via_sysret(&ctx);
     }
 }

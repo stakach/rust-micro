@@ -264,6 +264,21 @@ pub unsafe fn apply_fpu_gate_for(tcb: &crate::tcb::Tcb) {
     set_cr0_ts((tcb.flags & FPU_DISABLED) != 0);
 }
 
+/// Load `tcb`'s hardware-debug state (DR0-3/DR6/DR7) into the live
+/// registers before returning to it. Call from every return-to-user
+/// dispatch tail (mirrors seL4's `restore_user_debug_context`). When the
+/// thread uses no breakpoints this just clears the DR7 enable bits. TF
+/// (single-step) is carried on the thread's saved RFLAGS, set by the
+/// ConfigureSingleStepping invocation and preserved across #DB.
+pub unsafe fn apply_debug_state_for(tcb: &crate::tcb::Tcb) {
+    use crate::arch::x86_64::debug;
+    if tcb.debug.any_breakpoint_used() {
+        debug::load_breakpoint_state(&tcb.debug);
+    } else {
+        debug::load_all_disabled(&tcb.debug);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Field offsets the naked stub references. Keep these in sync with
 // `PerCpuSyscallArea` — `static_assertions` would catch drift but
@@ -816,6 +831,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // thread; if `fpuDisabled` is set, the next FPU op
             // there must trap into our #NM handler.
             apply_fpu_gate_for(s.scheduler.slab.get(next));
+            apply_debug_state_for(s.scheduler.slab.get(next));
             // REGRESSIONS0001 — if `next` was set up via
             // seL4_TCB_WriteRegisters and the user expects RCX/R11
             // to round-trip as register values (not RIP/RFLAGS),
@@ -883,6 +899,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     crate::arch::x86_64::msr::wrmsr(
                         crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
                     apply_fpu_gate_for(s.scheduler.slab.get(next_id));
+                    apply_debug_state_for(s.scheduler.slab.get(next_id));
                     let pcc = current_cpu_user_ctx_mut();
                     *pcc = next_ctx;
                     if s.scheduler.slab.get(next_id).use_iretq_resume {
