@@ -48,6 +48,11 @@ pub fn default_config() -> HashMap<String, bool> {
         ("ENABLE_SMP_SUPPORT", false),
         ("CONFIG_HARDWARE_DEBUG_API", false),
         ("CONFIG_SET_TLS_BASE_SELF", false),
+        // Phase 44 — VT-d IOMMU. Enables the io_space_cap (tag 15)
+        // and io_page_table_cap (tag 17) bitfield blocks in
+        // structures_x86_64.bf so `IoSpaceCap` / `IoPageTableCap`
+        // generate for the IOPT invocation path.
+        ("CONFIG_IOMMU", true),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))

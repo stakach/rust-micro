@@ -372,7 +372,19 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
     let mut free = extract_free(&entries[..n])?;
 
     const USER_PAGES_SIZE: u64 = 16 * 1024 * 1024;
-    let user_pages_base = carve_chunk(&mut free, USER_PAGES_SIZE, 12)?;
+    // Phase 44 — the VT-d IOMMU's root + context tables live in a small
+    // pool sliced off the TOP of the user-pages carve. Bundling it with
+    // the 16 MiB user-pages chunk (rather than a separate carve_chunk)
+    // is deliberate: a standalone small carve would land in the lowest
+    // free region (conventional memory at paddr 0), which is exactly
+    // where place_rootserver lays down the rootserver — vtd_init would
+    // then zero the rootserver's TCB. The 16 MiB chunk is large enough
+    // that it never fits in that low region, so the pool stays clear.
+    #[cfg(target_arch = "x86_64")]
+    const IOMMU_POOL_SIZE: u64 = 64 * 1024;
+    #[cfg(not(target_arch = "x86_64"))]
+    const IOMMU_POOL_SIZE: u64 = 0;
+    let user_pages_base = carve_chunk(&mut free, USER_PAGES_SIZE + IOMMU_POOL_SIZE, 12)?;
 
     arch::log("boot: reserved user-pages @0x");
     log_hex64(user_pages_base);
@@ -382,6 +394,19 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
     unsafe {
         crate::rootserver::install_user_page_region(
             user_pages_base, USER_PAGES_SIZE);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let iommu_base = user_pages_base + USER_PAGES_SIZE;
+        arch::log("boot: reserved iommu-pool @0x");
+        log_hex64(iommu_base);
+        arch::log(".."); log_hex64(iommu_base + IOMMU_POOL_SIZE);
+        arch::log("\n");
+        unsafe {
+            crate::arch::x86_64::iommu::install_iommu_pool(
+                iommu_base, IOMMU_POOL_SIZE);
+        }
     }
 
     // Phase 42 — sel4test's allocman needs to carve TCBs, CNodes,

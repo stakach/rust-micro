@@ -19,8 +19,9 @@
 
 use crate::structures::*;
 use crate::structures::arch::{
-    AsidControlCap, AsidPoolCap, FrameCap, IoPortCap, IoPortControlCap,
-    PageDirectoryCap, PageTableCap, PdptCap, Pml4Cap,
+    AsidControlCap, AsidPoolCap, FrameCap, IoPageTableCap, IoPortCap,
+    IoPortControlCap, IoSpaceCap, PageDirectoryCap, PageTableCap, PdptCap,
+    Pml4Cap,
 };
 use crate::structures::{SchedContextCap, SchedControlCap};
 use crate::types::seL4_Word as Word;
@@ -62,6 +63,8 @@ pub mod tag {
     pub const PML4: u64 = 9;
     pub const ASID_CONTROL: u64 = 11;
     pub const ASID_POOL: u64 = 13;
+    pub const IO_SPACE: u64 = 15;
+    pub const IO_PAGE_TABLE: u64 = 17;
     pub const IO_PORT: u64 = 19;
     pub const IO_PORT_CONTROL: u64 = 31;
 
@@ -176,6 +179,40 @@ pub struct ReplyStorage;
 /// occupies a 2^size_bits-byte block; the smallest is `MIN_SCHED_CONTEXT_BITS`
 /// (= 8 = 256 bytes — large enough for the refill array).
 pub struct SchedContextStorage;
+/// Storage backing a `Cap::IoPageTable` (Phase 44) — one 4 KiB page
+/// of 512 VT-d second-level PTEs. Retyped from Untyped exactly like a
+/// `PageTableStorage`.
+pub struct IoPageTableStorage;
+
+/// How a `Cap::Frame` is currently mapped. Mirrors seL4's
+/// `vm_page_map_type` / `capFMapType` field: a frame may be mapped
+/// into a normal vspace or into a VT-d IO space, and the unmap path
+/// must dispatch differently. `None` = unmapped.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum FrameMapType {
+    #[default]
+    None,
+    VSpace,
+    IoSpace,
+}
+
+impl FrameMapType {
+    pub const fn to_word(self) -> u64 {
+        // Matches seL4 vm_page_map_type: None=0, VSpace=1, IOSpace=2.
+        match self {
+            Self::None => 0,
+            Self::VSpace => 1,
+            Self::IoSpace => 2,
+        }
+    }
+    pub const fn from_word(w: u64) -> Self {
+        match w {
+            1 => Self::VSpace,
+            2 => Self::IoSpace,
+            _ => Self::None,
+        }
+    }
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum FrameSize {
@@ -310,6 +347,9 @@ pub enum Cap {
         mapped: Option<u64>,
         asid: u16,
         is_device: bool,
+        /// Whether the current mapping is into a vspace or an IO
+        /// space (or none). Drives unmap dispatch (Phase 44).
+        map_type: FrameMapType,
     },
     /// x86 leaf page table (cap tag = 3) — points at a 4 KiB
     /// table that holds 512 PTEs.
@@ -383,6 +423,26 @@ pub enum Cap {
     /// rootserver gets one in slot 14 (`seL4_CapIOPortControl`)
     /// of its CNode at boot.
     IOPortControl,
+    /// Phase 44 — VT-d IO-space cap (tag 15). Names the PCI request-id
+    /// (`pci_device`) + IO domain (`domain_id`) that an IO page-table /
+    /// IO frame mapping targets. The rootserver gets the master
+    /// (`pci_device = 0`, `domain_id = 0`) in slot `seL4_CapIOSpace`;
+    /// `CNode_Mint` stamps a real request-id + domain from the badge.
+    IoSpace {
+        domain_id: u16,
+        pci_device: u16,
+    },
+    /// Phase 44 — VT-d IO page table cap (tag 17). A retyped 4 KiB
+    /// page of 512 VT-d PTEs. `is_mapped`/`level`/`mapped_address`/
+    /// `ioasid` track where in an IO space's translation tree this PT
+    /// is installed (mirrors seL4's io_page_table_cap fields).
+    IoPageTable {
+        ptr: PPtr<IoPageTableStorage>,
+        is_mapped: bool,
+        level: u8,
+        mapped_address: u64,
+        ioasid: u16,
+    },
     /// Any other arch-tagged cap (page tables, ASID pool, etc.).
     /// Stored as the raw two-word encoding; full decoding for the
     /// remaining cap types lands in later phases.
@@ -520,6 +580,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 },
                 asid: c.capFMappedASID() as u16,
                 is_device: c.capFIsDevice() != 0,
+                map_type: FrameMapType::from_word(c.capFMapType()),
             }
         }
         tag::PAGE_TABLE => {
@@ -611,6 +672,26 @@ pub fn from_words(words: [Word; 2]) -> Cap {
             }
         }
         tag::IO_PORT_CONTROL => Cap::IOPortControl,
+        tag::IO_SPACE => {
+            let c = IoSpaceCap { words };
+            Cap::IoSpace {
+                domain_id: c.capDomainID() as u16,
+                pci_device: c.capPCIDevice() as u16,
+            }
+        }
+        tag::IO_PAGE_TABLE => {
+            let c = IoPageTableCap { words };
+            let Some(ptr) = PPtr::<IoPageTableStorage>::new(c.capIOPTBasePtr()) else {
+                return Cap::Null;
+            };
+            Cap::IoPageTable {
+                ptr,
+                is_mapped: c.capIOPTIsMapped() != 0,
+                level: c.capIOPTLevel() as u8,
+                mapped_address: c.capIOPTMappedAddress(),
+                ioasid: c.capIOPTIOASID() as u16,
+            }
+        }
         t if tag::is_arch(t) => Cap::Arch { cap_type: t, words },
         _ => Cap::Null,
     }
@@ -774,7 +855,7 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             c = c.with_capType(tag::IO_PORT_CONTROL);
             c.words
         }
-        Cap::Frame { ptr, size, rights, mapped, asid, is_device } => {
+        Cap::Frame { ptr, size, rights, mapped, asid, is_device, map_type } => {
             // Visible field order (no explicit_params on frame_cap):
             //   capFMappedASID, capFBasePtr, capType, capFSize,
             //   capFMapType, capFMappedAddress, capFVMRights,
@@ -784,10 +865,33 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
                 ptr.addr(),
                 tag::FRAME,
                 size.to_word(),
-                0,                              // capFMapType: 0 = normal (non-EPT)
+                map_type.to_word(),             // capFMapType: None/VSpace/IOSpace
                 mapped.unwrap_or(0),
                 rights.to_word(),
                 *is_device as u64,
+            )
+            .words
+        }
+        Cap::IoSpace { domain_id, pci_device } => {
+            // io_space_cap (no explicit_params): visible field order is
+            //   capType, capDomainID, capPCIDevice.
+            let mut c = IoSpaceCap::zeroed();
+            c = c.with_capType(tag::IO_SPACE);
+            c = c.with_capDomainID(*domain_id as u64);
+            c = c.with_capPCIDevice(*pci_device as u64);
+            c.words
+        }
+        Cap::IoPageTable { ptr, is_mapped, level, mapped_address, ioasid } => {
+            // io_page_table_cap explicit_params order:
+            //   capType, capIOPTIsMapped, capIOPTLevel,
+            //   capIOPTMappedAddress, capIOPTIOASID, capIOPTBasePtr.
+            IoPageTableCap::new(
+                tag::IO_PAGE_TABLE,
+                *is_mapped as u64,
+                *level as u64,
+                *mapped_address,
+                *ioasid as u64,
+                ptr.addr(),
             )
             .words
         }
@@ -843,6 +947,7 @@ pub mod spec {
         roundtrip_asid_caps();
         roundtrip_sched_context_cap();
         roundtrip_sched_control_cap();
+        roundtrip_iommu_caps();
         type_tag_dispatch();
 
         arch::log("Cap round-trip tests completed\n");
@@ -1014,6 +1119,7 @@ pub mod spec {
             mapped: Some(0x0000_0080_0000_1000),
             asid: 7,
             is_device: false,
+            map_type: FrameMapType::VSpace,
         };
         let words = to_words(&cap);
         // Cap type tag = 1 (FRAME).
@@ -1029,6 +1135,7 @@ pub mod spec {
             mapped: None,
             asid: 0,
             is_device: true,
+            map_type: FrameMapType::None,
         };
         let words = to_words(&cap2);
         let back = from_words(words);
@@ -1037,17 +1144,40 @@ pub mod spec {
     }
 
     fn roundtrip_arch_passthrough() {
-        // Use tag 15 (io_space_cap) — still un-typed. Earlier
-        // phases used 1 (frame), 3 (page_table), 11 (asid_control);
-        // those now all decode to typed variants.
+        // Use tag 25 (ept_pml4_cap, CONFIG_VTX-only — still un-typed
+        // in this build). Earlier phases used 1 (frame), 3
+        // (page_table), 11 (asid_control), 15 (io_space); those now
+        // all decode to typed variants.
         let mut words = [0u64; 2];
-        words[0] = 15u64 << 59;
+        words[0] = 25u64 << 59;
         let back = from_words(words);
         match back {
-            Cap::Arch { cap_type: 15, words: w } => assert_eq!(w, words),
-            other => panic!("expected Cap::Arch{{15,..}}, got {:?}", other),
+            Cap::Arch { cap_type: 25, words: w } => assert_eq!(w, words),
+            other => panic!("expected Cap::Arch{{25,..}}, got {:?}", other),
         }
         arch::log("  ✓ arch cap passes through opaquely (un-typed tags)\n");
+    }
+
+    fn roundtrip_iommu_caps() {
+        // io_space_cap (tag 15): domain_id + pci_device round-trip.
+        let ios = Cap::IoSpace { domain_id: 0xf, pci_device: 0x216 };
+        let words = to_words(&ios);
+        assert_eq!(cap_type_of(words), tag::IO_SPACE);
+        assert_eq!(from_words(words), ios);
+
+        // io_page_table_cap (tag 17). capIOPTBasePtr is field_high 48
+        // (4 KiB-aligned), capIOPTMappedAddress field_high 48.
+        let iopt = Cap::IoPageTable {
+            ptr: PPtr::<IoPageTableStorage>::new(0x0000_0000_0050_0000).unwrap(),
+            is_mapped: true,
+            level: 3,
+            mapped_address: 0x1000_0000,
+            ioasid: 0x216,
+        };
+        let words = to_words(&iopt);
+        assert_eq!(cap_type_of(words), tag::IO_PAGE_TABLE);
+        assert_eq!(from_words(words), iopt);
+        arch::log("  ✓ io_space + io_page_table caps round-trip\n");
     }
 
     fn type_tag_dispatch() {

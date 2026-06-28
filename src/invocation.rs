@@ -49,6 +49,8 @@ fn inv_cap_tag(c: &Cap) -> &'static str {
         Cap::Notification { .. }  => "Ntfn",
         Cap::IOPort { .. }        => "IoP",
         Cap::IOPortControl        => "IoPC",
+        Cap::IoSpace { .. }       => "IoS",
+        Cap::IoPageTable { .. }   => "IoPT",
         Cap::Null                 => "Null",
         _                         => "??",
     }
@@ -204,6 +206,12 @@ pub fn decode_invocation(
             decode_io_port(first_port, last_port, label, args, invoker)
         }
         Cap::IOPortControl => decode_io_port_control(label, args, invoker),
+        // Phase 44 — VT-d. IoPageTable caps take Map/Unmap; IoSpace
+        // caps have no invocations of their own.
+        Cap::IoPageTable { .. } => decode_x86_iopt(target, label, args, invoker),
+        Cap::IoSpace { .. } => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        ))),
         Cap::Null => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidCapability,
         ))),
@@ -230,6 +238,7 @@ fn decode_frame(
     match label {
         InvocationLabel::X86PageMap => decode_frame_map(target, args, invoker),
         InvocationLabel::X86PageUnmap => decode_frame_unmap(target, args, invoker),
+        InvocationLabel::X86PageMapIO => decode_x86_iomap(target, args, invoker),
         InvocationLabel::X86PageGetAddress => decode_frame_get_address(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
@@ -395,6 +404,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
                             mapped: Some(vaddr),
                             asid: asid_for_cap,
                             is_device: _device,
+                            map_type: crate::cap::FrameMapType::VSpace,
                         };
                         slot.set_cap(&updated);
                         break;
@@ -436,21 +446,21 @@ fn pml4_paddr_for_asid(asid: u16) -> u64 {
 }
 
 fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    let (paddr, size, mapped_vaddr, asid) = match target {
-        Cap::Frame { ptr, size, mapped, asid, .. } =>
-            (ptr.addr(), size, mapped, asid),
+    let (paddr, size, mapped_vaddr, asid, map_type) = match target {
+        Cap::Frame { ptr, size, mapped, asid, map_type, .. } =>
+            (ptr.addr(), size, mapped, asid, map_type),
         _ => unreachable!(),
     };
 
-    // Phase 28g / 42 / 43 — clear the PTE in the live page tables
-    // for the VSPACE the frame is mapped in (via asid → PML4) and
-    // fan a TLB shootdown to other CPUs. The previous version walked
-    // current CR3, which is wrong when the invoker's CSpace contains
-    // a frame cap mapped in a *different* vspace (sel4test's driver
-    // unmapping pages from the test process's vspace clobbered the
-    // driver's own page tables at the same vaddr).
+    // Phase 44 — a frame mapped into a VT-d IO space is torn down via
+    // unmapIOPage (clear the leaf VT-d PTE), NOT the vspace path. The
+    // IO mapping's "asid" field is the PCI request-id.
     #[cfg(target_arch = "x86_64")]
-    if let Some(vaddr) = mapped_vaddr {
+    if map_type == crate::cap::FrameMapType::IoSpace {
+        if let Some(io_address) = mapped_vaddr {
+            unsafe { unmap_io_page(asid, io_address, paddr); }
+        }
+    } else if let Some(vaddr) = mapped_vaddr {
         unsafe {
             let pml4_paddr = pml4_paddr_for_asid(asid);
             if pml4_paddr != 0 {
@@ -504,6 +514,7 @@ fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResu
                             mapped: None,
                             asid: 0,
                             is_device,
+                            map_type: crate::cap::FrameMapType::None,
                         });
                         break;
                     }
@@ -512,6 +523,343 @@ fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResu
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 44 — VT-d IO page-table / IO-frame invocations. Mirrors
+// seL4 src/arch/x86/object/iospace.c.
+// ---------------------------------------------------------------------------
+
+/// Fetch the invoker's single pending extra cap (the IO-space cap),
+/// consuming the pending list. Returns `Cap::Null` if none.
+fn take_single_extra_cap(invoker: TcbId) -> Cap {
+    unsafe {
+        let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+        let cap = if inv_tcb.pending_extra_caps_count > 0 {
+            inv_tcb.pending_extra_caps[0]
+        } else {
+            Cap::Null
+        };
+        inv_tcb.pending_extra_caps_count = 0;
+        cap
+    }
+}
+
+/// Overwrite the IoPageTable cap (identified by its unique base paddr)
+/// in the invoker's root CNode with `new_cap`.
+fn rewrite_iopt_cap_in_cspace(invoker: TcbId, base_paddr: u64, new_cap: &Cap) {
+    unsafe {
+        let s = KERNEL.get();
+        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+        let cnode_ptr = match cspace_root {
+            Cap::CNode { ptr, .. } => ptr,
+            _ => return,
+        };
+        let cnode_idx = KernelState::cnode_index(cnode_ptr);
+        if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
+            for slot in slots.iter_mut() {
+                if let Cap::IoPageTable { ptr, .. } = slot.cap() {
+                    if ptr.addr() == base_paddr {
+                        slot.set_cap(new_cap);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `X86IOPageTable::{Map,Unmap}` — decodeX86IOPTInvocation (iospace.c:169).
+fn decode_x86_iopt(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::arch::x86_64::iommu;
+
+        let (base_paddr, is_mapped, level, mapped_address, ioasid) = match target {
+            Cap::IoPageTable { ptr, is_mapped, level, mapped_address, ioasid } =>
+                (ptr.addr(), is_mapped, level, mapped_address, ioasid),
+            _ => unreachable!(),
+        };
+
+        if label == InvocationLabel::X86IOPageTableUnmap {
+            // deleteIOPageTable (iospace.c:397) then clear isMapped.
+            unsafe { delete_io_page_table(base_paddr, is_mapped, level, mapped_address, ioasid); }
+            let new_cap = Cap::IoPageTable {
+                ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
+                is_mapped: false,
+                level: 0,
+                mapped_address: 0,
+                ioasid: 0,
+            };
+            rewrite_iopt_cap_in_cspace(invoker, base_paddr, &new_cap);
+            return Ok(());
+        }
+
+        if label != InvocationLabel::X86IOPageTableMap {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_IllegalOperation)));
+        }
+
+        // X86IOPageTableMap. extraCaps[0] = io_space, arg0 = io_address.
+        let io_space = take_single_extra_cap(invoker);
+        let io_address = args.a2 & !((1u64 << (iommu::VTD_PT_INDEX_BITS + iommu::PAGE_BITS)) - 1);
+
+        if is_mapped {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        }
+        let (pci_request_id, domain_id) = match io_space {
+            Cap::IoSpace { pci_device, domain_id } => (pci_device, domain_id),
+            _ => return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability))),
+        };
+        // asidInvalid == 0.
+        if pci_request_id == 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        }
+
+        let ctx = unsafe { iommu::lookup_vtd_context_slot(pci_request_id, true) };
+        let Some(ctx) = ctx else {
+            // No IOMMU / pool exhausted.
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        };
+
+        if !unsafe { ctx.present() } {
+            // Install this PT as the context (1st-level) root.
+            unsafe { ctx.install_root(domain_id, base_paddr); }
+            let new_cap = Cap::IoPageTable {
+                ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
+                is_mapped: true,
+                level: 0,
+                mapped_address: 0,
+                ioasid: pci_request_id,
+            };
+            rewrite_iopt_cap_in_cspace(invoker, base_paddr, &new_cap);
+            return Ok(());
+        }
+
+        // Context present — install this PT as an intermediate table.
+        let top = unsafe { ctx.asr() };
+        let lu = unsafe { iommu::lookup_iopt_slot(top, io_address) };
+        if !lu.ok {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+        let new_level = iommu::num_iopt_levels() - lu.level;
+        if unsafe { iommu::slot_addr(lu.slot) } != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst)));
+        }
+        unsafe { iommu::slot_install(lu.slot, base_paddr, true, true); }
+        let new_cap = Cap::IoPageTable {
+            ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
+            is_mapped: true,
+            level: new_level as u8,
+            mapped_address: io_address,
+            ioasid: pci_request_id,
+        };
+        rewrite_iopt_cap_in_cspace(invoker, base_paddr, &new_cap);
+        Ok(())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (target, label, args, invoker);
+        Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation)))
+    }
+}
+
+/// deleteIOPageTable (iospace.c:397). Clears whatever VT-d entry this
+/// PT is installed at, if it still owns it.
+#[cfg(target_arch = "x86_64")]
+unsafe fn delete_io_page_table(
+    base_paddr: u64,
+    is_mapped: bool,
+    level: u8,
+    mapped_address: u64,
+    ioasid: u16,
+) {
+    use crate::arch::x86_64::iommu;
+    if !is_mapped {
+        return;
+    }
+    let Some(ctx) = iommu::lookup_vtd_context_slot(ioasid, false) else {
+        return;
+    };
+    if !ctx.present() {
+        return;
+    }
+    let top = ctx.asr();
+    if level == 0 {
+        // Top-level: this PT is the context root. Only clear if it
+        // still owns the context entry.
+        if top != base_paddr {
+            return;
+        }
+        ctx.clear();
+    } else {
+        let lu = iommu::lookup_iopt_slot_levels(
+            top, mapped_address >> iommu::PAGE_BITS, (level - 1) as u64, (level - 1) as u64);
+        if !lu.ok || lu.level != 0 {
+            return;
+        }
+        if iommu::slot_addr(lu.slot) != base_paddr {
+            return;
+        }
+        iommu::slot_clear(lu.slot);
+    }
+}
+
+/// unmapIOPage (iospace.c:453). Clears the leaf VT-d PTE for an
+/// IO-mapped frame, if the frame still owns it.
+#[cfg(target_arch = "x86_64")]
+unsafe fn unmap_io_page(pci_request_id: u16, io_address: u64, frame_paddr: u64) {
+    use crate::arch::x86_64::iommu;
+    let Some(ctx) = iommu::lookup_vtd_context_slot(pci_request_id, false) else {
+        return;
+    };
+    if !ctx.present() {
+        return;
+    }
+    let top = ctx.asr();
+    let lu = iommu::lookup_iopt_slot(top, io_address);
+    if !lu.ok || lu.level != 0 {
+        return;
+    }
+    if iommu::slot_addr(lu.slot) != frame_paddr {
+        return;
+    }
+    iommu::slot_clear(lu.slot);
+}
+
+/// `X86Page::MapIO` — decodeX86IOMapInvocation (iospace.c:296). Maps a
+/// 4 KiB frame into an IO space's leaf VT-d PTE.
+fn decode_x86_iomap(
+    target: Cap,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::arch::x86_64::iommu;
+
+        let (frame_paddr, size, frame_rights, frame_mapped, frame_device) = match target {
+            Cap::Frame { ptr, size, rights, mapped, is_device, .. } =>
+                (ptr.addr(), size, rights, mapped, is_device),
+            _ => unreachable!(),
+        };
+
+        // Must be a 4 KiB page, currently unmapped.
+        if !matches!(size, crate::cap::FrameSize::Small) {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        }
+        if frame_mapped.is_some() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        }
+
+        // arg0 = rights mask, arg1 = io_address.
+        let rights_mask = args.a2;
+        let io_address = args.a3 & !((1u64 << iommu::PAGE_BITS) - 1);
+
+        let io_space = take_single_extra_cap(invoker);
+        let pci_request_id = match io_space {
+            Cap::IoSpace { pci_device, .. } => pci_device,
+            _ => return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability))),
+        };
+        if pci_request_id == 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability)));
+        }
+
+        let ctx = unsafe { iommu::lookup_vtd_context_slot(pci_request_id, false) };
+        let Some(ctx) = ctx else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        };
+        if !unsafe { ctx.present() } {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+
+        let top = unsafe { ctx.asr() };
+        let lu = unsafe { iommu::lookup_iopt_slot(top, io_address) };
+        if !lu.ok || lu.level != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup)));
+        }
+        if unsafe { iommu::slot_addr(lu.slot) } != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst)));
+        }
+
+        // write/read = (rights mask) AND (frame rights).
+        const ALLOW_WRITE: u64 = 1 << 0;
+        const ALLOW_READ: u64 = 1 << 1;
+        let write = (rights_mask & ALLOW_WRITE != 0)
+            && matches!(frame_rights, crate::cap::FrameRights::ReadWrite);
+        let read = (rights_mask & ALLOW_READ != 0)
+            && !matches!(frame_rights, crate::cap::FrameRights::KernelOnly);
+        if !write && !read {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidArgument)));
+        }
+        unsafe { iommu::slot_install(lu.slot, frame_paddr, write, read); }
+
+        // Record the IO mapping on the frame cap.
+        let new_cap = Cap::Frame {
+            ptr: crate::cap::PPtr::new(frame_paddr).unwrap(),
+            size,
+            rights: frame_rights,
+            mapped: Some(io_address),
+            asid: pci_request_id,
+            is_device: frame_device,
+            map_type: crate::cap::FrameMapType::IoSpace,
+        };
+        rewrite_frame_cap_in_cspace(invoker, frame_paddr, &new_cap);
+        Ok(())
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (target, args, invoker);
+        Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation)))
+    }
+}
+
+/// Overwrite the (unmapped) Frame cap with `base_paddr` in the
+/// invoker's root CNode. Used by the IO-map path to record the
+/// IO-space mapping on the fresh frame cap.
+#[cfg(target_arch = "x86_64")]
+fn rewrite_frame_cap_in_cspace(invoker: TcbId, base_paddr: u64, new_cap: &Cap) {
+    unsafe {
+        let s = KERNEL.get();
+        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+        let cnode_ptr = match cspace_root {
+            Cap::CNode { ptr, .. } => ptr,
+            _ => return,
+        };
+        let cnode_idx = KernelState::cnode_index(cnode_ptr);
+        if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
+            for slot in slots.iter_mut() {
+                if let Cap::Frame { ptr, mapped: None, .. } = slot.cap() {
+                    if ptr.addr() == base_paddr {
+                        slot.set_cap(new_cap);
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `X86Page::GetAddress` — return the frame's physical address in
@@ -3242,6 +3590,7 @@ fn cnode_copy_or_mint(
             // TODO: mask Frame/Reply rights when sel4test exercises them.
             _ => {}
         }
+        let mut io_mint_invalid = false;
         if mint {
             // Mirrors upstream `updateCapData(false, badge, cap)`:
             // for Endpoint/Notification, `badge` is the badge value;
@@ -3261,6 +3610,24 @@ fn cnode_copy_or_mint(
                 Cap::Notification { badge: b, .. } => {
                     *b = crate::cap::Badge(badge);
                 }
+                // Phase 44 — minting an io_space cap stamps the PCI
+                // request-id + IO domain from the badge (mirrors
+                // upstream updateCapData for cap_io_space_cap:
+                // io_space_capdata { domainID[31:16], PCIDevice[15:0] }).
+                // Only the master (pci_device == 0) may be re-stamped,
+                // and the domain must be non-zero, else the result is a
+                // null cap. `io_mint_invalid` defers the null assignment
+                // until after the `&mut copy` borrow ends.
+                Cap::IoSpace { domain_id, pci_device } => {
+                    let new_domain = ((badge >> 16) & 0xffff) as u16;
+                    let new_pci = (badge & 0xffff) as u16;
+                    if *pci_device == 0 && new_domain != 0 {
+                        *domain_id = new_domain;
+                        *pci_device = new_pci;
+                    } else {
+                        io_mint_invalid = true;
+                    }
+                }
                 Cap::CNode { ptr, radix, guard_size, guard } => {
                     if badge != 0 {
                         let new_guard_size = (badge & 0x3F) as u8;
@@ -3279,6 +3646,9 @@ fn cnode_copy_or_mint(
                 }
                 _ => {}
             }
+        }
+        if io_mint_invalid {
+            copy = Cap::Null;
         }
         if let Some(slot) = s.cnode_slot_mut(dest_cnode_idx, dest_res.slot_index) {
             slot.set_cap(&copy);
@@ -3493,6 +3863,21 @@ unsafe fn maybe_free_object(
                 s.free_reply(idx);
             }
         }
+        Cap::IoPageTable { ptr, is_mapped, level, mapped_address, ioasid } => {
+            // Phase 44 — deleting a mapped IO page table (e.g. at test
+            // teardown when the child's Untyped is revoked) tears down
+            // its VT-d entry (deleteIOPageTable). Without this, the
+            // context root / intermediate PTE leaks into the next test
+            // that reuses the same PCI request-id, corrupting its tree.
+            #[cfg(target_arch = "x86_64")]
+            if *is_mapped {
+                unsafe {
+                    delete_io_page_table(
+                        ptr.addr(), *is_mapped, *level, *mapped_address, *ioasid);
+                }
+            }
+            let _ = (s, ptr, is_mapped, level, mapped_address, ioasid);
+        }
         Cap::AsidPool { asid_base, .. } => {
             // VSPACE0003/0004 — ASID pools are a fixed resource
             // (MAX_ASID_POOLS). Recycle the pool's index when its cap
@@ -3624,26 +4009,33 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // user accesses to that vaddr to fault. Without this, the page
         // stays mapped via stale PTE and the test thread silently
         // continues into corrupted state.
-        if let Cap::Frame { ptr, size, mapped: Some(vaddr), asid, .. } = deleted_cap {
+        if let Cap::Frame { ptr, size, mapped: Some(vaddr), asid, map_type, .. } = deleted_cap {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                let pml4_paddr = pml4_paddr_for_asid(asid);
-                if pml4_paddr != 0 {
-                    match size {
-                        crate::cap::FrameSize::Small => {
-                            crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
-                                pml4_paddr, vaddr);
+                if map_type == crate::cap::FrameMapType::IoSpace {
+                    // Phase 44 — a deleted IO-mapped frame clears its
+                    // VT-d leaf PTE so the mapping doesn't leak into the
+                    // next test that reuses the same PCI request-id.
+                    unmap_io_page(asid, vaddr, ptr.addr());
+                } else {
+                    let pml4_paddr = pml4_paddr_for_asid(asid);
+                    if pml4_paddr != 0 {
+                        match size {
+                            crate::cap::FrameSize::Small => {
+                                crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                                    pml4_paddr, vaddr);
+                            }
+                            crate::cap::FrameSize::Large => {
+                                crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
+                                    pml4_paddr, vaddr);
+                            }
+                            crate::cap::FrameSize::Huge => {
+                                crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
+                                    pml4_paddr, vaddr);
+                            }
                         }
-                        crate::cap::FrameSize::Large => {
-                            crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
-                                pml4_paddr, vaddr);
-                        }
-                        crate::cap::FrameSize::Huge => {
-                            crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
-                                pml4_paddr, vaddr);
-                        }
+                        crate::smp::shootdown_tlb(vaddr);
                     }
-                    crate::smp::shootdown_tlb(vaddr);
                 }
             }
             let _ = (ptr, asid, vaddr, size);
@@ -5775,6 +6167,7 @@ pub mod spec {
             mapped: None,
             asid: 0,
             is_device: false,
+            map_type: crate::cap::FrameMapType::None,
         };
         unsafe { KERNEL.get().cnodes[0].0[1] = Cte::with_cap(&frame_cap); }
 

@@ -75,6 +75,9 @@ pub const X86_LARGE_PAGE: u64 = 10;
 pub const X86_PAGE_TABLE: u64 = 11;
 /// 4 KiB page directory — backs `Cap::PageDirectory` (PD, 512 PDEs).
 pub const X86_PAGE_DIRECTORY: u64 = 12;
+/// Phase 44 — 4 KiB VT-d IO page table — backs `Cap::IoPageTable`
+/// (512 VT-d PTEs). `seL4_X86_IOPageTableObject` with CONFIG_IOMMU.
+pub const X86_IO_PAGE_TABLE: u64 = 13;
 
 // ---------------------------------------------------------------------------
 // ObjectType enum.
@@ -172,8 +175,9 @@ pub fn size_in_bits(ty: ObjectType, user_size_bits: u32) -> Result<u32, SizeErro
         ObjectType::Arch(t) => match t {
             X86_4K => Ok(12),
             X86_LARGE_PAGE => Ok(21),
-            // PT/PD/PDPT/PML4 are each one 4 KiB page of bitfield entries.
-            X86_PAGE_TABLE | X86_PAGE_DIRECTORY | X86_PDPT | X86_PML4 => Ok(12),
+            // PT/PD/PDPT/PML4/IOPT are each one 4 KiB page of bitfield entries.
+            X86_PAGE_TABLE | X86_PAGE_DIRECTORY | X86_PDPT | X86_PML4
+            | X86_IO_PAGE_TABLE => Ok(12),
             _ => Err(SizeError::Unsupported),
         },
     }

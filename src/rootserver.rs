@@ -480,6 +480,7 @@ pub unsafe fn launch_rootserver() -> ! {
         mapped: Some(img.bootinfo_vaddr),
         asid: ROOTSERVER_ASID,
         is_device: false,
+        map_type: crate::cap::FrameMapType::VSpace,
     });
     s.cnodes[ROOTSERVER_CNODE_IDX].0[10] = Cte::with_cap(&Cap::Frame {
         ptr: PPtr::<FrameStorage>::new(img.ipc_buffer_paddr).expect("ipc paddr"),
@@ -488,6 +489,7 @@ pub unsafe fn launch_rootserver() -> ! {
         mapped: Some(img.ipc_buffer_vaddr),
         asid: ROOTSERVER_ASID,
         is_device: false,
+        map_type: crate::cap::FrameMapType::VSpace,
     });
     // Phase 33b / 36e — IRQControl at canonical slot 4.
     s.cnodes[ROOTSERVER_CNODE_IDX].0[4] = Cte::with_cap(&Cap::IrqControl);
@@ -514,7 +516,18 @@ pub unsafe fn launch_rootserver() -> ! {
     // domain handler stamps the domain field on the target TCB
     // (NUM_DOMAINS=1, so only domain 0 is valid).
     s.cnodes[ROOTSERVER_CNODE_IDX].0[11] = Cte::with_cap(&Cap::Domain);
-    // Slots 8, 12, 13, 15: empty (no IO / SMMU / SMC support).
+    // Phase 44 — master IO-space cap at canonical slot 8
+    // (`seL4_CapIOSpace`), present only when a VT-d unit was found.
+    // sel4test's IOPT tests CNode_Mint a per-device io_space cap from
+    // this master (badge = (domainID << 16) | pciRequestID).
+    #[cfg(target_arch = "x86_64")]
+    if crate::arch::x86_64::iommu::iommu_present() {
+        s.cnodes[ROOTSERVER_CNODE_IDX].0[8] = Cte::with_cap(&Cap::IoSpace {
+            domain_id: 0,
+            pci_device: 0,
+        });
+    }
+    // Slots 12, 13, 15: empty (no SMMU / SMC support).
     // Phase 37b — InitThreadSC at canonical slot 14. The
     // SchedContext object was allocated above and bound to the
     // rootserver TCB.
@@ -588,6 +601,7 @@ pub unsafe fn launch_rootserver() -> ! {
                 mapped: Some(pm.vaddr),
                 asid: ROOTSERVER_ASID,
                 is_device: false,
+                map_type: crate::cap::FrameMapType::VSpace,
             });
     }
     let user_image_end: Word = user_image_start + n_image_pages as Word;
@@ -778,7 +792,22 @@ unsafe fn build_bootinfo(
         extraLen: extra_bi_size,
         nodeID: 0,
         numNodes: n_cores,
-        numIOPTLevels: 0,
+        // Phase 44 — VT-d uses 4 IO page-table levels (see iommu.rs);
+        // 0 when no IOMMU is present.
+        numIOPTLevels: {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if crate::arch::x86_64::iommu::iommu_present() {
+                    crate::arch::x86_64::iommu::num_iopt_levels() as Word
+                } else {
+                    0
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                0
+            }
+        },
         ipcBuffer: ipc_buffer_vaddr as *mut crate::types::seL4_IPCBuffer,
         empty: seL4_SlotRegion { start: user_image_end, end: cnode_slots },
         sharedFrames: seL4_SlotRegion { start: 0, end: 0 },

@@ -277,8 +277,8 @@ fn make_object_cap(
                 PageTableStorage, PdptStorage, Pml4Storage,
             };
             use crate::object_type::{
-                X86_4K, X86_LARGE_PAGE, X86_PAGE_DIRECTORY, X86_PAGE_TABLE,
-                X86_PDPT, X86_PML4,
+                X86_4K, X86_IO_PAGE_TABLE, X86_LARGE_PAGE, X86_PAGE_DIRECTORY,
+                X86_PAGE_TABLE, X86_PDPT, X86_PML4,
             };
             match t {
                 X86_4K | X86_LARGE_PAGE => {
@@ -298,6 +298,18 @@ fn make_object_cap(
                         mapped: None,
                         asid: 0,
                         is_device: parent_is_device,
+                        map_type: crate::cap::FrameMapType::None,
+                    })
+                }
+                X86_IO_PAGE_TABLE => {
+                    let ptr = PPtr::<crate::cap::IoPageTableStorage>::new(obj_addr)
+                        .ok_or(RetypeError::InvalidArgument)?;
+                    Ok(Cap::IoPageTable {
+                        ptr,
+                        is_mapped: false,
+                        level: 0,
+                        mapped_address: 0,
+                        ioasid: 0,
                     })
                 }
                 X86_PAGE_TABLE => {

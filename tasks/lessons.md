@@ -259,3 +259,24 @@ cheap boot probe FIRST. Settled two calls this session:
 TCG perf reality: cross-AS IPC = CR3 reload = full softmmu TLB flush (no PCID under
 TCG) → DOMAINS0004/0005 busy-wait tests are ~40x slow + host-variance. Correct, not
 buggy. Real kernel win found anyway: shootdown_tlb skips idle cores (510cf06).
+
+## sel4test rootserver staging + per-test VT-d leak (2026-06-28)
+Two traps hit while landing the VT-d IOPT family:
+1. STAGING ORDER: `build_kernel.sh` re-stages the small DEMO rootserver into
+   `.tmp/rootserver.elf` (overwriting any sel4test-driver copy). So the correct
+   per-iteration order is: build_kernel.sh → cp sel4test-driver .tmp/rootserver.elf
+   → make_image.sh → run_specs.sh. If you skip the re-cp, you run the demo
+   rootserver (look for "[rootserver alive]/multi-vspace setup ok" + a stray #PF)
+   and NO sel4test output — easy to misread as a kernel regression.
+2. CROSS-TEST GLOBAL STATE: sel4test uses *_leaky allocs and a HARDCODED badge
+   (DOMAIN_ID<<16 | FAKE_PCI_DEVICE) every test → same PCI request-id → same VT-d
+   context entry reused across tests. The per-test cleanup that resets it is
+   finaliseCap at process teardown (Untyped revoke deletes the child's leaked
+   IOPageTable/IO-frame caps). MUST implement finalise-on-delete (deleteIOPageTable
+   / unmapIOPage) or leaked mappings corrupt the NEXT test's translation tree.
+   Symptom: only IOPT0008 fails (it's the only test hardcoding pts[EXPECTED_PT_DEPTH]);
+   earlier lenient tests pass on the corrupted-but-tolerable tree.
+3. Boot-pool placement: a standalone small carve_chunk lands in the lowest free
+   region (conventional RAM @ paddr 0), which is exactly where place_rootserver
+   lays the rootserver — vtd_init then zeroes the rootserver TCB. Slice such pools
+   off the TOP of the big 16MiB user-pages carve instead.

@@ -215,9 +215,6 @@ fn bsp_main_big_stack() -> ! {
 
     arch::log("Kernel initialization complete on BSP\n");
 
-    #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::iommu::viability_probe();
-
     // Release APs — the shared GDT and IDT are now populated, so
     // they can safely lgdt/lidt and load their per-CPU TSS.
     let n_cores = bootboot::get_num_cores() as u32;
@@ -244,6 +241,13 @@ fn bsp_main_big_stack() -> ! {
         }
         arch::log("\n");
     }
+
+    // Phase 44 — initialise the VT-d IOMMU now that the IOMMU table
+    // pool has been carved from low RAM (in reserve_user_page_region).
+    // Sets numIOPTLevels + the master io_space cap availability before
+    // the rootserver's CNode is populated.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::iommu::vtd_init();
 
     #[cfg(feature = "spec")]
     spec::test_main();
