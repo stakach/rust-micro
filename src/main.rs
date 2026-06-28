@@ -396,7 +396,10 @@ fn ap_scheduler_loop() -> ! {
                         // this flush — MULTICORE0002). Otherwise only
                         // reload on a vspace change so the yield-stress
                         // test doesn't crawl (MULTICORE0004).
+                        #[cfg(feature = "smp")]
                         let was_idle = crate::smp::take_went_idle();
+                        #[cfg(not(feature = "smp"))]
+                        let was_idle = false;
                         let cur_cr3: u64;
                         core::arch::asm!(
                             "mov {}, cr3",

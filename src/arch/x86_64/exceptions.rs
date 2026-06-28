@@ -326,7 +326,15 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
             // pages and ran wild). When NOT coming from idle, only reload
             // on an actual vspace change — flushing every dispatch makes
             // the yield-stress test crawl (MULTICORE0004).
+            // The from-idle CR3 reload is only needed under real SMP (a
+            // core that idled on a vspace can miss a cross-core
+            // shootdown). In the default single-node build it's pure
+            // overhead AND perturbs the flaky suspend/resume timing
+            // (SCHED0000), so gate it behind `smp`.
+            #[cfg(feature = "smp")]
             let was_idle = crate::smp::take_went_idle();
+            #[cfg(not(feature = "smp"))]
+            let was_idle = false;
             let cur_cr3: u64;
             core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                 options(nomem, nostack, preserves_flags));
