@@ -239,3 +239,10 @@ via bare "THREADS". N/A on x86_64+QEMU: VSPACE0001 (AARCH-only), VSPACE0010
 DOMAINS0001-0004 already pass (DomainSet_Set validation). Tier 2 needs
 KernelNumDomains>1 (CMake DOMAINS=ON) + domain scheduler + ScheduleConfigure
 /ScheduleSetStart invocations. Targets: DOMAINS0000/0004/0005/9999.
+
+## DOMAINS DONE (2026-06-28, 156/156)
+Full domain scheduler + invocations. Build needs DOMAINS=ON (NumDomains=4).
+Root cause of the long debug: no idle thread → empty-domain choose=None →
+swap_iretq resumed the interrupted thread out-of-domain w/ current=None →
+stale-context #PF during teardown. Fixed by parking+idling. DOMAINS0004/5
+slow-but-pass under TCG (cross-domain busy-wait RPC). No regressions.
