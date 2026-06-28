@@ -224,6 +224,18 @@ pub fn shootdown_tlb(vaddr: u64) {
     let n_cores = crate::bootboot::get_num_cores() as u32;
     for cpu in 0..n_cores.min(MAX_CPUS as u32) {
         if cpu == me { continue; }
+        // Only a CPU actively running a user thread can hold the stale
+        // mapping in its TLB. An idle CPU (current == None) reloads CR3
+        // — which flushes the TLB — when it's next handed a thread, so
+        // a shootdown IPI to it is pure waste. Skipping idle cores
+        // matters a lot under single-threaded TCG: a single-CPU
+        // workload that unmaps frequently (DOMAINS' per-test helper
+        // teardown) would otherwise wake the 3 idle APs on every unmap,
+        // and they burn emulator cycles spinning on the BKL.
+        let running = unsafe {
+            crate::kernel::KERNEL.get().scheduler.current_for_cpu(cpu).is_some()
+        };
+        if !running { continue; }
         send_ipi(cpu, IpiKind::InvalidateTlb { vaddr });
     }
 }
@@ -431,10 +443,28 @@ pub mod spec {
         let n_aps = n_cores - 1;
 
         bkl_acquire();
+        // `shootdown_tlb` skips idle cores (current == None) since they
+        // flush via CR3 reload when next scheduled. To exercise the
+        // fan-out we mark every AP as "running" with a placeholder TCB
+        // id (the InvalidateTlb handler only `invlpg`s the vaddr — it
+        // never dereferences `current`), fire the shootdown, then
+        // restore them to idle.
+        {
+            let s = unsafe { crate::kernel::KERNEL.get() };
+            for ap in 1..n_cores.min(MAX_CPUS as u32) {
+                s.scheduler.set_current_for_cpu(ap, Some(crate::tcb::TcbId(0)));
+            }
+        }
         // Pick a vaddr that BOOTBOOT does NOT map (kernel half,
         // unused) so each AP's `invlpg` is a harmless no-op rather
         // than perturbing a live mapping.
         shootdown_tlb(0xFFFF_8000_DEAD_F000);
+        {
+            let s = unsafe { crate::kernel::KERNEL.get() };
+            for ap in 1..n_cores.min(MAX_CPUS as u32) {
+                s.scheduler.set_current_for_cpu(ap, None);
+            }
+        }
         bkl_release();
 
         // Each AP's ISR bumps the counter once per IPI it handles.
