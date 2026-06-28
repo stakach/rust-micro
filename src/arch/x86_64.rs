@@ -11,6 +11,7 @@ pub mod exceptions;
 pub mod gdt;
 pub mod interrupts;
 pub mod ioapic;
+pub mod iommu;
 pub mod lapic;
 pub mod msr;
 pub mod paging;

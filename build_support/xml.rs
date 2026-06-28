@@ -39,7 +39,10 @@ pub fn default_config() -> HashMap<&'static str, bool> {
         // libsel4 the tests are built against.
         ("CONFIG_HARDWARE_DEBUG_API", true),
         ("CONFIG_VTX", false),
-        ("CONFIG_IOMMU", false),
+        // IOMMU enabled (IOPT tests). Generates X86IOPageTableMap/Unmap
+        // + X86PageMapIO invocation labels and the seL4_X86_IOPageTableObject
+        // type — must match the libsel4 the tests link against.
+        ("CONFIG_IOMMU", true),
         ("CONFIG_ENABLE_BENCHMARKS", false),
         ("CONFIG_BENCHMARK_TRACK_UTILISATION", false),
         // Phase 41 — sel4test-driver issues SysDebugHalt /

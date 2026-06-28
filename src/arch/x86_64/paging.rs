@@ -152,6 +152,26 @@ pub const PTE_NX: u64 = 1 << 63;
 
 pub const KERNEL_MMIO_VBASE: u64 = 0xFFFF_FFFF_F800_0000;
 pub const KERNEL_LAPIC_VBASE: u64 = KERNEL_MMIO_VBASE; // first MMIO slot
+pub const KERNEL_IOMMU_VBASE: u64 = KERNEL_MMIO_VBASE + 0x1000; // second slot (VT-d regs)
+
+/// Map a single 4 KiB MMIO page (strong-uncacheable) into the kernel
+/// half at `vaddr`, backing it with `paddr`. For device register files
+/// (LAPIC, IOMMU/VT-d) that live above the linear map. Patches the live
+/// PML4; the caller picks a free `KERNEL_MMIO_VBASE` slot.
+pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
+    let pml4 = (read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    map_4k_into(
+        pml4,
+        vaddr,
+        paddr & !0xFFF,
+        PTE_PRESENT | PTE_RW | PTE_PCD | PTE_PWT | PTE_NX,
+    );
+    core::arch::asm!(
+        "invlpg [{addr}]",
+        addr = in(reg) vaddr,
+        options(nostack, preserves_flags),
+    );
+}
 
 /// Base of the kernel-half "linear map": every physical address `p`
 /// in the range [0, LINEAR_MAP_GIB·1 GiB) is reachable from kernel

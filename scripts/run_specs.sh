@@ -54,9 +54,18 @@ fi
 # The firmware is loaded as pflash rather than via -bios because the EDK2
 # images shipped with Homebrew QEMU aren't padded to the 4 MiB size that
 # the legacy -bios path requires.
+# q35 machine (not the default i440fx) is required for the Intel VT-d
+# IOMMU (`-device intel-iommu`), which CONFIG_IOMMU / the IOPT tests
+# need. Under q35 the boot disk lands on AHCI/SATA and OVMF won't
+# auto-boot it from a bare `-drive`, so we attach it explicitly with
+# `bootindex=0`. intremap=off: we only do DMA remapping, not IRQ remap.
 exec qemu-system-x86_64 \
-  -drive format=raw,file="$IMAGE" \
+  -machine q35 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
+  -drive format=raw,file="$IMAGE",if=none,id=bootdisk \
+  -device ahci,id=ahci0 \
+  -device ide-hd,drive=bootdisk,bus=ahci0.0,bootindex=0 \
+  -device intel-iommu,intremap=off \
   -m 1024M \
   -smp 4 \
   -serial stdio \

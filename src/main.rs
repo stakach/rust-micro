@@ -215,6 +215,9 @@ fn bsp_main_big_stack() -> ! {
 
     arch::log("Kernel initialization complete on BSP\n");
 
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::iommu::viability_probe();
+
     // Release APs — the shared GDT and IDT are now populated, so
     // they can safely lgdt/lidt and load their per-CPU TSS.
     let n_cores = bootboot::get_num_cores() as u32;

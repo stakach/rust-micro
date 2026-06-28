@@ -158,6 +158,70 @@ pub fn iter_madt_entries<F: FnMut(MadtEntry)>(madt: &MadtHeader, mut f: F) -> us
 }
 
 // ---------------------------------------------------------------------------
+// DMAR — DMA Remapping table (Intel VT-d IOMMU). Present when QEMU is
+// launched with `-machine q35 -device intel-iommu`.
+// ---------------------------------------------------------------------------
+
+pub const DMAR_SIGNATURE: &[u8; 4] = b"DMAR";
+
+/// Walk the RSDT/XSDT for the DMAR table; returns its physical address.
+pub fn find_dmar(sdt_addr: u64) -> Result<u64, AcpiError> {
+    let hdr = validate_sdt(sdt_addr)?;
+    let sig: [u8; 4] = unsafe { read_unaligned(&raw const hdr.signature) };
+    let length: u32 = unsafe { read_unaligned(&raw const hdr.length) };
+    let entry_size: usize = match &sig {
+        b"RSDT" => 4,
+        b"XSDT" => 8,
+        _ => return Err(AcpiError::BadSignature),
+    };
+    let entries_base = sdt_addr + core::mem::size_of::<SdtHeader>() as u64;
+    let entry_count = (length as usize - core::mem::size_of::<SdtHeader>()) / entry_size;
+    for i in 0..entry_count {
+        let entry_addr = entries_base + (i as u64) * entry_size as u64;
+        let table_addr: u64 = match entry_size {
+            4 => (unsafe { read_unaligned(entry_addr as *const u32) }) as u64,
+            _ => unsafe { read_unaligned(entry_addr as *const u64) },
+        };
+        if let Ok(hdr2) = validate_sdt(table_addr) {
+            let sig2: [u8; 4] = unsafe { read_unaligned(&raw const hdr2.signature) };
+            if sig2 == *DMAR_SIGNATURE {
+                return Ok(table_addr);
+            }
+        }
+    }
+    Err(AcpiError::NoTable)
+}
+
+/// Parse the DMAR remapping structures for the first DRHD (DMA
+/// Remapping Hardware unit Definition, type 0) and return its IOMMU
+/// register base physical address. Layout after the 36-byte SDT header:
+/// host_addr_width(u8), flags(u8), reserved[10]; then remapping
+/// structures each `type(u16) length(u16) ...`; DRHD has the 64-bit
+/// register base at struct-offset +8.
+pub fn dmar_first_drhd_base(dmar_addr: u64) -> Option<u64> {
+    let total_len = unsafe {
+        read_unaligned(&raw const (*(dmar_addr as *const SdtHeader)).length)
+    } as usize;
+    let mut off = core::mem::size_of::<SdtHeader>() + 12; // +host_addr_width/flags/resv
+    while off + 4 <= total_len {
+        let ty: u16 = unsafe { read_unaligned((dmar_addr + off as u64) as *const u16) };
+        let len: u16 = unsafe { read_unaligned((dmar_addr + (off + 2) as u64) as *const u16) };
+        if len < 4 || off + len as usize > total_len {
+            break;
+        }
+        if ty == 0 {
+            // DRHD — register base at +8.
+            let base: u64 = unsafe {
+                read_unaligned((dmar_addr + (off + 8) as u64) as *const u64)
+            };
+            return Some(base);
+        }
+        off += len as usize;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Errors and helpers.
 // ---------------------------------------------------------------------------
 
