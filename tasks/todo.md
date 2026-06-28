@@ -246,3 +246,10 @@ Root cause of the long debug: no idle thread → empty-domain choose=None →
 swap_iretq resumed the interrupted thread out-of-domain w/ current=None →
 stale-context #PF during teardown. Fixed by parking+idling. DOMAINS0004/5
 slow-but-pass under TCG (cross-domain busy-wait RPC). No regressions.
+
+## HW-DEBUG DONE (2026-06-28, 157 green w/o DOMAINS, ~164 with)
+Full CONFIG_HARDWARE_DEBUG_API: DR0-7 breakpoints + TF single-step.
+BREAKPOINT_001/003-007 + BREAK_REQUEST_001 + SINGLESTEP_001 pass.
+Build: settings.cmake HardwareDebugAPI=ON + xml.rs codegen flag (label
+shift!). No regression. KNOWN: DOMAINS0004/5 TCG-flaky, livelock combined
+gate ~50% (pre-existing, separate from HW-debug).
