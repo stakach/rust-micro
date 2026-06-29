@@ -8,6 +8,7 @@ pub mod context;
 pub mod cpu;
 pub mod debug;
 pub mod exceptions;
+pub mod fpu_ctx;
 pub mod gdt;
 pub mod interrupts;
 pub mod ioapic;

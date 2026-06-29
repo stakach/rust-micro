@@ -204,6 +204,11 @@ fn bsp_main_big_stack() -> ! {
     arch::log("Initializing SYSCALL MSRs...\n");
     arch::init_syscall_msrs();
 
+    // SMP FPU save/restore: ensure CR4.OSFXSR and capture the canonical
+    // FINIT FXSAVE image so every new TCB starts from valid FPU state.
+    #[cfg(all(target_arch = "x86_64", feature = "smp"))]
+    crate::arch::x86_64::fpu_ctx::init_fpu_template();
+
     // Phase 28d — install kernel page tables (so the LAPIC is
     // mapped at KERNEL_LAPIC_VBASE) then software-enable the BSP's
     // LAPIC. Once enabled, IPI delivery works in either direction.
@@ -389,6 +394,10 @@ fn ap_scheduler_loop() -> ! {
                         // consumed-report before snapshotting ctx.
                         crate::sched_context::complete_yield_if_pending(tcb_id);
                         let tcb = s.scheduler.slab.get(tcb_id);
+                        // Snapshot the context now (Copy) so the FPU
+                        // switch below can take `&mut slab` after the
+                        // immutable `tcb` borrow has ended.
+                        let next_user_ctx = tcb.user_context;
 
                         // SMP: if this AP went idle since its last
                         // dispatch, reload CR3 to flush a possibly-stale
@@ -421,9 +430,17 @@ fn ap_scheduler_loop() -> ! {
                             tcb.cpu_context.fs_base,
                         );
 
+                        // SMP: make this thread's FPU state resident on
+                        // this AP before resuming it (fxsave outgoing
+                        // owner, fxrstor this thread). Critical for
+                        // FPU0002 round-robin migration.
+                        #[cfg(feature = "smp")]
+                        crate::arch::x86_64::fpu_ctx::fpu_switch_to(
+                            &mut s.scheduler.slab, tcb_id);
+
                         let pcc = crate::arch::x86_64::syscall_entry
                             ::current_cpu_user_ctx_mut();
-                        *pcc = tcb.user_context;
+                        *pcc = next_user_ctx;
                         pcc as *const crate::arch::x86_64::syscall_entry::UserContext
                     };
 
@@ -452,6 +469,15 @@ fn ap_scheduler_loop() -> ! {
             }
         }
 
+        // SMP: this AP is about to idle — flush its live FPU state back
+        // to the owner TCB so a thread migrated off this idle core (which
+        // `remote_tcb_stall` won't stall/flush) restores fresh state.
+        // Critical for FPU0002 reliability across 400 migrations.
+        #[cfg(all(target_arch = "x86_64", feature = "smp"))]
+        unsafe {
+            crate::arch::x86_64::fpu_ctx::flush_local_fpu(
+                &mut crate::kernel::KERNEL.get().scheduler.slab);
+        }
         // Park on the kernel root page table before idling: a user
         // vspace left in CR3 can be freed by another core's process
         // teardown, after which our next interrupt reads an unmapped

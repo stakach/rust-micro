@@ -700,6 +700,12 @@ pub unsafe fn launch_rootserver() -> ! {
         options(nostack, preserves_flags),
     );
 
+    // SMP: establish the rootserver as this core's FPU owner so its
+    // x87/SSE state is tracked from first entry (otherwise a later
+    // switch wouldn't save it).
+    #[cfg(feature = "smp")]
+    crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, id);
+
     let ctx = s.scheduler.slab.get(id).user_context;
     enter_user_via_sysret(&ctx);
 }

@@ -360,10 +360,15 @@ pub(crate) fn swap_iretq_context_if_preempted(
                 crate::arch::x86_64::exceptions::dispatch_next_or_idle("");
             }
         };
-        if Some(next) == interrupted {
-            s.scheduler.set_current(Some(next));
-            return;
-        }
+        // Snapshot the interrupted thread's live registers into its TCB
+        // FIRST — even when it is the thread we're about to resume on this
+        // core (`next == interrupted`). That case resumes via the IRQ
+        // frame's iretq here, but if the thread is later MIGRATED and
+        // dispatched fresh on another core before its next preemption, the
+        // fresh dispatch reads `user_context` and (with use_iretq_resume
+        // clear) sysrets — landing at RIP = stale rcx, which mid-`memcmp`
+        // is a data value (FPU0002's constant garbage RIP). Saving here
+        // keeps the TCB context current and forces iretq resume.
         if let Some(prev) = interrupted {
             let prev_tcb = s.scheduler.slab.get_mut(prev);
             // FULL context save. An IRQ can preempt any user
@@ -393,6 +398,10 @@ pub(crate) fn swap_iretq_context_if_preempted(
             prev_tcb.user_context.rip = ctx.rip;
             prev_tcb.user_context.rflags = ctx.rflags;
             prev_tcb.use_iretq_resume = true;
+        }
+        if Some(next) == interrupted {
+            s.scheduler.set_current(Some(next));
+            return;
         }
         let use_iretq = {
             let next_tcb = s.scheduler.slab.get_mut(next);
@@ -465,6 +474,10 @@ pub(crate) fn swap_iretq_context_if_preempted(
             crate::arch::x86_64::msr::IA32_FS_BASE,
             s.scheduler.slab.get(next).cpu_context.fs_base,
         );
+        // SMP: the running thread changed under this IRQ — make the
+        // incoming thread's FPU state resident on this core.
+        #[cfg(feature = "smp")]
+        crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next);
         s.scheduler.set_current(Some(next));
     }
 }

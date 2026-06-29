@@ -3865,6 +3865,11 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     }
     s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
     scrub_tcb_refs(s, id);
+    // seL4 `fpuRelease`: drop any core's ownership of this thread's FPU
+    // state before its save area vanishes, so a later `fpu_switch_to`
+    // can't `fxsave` into a freed TCB.
+    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+    crate::arch::x86_64::fpu_ctx::fpu_release(id);
     s.scheduler.slab.entries[id.0 as usize] = None;
 }
 

@@ -267,6 +267,9 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
             }
             crate::arch::x86_64::msr::wrmsr(
                 crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+            #[cfg(feature = "smp")]
+            crate::arch::x86_64::fpu_ctx::fpu_switch_to(
+                &mut s.scheduler.slab, next_id);
             crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
                 s.scheduler.slab.get(next_id));
             crate::arch::x86_64::syscall_entry::apply_debug_state_for(
@@ -289,6 +292,10 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
         }
         // No runnable thread — idle this CPU until an IRQ wakes it.
         crate::arch::log("[#NM: no next thread, idling CPU]\n");
+        // SMP: flush live FPU state to its owner TCB before idling so a
+        // migration off this idle core restores fresh state.
+        #[cfg(feature = "smp")]
+        crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
         drop(_bkl);
         loop { core::arch::asm!("sti", "hlt"); }
     }
@@ -345,6 +352,9 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         }
         crate::arch::x86_64::msr::wrmsr(
             crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+        #[cfg(feature = "smp")]
+        crate::arch::x86_64::fpu_ctx::fpu_switch_to(
+            &mut s.scheduler.slab, next_id);
         crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
             s.scheduler.slab.get(next_id));
         crate::arch::x86_64::syscall_entry::apply_debug_state_for(
@@ -363,6 +373,13 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
             pcc as *const _);
     }
     if !logged { crate::arch::log(idle_tag); logged = true; }
+    // SMP: about to idle with no runnable thread — flush this core's
+    // live FPU state back to its owner TCB. A thread can be migrated
+    // off an *idle* core (where `remote_tcb_stall` finds current==None
+    // and does no stall/flush); without this, the destination core
+    // would restore stale TCB state and FPU0002 corrupts (flaky).
+    #[cfg(feature = "smp")]
+    crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
     // Idle: drop the lock so the timer ISR can run, halt until an
     // interrupt, then re-acquire and loop back to choose_thread.
     // Mark went-idle so the next dispatch flushes a possibly-stale TLB.

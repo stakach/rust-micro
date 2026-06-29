@@ -289,7 +289,18 @@ pub fn remote_tcb_stall(tcb: TcbId) -> bool {
         let aff = s.scheduler.slab.get(tcb).affinity;
         (aff, s.scheduler.current_for_cpu(aff) == Some(tcb))
     };
-    if aff == me || !running_there {
+    // Stall the source core not only when it is actively running `tcb`,
+    // but also when `tcb`'s FPU image is still resident in that core's
+    // registers (it ran there, then the core went idle without flushing).
+    // Migrating without flushing leaves two cores believing they own the
+    // thread's FPU; the next save races and an old image clobbers the
+    // live one (FPU0002 flakiness). The stall handler flushes via
+    // `flush_local_fpu`. `owner_is` is one relaxed load.
+    #[cfg(feature = "smp")]
+    let fpu_resident = crate::arch::x86_64::fpu_ctx::owner_is(aff as usize, tcb);
+    #[cfg(not(feature = "smp"))]
+    let fpu_resident = false;
+    if aff == me || (!running_there && !fpu_resident) {
         return false;
     }
     let a = aff as usize;

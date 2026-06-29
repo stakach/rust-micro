@@ -546,6 +546,15 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     unsafe {
         if let Some(prev) = KERNEL.get().scheduler.current() {
             KERNEL.get().scheduler.slab.get_mut(prev).user_context = *ctx;
+            // This thread entered via SYSCALL, so its resume RIP lives in
+            // rcx (sysret convention) — clear use_iretq_resume so a later
+            // dispatch sysrets rather than iretq'ing to a stale
+            // user_context.rip. The swap path sets this true on IRQ
+            // preemption; this is the matching clear that keeps the
+            // "resume mode = last user exit" invariant correct (without
+            // it, a thread preempted then making a syscall would resume
+            // via iretq to the wrong RIP — boot rootserver → RIP=0).
+            KERNEL.get().scheduler.slab.get_mut(prev).use_iretq_resume = false;
             IN_FLIGHT_INVOKER.store(prev.0 as u32, AtomOrd::Relaxed);
         } else {
             IN_FLIGHT_INVOKER.store(u32::MAX, AtomOrd::Relaxed);
@@ -830,6 +839,12 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // flags. The asm tail is about to sysretq into the
             // thread; if `fpuDisabled` is set, the next FPU op
             // there must trap into our #NM handler.
+            // SMP: make the resumed thread's FPU state resident on this
+            // core (fxsave outgoing owner, fxrstor `next`) BEFORE the TS
+            // gate — fpu_switch_to clears TS to fxrstor, so the gate must
+            // run after it to set the final CR0.TS for `next`.
+            #[cfg(feature = "smp")]
+            crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next);
             apply_fpu_gate_for(s.scheduler.slab.get(next));
             apply_debug_state_for(s.scheduler.slab.get(next));
             // REGRESSIONS0001 — if `next` was set up via
@@ -868,6 +883,13 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // through and returning, since they have no scheduler
             // state and shouldn't sit in a wait-for-IRQ loop.
             let _ = result;
+            // SMP: flush this core's live FPU state to its owner TCB
+            // before idling. The just-blocked thread owns the FPU here;
+            // if it is later migrated off this (now idle) core,
+            // `remote_tcb_stall` won't stall/flush it, so its state must
+            // already be in its TCB (FPU0002 flakiness fix).
+            #[cfg(feature = "smp")]
+            crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
             crate::smp::bkl_release();
             loop {
                 // SMP: this core is about to go idle (no runnable
@@ -920,6 +942,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     }
                     crate::arch::x86_64::msr::wrmsr(
                         crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+                    #[cfg(feature = "smp")]
+                    crate::arch::x86_64::fpu_ctx::fpu_switch_to(
+                        &mut s.scheduler.slab, next_id);
                     apply_fpu_gate_for(s.scheduler.slab.get(next_id));
                     apply_debug_state_for(s.scheduler.slab.get(next_id));
                     let pcc = current_cpu_user_ctx_mut();

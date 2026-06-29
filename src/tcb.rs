@@ -136,6 +136,33 @@ pub struct CpuContext {
     pub fs_base: u64,
 }
 
+/// 512-byte, 16-byte-aligned FXSAVE region carried on each TCB (SMP
+/// FPU save/restore — see `arch::x86_64::fpu_ctx`). Only present in the
+/// `smp` build; the default single-node kernel needs no per-TCB FPU
+/// storage because a thread's FPU state stays resident in the hardware
+/// until it next runs (no cross-core migration to carry it).
+#[cfg(feature = "smp")]
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug)]
+pub struct FxArea(pub [u8; 512]);
+
+#[cfg(feature = "smp")]
+impl FxArea {
+    /// A valid FINIT FXSAVE image: FCW=0x037F (offset 0) and
+    /// MXCSR=0x1F80 (offset 24); everything else zero (abridged FTW =
+    /// all-empty). `fxrstor` of this never #GPs — unlike a zeroed area,
+    /// no reserved MXCSR bit is set. Used as the default until the boot
+    /// template (identical content) stamps in at allocation.
+    pub const FINIT: FxArea = {
+        let mut b = [0u8; 512];
+        b[0] = 0x7F; // FCW low  \ = 0x037F
+        b[1] = 0x03; // FCW high /
+        b[24] = 0x80; // MXCSR low  \ = 0x1F80
+        b[25] = 0x1F; // MXCSR high /
+        FxArea(b)
+    };
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Tcb {
     pub state: ThreadStateType,
@@ -328,6 +355,12 @@ pub struct Tcb {
     /// `WriteRegisters(resume=true)` (upstream `restart()` cancels
     /// the fault).
     pub pending_fault: u8,
+    /// SMP-only saved FPU (x87/SSE) register file. Live state is held
+    /// in the hardware while this thread owns a core's FPU; it is
+    /// `fxsave`d here on a switch-away / cross-core migration and
+    /// `fxrstor`d on switch-to. Initialised to a valid FINIT image.
+    #[cfg(feature = "smp")]
+    pub fpu_state: FxArea,
 }
 
 impl Default for Tcb {
@@ -375,6 +408,8 @@ impl Default for Tcb {
             timeout_endpoint_cap: crate::cap::Cap::Null,
             debug: crate::arch::x86_64::debug::DebugState::new(),
             pending_fault: 0,
+            #[cfg(feature = "smp")]
+            fpu_state: FxArea::FINIT,
         }
     }
 }
@@ -427,6 +462,15 @@ impl TcbSlab {
         for (i, slot) in self.entries.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(tcb);
+                // Stamp the boot-captured FINIT FPU template so the
+                // first `fxrstor` of this thread restores valid state
+                // (SMP FPU save/restore). The `Default` is already a
+                // valid FINIT image; this just adopts the canonical
+                // boot-captured one for fidelity.
+                #[cfg(feature = "smp")]
+                crate::arch::x86_64::fpu_ctx::stamp_template(
+                    &mut slot.as_mut().unwrap().fpu_state,
+                );
                 return Some(TcbId(i as u16));
             }
         }

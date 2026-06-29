@@ -202,6 +202,12 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
                     p.use_iretq_resume = true;
                 }
             }
+            // A thread migrated off this core has its live FPU state in
+            // THIS core's registers, not its TCB. Flush it back so the
+            // destination core restores fresh state (the crux of
+            // FPU0002). Clears this core's FPU ownership.
+            #[cfg(feature = "smp")]
+            crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
             s.scheduler.set_current(None);
         }
         eoi();
