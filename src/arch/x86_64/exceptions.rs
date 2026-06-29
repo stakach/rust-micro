@@ -149,15 +149,20 @@ pub unsafe extern "C" fn device_not_available_entry() {
         "mov gs:[16 + 96],  r13",
         "mov gs:[16 + 104], r14",
         "mov gs:[16 + 112], r15",
-        // Stamp the iretq frame's saved RIP / RFLAGS / RSP into
-        // user_ctx. sysretq restores RIP from rcx and RFLAGS from
-        // r11, so user_ctx.rcx = RIP and user_ctx.r11 = RFLAGS.
+        // Stamp the iretq frame's saved RIP / RFLAGS / RSP into the
+        // DEDICATED user_ctx slots (iretq-flavor), leaving the TRUE rcx /
+        // r11 saved above intact — matching page_fault_entry /
+        // invalid_opcode_entry. The handler marks the faulter
+        // use_iretq_resume=true, so resume_ip must read user_ctx.rip
+        // (not rcx). The old sysret-flavor stamp (rcx=RIP) was masked by
+        // the dispatch clearing use_iretq_resume; once that clear was
+        // removed it left the #NM context inconsistent (FPU0004).
         "mov rax, [rsp + 0]",
-        "mov gs:[16 + 16],  rax",   // user_ctx.rcx = saved RIP
+        "mov gs:[16 + 128], rax",   // user_ctx.rip    = saved RIP
         "mov rax, [rsp + 16]",
-        "mov gs:[16 + 80],  rax",   // user_ctx.r11 = saved RFLAGS
+        "mov gs:[16 + 136], rax",   // user_ctx.rflags = saved RFLAGS
         "mov rax, [rsp + 24]",
-        "mov gs:[16 + 120], rax",   // user_ctx.rsp = saved RSP
+        "mov gs:[16 + 120], rax",   // user_ctx.rsp    = saved RSP
         // Call the typed Rust handler with (saved_rip, saved_cs).
         // Stack stays on the IDT-pushed kernel stack (TSS RSP0 for
         // user-mode entry). Plenty of room for one C call.
@@ -277,9 +282,9 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
             let pcc = crate::arch::x86_64::syscall_entry
                 ::current_cpu_user_ctx_mut();
             *pcc = next_ctx;
-            // Honour use_iretq_resume on this resume path too.
+            // Honour use_iretq_resume on this resume path too. Don't clear
+            // it — it tracks the save flavor (see swap_iretq_context...).
             if s.scheduler.slab.get(next_id).use_iretq_resume {
-                s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
                 drop(_bkl);
                 crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
                     pcc as *const _);
@@ -363,7 +368,6 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
             ::current_cpu_user_ctx_mut();
         *pcc = next_ctx;
         if s.scheduler.slab.get(next_id).use_iretq_resume {
-            s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
             crate::smp::bkl_release();
             crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
                 pcc as *const _);

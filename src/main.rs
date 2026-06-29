@@ -448,13 +448,10 @@ fn ap_scheduler_loop() -> ! {
                     // and RIP/RFLAGS in dedicated fields — resume
                     // via iretq, not sysretq.
                     let use_iretq = unsafe {
-                        let s = crate::kernel::KERNEL.get();
-                        let f = s.scheduler.slab.get(tcb_id).use_iretq_resume;
-                        if f {
-                            s.scheduler.slab.get_mut(tcb_id)
-                                .use_iretq_resume = false;
-                        }
-                        f
+                        // Don't clear — use_iretq_resume tracks the save
+                        // flavor and persists until the next save.
+                        crate::kernel::KERNEL.get()
+                            .scheduler.slab.get(tcb_id).use_iretq_resume
                     };
                     smp::bkl_release();
                     unsafe {

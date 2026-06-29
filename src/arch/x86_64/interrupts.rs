@@ -403,14 +403,14 @@ pub(crate) fn swap_iretq_context_if_preempted(
             s.scheduler.set_current(Some(next));
             return;
         }
-        let use_iretq = {
-            let next_tcb = s.scheduler.slab.get_mut(next);
-            let f = next_tcb.use_iretq_resume;
-            if f {
-                next_tcb.use_iretq_resume = false;
-            }
-            f
-        };
+        // `use_iretq_resume` tracks the SAVE flavor (IRQ-preempted = true,
+        // syscall = false) and persists until the thread is next saved —
+        // do NOT clear it here. Clearing it on dispatch left the saved
+        // context iretq-flavor (RIP in .rip, real rcx in .rcx) while the
+        // flag claimed sysret-flavor, so reported_ip/resume_ip later read
+        // .rcx (a live data value) as the RIP — a ReadRegisters→
+        // WriteRegisters restart then resumed at that garbage (FPU0002).
+        let use_iretq = s.scheduler.slab.get(next).use_iretq_resume;
         // activateThread — write a pending YieldTo consumed-report
         // before snapshotting the context we're about to load.
         crate::sched_context::complete_yield_if_pending(next);

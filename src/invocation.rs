@@ -4796,9 +4796,11 @@ fn decode_tcb(
                             // sysretq path: rcx serves as RIP, r11
                             // as RFLAGS. Store rip/rflags there so
                             // the sysretq tail jumps to the right
-                            // place.
+                            // place. Mark the context sysret-flavor so
+                            // resume_ip/reported_ip read rcx as the RIP.
                             t.user_context.rcx = new_rip;
                             t.user_context.r11 = new_rflags;
+                            t.use_iretq_resume = false;
                         }
                         // fs_base / gs_base (slots 18, 19) ignored.
                         if resume {

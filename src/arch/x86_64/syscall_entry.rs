@@ -854,7 +854,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // the flag so subsequent syscall returns use sysretq
             // again.
             if s.scheduler.slab.get(next).use_iretq_resume {
-                s.scheduler.slab.get_mut(next).use_iretq_resume = false;
                 let pcc = current_cpu_user_ctx_mut();
                 *pcc = new_ctx;
                 crate::smp::bkl_release();
@@ -950,7 +949,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     let pcc = current_cpu_user_ctx_mut();
                     *pcc = next_ctx;
                     if s.scheduler.slab.get(next_id).use_iretq_resume {
-                        s.scheduler.slab.get_mut(next_id).use_iretq_resume = false;
                         crate::smp::bkl_release();
                         enter_user_via_iretq(pcc as *const _);
                     }
