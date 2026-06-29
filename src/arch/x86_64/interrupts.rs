@@ -360,15 +360,18 @@ pub(crate) fn swap_iretq_context_if_preempted(
                 crate::arch::x86_64::exceptions::dispatch_next_or_idle("");
             }
         };
-        // Snapshot the interrupted thread's live registers into its TCB
-        // FIRST — even when it is the thread we're about to resume on this
-        // core (`next == interrupted`). That case resumes via the IRQ
-        // frame's iretq here, but if the thread is later MIGRATED and
-        // dispatched fresh on another core before its next preemption, the
-        // fresh dispatch reads `user_context` and (with use_iretq_resume
-        // clear) sysrets — landing at RIP = stale rcx, which mid-`memcmp`
-        // is a data value (FPU0002's constant garbage RIP). Saving here
-        // keeps the TCB context current and forces iretq resume.
+        // Same thread resumes on this core: it resumes via the IRQ frame's
+        // iretq (registers intact). The default (single-node) build skips
+        // the save entirely here — writing the TCB context corrupts threads
+        // this core re-enters without a full round-trip (it broke DOMAINS
+        // rotation). The smp build instead saves FIRST (below) so a later
+        // MIGRATION dispatches the thread from a current context (FPU0002),
+        // then takes the same early return after the save.
+        #[cfg(not(feature = "smp"))]
+        if Some(next) == interrupted {
+            s.scheduler.set_current(Some(next));
+            return;
+        }
         if let Some(prev) = interrupted {
             let prev_tcb = s.scheduler.slab.get_mut(prev);
             // FULL context save. An IRQ can preempt any user
@@ -399,6 +402,9 @@ pub(crate) fn swap_iretq_context_if_preempted(
             prev_tcb.user_context.rflags = ctx.rflags;
             prev_tcb.use_iretq_resume = true;
         }
+        // smp: now take the same-core early return, AFTER having saved the
+        // interrupted thread's context above (so a migration sees it).
+        #[cfg(feature = "smp")]
         if Some(next) == interrupted {
             s.scheduler.set_current(Some(next));
             return;
