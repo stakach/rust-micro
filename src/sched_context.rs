@@ -68,6 +68,12 @@ pub struct SchedContext {
     /// timeout fault (TIMEOUTFAULT) so the handler can identify which
     /// thread/SC overran.
     pub badge: u64,
+    /// The core this SC was configured for — seL4's `scCore`. Set by
+    /// SchedControl_Configure (the SchedControl cap is per-core). A TCB
+    /// bound to this SC follows it onto this core, so binding an SC that
+    /// was configured on core N before the bind (SCHED_CONTEXT_0014's
+    /// configure-then-bind order) still homes the thread on core N.
+    pub core: u8,
 }
 
 impl Default for SchedContext {
@@ -86,6 +92,7 @@ impl SchedContext {
             consumed: 0,
             yield_from: None,
             badge: 0,
+            core: 0,
         }
     }
 

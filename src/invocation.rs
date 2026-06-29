@@ -1672,6 +1672,27 @@ fn decode_sched_context(
                             s.scheduler.slab.get(tcb_id).is_runnable();
                         s.scheduler.slab.get_mut(tcb_id).sc = Some(sc_id);
                         s.sched_contexts[sc_id as usize].bound_tcb = Some(tcb_id);
+                        // The SC carries the core it was configured for
+                        // (per-core SchedControl). The bound thread follows
+                        // it there so a later Resume runs it on that core —
+                        // this is the configure-then-bind order used by
+                        // sel4utils (SCHED_CONTEXT_0014), where Configure saw
+                        // no bound TCB to migrate. Pull an already-queued
+                        // thread off its old core first; the make_runnable /
+                        // on_sc_gained paths below re-enqueue on the new
+                        // affinity. Gated to the smp build (the default
+                        // single-node build ignores per-core affinity).
+                        #[cfg(feature = "smp")]
+                        {
+                            let target = s.sched_contexts[sc_id as usize].core as u32;
+                            let old = s.scheduler.slab.get(tcb_id).affinity;
+                            if old != target && was_runnable {
+                                let dom = s.scheduler.slab.get(tcb_id).domain as usize;
+                                s.scheduler.nodes[old as usize].queues[dom]
+                                    .dequeue(&mut s.scheduler.slab, tcb_id);
+                            }
+                            s.scheduler.slab.get_mut(tcb_id).affinity = target;
+                        }
                         // Phase 43 — BIND005 deferred wake. If a
                         // notification was signalled while this TCB
                         // had no SC, the badge is parked in the
@@ -2029,6 +2050,12 @@ fn decode_sched_control(
                 };
                 sc.head = 0;
                 sc.count = 1;
+                // Record the core this SC is configured for (seL4 scCore).
+                // A TCB bound to this SC afterwards follows it onto this
+                // core — needed when Configure runs before Bind
+                // (SCHED_CONTEXT_0014's configure-then-bind order), where
+                // the migrate below sees no bound TCB yet.
+                sc.core = sched_control_core as u8;
                 // SMP: the per-core SchedControl cap names the core this
                 // SC (and its bound thread) should run on. Migrate the
                 // bound thread there. seL4 binds the core to the SC; we
@@ -5029,6 +5056,19 @@ fn decode_tcb(
                 let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
                 let upstream = info.extra_caps() > 0;
                 let vaddr = args.a2;
+                // seL4 decodeSetIPCBuffer: a zero buffer address means "no
+                // IPC buffer" — bufferSlot is NULL and the frame cap is
+                // ignored entirely. sel4utils relies on this for
+                // no_ipc_buffer threads (e.g. SCHED_CONTEXT_0014), passing
+                // addr 0 + seL4_CapNull. Clear the buffer without requiring
+                // a Frame cap; drain any staged cap so it can't leak.
+                if vaddr == 0 {
+                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+                    let t = s.scheduler.slab.get_mut(id);
+                    t.ipc_buffer = 0;
+                    t.ipc_buffer_paddr = 0;
+                    return Ok(());
+                }
                 let frame_cap = if upstream {
                     let inv_tcb = s.scheduler.slab.get_mut(invoker);
                     if inv_tcb.pending_extra_caps_count == 0 {

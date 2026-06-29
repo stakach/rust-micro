@@ -572,6 +572,18 @@ impl KernelState {
             // notification holding the SC for passive-server use.
             if let Some(tcb_id) = self.sched_contexts[i].bound_tcb {
                 if self.scheduler.slab.try_get(tcb_id).is_some() {
+                    // Cross-core delete race (SCHED_CONTEXT_0014): if the
+                    // bound thread is currently running on another core,
+                    // stall that core off it before we tear the binding
+                    // down. Otherwise the core keeps executing a thread
+                    // that has just lost its scheduling context (its
+                    // ready-queue entry and `current` are cleared out from
+                    // under it here) and the next trap delivers a garbage
+                    // fault. seL4 does the same `remoteTCBStall` before
+                    // unbinding an SC. No-op unless the thread is live on a
+                    // different core; gated to the smp build.
+                    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                    crate::smp::remote_tcb_stall(tcb_id);
                     // Remove from the ready queue / surrender the CPU
                     // before clearing the SC so a runnable thread that
                     // loses its SC can't keep being scheduled.
