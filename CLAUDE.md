@@ -10,10 +10,15 @@ We're using qemu for development.
 
 ## Building and testing
 
+See **[README.md](README.md)** for the full build/run instructions: the build
+pipeline, the cargo-feature reference (`smp`, `fastpath`, `fpu`, `vmx`,
+`microtest`, `libsel4-hello`, …), and how to build + run the upstream sel4test
+conformance suite against the kernel.
+
 There are scripts for:
 
-* ./scripts/build_kernel.sh - compiles the kernel with the spec feature flag and any additional ones you pass to it
-  * i.e. `./scripts/build_kernel.sh paging` to test paging
+* ./scripts/build_kernel.sh - compiles the kernel with the spec feature flag and any additional ones you pass to it (then chains make_image.sh)
+  * e.g. `./scripts/build_kernel.sh smp` to build with the multicore feature
 * ./scripts/make_image.sh - makes a bootable disk image
 * ./scripts/run_specs.sh - runs the kernel in qemu with serial output enabled for debugging
 
