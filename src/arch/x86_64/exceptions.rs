@@ -396,7 +396,11 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
     crate::arch::x86_64::paging::park_on_kernel_root();
     crate::smp::mark_went_idle();
     crate::smp::bkl_release();
-    core::arch::asm!("sti", "hlt");
+    // `cli` after `hlt`: restore the kernel's IF=0 invariant before the
+    // BKL-held re-acquire + loop-back below, so the timer IRQ can't
+    // re-enter bkl_acquire while we hold the lock (the silent DOMAINS
+    // hang — see the syscall idle loop in syscall_entry.rs).
+    core::arch::asm!("sti", "hlt", "cli");
     crate::smp::bkl_acquire();
     }
 }

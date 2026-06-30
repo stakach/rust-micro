@@ -486,11 +486,16 @@ fn ap_scheduler_loop() -> ! {
         smp::mark_went_idle();
         smp::bkl_release();
 
-        // Wait for next IPI / IRQ.
+        // Wait for next IPI / IRQ. `cli` after `hlt` restores the
+        // kernel's IF=0 invariant before this loop re-acquires the BKL at
+        // the top, so an IRQ can't re-enter bkl_acquire while we hold it
+        // (the BKL re-entrancy / silent-hang class fixed in the BSP idle
+        // loops — syscall_entry.rs / exceptions.rs).
         unsafe {
             core::arch::asm!(
                 "sti",
                 "hlt",
+                "cli",
                 options(nostack, preserves_flags),
             );
         }

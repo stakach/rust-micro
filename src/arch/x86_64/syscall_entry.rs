@@ -341,6 +341,14 @@ pub unsafe extern "C" fn enter_user_via_iretq(ctx: *const UserContext) -> ! {
         "mov rax, [rdi + 120]",   // RSP
         "push rax",
         "mov rax, [rdi + 136]",   // RFLAGS
+        // seL4 invariant: user threads ALWAYS run with IF=1. The swap
+        // path sanitizes the same way (interrupts.rs). Without this, a
+        // thread whose saved RFLAGS has IF=0 (e.g. a reused TCB slot
+        // carrying stale flags) resumes with interrupts disabled — the
+        // timer IRQ never fires, the kernel clock freezes, and any
+        // timing-dependent test wedges (DOMAINS0004's busy-sleep).
+        "and rax, 0xDD5",         // keep user-controllable flags only
+        "or rax, 0x202",          // force IF=1 (+ reserved bit 1)
         "push rax",
         "mov rax, 0x2B",
         "push rax",
@@ -390,6 +398,11 @@ pub unsafe extern "C" fn enter_user_via_sysret(ctx: *const UserContext) -> ! {
         "mov r9,  [rdi + 64]",
         "mov r10, [rdi + 72]",
         "mov r11, [rdi + 80]",   // user RFLAGS — sysretq reads this
+        // seL4 invariant: user always resumes with IF=1 (see the iretq
+        // path + the swap). Guards against a stale/garbage saved RFLAGS
+        // freezing the kernel clock by leaving interrupts disabled.
+        "and r11, 0xDD5",
+        "or r11, 0x202",
         "mov r12, [rdi + 88]",
         "mov r13, [rdi + 96]",
         "mov r14, [rdi + 104]",
@@ -889,7 +902,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // already be in its TCB (FPU0002 flakiness fix).
             #[cfg(feature = "smp")]
             crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
-            crate::smp::bkl_release();
             loop {
                 // SMP: this core is about to go idle (no runnable
                 // thread). `shootdown_tlb` SKIPS idle cores, so any
@@ -905,7 +917,17 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 #[cfg(feature = "smp")]
                 crate::arch::x86_64::paging::park_on_kernel_root();
                 crate::smp::mark_went_idle();
-                core::arch::asm!("sti", "hlt",
+                // Release the BKL BEFORE idling on EVERY iteration. The
+                // old code released once before the loop, so a no-thread
+                // wake looped back here STILL holding it — and the timer
+                // IRQ then re-entered bkl_acquire (lapic.rs) and
+                // deadlock-spun with IF=0, freezing the clock (the silent
+                // DOMAINS hang). The `cli` after `hlt` restores the
+                // kernel's IF=0 invariant before the BKL-held re-acquire +
+                // dispatch below, so the timer can't re-enter while we
+                // hold the lock either.
+                crate::smp::bkl_release();
+                core::arch::asm!("sti", "hlt", "cli",
                     options(nostack, preserves_flags));
                 // After waking, re-evaluate. If something is now
                 // runnable, dispatch it via enter_user_via_sysret.

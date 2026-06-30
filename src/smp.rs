@@ -88,6 +88,18 @@ pub static BKL: AtomicU32 = AtomicU32::new(0);
 /// mode with IF=0 (so the same CPU can't re-enter via interrupt).
 pub fn bkl_acquire() {
     let me = crate::arch::get_cpu_id() + 1;
+    // Defensive: a re-entrant acquire by the SAME cpu must never happen —
+    // the kernel keeps IF=0 while holding the BKL and clears IF (`cli`)
+    // after every idle `sti;hlt` before re-acquiring (see the BSP idle
+    // loops in syscall_entry.rs / exceptions.rs and the AP loop in
+    // main.rs). If it ever does, bkl_acquire would otherwise deadlock-spin
+    // forever with interrupts off, freezing the kernel clock silently.
+    // Log loudly and proceed instead — on a single node the kernel data
+    // is already exclusively ours, so recursing is safe and visible.
+    if BKL.load(Ordering::Relaxed) == me {
+        crate::arch::log("!!! BUG: re-entrant BKL acquire (IF discipline violated)\n");
+        return;
+    }
     loop {
         match BKL.compare_exchange_weak(
             0,
