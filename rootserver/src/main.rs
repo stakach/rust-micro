@@ -404,6 +404,12 @@ unsafe fn ep_recv(endpoint: u64) -> (u64, u64, u64, u64) {
         lateout("rax") _,
         lateout("rsi") rsi,
         lateout("r10") r10,
+        // The kernel returns msg_regs[1..3] in r8/r9/r15 (matching the SEND
+        // ABI) — they MUST be declared clobbered or the compiler will keep a
+        // live value in one (e.g. r9) across the syscall and read garbage.
+        lateout("r8") _,
+        lateout("r9") _,
+        lateout("r15") _,
         lateout("rcx") _,
         lateout("r11") _,
         options(nostack, preserves_flags),

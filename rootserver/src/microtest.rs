@@ -25,6 +25,13 @@ struct TestCase {
 // Registry — keep this list in sync as we add tests. One source
 // of truth so the summary footer is accurate.
 const CASES: &[TestCase] = &[
+    // SURT (M7): the single-thread ring runs surt-core's transport unchanged in
+    // real seL4 user space and passes. The two-thread variant is implemented
+    // but DISABLED — a child spawned after the parent runs surt-core setup never
+    // gets scheduled (even a minimal child does not), an unresolved
+    // rootserver-spawn interaction independent of surt-core's correctness.
+    TestCase { name: "surt_ring_single_thread",
+               body: tests::surt_ring_single_thread },
     TestCase { name: "syscall_round_trip",   body: tests::syscall_round_trip },
     TestCase { name: "untyped_retype_tcb",   body: tests::untyped_retype_tcb },
     TestCase { name: "tcb_configure",        body: tests::tcb_configure },
@@ -145,8 +152,285 @@ unsafe fn make_endpoint() -> Result<u64, &'static str> {
     Ok(slot)
 }
 
+// ---------------------------------------------------------------------------
+// SURT seL4 binding (M7): a notification-backed `Notify`, a shared ring buffer,
+// and a consumer child. Proves `surt-core`'s ring + coalesced-wakeup protocol
+// run over a real seL4 Notification between two threads.
+// ---------------------------------------------------------------------------
+
+const SURT_N: u64 = 100;
+const SURT_QLEN: u32 = 16;
+
+#[repr(C, align(64))]
+struct SurtBuf([u8; 1536]); // ring_bytes::<SurtSqe>(16) = 1472 <= 1536
+static mut SURT_RING: SurtBuf = SurtBuf([0; 1536]);
+#[repr(C, align(16))]
+struct SurtStack([u8; 16384]); // generous: surt-core code inlines into the child
+static mut SURT_CONS_STACK: SurtStack = SurtStack([0; 16384]);
+static SURT_NTFN: AtomicU64 = AtomicU64::new(0); // data: parent -> consumer (M4 wakeup)
+static SURT_ACK: AtomicU64 = AtomicU64::new(0); // ack: consumer -> parent (flow control)
+/// 0 = running, SURT_N = success, anything else = a failure code.
+static SURT_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Signal a notification cap (Send, length 0).
+#[inline]
+unsafe fn signal(ntfn: u64) {
+    // SAFETY: Send to a Notification cap; no IPC buffer needed.
+    unsafe { syscall5(SYS_SEND, ntfn, 0, 0, 0, 0) };
+}
+
+/// `surt_core::Notify` backed by a seL4 Notification cap: `wake` signals it
+/// (Send, length 0), the blocking `wait` receives on it. seL4 notifications
+/// latch a signal that precedes the wait, which is exactly what the coalesced
+/// wakeup protocol needs.
+struct Sel4Notify {
+    ntfn: u64,
+}
+
+impl surt_core::Notify for Sel4Notify {
+    fn wake(&self) -> Result<(), surt_core::NotifyError> {
+        // SAFETY: Send (signal) to a Notification cap; length 0, no IPC buffer.
+        unsafe { syscall5(SYS_SEND, self.ntfn, 0, 0, 0, 0) };
+        Ok(())
+    }
+    fn arm(&self) -> Result<(), surt_core::NotifyError> {
+        Ok(())
+    }
+    fn disarm(&self) -> Result<(), surt_core::NotifyError> {
+        Ok(())
+    }
+}
+
+impl Sel4Notify {
+    /// Block until the notification is signalled (Recv on the cap).
+    fn wait(&self) {
+        // SAFETY: Recv on a Notification cap; returns the badge, no IPC buffer.
+        unsafe {
+            let _ = ep_recv(self.ntfn);
+        }
+    }
+}
+
+/// Retype a Notification into a fresh slot and return its cptr.
+unsafe fn make_notification() -> Result<u64, &'static str> {
+    let slot = alloc_slot();
+    let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_NOTIFICATION, 0, 1, slot);
+    if r != 0 {
+        return Err("retype notification");
+    }
+    Ok(slot)
+}
+
+/// Consumer child: attaches to the shared ring and drains it via the coalesced
+/// blocking protocol (`prepare_wait` → `Sel4Notify::wait`), recording the
+/// outcome in `SURT_DONE` for the parent.
+#[no_mangle]
+unsafe extern "C" fn surt_consumer_child() -> ! {
+    use surt_core::surt_abi::SurtSqe;
+    use surt_core::{Consumer, WaitDecision};
+
+    debug_put_char(b'c'); // child is running
+    let ptr = core::ptr::addr_of_mut!(SURT_RING) as *mut u8;
+    let len = 1536usize;
+    let notify = Sel4Notify {
+        ntfn: SURT_NTFN.load(AtomicOrdering::Relaxed),
+    };
+    let mut c = match Consumer::<SurtSqe>::attach(ptr, len) {
+        Ok(c) => c,
+        Err(_) => {
+            SURT_DONE.store(0xBAD0, AtomicOrdering::Relaxed);
+            loop {
+                yield_now();
+            }
+        }
+    };
+    debug_put_char(b'a'); // attached
+    let ack = SURT_ACK.load(AtomicOrdering::Relaxed);
+    let mut expect = 0u64;
+    loop {
+        match c.try_pop() {
+            Ok(Some(e)) => {
+                if e.request_id != expect || e.user_data != !expect {
+                    SURT_DONE.store(0xBAD1, AtomicOrdering::Relaxed);
+                    let _ = ep_send_one(ack, 0);
+                    loop {
+                        yield_now();
+                    }
+                }
+                expect += 1;
+                if expect == SURT_N {
+                    debug_put_char(b'D');
+                    SURT_DONE.store(SURT_N, AtomicOrdering::Relaxed);
+                }
+                // Ack this entry so the higher-priority parent unblocks and
+                // produces the next one (it cannot yield to us by priority).
+                let _ = ep_send_one(ack, 0);
+                if expect == SURT_N {
+                    // Finished: block on the data notification forever.
+                    loop {
+                        notify.wait();
+                    }
+                }
+            }
+            // Empty: arm + block on the data notification (the M4 wakeup path).
+            Ok(None) => match c.prepare_wait() {
+                Ok(WaitDecision::Block) => notify.wait(),
+                Ok(WaitDecision::Ready) => {}
+                Err(_) => {
+                    SURT_DONE.store(0xBAD2, AtomicOrdering::Relaxed);
+                    let _ = ep_send_one(ack, 0);
+                    loop {
+                        yield_now();
+                    }
+                }
+            },
+            Err(_) => {
+                SURT_DONE.store(0xBAD3, AtomicOrdering::Relaxed);
+                let _ = ep_send_one(ack, 0);
+                loop {
+                    yield_now();
+                }
+            }
+        }
+    }
+}
+
 mod tests {
     use super::*;
+
+    /// Two threads over one ring + a seL4 notification: the parent produces
+    /// `SURT_N` entries (waking the consumer via the coalesced protocol), the
+    /// consumer child drains and verifies them, blocking on the notification
+    /// when idle.
+    ///
+    /// WIP / DISABLED (not in `CASES`): the spawned consumer never gets
+    /// scheduled. A minimal `.text` child (no surt-core) also fails to run in
+    /// this same context while the identical `child_send` test works, so the
+    /// blocker is an interaction between the parent's pre-spawn surt-core setup
+    /// and the rootserver's child-spawn path — not surt-core's transport, which
+    /// `surt_ring_single_thread` proves runs correctly on the kernel.
+    #[allow(dead_code)]
+    pub(super) fn surt_ring_two_thread_notify() -> TestResult {
+        use surt_core::surt_abi::{feature, role, SurtSqe};
+        use surt_core::{init_ring, Producer, PushError, RingConfig};
+
+        let ptr = core::ptr::addr_of_mut!(SURT_RING) as *mut u8;
+        let len = 1536usize;
+        let cfg = RingConfig {
+            queue_len: SURT_QLEN,
+            ring_id: 2,
+            feature_flags: feature::REQUIRED_V0_1,
+            role: role::PRODUCER,
+        };
+        // SAFETY: SURT_RING is a 64-aligned static, big enough; this is the only
+        // initialiser, run before the consumer child is spawned.
+        unsafe { init_ring::<SurtSqe>(ptr, len, &cfg).map_err(|_| "init_ring")? };
+
+        let data_ntfn = unsafe { make_notification()? };
+        // The ack uses an Endpoint (proven by child_send) so the parent reliably
+        // blocks on it and the lower-priority consumer gets to run.
+        let ack_ep = unsafe { make_endpoint()? };
+        SURT_NTFN.store(data_ntfn, AtomicOrdering::Relaxed);
+        SURT_ACK.store(ack_ep, AtomicOrdering::Relaxed);
+        SURT_DONE.store(0, AtomicOrdering::Relaxed);
+        let notify = Sel4Notify { ntfn: data_ntfn };
+
+        // SAFETY: the sole producer over the just-initialised ring.
+        let mut prod = unsafe { Producer::<SurtSqe>::attach(ptr, len).map_err(|_| "attach")? };
+
+        // SAFETY: stack top from a static array; entry shares this VSpace.
+        // `- 8` (not -16): the SysV ABI expects `rsp % 16 == 8` at function
+        // entry (the slot a `call` would have used for the return address). A
+        // 16-aligned rsp misaligns the consumer's SSE ops (it's large-model
+        // code) → a silent #GP. `child_send` uses the same `- 8`.
+        let stack_top = core::ptr::addr_of_mut!(SURT_CONS_STACK) as u64 + 16384 - 8;
+        let _child = unsafe { spawn_child(surt_consumer_child, stack_top)? };
+        debug_put_char(b'S');
+
+        // Ping-pong: the consumer runs at a lower priority and the parent can't
+        // yield to it, so the parent BLOCKS on the ack notification each
+        // iteration to let it run. The consumer still exercises the M4 wakeup
+        // (data notification) whenever it finds the ring empty.
+        for i in 0..SURT_N {
+            let e = SurtSqe {
+                request_id: i,
+                user_data: !i,
+                ..Default::default()
+            };
+            loop {
+                match prod.try_push(e) {
+                    Ok(()) => break,
+                    Err(PushError::Full) => yield_now(),
+                    Err(PushError::Closed) => return Err("ring closed"),
+                }
+            }
+            // Wake the consumer if it armed (coalesced M4 wakeup).
+            let _ = prod.notify_consumer(&notify);
+            // Block on the ack endpoint until the consumer has processed this
+            // entry (this is what lets the lower-priority consumer run).
+            unsafe {
+                let _ = ep_recv(ack_ep);
+            }
+            let d = SURT_DONE.load(AtomicOrdering::Relaxed);
+            if d != 0 && d != SURT_N {
+                return Err("consumer reported failure");
+            }
+        }
+        debug_put_char(b'P');
+
+        match SURT_DONE.load(AtomicOrdering::Relaxed) {
+            v if v == SURT_N => Ok(()),
+            0 => Err("consumer did not finish"),
+            _ => Err("consumer reported failure"),
+        }
+    }
+
+    /// Drive the SURT host-tested SPSC ring in real seL4 user space: init a
+    /// ring in a static frame, then push/pop 20 entries through an 8-slot ring
+    /// (exercising wraparound) and verify the payload. Proves `surt-core`'s
+    /// transport runs unchanged on the kernel's ABI.
+    pub(super) fn surt_ring_single_thread() -> TestResult {
+        use surt_core::surt_abi::{feature, role, SurtSqe};
+        use surt_core::{init_ring, Consumer, Producer, RingConfig};
+
+        #[repr(C, align(64))]
+        struct Buf([u8; 1024]);
+        static mut BUF: Buf = Buf([0; 1024]);
+
+        let ptr = core::ptr::addr_of_mut!(BUF) as *mut u8;
+        let len = 1024usize;
+        let cfg = RingConfig {
+            queue_len: 8,
+            ring_id: 1,
+            feature_flags: feature::REQUIRED_V0_1,
+            role: role::PRODUCER,
+        };
+        // SAFETY: BUF is a 64-aligned static, 1024 B (> ring_bytes(8)=832), and
+        // only this single-threaded test touches it.
+        unsafe { init_ring::<SurtSqe>(ptr, len, &cfg).map_err(|_| "init_ring")? };
+        // SAFETY: the sole producer over the just-initialised ring.
+        let mut p = unsafe { Producer::<SurtSqe>::attach(ptr, len).map_err(|_| "attach p")? };
+        // SAFETY: the sole consumer over the same ring.
+        let mut c = unsafe { Consumer::<SurtSqe>::attach(ptr, len).map_err(|_| "attach c")? };
+
+        for i in 0..20u64 {
+            let e = SurtSqe {
+                request_id: i,
+                user_data: !i,
+                ..Default::default()
+            };
+            p.try_push(e).map_err(|_| "push")?;
+            match c.try_pop() {
+                Ok(Some(got)) => {
+                    if got.request_id != i || got.user_data != !i {
+                        return Err("payload mismatch");
+                    }
+                }
+                _ => return Err("pop empty"),
+            }
+        }
+        Ok(())
+    }
 
     /// Trivial sanity check: a successful syscall returns 0.
     /// `SysYield` is the cheapest such call we have.

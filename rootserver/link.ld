@@ -21,21 +21,30 @@ SECTIONS {
     .text : {
         *(.text._start)
         *(.text .text.*)
+        /* Large-code-model text — code that references the surt-core crate
+         * lands here. Must be in this loadable, executable segment or a
+         * spawned thread whose entry is such a function never runs. */
+        *(.ltext .ltext.*)
     }
 
     . = ALIGN(0x1000);
     .rodata : {
         *(.rodata .rodata.*)
+        *(.lrodata .lrodata.*)
     }
 
     . = ALIGN(0x1000);
     .data : {
         *(.data .data.*)
+        *(.ldata .ldata.*)
     }
 
     . = ALIGN(0x1000);
     .bss : {
         *(.bss .bss.*)
+        /* Large-model BSS (e.g. the SURT ring/stack statics) — must sit in
+         * the zeroed, mapped .bss segment. */
+        *(.lbss .lbss.*)
         *(COMMON)
     }
 

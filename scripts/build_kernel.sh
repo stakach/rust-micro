@@ -63,6 +63,7 @@ else
     cd rootserver
     cargo +nightly build \
       -Z build-std=core \
+      -Z build-std-features=compiler-builtins-mem \
       -Z unstable-options \
       -Z json-target-spec \
       --target triplet.json \
