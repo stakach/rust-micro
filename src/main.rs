@@ -314,6 +314,11 @@ fn ap_main(apic_id: arch::CpuId) -> ! {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::lapic::init_lapic();
 
+    // Each AP needs its own FPU/CR4 set up to match the BSP, or migrated
+    // threads run with a different FPU config across cores (FPU0002).
+    #[cfg(all(target_arch = "x86_64", feature = "smp"))]
+    crate::arch::x86_64::fpu_ctx::init_fpu_ap();
+
     smp::mark_ap_alive();
 
     ap_scheduler_loop();

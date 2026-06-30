@@ -90,6 +90,23 @@ pub fn init_fpu_template() {
     }
 }
 
+/// Per-AP FPU init. Each core has its own CR0/CR4 and physical FPU, so
+/// every AP must enable OSFXSR (+OSXMMEXCPT) and `fninit` its x87 state to
+/// match the BSP's `init_fpu_template` — otherwise APs run with a
+/// different CR4 / x87 control word than core 0 (observed: APs were
+/// missing CR4.OSXMMEXCPT). Does NOT re-capture FX_TEMPLATE. Once per AP.
+pub fn init_fpu_ap() {
+    unsafe {
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4,
+            options(nomem, nostack, preserves_flags));
+        cr4 |= (1 << 9) | (1 << 10);
+        core::arch::asm!("mov cr4, {}", in(reg) cr4,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("fninit", options(nostack, preserves_flags));
+    }
+}
+
 /// Copy the boot FPU template into a freshly-allocated TCB's save area.
 pub fn stamp_template(area: &mut FxArea) {
     unsafe {
