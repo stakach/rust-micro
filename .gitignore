@@ -2,6 +2,7 @@
 /target/
 /rootserver/target/
 /rootserver/Cargo.lock
+/sel4-user-ring/target/
 /.tmp/
 bootboot.efi
 disk.img
