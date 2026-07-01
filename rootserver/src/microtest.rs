@@ -36,6 +36,8 @@ const CASES: &[TestCase] = &[
                body: tests::surt_ring_two_thread_notify },
     TestCase { name: "surt_ring_multiprocess",
                body: tests::surt_ring_multiprocess },
+    TestCase { name: "surt_ring_connect",
+               body: tests::surt_ring_connect },
     TestCase { name: "syscall_round_trip",   body: tests::syscall_round_trip },
     TestCase { name: "untyped_retype_tcb",   body: tests::untyped_retype_tcb },
     TestCase { name: "tcb_configure",        body: tests::tcb_configure },
@@ -463,6 +465,237 @@ unsafe extern "C" fn surt_multiproc_consumer() -> ! {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SURT dynamic connect (M7): TWO isolated components — a producer and a
+// consumer, each in its OWN VSpace — that discover and connect at runtime. The
+// producer creates the ring, then announces {ring frame cap, notification} to
+// the consumer over a well-known control Endpoint (the SURT handshake); the
+// consumer maps the granted frame into ITS OWN VSpace and drains. Neither is
+// wired up by the rootserver beyond the initial spawn + the shared control /
+// result endpoints. (Phase 1: the components still share the rootserver CNode,
+// so the "grant" is a cptr in the handshake message + a peer-side map; Phase 2
+// gives each its own CSpace and transfers the caps for real.)
+// ---------------------------------------------------------------------------
+
+const CONN_IMAGE_BASE: u64 = 0x0000_0100_0040_0000;
+const CONN_SCRATCH_VADDR: u64 = 0x0000_0100_005F_C000; // rootserver-side staging
+const CONN_ARGS_VADDR: u64 = 0x0000_0100_005F_D000; // per-component boot args
+const CONN_STACK_VADDR: u64 = 0x0000_0100_005F_E000;
+const CONN_RING_VADDR: u64 = 0x0000_0100_005F_F000;
+const CONN_RING_LEN: usize = 1536;
+const CONN_MAGIC: u64 = 0x5355_5254_434E_5F31; // "SURTCN_1"
+
+/// Send a ≤3-word control message (no caps, fits in registers — no IPC buffer).
+#[inline]
+unsafe fn conn_send3(ep: u64, m0: u64, m1: u64, m2: u64) {
+    let _ = syscall5(SYS_SEND, ep, /* length */ 3, m0, m1, m2);
+}
+
+/// Receive a 3-word control message; returns (MR0, MR1, MR2) from r10/r8/r9.
+unsafe fn conn_recv3(ep: u64) -> (u64, u64, u64) {
+    let m0: u64;
+    let m1: u64;
+    let m2: u64;
+    core::arch::asm!(
+        "syscall",
+        in("rdx") SYS_RECV as u64,
+        in("rdi") ep,
+        lateout("rax") _,
+        lateout("rsi") _,
+        lateout("r10") m0,
+        lateout("r8") m1,
+        lateout("r9") m2,
+        lateout("r15") _,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack, preserves_flags),
+    );
+    (m0, m1, m2)
+}
+
+/// Build a fresh isolated VSpace: a new PML4 with one PDPT/PD/PT chain, the
+/// rootserver image mapped read-only (so the component executes surt-core), and
+/// a private stack. Returns the PML4 cptr. The one PT covers the whole 2 MiB
+/// region, so the caller can `page_map` the args / ring frames into it too.
+#[allow(dead_code)]
+unsafe fn build_component_vspace() -> u64 {
+    let img_start = IMAGE_FRAMES_START.load(AtomicOrdering::Relaxed);
+    let img_count = IMAGE_FRAMES_COUNT.load(AtomicOrdering::Relaxed);
+    let pml4 = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    let pdpt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+    let pd = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+    let pt = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+    let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, CONN_IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, CONN_IMAGE_BASE, pml4);
+    let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, CONN_IMAGE_BASE, pml4);
+    for i in 0..img_count {
+        let cp = alloc_slot();
+        let _ = syscall5(
+            SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12,
+            cp, img_start + i, 0);
+        let _ = page_map(cp, CONN_IMAGE_BASE + i * 0x1000, /* RO */ 2, pml4);
+    }
+    let stack_slot = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, stack_slot);
+    let _ = page_map(stack_slot, CONN_STACK_VADDR, /* RW */ 3, pml4);
+    pml4
+}
+
+/// Retype a fresh frame, fill it (via a rootserver-side scratch mapping) with
+/// `words`, then map it into `pml4` at `vaddr` so the component reads its boot
+/// args from a known vaddr (the component can't read a runtime static — its
+/// data/bss is mapped read-only).
+#[allow(dead_code)]
+unsafe fn make_args_frame(pml4: u64, vaddr: u64, words: &[u64]) {
+    let frame = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, frame);
+    let _ = page_map(frame, CONN_SCRATCH_VADDR, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+    let dst = CONN_SCRATCH_VADDR as *mut u64;
+    for (i, &w) in words.iter().enumerate() {
+        core::ptr::write_volatile(dst.add(i), w);
+    }
+    let _ = page_unmap(frame); // release the scratch mapping so we can remap it
+    let _ = page_map(frame, vaddr, /* RW */ 3, pml4);
+}
+
+/// Spawn a component thread in `pml4` (shared rootserver CNode in Phase 1),
+/// priority 100, with a bound SchedContext.
+#[allow(dead_code)]
+unsafe fn spawn_component(
+    pml4: u64,
+    entry: unsafe extern "C" fn() -> !,
+) -> Result<u64, &'static str> {
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, /* fault_ep */ 0, CAP_INIT_THREAD_CNODE, pml4);
+    let stack_top = CONN_STACK_VADDR + 4096 - 8;
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    attach_sched_context(tcb)?;
+    let _ = tcb_resume(tcb);
+    Ok(tcb)
+}
+
+/// Producer component entry. Its ring is already mapped at `CONN_RING_VADDR` by
+/// the rootserver; it reads its cptrs from the boot-args frame, `init_ring`s,
+/// announces the ring to the peer over the control endpoint, then produces.
+/// Uses only stack locals, the args/ring frames, and cptrs read from args.
+#[no_mangle]
+#[link_section = ".text.surt_connect_producer"]
+unsafe extern "C" fn surt_connect_producer() -> ! {
+    use surt_core::surt_abi::{feature, role, SurtSqe};
+    use surt_core::{init_ring, Producer, PushError, RingConfig};
+
+    let args = CONN_ARGS_VADDR as *const u64;
+    let magic = core::ptr::read_volatile(args);
+    let control_ep = core::ptr::read_volatile(args.add(1));
+    let data_ntfn = core::ptr::read_volatile(args.add(2));
+    let ring_cptr = core::ptr::read_volatile(args.add(3));
+    if magic != CONN_MAGIC {
+        loop { yield_now(); }
+    }
+
+    let cfg = RingConfig {
+        queue_len: SURT_QLEN,
+        ring_id: 4,
+        feature_flags: feature::REQUIRED_V0_1,
+        role: role::PRODUCER,
+    };
+    if init_ring::<SurtSqe>(CONN_RING_VADDR as *mut u8, CONN_RING_LEN, &cfg).is_err() {
+        loop { yield_now(); }
+    }
+    let mut prod = match Producer::<SurtSqe>::attach(CONN_RING_VADDR as *mut u8, CONN_RING_LEN) {
+        Ok(p) => p,
+        Err(_) => loop { yield_now(); },
+    };
+
+    // Dynamic connect: hand the peer the ring frame cap + the wakeup notification.
+    conn_send3(control_ep, CONN_MAGIC, ring_cptr, data_ntfn);
+
+    let notify = Sel4Notify { ntfn: data_ntfn };
+    let mut i = 0u64;
+    while i < SURT_N {
+        let e = SurtSqe {
+            request_id: i,
+            user_data: !i,
+            ..Default::default()
+        };
+        match prod.try_push(e) {
+            Ok(()) => {
+                let _ = prod.notify_consumer(&notify);
+                i += 1;
+            }
+            Err(PushError::Full) => yield_now(),
+            Err(PushError::Closed) => break,
+        }
+    }
+    loop { yield_now(); }
+}
+
+/// Consumer component entry. Discovers the connection by receiving the ring
+/// frame cap + notification over the control endpoint, maps the granted frame
+/// into ITS OWN VSpace, drains + verifies, and reports the verdict to the
+/// rootserver's result endpoint. No writable statics.
+#[no_mangle]
+#[link_section = ".text.surt_connect_consumer"]
+unsafe extern "C" fn surt_connect_consumer() -> ! {
+    use surt_core::surt_abi::SurtSqe;
+    use surt_core::{Consumer, WaitDecision};
+
+    let args = CONN_ARGS_VADDR as *const u64;
+    let control_ep = core::ptr::read_volatile(args.add(1));
+    let result_ep = core::ptr::read_volatile(args.add(2));
+    let my_pml4 = core::ptr::read_volatile(args.add(3));
+
+    // Discover: receive {magic, ring frame cap, notification} from the producer.
+    let (magic, ring_cptr, ntfn) = conn_recv3(control_ep);
+    if magic != CONN_MAGIC {
+        let _ = ep_send_one(result_ep, 0xBAD1);
+        loop { yield_now(); }
+    }
+    // Map the granted frame into OUR OWN VSpace, then attach.
+    let _ = page_map(ring_cptr, CONN_RING_VADDR, /* RW */ 3, my_pml4);
+    let mut c = match Consumer::<SurtSqe>::attach(CONN_RING_VADDR as *mut u8, CONN_RING_LEN) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = ep_send_one(result_ep, 0xBAD2);
+            loop { yield_now(); }
+        }
+    };
+
+    let notify = Sel4Notify { ntfn };
+    let mut expect = 0u64;
+    while expect < SURT_N {
+        match c.try_pop() {
+            Ok(Some(e)) => {
+                if e.request_id != expect || e.user_data != !expect {
+                    let _ = ep_send_one(result_ep, 0xBAD3);
+                    loop { yield_now(); }
+                }
+                expect += 1;
+            }
+            Ok(None) => match c.prepare_wait() {
+                Ok(WaitDecision::Block) => notify.wait(),
+                Ok(WaitDecision::Ready) => {}
+                Err(_) => {
+                    let _ = ep_send_one(result_ep, 0xBAD4);
+                    loop { yield_now(); }
+                }
+            },
+            Err(_) => {
+                let _ = ep_send_one(result_ep, 0xBAD5);
+                loop { yield_now(); }
+            }
+        }
+    }
+    let _ = ep_send_one(result_ep, 0); // verdict: success
+    loop { yield_now(); }
+}
+
 mod tests {
     use super::*;
 
@@ -665,6 +898,54 @@ mod tests {
                 if payload != i {
                     return Err("consumer verdict mismatch");
                 }
+            }
+            Ok(())
+        }
+    }
+
+    /// Dynamic connect: a producer and a consumer, EACH in its own isolated
+    /// VSpace, discover and connect at runtime. The rootserver spawns both and
+    /// hands out a control endpoint; the producer creates the ring, maps it,
+    /// `init_ring`s, and announces {ring frame cap, notification} to the peer
+    /// over the control endpoint; the consumer maps the granted frame into its
+    /// OWN VSpace, drains + verifies, and reports the verdict. The rootserver
+    /// only brokers the initial spawn — the channel is established by the two
+    /// components themselves. (Phase 1: shared CNode; the transfer is a cptr in
+    /// the handshake + a peer-side map.)
+    pub(super) fn surt_ring_connect() -> TestResult {
+        unsafe {
+            if IMAGE_FRAMES_COUNT.load(AtomicOrdering::Relaxed) == 0 {
+                return Err("no image frames");
+            }
+            let control_ep = make_endpoint()?;
+            let result_ep = make_endpoint()?;
+            let data_ntfn = make_notification()?;
+
+            // --- Producer component: own VSpace; ring created + mapped here, a
+            // copy of the frame cap handed to it to announce to the consumer.
+            let prod_pml4 = build_component_vspace();
+            let ring_slot = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ring_slot);
+            let _ = page_map(ring_slot, CONN_RING_VADDR, /* RW */ 3, prod_pml4);
+            let ring_copy = alloc_slot();
+            let _ = syscall5(
+                SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12,
+                ring_copy, ring_slot, 0);
+            make_args_frame(prod_pml4, CONN_ARGS_VADDR,
+                &[CONN_MAGIC, control_ep, data_ntfn, ring_copy]);
+
+            // --- Consumer component: own VSpace; receives the connection.
+            let cons_pml4 = build_component_vspace();
+            make_args_frame(cons_pml4, CONN_ARGS_VADDR,
+                &[CONN_MAGIC, control_ep, result_ep, cons_pml4]);
+
+            // Launch both, then wait for the consumer's verdict.
+            spawn_component(prod_pml4, surt_connect_producer)?;
+            spawn_component(cons_pml4, surt_connect_consumer)?;
+
+            let (_rax, _badge, _info, verdict) = ep_recv(result_ep);
+            if verdict != 0 {
+                return Err("consumer reported failure");
             }
             Ok(())
         }
