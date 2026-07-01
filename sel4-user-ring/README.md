@@ -62,17 +62,26 @@ tools/
   control-path handshake, capability transfer, fault/teardown, the wait loop, and
   the `surt-sel4` API + implementation order.
 - **M7 binding on the kernel** — `surt-core` builds into the rust-micro rootserver
-  and three microtests pass in QEMU: **single-thread**, **two-thread** (one VSpace,
-  coalesced-wakeup ping-pong over a real seL4 Notification), and — the real goal —
-  **multiprocess**: a producer and a consumer in **separate address spaces (PML4s)**
-  sharing one ring **frame**, granted by `CNode_Copy`'ing the frame cap and
-  double-mapping it. The consumer runs surt-core unchanged in a fresh VSpace (the
-  rootserver image mapped read-only + a private stack), proving the transport works
-  cross-address-space exactly as the design doc (§4, §7, §10) specs. `Sel4Notify` is
-  implemented; the integration surfaced+fixed real bugs (an `ep_recv` register
-  clobber, child stack alignment, linker large-model sections) and a whole class of
-  stale rootserver ABI constants (invocation labels, slot layout, register/reply
-  ABI) that had drifted from the kernel. See [`tasks/todo.md`](tasks/todo.md).
+  and five microtests pass in QEMU, climbing from one thread to two isolated
+  components that connect themselves:
+  1. **single-thread** — the ring runs unchanged on the real seL4 ABI.
+  2. **two-thread** (one VSpace) — coalesced-wakeup ping-pong over a real Notification.
+  3. **multiprocess** — a producer + consumer in **separate address spaces** sharing
+     one ring **frame**, granted by `CNode_Copy` + double-mapping; the consumer runs
+     surt-core in a fresh VSpace (image mapped read-only + private stack).
+  4. **dynamic connect** (`surt_ring_connect`) — the producer becomes its **own
+     isolated component**; the two components **discover and connect at runtime** over
+     a control Endpoint (the producer creates the ring and announces it; the consumer
+     maps the granted frame into its own VSpace), the rootserver only brokering the spawn.
+  5. **capability transfer** (`surt_ring_cap_transfer`) — the full §6/§7 handshake:
+     each component has its **own CSpace** (a guarded CNode) and IPC buffer, and the
+     frame + notification caps are **transferred between the two distinct CSpaces over
+     IPC** (extraCaps) — no shared CNode.
+
+  `Sel4Notify` is implemented; the integration surfaced+fixed real bugs (an `ep_recv`
+  register clobber, child stack alignment, linker large-model sections) and a whole
+  class of stale rootserver ABI constants (invocation labels, slot layout,
+  register/reply ABI) that had drifted from the kernel. See [`tasks/todo.md`](tasks/todo.md).
 
 ```sh
 cargo run -p surt-bench --release   # run the host benchmarks
