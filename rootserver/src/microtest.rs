@@ -34,6 +34,8 @@ const CASES: &[TestCase] = &[
                body: tests::surt_ring_single_thread },
     TestCase { name: "surt_ring_two_thread_notify",
                body: tests::surt_ring_two_thread_notify },
+    TestCase { name: "surt_ring_multiprocess",
+               body: tests::surt_ring_multiprocess },
     TestCase { name: "syscall_round_trip",   body: tests::syscall_round_trip },
     TestCase { name: "untyped_retype_tcb",   body: tests::untyped_retype_tcb },
     TestCase { name: "tcb_configure",        body: tests::tcb_configure },
@@ -56,7 +58,12 @@ const CASES: &[TestCase] = &[
 /// Entry point invoked from `_start` when `--features microtest`
 /// is on. Runs every case in `CASES`, prints a summary, then
 /// emits the kernel-exit sentinel.
-pub unsafe fn run(ipc_buffer_vaddr: u64, empty_start: u64) {
+pub unsafe fn run(
+    ipc_buffer_vaddr: u64,
+    empty_start: u64,
+    image_frames_start: u64,
+    image_frames_count: u64,
+) {
     // Capture the kernel-published IPC-buffer vaddr before any test runs; the
     // tests stage syscall args through it (see `ROOTSERVER_IPCBUF`).
     ROOTSERVER_IPCBUF.store(ipc_buffer_vaddr, AtomicOrdering::Relaxed);
@@ -65,6 +72,10 @@ pub unsafe fn run(ipc_buffer_vaddr: u64, empty_start: u64) {
     // allocator starts after them.
     SLOT_BASE.store(empty_start, AtomicOrdering::Relaxed);
     NEXT_SLOT.store(empty_start + 3, AtomicOrdering::Relaxed);
+    // The rootserver's loaded-image frame caps (for surt_ring_multiprocess,
+    // which maps the image into a second VSpace).
+    IMAGE_FRAMES_START.store(image_frames_start, AtomicOrdering::Relaxed);
+    IMAGE_FRAMES_COUNT.store(image_frames_count, AtomicOrdering::Relaxed);
 
     print_str(b"[microtest start] ipc_buffer @ ");
     print_hex(ipc_buffer_vaddr);
@@ -121,6 +132,12 @@ use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 /// general allocator `NEXT_SLOT` starts at `SLOT_BASE + 3`.
 static SLOT_BASE: AtomicU64 = AtomicU64::new(0);
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// The rootserver's loaded-image frame caps: `IMAGE_FRAMES_START` is the first
+/// cptr, and there are `IMAGE_FRAMES_COUNT` of them, in vaddr order from the
+/// image base. `surt_ring_multiprocess` copies + maps these into a fresh VSpace.
+static IMAGE_FRAMES_START: AtomicU64 = AtomicU64::new(0);
+static IMAGE_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// First reserved slot (the TCB `untyped_retype_tcb` creates and later tests
 /// reuse). Was the hardcoded `FIRST_EMPTY_SLOT`.
@@ -359,6 +376,93 @@ unsafe extern "C" fn surt_consumer_child() -> ! {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SURT multiprocess (M7): the same ring transport across TWO address spaces.
+// The producer is the rootserver main thread; the consumer runs in a FRESH
+// PML4 with only the rootserver image (read-only), a private stack, and the
+// shared ring frame mapped in. The ring frame is granted by CNode_Copy'ing its
+// cap and mapping the copy into the consumer's VSpace (surt-core uses offsets,
+// not pointers, so the two mappings may sit at different vaddrs — here they
+// happen to share one). Coordination rides a Notification + an ack Endpoint in
+// the shared CNode; the runtime cptrs are handed to the consumer through the
+// unused tail of the shared frame (the consumer has no writable statics — its
+// data/bss is mapped read-only).
+// ---------------------------------------------------------------------------
+
+/// Image base vaddr in the consumer's VSpace (matches the loader's layout so
+/// image frames map at their linked addresses and code runs unmodified).
+const MP_IMAGE_BASE_VADDR: u64 = 0x0000_0100_0040_0000;
+/// Consumer private stack + shared ring, high in the same 2 MiB PT as the image
+/// (PT[510] / PT[511]) so they never collide with a growing image (PT[0..]).
+const MP_STACK_VADDR: u64 = 0x0000_0100_005F_E000;
+const MP_RING_VADDR: u64 = 0x0000_0100_005F_F000;
+const MP_RING_LEN: usize = 1536; // ring_bytes::<SurtSqe>(16)=1472 <= 1536
+/// Spawn-args handoff area in the shared frame, clear of the ring region.
+/// Layout (u64 words): [0]=magic, [1]=ack_ep cptr, [2]=data_ntfn cptr.
+const MP_ARGS_OFF: usize = 2048;
+const MP_MAGIC: u64 = 0x5355_5254_4D50_5F31; // "SURTMP_1"
+
+/// Consumer entry, run in a SEPARATE VSpace. Touches only stack locals, the
+/// shared ring frame, and const cptrs it reads from the frame — NO writable
+/// static (its .data/.bss is mapped read-only). surt-core has no global mutable
+/// state, so this is sound.
+#[no_mangle]
+#[link_section = ".text.surt_multiproc_consumer"]
+unsafe extern "C" fn surt_multiproc_consumer() -> ! {
+    use surt_core::surt_abi::SurtSqe;
+    use surt_core::{Consumer, WaitDecision};
+
+    // Read the runtime cptrs the producer stashed in the shared frame tail.
+    let args = (MP_RING_VADDR + MP_ARGS_OFF as u64) as *const u64;
+    let magic = core::ptr::read_volatile(args);
+    let ack = core::ptr::read_volatile(args.add(1));
+    let notify = Sel4Notify {
+        ntfn: core::ptr::read_volatile(args.add(2)),
+    };
+    if magic != MP_MAGIC {
+        // Frame not published as expected; nothing trustworthy to ack on.
+        loop { yield_now(); }
+    }
+
+    let mut c = match Consumer::<SurtSqe>::attach(MP_RING_VADDR as *mut u8, MP_RING_LEN) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = ep_send_one(ack, 0xBADA);
+            loop { notify.wait(); }
+        }
+    };
+    let mut expect = 0u64;
+    loop {
+        match c.try_pop() {
+            Ok(Some(e)) => {
+                if e.request_id != expect || e.user_data != !expect {
+                    let _ = ep_send_one(ack, 0xBAD0);
+                    loop { notify.wait(); }
+                }
+                // Ack payload = the verified index; the producer asserts it.
+                let _ = ep_send_one(ack, expect);
+                expect += 1;
+                if expect == SURT_N {
+                    loop { notify.wait(); }
+                }
+            }
+            // Ring empty: arm + block on the data notification (M4 wakeup).
+            Ok(None) => match c.prepare_wait() {
+                Ok(WaitDecision::Block) => notify.wait(),
+                Ok(WaitDecision::Ready) => {}
+                Err(_) => {
+                    let _ = ep_send_one(ack, 0xBAD2);
+                    loop { notify.wait(); }
+                }
+            },
+            Err(_) => {
+                let _ = ep_send_one(ack, 0xBAD3);
+                loop { notify.wait(); }
+            }
+        }
+    }
+}
+
 mod tests {
     use super::*;
 
@@ -439,6 +543,130 @@ mod tests {
             v if v == SURT_N => Ok(()),
             0 => Err("consumer did not finish"),
             _ => Err("consumer reported failure"),
+        }
+    }
+
+    /// Multiprocess: producer (this thread) and consumer in SEPARATE address
+    /// spaces sharing one ring frame. Builds a fresh PML4 for the consumer,
+    /// maps the rootserver image into it read-only (so it can execute surt-core
+    /// unchanged) plus a private stack, retypes a ring frame and maps it into
+    /// BOTH VSpaces (the consumer's via a CNode_Copy of the frame cap), then
+    /// runs the coalesced-wakeup ping-pong across the address-space boundary.
+    /// (`if r != 0` checks are cosmetic — `syscall5` always returns 0; the real
+    /// assertion is the per-entry ack verdict + the absence of a consumer #PF.)
+    pub(super) fn surt_ring_multiprocess() -> TestResult {
+        use surt_core::surt_abi::{feature, role, SurtSqe};
+        use surt_core::{init_ring, Producer, PushError, RingConfig};
+
+        unsafe {
+            let img_start = IMAGE_FRAMES_START.load(AtomicOrdering::Relaxed);
+            let img_count = IMAGE_FRAMES_COUNT.load(AtomicOrdering::Relaxed);
+            if img_count == 0 {
+                return Err("no image frames");
+            }
+
+            // Coordination caps (shared CNode ⇒ the consumer names them by cptr).
+            let data_ntfn = make_notification()?;
+            let ack_ep = make_endpoint()?;
+
+            // --- Shared ring frame: retype + map into the producer's (root) VSpace.
+            let ring_slot = alloc_slot();
+            let _ = untyped_retype(
+                CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ring_slot);
+            // MP_RING_VADDR is inside the image's existing 2 MiB PT, so no new PT
+            // is needed in the rootserver's own VSpace.
+            let _ = page_map(ring_slot, MP_RING_VADDR, /* RW */ 3, CAP_INIT_THREAD_VSPACE);
+
+            // init the ring + attach the producer (rootserver-side mapping).
+            let cfg = RingConfig {
+                queue_len: SURT_QLEN,
+                ring_id: 3,
+                feature_flags: feature::REQUIRED_V0_1,
+                role: role::PRODUCER,
+            };
+            init_ring::<SurtSqe>(MP_RING_VADDR as *mut u8, MP_RING_LEN, &cfg)
+                .map_err(|_| "init_ring")?;
+            let mut prod = Producer::<SurtSqe>::attach(MP_RING_VADDR as *mut u8, MP_RING_LEN)
+                .map_err(|_| "attach producer")?;
+
+            // Publish the runtime cptrs for the consumer in the shared frame tail.
+            let args = (MP_RING_VADDR + MP_ARGS_OFF as u64) as *mut u64;
+            core::ptr::write_volatile(args.add(1), ack_ep);
+            core::ptr::write_volatile(args.add(2), data_ntfn);
+            core::ptr::write_volatile(args, MP_MAGIC); // magic last = "published"
+
+            // --- Consumer VSpace: fresh PML4 + one PDPT/PD/PT chain at the image.
+            let pml4 = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+            let pdpt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
+            let pd = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_DIRECTORY, PAGING_BITS, 1, pd);
+            let pt = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
+            let _ = paging_struct_map(pdpt, LBL_X86_PDPT_MAP, MP_IMAGE_BASE_VADDR, pml4);
+            let _ = paging_struct_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, MP_IMAGE_BASE_VADDR, pml4);
+            let _ = paging_struct_map(pt, LBL_X86_PAGE_TABLE_MAP, MP_IMAGE_BASE_VADDR, pml4);
+
+            // Map the whole image READ-ONLY (copy each frame cap so it maps into
+            // a second VSpace). Frames are in vaddr order from the image base;
+            // the ~7 aux frames past the image over-map at unused high vaddrs
+            // (harmless — the consumer only executes/reads the image prefix).
+            for i in 0..img_count {
+                let cp = alloc_slot();
+                let _ = syscall5(
+                    SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12,
+                    cp, img_start + i, 0);
+                let _ = page_map(cp, MP_IMAGE_BASE_VADDR + i * 0x1000, /* RO */ 2, pml4);
+            }
+
+            // Consumer's private stack.
+            let stack_slot = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, stack_slot);
+            let _ = page_map(stack_slot, MP_STACK_VADDR, /* RW */ 3, pml4);
+
+            // Grant the ring: copy the frame cap and map the copy into the
+            // consumer VSpace (same vaddr here; offsets not pointers make that a
+            // non-requirement).
+            let ring_copy = alloc_slot();
+            let _ = syscall5(
+                SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12,
+                ring_copy, ring_slot, 0);
+            let _ = page_map(ring_copy, MP_RING_VADDR, /* RW */ 3, pml4);
+
+            // --- Spawn the consumer TCB in the new VSpace (shared CNode).
+            let tcb = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+            let _ = tcb_set_space(tcb, /* fault_ep */ 0, CAP_INIT_THREAD_CNODE, pml4);
+            let stack_top = MP_STACK_VADDR + 4096 - 8;
+            let _ = tcb_write_registers(tcb, surt_multiproc_consumer as u64, stack_top, 0);
+            let _ = tcb_set_priority(tcb, 100);
+            attach_sched_context(tcb)?;
+            let _ = tcb_resume(tcb);
+
+            // --- Ping-pong across the address-space boundary.
+            let notify = Sel4Notify { ntfn: data_ntfn };
+            for i in 0..SURT_N {
+                let e = SurtSqe {
+                    request_id: i,
+                    user_data: !i,
+                    ..Default::default()
+                };
+                loop {
+                    match prod.try_push(e) {
+                        Ok(()) => break,
+                        Err(PushError::Full) => yield_now(),
+                        Err(PushError::Closed) => return Err("ring closed"),
+                    }
+                }
+                let _ = prod.notify_consumer(&notify);
+                // Block on the ack ep so the lower-priority consumer runs.
+                let (_rax, _badge, _info, payload) = ep_recv(ack_ep);
+                if payload != i {
+                    return Err("consumer verdict mismatch");
+                }
+            }
+            Ok(())
         }
     }
 

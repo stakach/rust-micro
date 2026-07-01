@@ -61,14 +61,18 @@ tools/
 - **M6 seL4-binding design ✅** — [`docs/architecture/surt_sel4_binding.md`](docs/architecture/surt_sel4_binding.md):
   control-path handshake, capability transfer, fault/teardown, the wait loop, and
   the `surt-sel4` API + implementation order.
-- **M7 binding on the kernel — PARTIAL** — `surt-core` builds into the rust-micro
-  rootserver and a **single-thread ring microtest passes in QEMU** (the transport
-  runs unchanged on the real seL4 ABI). `Sel4Notify` is implemented; the
-  integration surfaced and fixed three real kernel-side bugs (an `ep_recv`
-  register-clobber miscompile, a child stack-alignment requirement, and missing
-  large-model sections in the rootserver linker script). The two-thread
-  cross-thread test is implemented but disabled — an unresolved rootserver
-  child-spawn interaction, independent of surt-core. See [`tasks/todo.md`](tasks/todo.md).
+- **M7 binding on the kernel** — `surt-core` builds into the rust-micro rootserver
+  and three microtests pass in QEMU: **single-thread**, **two-thread** (one VSpace,
+  coalesced-wakeup ping-pong over a real seL4 Notification), and — the real goal —
+  **multiprocess**: a producer and a consumer in **separate address spaces (PML4s)**
+  sharing one ring **frame**, granted by `CNode_Copy`'ing the frame cap and
+  double-mapping it. The consumer runs surt-core unchanged in a fresh VSpace (the
+  rootserver image mapped read-only + a private stack), proving the transport works
+  cross-address-space exactly as the design doc (§4, §7, §10) specs. `Sel4Notify` is
+  implemented; the integration surfaced+fixed real bugs (an `ep_recv` register
+  clobber, child stack alignment, linker large-model sections) and a whole class of
+  stale rootserver ABI constants (invocation labels, slot layout, register/reply
+  ABI) that had drifted from the kernel. See [`tasks/todo.md`](tasks/todo.md).
 
 ```sh
 cargo run -p surt-bench --release   # run the host benchmarks
