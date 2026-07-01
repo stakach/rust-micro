@@ -38,6 +38,8 @@ const CASES: &[TestCase] = &[
                body: tests::surt_ring_multiprocess },
     TestCase { name: "surt_ring_connect",
                body: tests::surt_ring_connect },
+    TestCase { name: "surt_ring_cap_transfer",
+               body: tests::surt_ring_cap_transfer },
     TestCase { name: "syscall_round_trip",   body: tests::syscall_round_trip },
     TestCase { name: "untyped_retype_tcb",   body: tests::untyped_retype_tcb },
     TestCase { name: "tcb_configure",        body: tests::tcb_configure },
@@ -696,6 +698,212 @@ unsafe extern "C" fn surt_connect_consumer() -> ! {
     loop { yield_now(); }
 }
 
+// ---------------------------------------------------------------------------
+// SURT capability transfer (M7, Phase 2): the same dynamic connect, but each
+// component now has its OWN CSpace (a small CNode), and the ring frame +
+// notification caps are TRANSFERRED between the two distinct CSpaces over IPC
+// (seL4 extraCaps), not named through a shared CNode. The producer retypes the
+// ring + a notification from its own Untyped into its own CNode, maps the ring
+// in its own VSpace, then `Send`s them on the control endpoint with
+// `extraCaps=2`; the consumer, having set a receive path into its own CNode,
+// receives the two caps, maps the frame in its own VSpace, and drains. Each
+// component names caps with small cptrs (slot = cptr) via a guard-59 CNode.
+// ---------------------------------------------------------------------------
+
+const CONN_IPCBUF_VADDR: u64 = 0x0000_0100_005F_B000;
+const OBJ_CNODE: u64 = 4; // CapTable
+const OBJ_UNTYPED: u64 = 0;
+const LBL_CNODE_MINT: u64 = 26;
+/// A component's CNode: radix 5 (32 slots), guard 59 so `guard_size+radix=64`
+/// and the component names slot k with cptr k.
+const CN_RADIX: u32 = 5;
+const CN_GUARD_BADGE: u64 = 59; // guard_size (guard bits = 0)
+
+// Component-local cptrs (indices into each component's own CNode).
+const CT_CTRL_EP: u64 = 1; // producer: send+grant; consumer: recv
+const CT_PML4: u64 = 2; // this component's own PML4 (to map frames)
+const CT_UT_OR_RESULT: u64 = 3; // producer: its Untyped; consumer: result ep
+const CT_RING: u64 = 4; // producer: ring frame it retypes
+const CT_NTFN: u64 = 5; // producer: notification it retypes
+const CT_RECV_FRAME: u64 = 8; // consumer: transferred frame lands here
+const CT_RECV_NTFN: u64 = 9; // consumer: transferred notification (RECV_FRAME+1)
+
+/// Retype a radix-5 CNode and `CNode_Mint` a guard-59 view of it (so the owning
+/// component names slot k with cptr k and single-level lookups fully resolve).
+/// Returns the rootserver cptr of the GUARDED CNode cap — use it both as the
+/// `CNode_Copy` seed target and as the component's cspace_root.
+#[allow(dead_code)]
+unsafe fn build_component_cnode() -> u64 {
+    let raw = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
+    let guarded = alloc_slot();
+    // Mint raw→guarded within the rootserver CNode, badge = guard encoding.
+    let _ = syscall5(
+        SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_MINT << 12,
+        guarded, raw, CN_GUARD_BADGE);
+    guarded
+}
+
+/// Copy `src_cptr` (a rootserver cptr) into slot `dest_slot` of the component
+/// CNode named by the guarded cap `cnode_guarded`.
+#[allow(dead_code)]
+unsafe fn seed_cnode(cnode_guarded: u64, dest_slot: u64, src_cptr: u64) {
+    let _ = syscall5(
+        SYS_SEND, cnode_guarded, LBL_CNODE_COPY << 12, dest_slot, src_cptr, 0);
+}
+
+/// Producer with its OWN CSpace: retypes the ring + notification from its own
+/// Untyped into its own CNode, maps the ring, and TRANSFERS the two caps to the
+/// peer over the control endpoint (real seL4 cap transfer). Uses only its own
+/// small cptrs + its own IPC buffer at `CONN_IPCBUF_VADDR`.
+#[no_mangle]
+#[link_section = ".text.surt_ct_producer"]
+unsafe extern "C" fn surt_ct_producer() -> ! {
+    use surt_core::surt_abi::{feature, role, SurtSqe};
+    use surt_core::{init_ring, Producer, PushError, RingConfig};
+
+    // Carve the ring frame + a notification from our own Untyped (cptr 3).
+    let _ = untyped_retype(CT_UT_OR_RESULT, OBJ_X86_4K_PAGE, PAGING_BITS, 1, CT_RING);
+    let _ = untyped_retype(CT_UT_OR_RESULT, OBJ_NOTIFICATION, 0, 1, CT_NTFN);
+    // Map the ring in our own VSpace (cptr 2 = our PML4).
+    let _ = page_map(CT_RING, CONN_RING_VADDR, /* RW */ 3, CT_PML4);
+
+    let cfg = RingConfig {
+        queue_len: SURT_QLEN,
+        ring_id: 5,
+        feature_flags: feature::REQUIRED_V0_1,
+        role: role::PRODUCER,
+    };
+    if init_ring::<SurtSqe>(CONN_RING_VADDR as *mut u8, CONN_RING_LEN, &cfg).is_err() {
+        loop { yield_now(); }
+    }
+    let mut prod = match Producer::<SurtSqe>::attach(CONN_RING_VADDR as *mut u8, CONN_RING_LEN) {
+        Ok(p) => p,
+        Err(_) => loop { yield_now(); },
+    };
+
+    // Transfer {ring frame, notification} to the peer over the control endpoint.
+    let buf = CONN_IPCBUF_VADDR as *mut u64;
+    core::ptr::write_volatile(buf.add(122), CT_RING);
+    core::ptr::write_volatile(buf.add(123), CT_NTFN);
+    let msg_info: u64 = 1 | (2 << MSG_EXTRA_CAPS_SHIFT); // length=1 (magic) + 2 caps
+    let _ = syscall5(SYS_SEND, CT_CTRL_EP, msg_info, CONN_MAGIC, 0, 0);
+
+    let notify = Sel4Notify { ntfn: CT_NTFN };
+    let mut i = 0u64;
+    while i < SURT_N {
+        let e = SurtSqe {
+            request_id: i,
+            user_data: !i,
+            ..Default::default()
+        };
+        match prod.try_push(e) {
+            Ok(()) => {
+                let _ = prod.notify_consumer(&notify);
+                i += 1;
+            }
+            Err(PushError::Full) => yield_now(),
+            Err(PushError::Closed) => break,
+        }
+    }
+    loop { yield_now(); }
+}
+
+/// Consumer with its OWN CSpace: sets a receive path into its own CNode,
+/// RECEIVES the transferred ring frame + notification caps, maps the frame in
+/// its own VSpace, drains + verifies, and reports the verdict on the result ep.
+#[no_mangle]
+#[link_section = ".text.surt_ct_consumer"]
+unsafe extern "C" fn surt_ct_consumer() -> ! {
+    use surt_core::surt_abi::SurtSqe;
+    use surt_core::{Consumer, WaitDecision};
+
+    // Set the receive path (into our own cspace_root) BEFORE receiving.
+    let buf = CONN_IPCBUF_VADDR as *mut u64;
+    core::ptr::write_volatile(buf.add(125), 0); // receiveCNode = our cspace_root
+    core::ptr::write_volatile(buf.add(126), CT_RECV_FRAME); // receiveIndex
+    core::ptr::write_volatile(buf.add(127), 64); // receiveDepth
+
+    let (magic, _, _) = conn_recv3(CT_CTRL_EP);
+    if magic != CONN_MAGIC {
+        let _ = ep_send_one(CT_UT_OR_RESULT, 0xBAD1);
+        loop { yield_now(); }
+    }
+    // The transferred frame is now at cptr CT_RECV_FRAME, the notification at
+    // CT_RECV_NTFN. Map the frame into our own VSpace and attach.
+    let _ = page_map(CT_RECV_FRAME, CONN_RING_VADDR, /* RW */ 3, CT_PML4);
+    let mut c = match Consumer::<SurtSqe>::attach(CONN_RING_VADDR as *mut u8, CONN_RING_LEN) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = ep_send_one(CT_UT_OR_RESULT, 0xBAD2);
+            loop { yield_now(); }
+        }
+    };
+
+    let notify = Sel4Notify { ntfn: CT_RECV_NTFN };
+    let mut expect = 0u64;
+    while expect < SURT_N {
+        match c.try_pop() {
+            Ok(Some(e)) => {
+                if e.request_id != expect || e.user_data != !expect {
+                    let _ = ep_send_one(CT_UT_OR_RESULT, 0xBAD3);
+                    loop { yield_now(); }
+                }
+                expect += 1;
+            }
+            Ok(None) => match c.prepare_wait() {
+                Ok(WaitDecision::Block) => notify.wait(),
+                Ok(WaitDecision::Ready) => {}
+                Err(_) => {
+                    let _ = ep_send_one(CT_UT_OR_RESULT, 0xBAD4);
+                    loop { yield_now(); }
+                }
+            },
+            Err(_) => {
+                let _ = ep_send_one(CT_UT_OR_RESULT, 0xBAD5);
+                loop { yield_now(); }
+            }
+        }
+    }
+    let _ = ep_send_one(CT_UT_OR_RESULT, 0); // verdict: success (result ep is cptr 3)
+    loop { yield_now(); }
+}
+
+/// Build an isolated component: own VSpace (image RO + stack + IPC buffer) and
+/// own CNode seeded per `seeds` (dest_slot, rootserver_src_cptr), then spawn its
+/// TCB with that CNode as cspace_root. Returns the component's TCB (rootserver
+/// cptr) — kept only so the caller could suspend it; not otherwise used.
+#[allow(dead_code)]
+unsafe fn spawn_isolated_component(
+    entry: unsafe extern "C" fn() -> !,
+    seeds: &[(u64, u64)],
+) -> Result<u64, &'static str> {
+    let pml4 = build_component_vspace();
+    // Per-component IPC buffer (needed for the cap-transfer staging/receive).
+    let ipcbuf = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
+    let _ = page_map(ipcbuf, CONN_IPCBUF_VADDR, /* RW */ 3, pml4);
+    // Own CNode (guarded).
+    let cnode = build_component_cnode();
+    // Seed: the component's PML4 is always cptr CT_PML4; plus caller seeds.
+    seed_cnode(cnode, CT_PML4, pml4);
+    for &(slot, src) in seeds {
+        seed_cnode(cnode, slot, src);
+    }
+    // Spawn.
+    let tcb = alloc_slot();
+    let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
+    let _ = tcb_set_space(tcb, /* fault_ep */ 0, cnode, pml4);
+    let _ = syscall5(
+        SYS_SEND, tcb, LBL_TCB_SET_IPC_BUFFER << 12, CONN_IPCBUF_VADDR, ipcbuf, 0);
+    let stack_top = CONN_STACK_VADDR + 4096 - 8;
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, 0);
+    let _ = tcb_set_priority(tcb, 100);
+    attach_sched_context(tcb)?;
+    let _ = tcb_resume(tcb);
+    Ok(tcb)
+}
+
 mod tests {
     use super::*;
 
@@ -942,6 +1150,42 @@ mod tests {
             // Launch both, then wait for the consumer's verdict.
             spawn_component(prod_pml4, surt_connect_producer)?;
             spawn_component(cons_pml4, surt_connect_consumer)?;
+
+            let (_rax, _badge, _info, verdict) = ep_recv(result_ep);
+            if verdict != 0 {
+                return Err("consumer reported failure");
+            }
+            Ok(())
+        }
+    }
+
+    /// Full isolation + real capability transfer: a producer and a consumer,
+    /// each with its OWN CSpace (a guarded radix-5 CNode) and OWN VSpace + IPC
+    /// buffer. The producer retypes the ring frame + a notification from its own
+    /// Untyped into its own CNode, maps the ring, and TRANSFERS both caps to the
+    /// consumer over the control endpoint (seL4 extraCaps); the consumer receives
+    /// them into its own CNode, maps the frame in its own VSpace, drains, and
+    /// reports. No shared CNode — the caps genuinely move between CSpaces.
+    pub(super) fn surt_ring_cap_transfer() -> TestResult {
+        unsafe {
+            if IMAGE_FRAMES_COUNT.load(AtomicOrdering::Relaxed) == 0 {
+                return Err("no image frames");
+            }
+            // A retyped Endpoint cap has grant, needed for cap transfer.
+            let control_ep = make_endpoint()?;
+            let result_ep = make_endpoint()?;
+            // The producer's own Untyped, to carve the ring + notification.
+            let prod_ut = alloc_slot();
+            let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_UNTYPED, /* 64 KiB */ 16, 1, prod_ut);
+
+            spawn_isolated_component(
+                surt_ct_producer,
+                &[(CT_CTRL_EP, control_ep), (CT_UT_OR_RESULT, prod_ut)],
+            )?;
+            spawn_isolated_component(
+                surt_ct_consumer,
+                &[(CT_CTRL_EP, control_ep), (CT_UT_OR_RESULT, result_ep)],
+            )?;
 
             let (_rax, _badge, _info, verdict) = ep_recv(result_ep);
             if verdict != 0 {
