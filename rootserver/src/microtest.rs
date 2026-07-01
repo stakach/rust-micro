@@ -26,12 +26,14 @@ struct TestCase {
 // of truth so the summary footer is accurate.
 const CASES: &[TestCase] = &[
     // SURT (M7): the single-thread ring runs surt-core's transport unchanged in
-    // real seL4 user space and passes. The two-thread variant is implemented
-    // but DISABLED — a child spawned after the parent runs surt-core setup never
-    // gets scheduled (even a minimal child does not), an unresolved
-    // rootserver-spawn interaction independent of surt-core's correctness.
+    // real seL4 user space; the two-thread variant drives the same ring across a
+    // real seL4 Notification + ack endpoint between the parent and a spawned
+    // consumer child. The child now gets scheduled because `spawn_child` binds it
+    // a SchedContext (MCS: a no-SC TCB is never dispatched — see `spawn_child`).
     TestCase { name: "surt_ring_single_thread",
                body: tests::surt_ring_single_thread },
+    TestCase { name: "surt_ring_two_thread_notify",
+               body: tests::surt_ring_two_thread_notify },
     TestCase { name: "syscall_round_trip",   body: tests::syscall_round_trip },
     TestCase { name: "untyped_retype_tcb",   body: tests::untyped_retype_tcb },
     TestCase { name: "tcb_configure",        body: tests::tcb_configure },
@@ -54,8 +56,21 @@ const CASES: &[TestCase] = &[
 /// Entry point invoked from `_start` when `--features microtest`
 /// is on. Runs every case in `CASES`, prints a summary, then
 /// emits the kernel-exit sentinel.
-pub unsafe fn run() {
-    print_str(b"[microtest start]\n");
+pub unsafe fn run(ipc_buffer_vaddr: u64, empty_start: u64) {
+    // Capture the kernel-published IPC-buffer vaddr before any test runs; the
+    // tests stage syscall args through it (see `ROOTSERVER_IPCBUF`).
+    ROOTSERVER_IPCBUF.store(ipc_buffer_vaddr, AtomicOrdering::Relaxed);
+    // Base the CNode-slot allocator on the kernel-reported first empty slot.
+    // SLOT_BASE..SLOT_BASE+2 are the three fixed-slot reservations; the general
+    // allocator starts after them.
+    SLOT_BASE.store(empty_start, AtomicOrdering::Relaxed);
+    NEXT_SLOT.store(empty_start + 3, AtomicOrdering::Relaxed);
+
+    print_str(b"[microtest start] ipc_buffer @ ");
+    print_hex(ipc_buffer_vaddr);
+    print_str(b", first empty slot ");
+    print_u64(empty_start);
+    print_str(b"\n");
 
     let mut passed: usize = 0;
     let mut failed: usize = 0;
@@ -89,23 +104,44 @@ pub unsafe fn run() {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — slot allocator + spawn_child wrapper. Tests share a
-// running counter (`NEXT_SLOT`) so they don't have to coordinate
-// CNode-slot assignments by hand. Slots are *not* freed between
-// tests — once we land Delete with proper MDB tear-down we can
-// recycle, but for now the rootserver's CNode (radix=5 = 32 slots)
-// has plenty of headroom.
+// Helpers — slot allocator + spawn_child wrapper. Tests share a running
+// counter (`NEXT_SLOT`) so they don't have to coordinate CNode-slot
+// assignments by hand. Slots are *not* freed between tests — the rootserver's
+// CNode (radix 12 = 4096 slots) has plenty of headroom.
 // ---------------------------------------------------------------------------
 
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-/// First slot the harness will hand out. Phase 36e moved the
-/// canonical initial caps + Untyped to slots 0..20, so the first
-/// empty slot is 21. The `untyped_retype_tcb` test uses
-/// FIRST_EMPTY_SLOT (= 21), `tcb_set_ipc_buffer` uses 22, and
-/// `untyped_retype_reply` uses 23. The general-purpose
-/// allocator starts after them at 24.
-static NEXT_SLOT: AtomicU64 = AtomicU64::new(24);
+/// The harness allocates CNode slots monotonically starting just past the
+/// kernel-reported empty region (`BootInfo.empty.start`, captured in `run`).
+/// The boot cap layout is not a fixed size, so these must be runtime values —
+/// hardcoding them targets occupied slots and every retype fails DeleteFirst.
+/// `SLOT_BASE` reserves three slots for the fixed-slot tests (retype_tcb TCB
+/// reused by tcb_configure, the ipc-buffer frame, the reply object); the
+/// general allocator `NEXT_SLOT` starts at `SLOT_BASE + 3`.
+static SLOT_BASE: AtomicU64 = AtomicU64::new(0);
+static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// First reserved slot (the TCB `untyped_retype_tcb` creates and later tests
+/// reuse). Was the hardcoded `FIRST_EMPTY_SLOT`.
+#[inline]
+fn first_empty_slot() -> u64 {
+    SLOT_BASE.load(AtomicOrdering::Relaxed)
+}
+
+/// Runtime vaddr of the rootserver's IPC buffer, published by the kernel in
+/// `BootInfo.ipc_buffer` and captured in `run()`. The kernel derives this
+/// address from the loaded image's highest PT_LOAD vaddr (ELF-driven layout,
+/// commit df8c734), so it shifts whenever the rootserver binary's size changes
+/// — it must NOT be hardcoded. Tests stage msg-regs / extraCaps here for the
+/// kernel to read on SysSend.
+static ROOTSERVER_IPCBUF: AtomicU64 = AtomicU64::new(0);
+
+/// The rootserver's IPC-buffer vaddr (see `ROOTSERVER_IPCBUF`).
+#[inline]
+fn ipcbuf_vaddr() -> u64 {
+    ROOTSERVER_IPCBUF.load(AtomicOrdering::Relaxed)
+}
 
 #[allow(dead_code)]
 fn alloc_slot() -> u64 {
@@ -131,6 +167,7 @@ unsafe fn spawn_child(
         /* user_size_bits */ 0, /* num_objects */ 1, slot,
     );
     if r != 0 { return Err("retype TCB"); }
+
     let r = tcb_set_space(slot, /* fault_ep */ 0,
         CAP_INIT_THREAD_CNODE, CAP_INIT_THREAD_VSPACE);
     if r != 0 { return Err("setspace"); }
@@ -138,9 +175,39 @@ unsafe fn spawn_child(
     if r != 0 { return Err("writeregs"); }
     let r = tcb_set_priority(slot, 100);
     if r != 0 { return Err("setprio"); }
+    // MCS: a TCB with no bound SchedContext is not schedulable, so bind one
+    // before Resume (see `attach_sched_context`).
+    attach_sched_context(slot)?;
     let r = tcb_resume(slot);
     if r != 0 { return Err("resume"); }
     Ok(slot)
+}
+
+/// Retype + configure + bind a round-robin SchedContext to `tcb_slot`, making
+/// it independently schedulable under MCS. Returns the SC's slot.
+///
+/// A TCB with no bound SchedContext is NOT schedulable (`Tcb::is_schedulable`
+/// = runnable && sc.is_some()): `TCB::Resume` marks it Running but never
+/// enqueues it, and a plain `SYS_SEND` does not donate the sender's SC (only
+/// Call / NBSendRecv / NBSendWait do). Any worker the harness expects to run on
+/// its own (rather than only on a donated SC) needs this. budget == period ⇒ a
+/// round-robin SC that is always runnable (no budget starvation / timeout
+/// faults). Mirrors `main.rs::configure_child` for the MCS demo.
+#[allow(dead_code)]
+unsafe fn attach_sched_context(tcb_slot: u64) -> Result<u64, &'static str> {
+    let sc_slot = alloc_slot();
+    let r = untyped_retype(
+        CAP_INIT_UNTYPED, OBJ_SCHED_CONTEXT,
+        SCHED_CONTEXT_BITS, /* num_objects */ 1, sc_slot,
+    );
+    if r != 0 { return Err("retype SC"); }
+    // Legacy/spec ABI: budget/period are raw ticks (tick = 1 ms).
+    let r = sched_control_configure(
+        SLOT_SCHED_CONTROL, sc_slot, /* budget */ 10, /* period */ 10);
+    if r != 0 { return Err("sched_control configure"); }
+    let r = sched_context_bind(sc_slot, tcb_slot);
+    if r != 0 { return Err("sc bind"); }
+    Ok(sc_slot)
 }
 
 /// Retype an Endpoint into a fresh slot and return its cptr.
@@ -229,7 +296,6 @@ unsafe extern "C" fn surt_consumer_child() -> ! {
     use surt_core::surt_abi::SurtSqe;
     use surt_core::{Consumer, WaitDecision};
 
-    debug_put_char(b'c'); // child is running
     let ptr = core::ptr::addr_of_mut!(SURT_RING) as *mut u8;
     let len = 1536usize;
     let notify = Sel4Notify {
@@ -244,7 +310,6 @@ unsafe extern "C" fn surt_consumer_child() -> ! {
             }
         }
     };
-    debug_put_char(b'a'); // attached
     let ack = SURT_ACK.load(AtomicOrdering::Relaxed);
     let mut expect = 0u64;
     loop {
@@ -259,7 +324,6 @@ unsafe extern "C" fn surt_consumer_child() -> ! {
                 }
                 expect += 1;
                 if expect == SURT_N {
-                    debug_put_char(b'D');
                     SURT_DONE.store(SURT_N, AtomicOrdering::Relaxed);
                 }
                 // Ack this entry so the higher-priority parent unblocks and
@@ -298,18 +362,13 @@ unsafe extern "C" fn surt_consumer_child() -> ! {
 mod tests {
     use super::*;
 
-    /// Two threads over one ring + a seL4 notification: the parent produces
-    /// `SURT_N` entries (waking the consumer via the coalesced protocol), the
-    /// consumer child drains and verifies them, blocking on the notification
-    /// when idle.
-    ///
-    /// WIP / DISABLED (not in `CASES`): the spawned consumer never gets
-    /// scheduled. A minimal `.text` child (no surt-core) also fails to run in
-    /// this same context while the identical `child_send` test works, so the
-    /// blocker is an interaction between the parent's pre-spawn surt-core setup
-    /// and the rootserver's child-spawn path — not surt-core's transport, which
-    /// `surt_ring_single_thread` proves runs correctly on the kernel.
-    #[allow(dead_code)]
+    /// Two threads over one ring + a seL4 notification + ack endpoint: the
+    /// parent produces `SURT_N` entries (waking the consumer via the coalesced
+    /// M4 protocol), and the spawned consumer child drains and verifies them,
+    /// blocking on the data notification when the ring is empty. Proves the
+    /// SURT transport + coalesced-wakeup protocol run across two real seL4
+    /// threads. (`spawn_child` binds the consumer a SchedContext so it is
+    /// dispatched when the higher-priority parent blocks on the ack endpoint.)
     pub(super) fn surt_ring_two_thread_notify() -> TestResult {
         use surt_core::surt_abi::{feature, role, SurtSqe};
         use surt_core::{init_ring, Producer, PushError, RingConfig};
@@ -345,12 +404,11 @@ mod tests {
         // code) → a silent #GP. `child_send` uses the same `- 8`.
         let stack_top = core::ptr::addr_of_mut!(SURT_CONS_STACK) as u64 + 16384 - 8;
         let _child = unsafe { spawn_child(surt_consumer_child, stack_top)? };
-        debug_put_char(b'S');
 
         // Ping-pong: the consumer runs at a lower priority and the parent can't
-        // yield to it, so the parent BLOCKS on the ack notification each
-        // iteration to let it run. The consumer still exercises the M4 wakeup
-        // (data notification) whenever it finds the ring empty.
+        // yield to it, so the parent BLOCKS on the ack endpoint each iteration
+        // to let it run. The consumer still exercises the M4 wakeup (data
+        // notification) whenever it finds the ring empty.
         for i in 0..SURT_N {
             let e = SurtSqe {
                 request_id: i,
@@ -376,7 +434,6 @@ mod tests {
                 return Err("consumer reported failure");
             }
         }
-        debug_put_char(b'P');
 
         match SURT_DONE.load(AtomicOrdering::Relaxed) {
             v if v == SURT_N => Ok(()),
@@ -444,13 +501,13 @@ mod tests {
     /// state from userspace, so the retype-success rax (0) is
     /// the assertion.
     pub(super) fn untyped_retype_tcb() -> TestResult {
-        // Retype into the first empty CNode slot (FIRST_EMPTY_SLOT).
+        // Retype into the first reserved empty CNode slot.
         let r = untyped_retype(
             CAP_INIT_UNTYPED,
             OBJ_TCB,
             /* user_size_bits */ 0,
             /* num_objects */ 1,
-            FIRST_EMPTY_SLOT,
+            first_empty_slot(),
         );
         if r != 0 {
             return Err("retype failed");
@@ -497,46 +554,37 @@ mod tests {
             const RSP_MARKER: u64 = 0xBBBB_BBBB_2222_2222;
             const RFLAGS_MARKER: u64 = 0x202;
             const RAX_MARKER: u64 = 0xCCCC_CCCC_3333_3333;
-            const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
-            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
-            // msg_regs[3..3+count] = register values; msg word[i]
-            // is at IPC buffer u64 offset (1 + i).
-            core::ptr::write_volatile(buf.add(1 + 3), RIP_MARKER);
-            core::ptr::write_volatile(buf.add(1 + 4), RSP_MARKER);
-            core::ptr::write_volatile(buf.add(1 + 5), RFLAGS_MARKER);
-            core::ptr::write_volatile(buf.add(1 + 6), RAX_MARKER);
-
-            let length: u64 = 3 + 4;
+            // Upstream WriteRegisters wire layout (see the kernel handler):
+            //   mr0 = resume|flags, mr1 = count, mr2 = rip, mr3 = rsp,
+            //   mr4 = rflags, mr5 = rax. mr0..mr3 in registers; mr4+ in the
+            //   IPC buffer at word (1 + mr_index).
+            let buf = ipcbuf_vaddr() as *mut u64;
+            core::ptr::write_volatile(buf.add(5), RFLAGS_MARKER); // mr4
+            core::ptr::write_volatile(buf.add(6), RAX_MARKER);    // mr5
+            let count: u64 = 4;
+            let length: u64 = 2 + count;
             let label_writeregs: u64 = 3;
             let msg_info_w = (label_writeregs << 12) | (length & 0x7F);
-            // Phase 38c — upstream SYSCALL ABI: nr in rdx, msg regs
-            // in r10/r8/r9/r15. 38c-followup: rax is preserved by
-            // the kernel; success/failure is signalled via
-            // msginfo/faults, not via rax.
             core::arch::asm!(
                 "syscall",
                 in("rdx") SYS_SEND as u64,
                 in("rdi") tcb_slot,
                 in("rsi") msg_info_w,
-                in("r10") /* a2 = resume */ 0u64,
-                in("r8")  /* a3 = arch_flags */ 0u64,
-                in("r9")  /* a4 = count */ 4u64,
-                in("r15") /* a5 = rip */ RIP_MARKER,
+                in("r10") /* mr0 = resume */ 0u64,
+                in("r8")  /* mr1 = count */ count,
+                in("r9")  /* mr2 = rip */ RIP_MARKER,
+                in("r15") /* mr3 = rsp */ RSP_MARKER,
                 lateout("rax") _,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack, preserves_flags),
             );
 
-            // Now ReadRegisters with count=4. The kernel writes
-            // count words back into the invoker's msg_regs (and
-            // overflows into the IPC buffer past msg_regs.len()).
-            // Our SCRATCH_MSG_LEN is 8, so count=4 fits entirely
-            // in msg_regs and ALSO fans into the user_context's
-            // r10/r8/r9/r15 via the receive-path syscall return
-            // (Phase 38c — upstream seL4 IPC return ABI).
+            // ReadRegisters: upstream ABI carries count in mr1 (= a3), and the
+            // kernel fans the first four output words back into r10/r8/r9/r15
+            // (rip/rsp/rflags/rax) on the syscall return.
             let label_readregs: u64 = 2;
-            let msg_info_r = (label_readregs << 12) | (1u64 & 0x7F);
+            let msg_info_r = (label_readregs << 12) | (2u64 & 0x7F);
             let read_rip: u64;
             let read_rsp: u64;
             let read_rflags: u64;
@@ -546,10 +594,10 @@ mod tests {
                 in("rdx") SYS_SEND as u64,
                 in("rdi") tcb_slot,
                 in("rsi") msg_info_r,
-                inout("r10") /* a2 = resume */ 0u64 => read_rip,
-                inout("r8")  /* a3 = arch_flags */ 0u64 => read_rsp,
-                inout("r9")  /* a4 = count */ 4u64 => read_rflags,
-                inout("r15") /* a5 = unused */ 0u64 => read_rax,
+                inout("r10") /* mr0 = suspend */ 0u64 => read_rip,
+                inout("r8")  /* mr1 = count */ 4u64 => read_rsp,
+                inout("r9")  /* mr2 */ 0u64 => read_rflags,
+                inout("r15") /* mr3 */ 0u64 => read_rax,
                 lateout("rax") _,
                 lateout("rcx") _,
                 lateout("r11") _,
@@ -590,8 +638,7 @@ mod tests {
             // Stage extraCaps[0..3] in our IPC buffer at
             // caps_or_badges offset = 122. cspace, vspace,
             // ipc_buffer_frame.
-            const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
-            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+            let buf = ipcbuf_vaddr() as *mut u64;
             core::ptr::write_volatile(buf.add(122), CAP_INIT_THREAD_CNODE);
             core::ptr::write_volatile(buf.add(123), CAP_INIT_THREAD_VSPACE);
             core::ptr::write_volatile(buf.add(124), ipcbuf_slot);
@@ -662,6 +709,9 @@ mod tests {
             if r != 0 { return Err("setspace"); }
             let r = tcb_set_priority(tcb_slot, 100);
             if r != 0 { return Err("setprio"); }
+            // WriteRegisters below resumes the worker (a2 = resume = 1); under
+            // MCS it needs a bound SchedContext to actually be dispatched.
+            attach_sched_context(tcb_slot)?;
 
             // Stage the register values into our IPC buffer at
             // msg[3..3+count] so the staging in handle_send picks
@@ -678,37 +728,32 @@ mod tests {
                 0x202,                              // rflags (IF=1)
                 RAX_PAYLOAD,                        // rax
             ];
-            // Stage into our IPC buffer at msg[3..3+4]. msg[i] is
-            // at IPC-buffer u64 offset (1 + i).
-            const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
-            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
-            for (i, &v) in regs.iter().enumerate() {
-                core::ptr::write_volatile(buf.add(1 + 3 + i), v);
-            }
-
-            // SysSend to the TCB cap. The standard `syscall5`
-            // helper only stages 5 user args (rdi..r8), so we
-            // open-code an asm! to also fill r9 (= args.a5).
-            //   a2 = resume_target = 1
-            //   a3 = arch_flags    = 0
-            //   a4 = count         = 4
-            //   a5 = msg_regs[3]   = rip (the first reg value)
-            //   msginfo.length = 3 + count = 7 — kernel handler
-            //   routes into the upstream-shape WriteRegisters
-            //   branch.
-            let length: u64 = 3 + regs.len() as u64;
+            // Upstream `seL4_TCB_WriteRegisters` wire layout (must match the
+            // kernel's TCBWriteRegisters handler):
+            //   mr0 = resume | (arch_flags << 8)
+            //   mr1 = count
+            //   mr2 = rip  (regs[0])    mr3 = rsp (regs[1])
+            //   mr4.. = rflags, rax, ...
+            // mr0..mr3 ride in the register fast-path (a2..a5 = r10/r8/r9/r15);
+            // mr4+ live in the IPC buffer at word (1 + mr_index). Staging count
+            // in a4 (the old layout) made the kernel read count=0 and write no
+            // registers — the worker then ran at rip=0 and #PF'd.
+            let buf = ipcbuf_vaddr() as *mut u64;
+            core::ptr::write_volatile(buf.add(5), regs[2]); // mr4 = rflags
+            core::ptr::write_volatile(buf.add(6), regs[3]); // mr5 = rax
+            let count: u64 = regs.len() as u64;
+            let length: u64 = 2 + count; // mr0..mr5 for count=4
             let label_writeregs: u64 = 3; // TCBWriteRegisters
             let msg_info = (label_writeregs << 12) | (length & 0x7F);
-            // Phase 38c — upstream SYSCALL ABI; rax preserved.
             core::arch::asm!(
                 "syscall",
                 in("rdx") SYS_SEND as u64,
                 in("rdi") tcb_slot,
                 in("rsi") msg_info,
-                in("r10") /* a2 */ 1u64,
-                in("r8")  /* a3 */ 0u64,
-                in("r9")  /* a4 */ regs.len() as u64,
-                in("r15") /* a5 */ regs[0],
+                in("r10") /* mr0 */ 1u64,      // resume = 1
+                in("r8")  /* mr1 */ count,
+                in("r9")  /* mr2 */ regs[0],   // rip
+                in("r15") /* mr3 */ regs[1],   // rsp
                 lateout("rax") _,
                 lateout("rcx") _,
                 lateout("r11") _,
@@ -804,8 +849,7 @@ mod tests {
             // Parent sets up its IPC buffer with the receive
             // descriptor pointing at `dest_slot` of its own CSpace
             // (receiveCNode = 0 means use cspace_root).
-            const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
-            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+            let buf = ipcbuf_vaddr() as *mut u64;
             core::ptr::write_volatile(buf.add(125), 0);          // receiveCNode = own
             core::ptr::write_volatile(buf.add(126), dest_slot);  // receiveIndex
             core::ptr::write_volatile(buf.add(127), 64);         // receiveDepth (ignored)
@@ -842,9 +886,8 @@ mod tests {
     /// is ours to inspect via the cap layer; from userspace we
     /// just assert retype succeeded.
     pub(super) fn untyped_retype_reply() -> TestResult {
-        // Slot 14 is reserved by the kernel for the rootserver's
-        // SchedControl cap; use the next free slot.
-        let dest_slot: u64 = 23; // Phase 36e shifted: was 15
+        // Third reserved fixed slot.
+        let dest_slot: u64 = first_empty_slot() + 2;
         let r = untyped_retype(
             CAP_INIT_UNTYPED,
             OBJ_REPLY,
@@ -865,10 +908,9 @@ mod tests {
         // Write the cptr we want to "transfer" into the rootserver's
         // own IPC buffer at the caps_or_badges[0] offset (word 122).
         // The kernel reads it during send-side staging.
-        const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
         const CAPS_OR_BADGES_OFFSET_BYTES: u64 = 122 * 8;
         unsafe {
-            let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+            let buf = ipcbuf_vaddr() as *mut u64;
             // Stage CAP_INIT_THREAD_CNODE (the rootserver's own
             // CNode cap, slot 2) so the kernel-side lookup
             // succeeds.
@@ -903,13 +945,13 @@ mod tests {
     /// the invocation; the kernel-side spec covers actual long-
     /// message round-trips.
     pub(super) fn tcb_set_ipc_buffer() -> TestResult {
-        let frame_slot: u64 = 22; // Phase 36e shifted: was 13
+        let frame_slot: u64 = first_empty_slot() + 1; // reserved slot
         let r = untyped_retype(
             CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE,
             PAGING_BITS, 1, frame_slot,
         );
         if r != 0 { return Err("retype frame failed"); }
-        let target = FIRST_EMPTY_SLOT; // TCB from `untyped_retype_tcb`
+        let target = first_empty_slot(); // TCB from `untyped_retype_tcb`
         let msg_info = LBL_TCB_SET_IPC_BUFFER << 12;
         let buffer_vaddr = 0x0000_0100_0090_0000u64;
         let r = unsafe {
@@ -926,7 +968,7 @@ mod tests {
     /// retyped in `untyped_retype_tcb` (slot 12) is reused here.
     pub(super) fn tcb_configure() -> TestResult {
         // a2 = fault_ep, a3 = cspace, a4 = vspace, a5 = prio.
-        let target = FIRST_EMPTY_SLOT;
+        let target = first_empty_slot();
         let prio = 50u64;
         let msg_info = LBL_TCB_CONFIGURE << 12;
         let r = unsafe {
@@ -991,19 +1033,18 @@ unsafe extern "C" fn microtest_send_child() -> ! {
 unsafe extern "C" fn microtest_reply_server() -> ! {
     let ep = REPLY_CAP_EP_SLOT.load(AtomicOrdering::Relaxed);
     let reply = REPLY_CAP_REPLY_SLOT.load(AtomicOrdering::Relaxed);
-    // Phase 38c — upstream SYSCALL ABI: SysRecv with reply cptr in
-    // r10 (= args.a2). The kernel sets r10 on return to msg_regs[0],
-    // so we read the payload back through the inout. SYSCALL clobbers
-    // rcx + r11; the kernel's IPC delivery rewrites rax/rsi/rdi/r10/
-    // r8/r9/r15 with the received message, so they all need lateout —
-    // without it Rust may keep live values in those registers across
-    // the syscall.
-    let mut r10_io: u64 = reply;
+    // MCS SYSCALL ABI: SysRecv carries the reply cptr in the reply register
+    // R12 (libsel4's MCS_REPLY_DECL pins `reply` to r12); the kernel reads it
+    // from there (see handle_recv). Putting it in r10 registered no reply
+    // object, so the Call's reply had no bound waiter and the caller hung.
+    // The received payload comes back in r10 (msg_reg[0]).
+    let payload: u64;
     core::arch::asm!(
         "syscall",
         in("rdx") SYS_RECV as u64,
         in("rdi") ep,
-        inout("r10") r10_io,
+        in("r12") reply,
+        lateout("r10") payload,
         lateout("rax") _,
         lateout("rsi") _,
         lateout("r8")  _,
@@ -1013,7 +1054,6 @@ unsafe extern "C" fn microtest_reply_server() -> ! {
         lateout("r11") _,
         options(nostack, preserves_flags),
     );
-    let payload = r10_io;
     // Send reply: target = the reply cap, length=1, payload+1.
     let _ = syscall5(SYS_SEND, reply, /* length */ 1,
                      payload.wrapping_add(1), 0, 0);
@@ -1049,9 +1089,8 @@ unsafe extern "C" fn microtest_cap_transfer_child() -> ! {
     // The parent has set up the rootserver's IPC buffer with the
     // cptr we want to transfer at caps_or_badges[0]; we just send
     // with msginfo.extraCaps = 1.
-    const ROOTSERVER_IPCBUF_VBASE: u64 = 0x0000_0100_0060_0000;
     let cap = CHILD_CAP_TRANSFER_CAP_SLOT.load(AtomicOrdering::Relaxed);
-    let buf = ROOTSERVER_IPCBUF_VBASE as *mut u64;
+    let buf = ipcbuf_vaddr() as *mut u64;
     core::ptr::write_volatile(buf.add(122), cap);
     let ep = CHILD_CAP_TRANSFER_EP_SLOT.load(AtomicOrdering::Relaxed);
     let msg_info: u64 = (1u64 << MSG_EXTRA_CAPS_SHIFT); // length=0, extraCaps=1
@@ -1061,7 +1100,7 @@ unsafe extern "C" fn microtest_cap_transfer_child() -> ! {
 
 const LBL_TCB_CONFIGURE: u64 = 5;
 const LBL_TCB_SET_IPC_BUFFER: u64 = 10;
-const LBL_CNODE_COPY: u64 = 21;
+const LBL_CNODE_COPY: u64 = 25;
 const SYS_NB_SEND: i64 = -6;
 const SYS_RECV: i64 = -7;
 const SYS_CALL: i64 = -1;

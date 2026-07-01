@@ -1,5 +1,51 @@
 # Lessons captured this session
 
+## Pattern: rootserver constants silently drift from the kernel's codegen
+
+Symptom — the microtest suite regressed (child_send "wrong payload", reply_cap
+"reply payload mismatch", register tests "rip/rax mismatch", ipc_extra_cap_staging
+#PF, and the two-thread SURT test hung). ALL of it traced to the *rootserver*
+carrying hardcoded constants that no longer matched the kernel, NOT a kernel bug.
+The kernel was correct throughout; only the userspace rootserver was stale.
+
+Three independent drifts, each masked because `rax` is preserved across SYSCALL
+(so the rootserver's `if r != 0` success checks are meaningless — the kernel
+signals errors via IPC/faults, never rax):
+
+1. **Boot cap layout grew** (df8c734's runtime user-page region added frame
+   caps): `BootInfo.empty.start` moved from ~21 to **45**, but the harness
+   hardcoded `FIRST_EMPTY_SLOT=21` / `NEXT_SLOT=24`. Every retype targeted an
+   OCCUPIED slot → `seL4_DeleteFirst` → no object created → the "endpoint" cap
+   was a stale non-endpoint → Recv returned InvalidCapability instantly (never
+   blocked) → children never scheduled. FIX: allocate from `BootInfo.empty.start`.
+
+2. **Invocation labels renumbered** (upstream-ABI alignment): kernel codegen has
+   `SchedControlConfigureFlags=37, SchedContextBind=38, CNodeCopy=25,
+   IRQIssueIRQHandler=30, IRQSetIRQHandler=32`, but the rootserver still used
+   33/34/21/26/28. So `spawn_child`'s SchedContext bind was misrouted → child
+   had no SC → `is_schedulable()` (= runnable && sc.is_some()) false → never
+   enqueued. FIX: match the generated `out/invocations.rs` values.
+
+3. **WriteRegisters/ReadRegisters ABI**: kernel reads `count` from `mr1` (a3)
+   and `rip/rsp` from `mr2/mr3` (a4/a5); the tests sent the OLD layout
+   (a4=count) → count read as 0 → zero registers written → worker ran at
+   `rip=0` and #PF'd. Also the reply server passed its reply cptr in r10, but
+   MCS reads it from **r12** → no reply bound → caller hung. FIX: match the
+   handlers in src/invocation.rs.
+
+**Under MCS, a spawned worker that must run on its own needs a bound
+SchedContext** (retype SC → SchedControl::Configure budget==period round-robin
+→ SchedContext::Bind → Resume). A no-SC TCB is Resume-able but never dispatched;
+plain SYS_SEND does NOT donate an SC (only Call/NBSendRecv/NBSendWait do).
+
+**Rule for myself**: when a rootserver invocation "succeeds" (r==0) but has no
+effect, suspect a stale constant, not kernel logic — rax is preserved, so r==0
+proves nothing. Cross-check EVERY hardcoded label against
+`target/.../out/invocations.rs`, every object-type against object_type.rs, and
+derive slot numbers from `BootInfo.empty.start`, never a literal. Debug by
+gating kernel-side `arch::log_n` on the invoker's priority (rootserver = 255).
+
+
 ## Pattern: large statics blow the BOOTBOOT default stack
 
 Symptom — `Scheduler` (~10 KiB) on the spec stack triple-faulted
