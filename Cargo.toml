@@ -43,3 +43,7 @@ libsel4-hello = []
 # no-op marker; the selection happens in build_kernel.sh (stages a different
 # .tmp/rootserver.elf).
 surt-demo = []
+# Boot a caller-staged .tmp/rootserver.elf without building a rootserver — for
+# out-of-tree root tasks (userspace-ntos) that consume this kernel as a
+# submodule. No-op marker; the logic is in build_kernel.sh.
+extern-rootserver = []

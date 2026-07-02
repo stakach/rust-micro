@@ -50,7 +50,16 @@ fi
 # program built against upstream libsel4. Validates the SYSCALL
 # ABI end-to-end against the real upstream toolchain.
 mkdir -p .tmp
-if [[ ",${FEATURES}," == *",libsel4-hello,"* ]]; then
+if [[ ",${FEATURES}," == *",extern-rootserver,"* ]]; then
+  # An out-of-tree root task (e.g. the userspace-ntos components, which consume
+  # this kernel as a submodule) has already staged its ELF at .tmp/rootserver.elf.
+  # Don't build or overwrite it — just image what's there.
+  if [[ ! -f .tmp/rootserver.elf ]]; then
+    echo "error: extern-rootserver set but .tmp/rootserver.elf is missing" >&2
+    exit 1
+  fi
+  echo "rootserver: using pre-staged .tmp/rootserver.elf (extern)"
+elif [[ ",${FEATURES}," == *",libsel4-hello,"* ]]; then
   ./vendor/libsel4-build/build.sh
   cp vendor/libsel4-build/out/hello.elf .tmp/rootserver.elf
   echo "rootserver staged: .tmp/rootserver.elf (libsel4 hello.elf)"
