@@ -52,14 +52,6 @@ fn alloc_slot() -> u64 {
     NEXT_SLOT.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
-// Extra invocation labels / object types used by the SURT handshake.
-const LBL_CNODE_COPY: u64 = 25;
-const LBL_CNODE_MINT: u64 = 26;
-const LBL_TCB_SET_IPC_BUFFER: u64 = 10;
-const MSG_EXTRA_CAPS_SHIFT: u64 = 7;
-const OBJ_CNODE: u64 = 4; // CapTable
-const OBJ_UNTYPED: u64 = 0;
-
 const SURT_N: u64 = 100;
 const SURT_QLEN: u32 = 16;
 

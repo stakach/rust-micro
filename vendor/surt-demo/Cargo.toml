@@ -17,6 +17,8 @@ name = "surt-demo"
 path = "src/main.rs"
 
 [dependencies]
+# The kernel's shared user-space ABI (syscalls, invocation helpers, BootInfo).
+sel4-rt = { path = "../../crates/sel4-rt" }
 # The seL4 binding for SURT, straight from crates.io — this demo is the
 # downstream consumer that proves the published crate runs on this kernel.
 # `default-features = false` keeps it core-only (no_std) for `-Z build-std=core`.

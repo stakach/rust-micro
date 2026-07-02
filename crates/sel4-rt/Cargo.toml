@@ -1,0 +1,16 @@
+# sel4-rt — the rust-micro kernel's user-space ABI as a shared crate.
+#
+# Every root task built for this kernel (the demo rootserver, vendor/surt-demo,
+# and the userspace-ntos components) hand-rolled the same syscall stubs,
+# invocation labels, object types, and BootInfo layout — a recurring source of
+# silent ABI drift. This crate is the one source of truth. It is no_std, has no
+# dependencies, and builds under `-Z build-std=core` for the custom bare-metal
+# target.
+[package]
+name = "sel4-rt"
+version = "0.1.0"
+edition = "2021"
+description = "seL4-style syscall ABI, invocation helpers, and BootInfo for rust-micro user-space root tasks (no_std)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]

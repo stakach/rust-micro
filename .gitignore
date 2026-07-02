@@ -10,6 +10,7 @@ disk.img
 # reference but never committed. The .bf and .xml inputs we depend on
 # are pinned under codegen/.
 /seL4/
+/references/
 
 # libsel4-build outputs (generated headers, built archives, venv).
 # The build.sh + config + src under vendor/libsel4-build/ ARE tracked.
