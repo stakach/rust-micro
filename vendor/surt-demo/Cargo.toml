@@ -20,7 +20,7 @@ path = "src/main.rs"
 # The seL4 binding for SURT, straight from crates.io — this demo is the
 # downstream consumer that proves the published crate runs on this kernel.
 # `default-features = false` keeps it core-only (no_std) for `-Z build-std=core`.
-surt-sel4 = { version = "0.1", default-features = false }
+surt-sel4 = { version = "0.1.1", default-features = false }
 
 [profile.release]
 panic = "abort"

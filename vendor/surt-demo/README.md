@@ -23,6 +23,11 @@ coalesced consumer loop). Scenarios, in order:
 5. **cap_transfer** — the flagship: two components with their own CSpaces; the ring frame
    + notification capabilities are transferred between the CSpaces over IPC. The consumer
    drains via `surt_sel4::drain_blocking`.
+6. **adaptive** — the SQPOLL-style path: same isolated-component setup as `connect`, but the
+   consumer drains via `surt_sel4::drain_adaptive` (busy-poll while entries flow — zero
+   syscalls — then block after an idle spin budget). The pure-poll `drain_polling` is host-
+   tested in the crate; it wants a dedicated core (a spinning poller starves a single core),
+   so it isn't a single-core QEMU scenario here.
 
 ## Run it
 
@@ -41,7 +46,8 @@ Expected tail:
   PASS multiprocess
   PASS connect
   PASS cap_transfer
-[surt-demo summary: 5 passed, 0 failed]
+  PASS adaptive
+[surt-demo summary: 6 passed, 0 failed]
 ```
 
 ## Layout

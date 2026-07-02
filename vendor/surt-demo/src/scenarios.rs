@@ -15,7 +15,7 @@
 use crate::*;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use surt_sel4::surt_core;
-use surt_sel4::{drain_blocking, CPtr, DrainExit, Sel4Env, Sel4Notify};
+use surt_sel4::{drain_adaptive, drain_blocking, CPtr, DrainExit, Sel4Env, Sel4Notify};
 
 // ---------------------------------------------------------------------------
 // The platform contract: SURT's fast-path wakeup needs exactly two seL4
@@ -520,6 +520,60 @@ unsafe extern "C" fn surt_connect_consumer() -> ! {
     }
 }
 
+/// Consumer component (shared CNode) that drains with `drain_adaptive` — the
+/// io_uring-SQPOLL-style path: busy-poll while entries flow, fall back to a
+/// coalesced block only after a spin budget of consecutive empties. Same
+/// handshake as `surt_connect_consumer`; only the drain loop differs.
+#[no_mangle]
+#[link_section = ".text.surt_adaptive_consumer"]
+unsafe extern "C" fn surt_adaptive_consumer() -> ! {
+    use surt_core::surt_abi::SurtSqe;
+    use surt_core::Consumer;
+
+    let args = CONN_ARGS_VADDR as *const u64;
+    let control_ep = core::ptr::read_volatile(args.add(1));
+    let result_ep = core::ptr::read_volatile(args.add(2));
+    let my_pml4 = core::ptr::read_volatile(args.add(3));
+
+    let (magic, ring_cptr, ntfn) = conn_recv3(control_ep);
+    if magic != CONN_MAGIC {
+        let _ = ep_send_one(result_ep, 0xBAD1);
+        loop {
+            yield_now();
+        }
+    }
+    let _ = page_map(ring_cptr, CONN_RING_VADDR, /* RW */ 3, my_pml4);
+    let mut c = match Consumer::<SurtSqe>::attach(CONN_RING_VADDR as *mut u8, CONN_RING_LEN) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = ep_send_one(result_ep, 0xBAD2);
+            loop {
+                yield_now();
+            }
+        }
+    };
+
+    // Poll up to 64× before blocking (SQPOLL idle-timeout style). While entries
+    // flow this drains with zero syscalls; it only blocks after a quiet spell,
+    // woken by the producer's coalesced notify.
+    let notify = Sel4Notify::new(&ENV, ntfn);
+    let mut expect = 0u64;
+    let mut ok = true;
+    let exit = drain_adaptive(&mut c, &notify, 64, |e: &SurtSqe| {
+        if e.request_id != expect || e.user_data != !expect {
+            ok = false;
+            return false;
+        }
+        expect += 1;
+        expect < SURT_N
+    });
+    let verdict = if ok && expect == SURT_N && exit == DrainExit::Stopped { 0 } else { 0xBAD3 };
+    let _ = ep_send_one(result_ep, verdict);
+    loop {
+        yield_now();
+    }
+}
+
 /// Retype a radix-5 CNode and `CNode_Mint` a guard-59 view (so the component
 /// names slot k with cptr k). Returns the guarded CNode cptr.
 unsafe fn build_component_cnode() -> u64 {
@@ -913,6 +967,41 @@ fn cap_transfer() -> DemoResult {
     }
 }
 
+/// Adaptive (SQPOLL-style) path: the same two-isolated-component setup as
+/// `connect`, but the consumer drains with `drain_adaptive` — polling while busy
+/// (zero syscalls) and blocking only after an idle spin budget. Reuses
+/// `surt_connect_producer`; both components run round-robin at the same priority.
+fn adaptive() -> DemoResult {
+    unsafe {
+        if IMAGE_FRAMES_COUNT.load(AtomicOrdering::Relaxed) == 0 {
+            return Err("no image frames");
+        }
+        let control_ep = make_endpoint()?;
+        let result_ep = make_endpoint()?;
+        let data_ntfn = make_notification()?;
+
+        let prod_pml4 = build_component_vspace();
+        let ring_slot = alloc_slot();
+        let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ring_slot);
+        let _ = page_map(ring_slot, CONN_RING_VADDR, /* RW */ 3, prod_pml4);
+        let ring_copy = alloc_slot();
+        let _ = syscall5(SYS_SEND, CAP_INIT_THREAD_CNODE, LBL_CNODE_COPY << 12, ring_copy, ring_slot, 0);
+        make_args_frame(prod_pml4, CONN_ARGS_VADDR, &[CONN_MAGIC, control_ep, data_ntfn, ring_copy]);
+
+        let cons_pml4 = build_component_vspace();
+        make_args_frame(cons_pml4, CONN_ARGS_VADDR, &[CONN_MAGIC, control_ep, result_ep, cons_pml4]);
+
+        spawn_component(prod_pml4, surt_connect_producer)?;
+        spawn_component(cons_pml4, surt_adaptive_consumer)?;
+
+        let (_rax, _badge, _info, verdict) = ep_recv(result_ep);
+        if verdict != 0 {
+            return Err("consumer reported failure");
+        }
+        Ok(())
+    }
+}
+
 // ===========================================================================
 // Harness
 // ===========================================================================
@@ -928,6 +1017,7 @@ const SCENARIOS: &[Scenario] = &[
     Scenario { name: "multiprocess", body: multiprocess },
     Scenario { name: "connect", body: connect },
     Scenario { name: "cap_transfer", body: cap_transfer },
+    Scenario { name: "adaptive", body: adaptive },
 ];
 
 /// Run every scenario, print a summary, then the kernel-exit sentinel.
