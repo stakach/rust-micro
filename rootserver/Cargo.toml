@@ -11,10 +11,9 @@ default = []
 # `[microtest done]` and qemu_exits.
 microtest = []
 
+# No external dependencies — the SURT ring transport moved to its own repo
+# (crates.io: surt-sel4); its on-kernel demo lives in vendor/surt-demo/.
 [dependencies]
-# SURT user-space ring transport. `core`-only (no_std, no alloc), so it builds
-# under the rootserver's `-Z build-std=core`. Re-exports `surt-abi`.
-surt-core = { path = "../sel4-user-ring/crates/surt-core", default-features = false }
 
 [profile.release]
 panic = "abort"

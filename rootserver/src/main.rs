@@ -619,12 +619,7 @@ pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // than hardcoding — otherwise its retypes target occupied slots and
         // fail with seL4_DeleteFirst (silently, since rax is preserved).
         let empty_start = (*bootinfo).empty.start;
-        // The rootserver's own loaded-image frame caps (in vaddr order from the
-        // image base). The multiprocess SURT test copies + maps these into a
-        // fresh VSpace so a consumer in a separate address space can execute
-        // surt-core code.
-        let img = (*bootinfo).user_image_frames;
-        microtest::run(ipc_buffer_vaddr, empty_start, img.start, img.end - img.start);
+        microtest::run(ipc_buffer_vaddr, empty_start);
         loop { yield_now(); }
     }
 

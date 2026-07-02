@@ -2,7 +2,6 @@
 /target/
 /rootserver/target/
 /rootserver/Cargo.lock
-/sel4-user-ring/target/
 /.tmp/
 bootboot.efi
 disk.img
@@ -29,6 +28,11 @@ disk.img
 /vendor/sel4test/init-build.sh
 /vendor/sel4test/griddle
 /vendor/sel4test/easy-settings.cmake
+
+# vendor/surt-demo/ is a standalone root task built by its build.sh; only its
+# source + scripts are tracked, the build artifacts are regenerable.
+/vendor/surt-demo/target/
+/vendor/surt-demo/Cargo.lock
 
 # Local agent state from Claude Code.
 /.claude/

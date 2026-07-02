@@ -54,6 +54,12 @@ if [[ ",${FEATURES}," == *",libsel4-hello,"* ]]; then
   ./vendor/libsel4-build/build.sh
   cp vendor/libsel4-build/out/hello.elf .tmp/rootserver.elf
   echo "rootserver staged: .tmp/rootserver.elf (libsel4 hello.elf)"
+elif [[ ",${FEATURES}," == *",surt-demo,"* ]]; then
+  # Phase 41 — the SURT demo rootserver: a standalone root task that consumes
+  # the PUBLISHED `surt-sel4` crate from crates.io and runs the SURT ring
+  # scenarios on this kernel. Its build.sh compiles it and stages the ELF.
+  ./vendor/surt-demo/build.sh
+  echo "rootserver staged: .tmp/rootserver.elf (surt-demo)"
 else
   ROOTSERVER_FEATURES=""
   if [[ ",${FEATURES}," == *",microtest,"* ]]; then
@@ -63,7 +69,6 @@ else
     cd rootserver
     cargo +nightly build \
       -Z build-std=core \
-      -Z build-std-features=compiler-builtins-mem \
       -Z unstable-options \
       -Z json-target-spec \
       --target triplet.json \

@@ -38,3 +38,8 @@ microtest = []
 # matches what libsel4-compiled code emits, as a stepping stone
 # toward running sel4test.
 libsel4-hello = []
+# Phase 41 — boot the SURT demo rootserver (vendor/surt-demo/, which consumes
+# the published surt-sel4 crate) instead of the default Rust rootserver. Kernel
+# no-op marker; the selection happens in build_kernel.sh (stages a different
+# .tmp/rootserver.elf).
+surt-demo = []

@@ -103,6 +103,7 @@ Passed positionally to `build_kernel.sh`; `spec` is always included.
 | `vmx`           | Hardware-virtualisation (VT-x) extensions. |
 | `microtest`     | Also build the rootserver with its structured test harness instead of the legacy demos. |
 | `libsel4-hello` | Swap the rootserver for `vendor/libsel4-build/out/hello.elf` (C built against upstream libsel4) — validates the SYSCALL ABI end-to-end. |
+| `surt-demo`     | Swap the rootserver for `vendor/surt-demo/` — a root task that consumes the published [`surt-sel4`](https://crates.io/crates/surt-sel4) crate and runs the SURT ring-transport scenarios on the kernel. See `vendor/surt-demo/README.md`. |
 | `arch-x86_64`   | (default) architecture selector. `arch-aarch64` exists in-tree, but the build scripts target x86_64 (`triplets/mykernel-x86.json`); AArch64 needs its own triplet. |
 | `mcs`           | No-op (retained for compatibility); MCS is always on. |
 
