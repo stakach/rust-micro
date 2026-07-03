@@ -258,20 +258,20 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     for i in 0..ROOTSERVER_STACK_PAGES {
         let stack_phys = alloc_page();
         let vaddr = stack_base + i * page;
-        map_user_4k_into_pml4(pml4, vaddr, stack_phys, /* writable */ true);
+        map_user_4k_into_pml4(pml4, vaddr, stack_phys, /* writable */ true, /* NX */ true);
         record_image_page(seen, &mut n_seen, vaddr, stack_phys, true)?;
     }
 
-    // Allocate + map the IPC buffer page.
+    // Allocate + map the IPC buffer page (data → NX).
     let ipcbuf_phys = alloc_page();
-    map_user_4k_into_pml4(pml4, ipc_buffer_vaddr, ipcbuf_phys, true);
+    map_user_4k_into_pml4(pml4, ipc_buffer_vaddr, ipcbuf_phys, true, /* NX */ true);
     record_image_page(seen, &mut n_seen, ipc_buffer_vaddr, ipcbuf_phys, true)?;
 
     // Allocate + map the BootInfo page (read-only — userspace reads
     // it but doesn't mutate). The kernel writes the struct via the
     // BOOTBOOT identity map before dispatch.
     let bi_phys = alloc_page();
-    map_user_4k_into_pml4(pml4, bootinfo_vaddr, bi_phys, false);
+    map_user_4k_into_pml4(pml4, bootinfo_vaddr, bi_phys, false, /* NX */ true);
     record_image_page(seen, &mut n_seen, bootinfo_vaddr, bi_phys, false)?;
 
     // Phase 42 — extended BootInfo page. sel4test's
@@ -282,7 +282,7 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     // headers we currently emit.
     let extra_bi_vaddr = bootinfo_vaddr + page;
     let extra_bi_phys = alloc_page();
-    map_user_4k_into_pml4(pml4, extra_bi_vaddr, extra_bi_phys, false);
+    map_user_4k_into_pml4(pml4, extra_bi_vaddr, extra_bi_phys, false, /* NX */ true);
     record_image_page(seen, &mut n_seen, extra_bi_vaddr, extra_bi_phys, false)?;
 
     // Publish the count for the BootInfo builder.
@@ -890,11 +890,15 @@ unsafe fn load_segment(
         // `alloc_page` returns a paddr; we reach it from kernel mode
         // through the linear map at `phys_to_lin(paddr)`.
         let writable = seg.writable();
+        // W^X: only the executable (code) segment gets X; data + read-only
+        // segments (incl. the heap in .bss) are mapped NX. Non-executable
+        // segments never carry code, so this never breaks execution.
+        let execute_never = !seg.executable();
         let phys_addr = match find_seen(seen, *n_seen, page_vaddr) {
             Some(p) => p,
             None => {
                 let phys = alloc_page();
-                map_user_4k_into_pml4(pml4, page_vaddr, phys, writable);
+                map_user_4k_into_pml4(pml4, page_vaddr, phys, writable, execute_never);
                 record_image_page(seen, n_seen, page_vaddr, phys, writable)?;
                 phys
             }

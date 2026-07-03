@@ -250,13 +250,13 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         let receiver_pml4 = super::paging::make_user_pml4();
 
         map_user_4k_into_pml4(sender_pml4, SENDER_CODE_VBASE,
-            kernel_virt_to_phys((&raw const SENDER_CODE_PAGE) as u64), false);
+            kernel_virt_to_phys((&raw const SENDER_CODE_PAGE) as u64), false, false);
         map_user_4k_into_pml4(sender_pml4, SENDER_STACK_VBASE,
-            kernel_virt_to_phys((&raw const SENDER_STACK_PAGE) as u64), true);
+            kernel_virt_to_phys((&raw const SENDER_STACK_PAGE) as u64), true, false);
         map_user_4k_into_pml4(receiver_pml4, RECEIVER_CODE_VBASE,
-            kernel_virt_to_phys((&raw const RECEIVER_CODE_PAGE) as u64), false);
+            kernel_virt_to_phys((&raw const RECEIVER_CODE_PAGE) as u64), false, false);
         map_user_4k_into_pml4(receiver_pml4, RECEIVER_STACK_VBASE,
-            kernel_virt_to_phys((&raw const RECEIVER_STACK_PAGE) as u64), true);
+            kernel_virt_to_phys((&raw const RECEIVER_STACK_PAGE) as u64), true, false);
 
         // Build the kernel-side state: an endpoint, two CNodes
         // (one per thread) each containing the same endpoint cap
@@ -363,12 +363,12 @@ pub unsafe fn launch_smp_ping_thread() -> crate::tcb::TcbId {
     map_user_4k_into_pml4(
         pml4, PING_CODE_VBASE,
         kernel_virt_to_phys((&raw const PING_CODE_PAGE) as u64),
-        false,
+        false, false,
     );
     map_user_4k_into_pml4(
         pml4, PING_STACK_VBASE,
         kernel_virt_to_phys((&raw const PING_STACK_PAGE) as u64),
-        true,
+        true, false,
     );
 
     let s = KERNEL.get();
@@ -539,10 +539,11 @@ pub unsafe fn map_user_4k_into_pml4(
     vaddr: u64,
     paddr: u64,
     writable: bool,
+    execute_never: bool,
 ) {
     let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000)
         as *mut u64;
-    map_user_4k_in(pml4, vaddr, paddr, writable, false);
+    map_user_4k_in(pml4, vaddr, paddr, writable, execute_never);
 }
 
 unsafe fn map_user_4k(vaddr: u64, paddr: u64, writable: bool) {
