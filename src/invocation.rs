@@ -274,6 +274,9 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     }
     let rights = crate::cap::FrameRights::from_word(args.a3);
     let writable = matches!(rights, crate::cap::FrameRights::ReadWrite);
+    // The rights word's bit 2 (0b100) carries `ExecuteNever` (`from_word` ignores
+    // it) — set the page's NX bit so it can't be executed (W^X).
+    let execute_never = args.a3 & 0b100 != 0;
 
     // Two wire formats coexist:
     //   * Phase 33d (compressed, microtest): args.a4 = vspace_cptr.
@@ -342,15 +345,15 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             let map_result = match size {
                 crate::cap::FrameSize::Small => {
                     usermode::map_user_4k_into_foreign_pml4(
-                        pml4_paddr, vaddr, paddr, writable)
+                        pml4_paddr, vaddr, paddr, writable, execute_never)
                 }
                 crate::cap::FrameSize::Large => {
                     usermode::map_user_2m_into_foreign_pml4(
-                        pml4_paddr, vaddr, paddr, writable)
+                        pml4_paddr, vaddr, paddr, writable, execute_never)
                 }
                 crate::cap::FrameSize::Huge => {
                     usermode::map_user_1g_into_foreign_pml4(
-                        pml4_paddr, vaddr, paddr, writable)
+                        pml4_paddr, vaddr, paddr, writable, execute_never)
                 }
             };
             if let Err(missing) = map_result {
@@ -371,7 +374,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
                     seL4_Error::seL4_FailedLookup)));
             }
         } else if matches!(size, crate::cap::FrameSize::Small) {
-            usermode::map_user_4k_public(vaddr, paddr, writable);
+            usermode::map_user_4k_public(vaddr, paddr, writable, execute_never);
         } else {
             // Legacy microtest path doesn't support Large/Huge.
             return Err(KException::SyscallError(SyscallError::new(

@@ -483,10 +483,10 @@ pub fn launch_user_mode_test() -> ! {
 /// internal `map_user_4k` so the invocation layer can call it
 /// for `Cap::Frame::Map` — Frame::Map always installs in the
 /// invoker's vspace, which is whatever CR3 currently points at.
-pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool) {
+pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool, execute_never: bool) {
     let pml4 = super::paging::phys_to_lin(
         read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    map_user_4k_in(pml4, vaddr, paddr, writable);
+    map_user_4k_in(pml4, vaddr, paddr, writable, execute_never);
 }
 
 /// Phase 28g — clear the 4 KiB PTE for `vaddr` in the live PML4
@@ -542,16 +542,22 @@ pub unsafe fn map_user_4k_into_pml4(
 ) {
     let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000)
         as *mut u64;
-    map_user_4k_in(pml4, vaddr, paddr, writable);
+    map_user_4k_in(pml4, vaddr, paddr, writable, false);
 }
 
 unsafe fn map_user_4k(vaddr: u64, paddr: u64, writable: bool) {
     let pml4 = super::paging::phys_to_lin(
         read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    map_user_4k_in(pml4, vaddr, paddr, writable);
+    map_user_4k_in(pml4, vaddr, paddr, writable, false);
 }
 
-unsafe fn map_user_4k_in(pml4: *mut u64, vaddr: u64, paddr: u64, writable: bool) {
+unsafe fn map_user_4k_in(
+    pml4: *mut u64,
+    vaddr: u64,
+    paddr: u64,
+    writable: bool,
+    execute_never: bool,
+) {
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
@@ -560,7 +566,8 @@ unsafe fn map_user_4k_in(pml4: *mut u64, vaddr: u64, paddr: u64, writable: bool)
     let mid_flags = PTE_PRESENT | PTE_RW | PTE_USER;
     let leaf_flags = PTE_PRESENT
         | PTE_USER
-        | if writable { PTE_RW } else { 0 };
+        | if writable { PTE_RW } else { 0 }
+        | if execute_never { super::paging::PTE_NX } else { 0 };
 
     let pdpt = ensure_user_table(pml4.add(pml4_idx), mid_flags);
     let pd = ensure_user_table(pdpt.add(pdpt_idx), mid_flags);
@@ -697,6 +704,7 @@ pub unsafe fn map_user_4k_into_foreign_pml4(
     vaddr: u64,
     frame_paddr: u64,
     writable: bool,
+    execute_never: bool,
 ) -> Result<(), u32> {
     let pml4 = super::paging::phys_to_lin(
         pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
@@ -734,6 +742,9 @@ pub unsafe fn map_user_4k_into_foreign_pml4(
     if writable {
         flags |= PTE_RW;
     }
+    if execute_never {
+        flags |= super::paging::PTE_NX;
+    }
     core::ptr::write_volatile(pt.add(pt_idx), (frame_paddr & !0xFFF) | flags);
     Ok(())
 }
@@ -751,6 +762,7 @@ pub unsafe fn map_user_2m_into_foreign_pml4(
     vaddr: u64,
     frame_paddr: u64,
     writable: bool,
+    execute_never: bool,
 ) -> Result<(), u32> {
     use super::paging::PTE_PS;
     let pml4 = super::paging::phys_to_lin(
@@ -778,6 +790,9 @@ pub unsafe fn map_user_2m_into_foreign_pml4(
     if writable {
         flags |= PTE_RW;
     }
+    if execute_never {
+        flags |= super::paging::PTE_NX;
+    }
     // 2 MiB-aligned paddr: low 21 bits zero.
     core::ptr::write_volatile(
         pd.add(pd_idx),
@@ -795,6 +810,7 @@ pub unsafe fn map_user_1g_into_foreign_pml4(
     vaddr: u64,
     frame_paddr: u64,
     writable: bool,
+    execute_never: bool,
 ) -> Result<(), u32> {
     use super::paging::PTE_PS;
     let pml4 = super::paging::phys_to_lin(
@@ -814,6 +830,9 @@ pub unsafe fn map_user_1g_into_foreign_pml4(
     let mut flags = PTE_PRESENT | PTE_USER | PTE_PS;
     if writable {
         flags |= PTE_RW;
+    }
+    if execute_never {
+        flags |= super::paging::PTE_NX;
     }
     // 1 GiB-aligned paddr: low 30 bits zero.
     core::ptr::write_volatile(

@@ -234,8 +234,13 @@ pub fn paging_struct_map(struct_cptr: u64, label: u64, vaddr: u64, vspace_cptr: 
     unsafe { syscall5(SYS_SEND, struct_cptr, msg_info, vaddr, vspace_cptr, 0) }
 }
 
+/// `ExecuteNever` flag for the `page_map` rights word (bit 2). OR it into `rights`
+/// to map a page non-executable (NX) — e.g. `3 | PAGE_EXECUTE_NEVER` for writable
+/// non-executable data, giving a true W^X mapping.
+pub const PAGE_EXECUTE_NEVER: u64 = 0b100;
+
 /// `X86Page::Map(vaddr, rights, vspace_cptr)`. `rights`: bit1=read, bit0=write
-/// (so `2` = RO, `3` = RW).
+/// (so `2` = RO, `3` = RW); OR in [`PAGE_EXECUTE_NEVER`] for a non-executable page.
 #[inline(always)]
 pub fn page_map(frame_cptr: u64, vaddr: u64, rights: u64, vspace_cptr: u64) -> u64 {
     let msg_info = LBL_X86_PAGE_MAP << 12;
