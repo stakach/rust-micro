@@ -134,6 +134,12 @@ pub struct CpuContext {
     /// the TCBSetTLSBase invocation. Restored on dispatch so each
     /// thread sees its own `%fs:0` reads.
     pub fs_base: u64,
+    /// The user `%gs` base — the Windows TEB anchor (`%gs:[0x30]` = TEB self,
+    /// `%gs:[0x60]` = PEB). Set by the `TCBSetTLSBase` invocation with a non-zero
+    /// selector (`a3`). Restored on dispatch into `IA32_KERNEL_GS_BASE`, so the
+    /// `swapgs` on the return-to-user makes `%gs` the thread's TEB while the
+    /// kernel keeps its per-CPU `%gs`.
+    pub gs_base: u64,
 }
 
 /// 512-byte, 16-byte-aligned FXSAVE region carried on each TCB (SMP
@@ -382,7 +388,7 @@ impl Default for Tcb {
             ipc_length: 0,
             msg_regs: [0; SCRATCH_MSG_LEN],
             ipc_badge: 0,
-            cpu_context: CpuContext { ksp: 0, cr3: 0, fs_base: 0 },
+            cpu_context: CpuContext { ksp: 0, cr3: 0, fs_base: 0, gs_base: 0 },
             cspace_root: crate::cap::Cap::Null,
             #[cfg(target_arch = "x86_64")]
             user_context:

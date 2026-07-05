@@ -5235,17 +5235,29 @@ fn decode_tcb(
                 Ok(())
             }
             // SetTLSBase via TCB invocation (vs the SysSetTLSBase
-            // syscall which sets the *invoker's* TLS). a2 = base.
-            // Save into the target TCB's cpu_context.fs_base so the
-            // dispatcher restores it on next entry.
+            // syscall which sets the *invoker's* TLS). a2 = base;
+            // a3 selects the segment: 0 (default) = %fs (Linux TLS),
+            // non-zero = %gs (the Windows TEB anchor). Save into the
+            // target TCB so the dispatcher restores it on next entry.
             InvocationLabel::TCBSetTLSBase => {
                 let base = args.a2;
-                s.scheduler.slab.get_mut(id).cpu_context.fs_base = base;
+                let want_gs = args.a3 != 0;
+                if want_gs {
+                    s.scheduler.slab.get_mut(id).cpu_context.gs_base = base;
+                } else {
+                    s.scheduler.slab.get_mut(id).cpu_context.fs_base = base;
+                }
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
                     if Some(id) == crate::kernel::current_thread() {
-                        use crate::arch::x86_64::msr::{wrmsr, IA32_FS_BASE};
-                        wrmsr(IA32_FS_BASE, base);
+                        use crate::arch::x86_64::msr::{wrmsr, IA32_FS_BASE, IA32_KERNEL_GS_BASE};
+                        // The user %gs base is applied via the swapped-out MSR so
+                        // the return-to-user `swapgs` makes it the active %gs.
+                        if want_gs {
+                            wrmsr(IA32_KERNEL_GS_BASE, base);
+                        } else {
+                            wrmsr(IA32_FS_BASE, base);
+                        }
                     }
                 }
                 Ok(())

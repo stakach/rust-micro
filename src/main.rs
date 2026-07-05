@@ -434,6 +434,15 @@ fn ap_scheduler_loop() -> ! {
                             crate::arch::x86_64::msr::IA32_FS_BASE,
                             tcb.cpu_context.fs_base,
                         );
+                        // Restore the per-thread user %gs base into the swapped-out
+                        // MSR: the return-to-user `swapgs` makes `%gs` this thread's
+                        // TEB (Windows `%gs:0x30`), while the active %gs stays the
+                        // kernel per-CPU base for the next SYSCALL entry. Threads that
+                        // never set a gs base carry 0 (harmless).
+                        crate::arch::x86_64::msr::wrmsr(
+                            crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
+                            tcb.cpu_context.gs_base,
+                        );
 
                         // SMP: make this thread's FPU state resident on
                         // this AP before resuming it (fxsave outgoing

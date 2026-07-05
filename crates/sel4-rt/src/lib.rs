@@ -198,6 +198,17 @@ pub fn tcb_set_ipc_buffer(target: u64, vaddr: u64, frame_cptr: u64) -> u64 {
     unsafe { syscall5(SYS_SEND, target, msg_info, vaddr, frame_cptr, 0) }
 }
 
+/// `TCBSetTLSBase` invocation label.
+pub const LBL_TCB_SET_TLS_BASE: u64 = 20;
+
+/// Set the target thread's user `%gs` base — the Windows TEB anchor (`%gs:[0x30]` = TEB self).
+/// (a2 = base, a3 = 1 selects `%gs`; a3 = 0 would select `%fs`.)
+#[inline(always)]
+pub fn tcb_set_gs_base(target: u64, base: u64) -> u64 {
+    let msg_info = LBL_TCB_SET_TLS_BASE << 12;
+    unsafe { syscall5(SYS_SEND, target, msg_info, base, 1, 0) }
+}
+
 /// `SchedControl::ConfigureFlags(target_sc, budget, period)`.
 #[inline(always)]
 pub fn sched_control_configure(sched_control: u64, target_sc_cptr: u64, budget: u64, period: u64) -> u64 {

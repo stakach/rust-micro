@@ -774,6 +774,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // live in the kernel half.
             let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
             let next_fs_base = s.scheduler.slab.get(next).cpu_context.fs_base;
+            let next_gs_base = s.scheduler.slab.get(next).cpu_context.gs_base;
             if next_cr3 != 0 {
                 let cur_cr3: u64;
                 core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
@@ -788,6 +789,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // tail. Same-thread case is a no-op write.
             crate::arch::x86_64::msr::wrmsr(
                 crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+            // Restore the per-thread user %gs base into the swapped-out
+            // MSR so the tail `swapgs` lands the next thread's TEB in
+            // %gs (Windows `%gs:0x30`). Threads with no gs base carry 0.
+            crate::arch::x86_64::msr::wrmsr(
+                crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE, next_gs_base);
             // Phase 15a: fan IPC delivery state from the receiving
             // TCB into its user-visible registers. Mirrors upstream
             // seL4's IPC return ABI (`x64_sys_recv`):
