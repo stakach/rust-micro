@@ -838,6 +838,20 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 new_ctx.r8  = tcb.msg_regs[1];
                 new_ctx.r9  = tcb.msg_regs[2];
                 new_ctx.r15 = tcb.msg_regs[3];
+                // Fan words 4..length out to the receiver's IPC buffer page (mirrors the
+                // receiver-blocked-first path in endpoint::transfer_msg) so a handler dispatched via
+                // the syscall tail — e.g. a syscall-servicing fault loop — sees the full message
+                // (all saved registers of an UnknownSyscall fault), not just the 4 register words.
+                let recv_buf_paddr = tcb.ipc_buffer_paddr;
+                let length = tcb.ipc_length as usize;
+                if length > 4 && recv_buf_paddr != 0 {
+                    let buf = (crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr)
+                        as *mut u64).wrapping_add(1); // skip the tag word
+                    let n = length.min(tcb.msg_regs.len());
+                    for i in 4..n {
+                        core::ptr::write_volatile(buf.add(i), tcb.msg_regs[i]);
+                    }
+                }
             }
             // Phase 38c-followup — rax is preserved across SYSCALL
             // (matches upstream seL4: their `handle_fastsyscall`
