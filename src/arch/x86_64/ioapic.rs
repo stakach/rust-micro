@@ -29,6 +29,13 @@ const IOAPIC_REG_REDTBL_BASE: u32 = 0x10;
 #[no_mangle]
 pub static mut IOAPIC_PADDR: u64 = 0;
 
+/// The IOAPIC's global-system-interrupt base (from the MADT). Callers pass a GSI;
+/// the redirection-table index is `gsi - IOAPIC_GSI_BASE`. On QEMU q35 this is 0
+/// (so pin == GSI), but honoring it keeps us correct on platforms with a nonzero
+/// base or (future) a second IOAPIC.
+#[no_mangle]
+pub static mut IOAPIC_GSI_BASE: u32 = 0;
+
 /// Default fallback if MADT enumeration hasn't run / didn't find one.
 /// Standard PC platforms place the first IOAPIC at this paddr.
 const IOAPIC_DEFAULT_PADDR: u64 = 0xFEC00000;
@@ -41,9 +48,10 @@ pub unsafe fn ensure_ioapic_paddr_discovered(madt_addr: u64) {
     }
     if let Ok(madt) = super::acpi::find_madt(madt_addr) {
         super::acpi::iter_madt_entries(madt, |e| {
-            if let super::acpi::MadtEntry::IoApic { address, .. } = e {
+            if let super::acpi::MadtEntry::IoApic { address, gsi_base, .. } = e {
                 if IOAPIC_PADDR == 0 {
                     IOAPIC_PADDR = address as u64;
+                    IOAPIC_GSI_BASE = gsi_base;
                 }
             }
         });
@@ -72,19 +80,26 @@ unsafe fn read_reg(reg: u32) -> u32 {
     ptr::read_volatile((base + IOAPIC_IOWIN_OFFSET) as *const u32)
 }
 
+/// Map a caller-supplied GSI to this IOAPIC's redirection-table index by subtracting
+/// the GSI base (saturating — a GSI below the base isn't ours, but clamp rather than
+/// wrap). On QEMU q35 the base is 0 so this is the identity.
+unsafe fn rte_index(gsi: u32) -> u32 {
+    gsi.saturating_sub(IOAPIC_GSI_BASE)
+}
+
 /// Set the mask bit (16) of `pin`'s redirection entry (read-modify-write so the
 /// vector / trigger / polarity bits are preserved). The kernel masks a level-
 /// triggered line on delivery so a still-asserted source can't storm the CPU; the
 /// owning IRQHandler::Ack unmasks it once the driver has cleared the device cause.
 pub unsafe fn mask_pin(pin: u32) {
-    let lo_reg = IOAPIC_REG_REDTBL_BASE + pin * 2;
+    let lo_reg = IOAPIC_REG_REDTBL_BASE + rte_index(pin) * 2;
     let lo = read_reg(lo_reg);
     write_reg(lo_reg, lo | (1 << 16));
 }
 
 /// Clear the mask bit (16) of `pin`'s redirection entry.
 pub unsafe fn unmask_pin(pin: u32) {
-    let lo_reg = IOAPIC_REG_REDTBL_BASE + pin * 2;
+    let lo_reg = IOAPIC_REG_REDTBL_BASE + rte_index(pin) * 2;
     let lo = read_reg(lo_reg);
     write_reg(lo_reg, lo & !(1 << 16));
 }
@@ -100,7 +115,7 @@ pub unsafe fn unmask_pin(pin: u32) {
 /// fire with a stale destination), then the low half last so the
 /// unmasked result becomes live atomically.
 pub unsafe fn program_redirection(pin: u32, vector: u32, level: u32, polarity: u32) {
-    let lo_reg = IOAPIC_REG_REDTBL_BASE + pin * 2;
+    let lo_reg = IOAPIC_REG_REDTBL_BASE + rte_index(pin) * 2;
     let hi_reg = lo_reg + 1;
 
     // High 32 bits: destination APIC ID in bits 56..63 — for our
