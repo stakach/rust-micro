@@ -66,6 +66,29 @@ unsafe fn write_reg(reg: u32, value: u32) {
     ptr::write_volatile((base + IOAPIC_IOWIN_OFFSET) as *mut u32, value);
 }
 
+unsafe fn read_reg(reg: u32) -> u32 {
+    let base = ioapic_base();
+    ptr::write_volatile((base + IOAPIC_REGSEL_OFFSET) as *mut u32, reg);
+    ptr::read_volatile((base + IOAPIC_IOWIN_OFFSET) as *const u32)
+}
+
+/// Set the mask bit (16) of `pin`'s redirection entry (read-modify-write so the
+/// vector / trigger / polarity bits are preserved). The kernel masks a level-
+/// triggered line on delivery so a still-asserted source can't storm the CPU; the
+/// owning IRQHandler::Ack unmasks it once the driver has cleared the device cause.
+pub unsafe fn mask_pin(pin: u32) {
+    let lo_reg = IOAPIC_REG_REDTBL_BASE + pin * 2;
+    let lo = read_reg(lo_reg);
+    write_reg(lo_reg, lo | (1 << 16));
+}
+
+/// Clear the mask bit (16) of `pin`'s redirection entry.
+pub unsafe fn unmask_pin(pin: u32) {
+    let lo_reg = IOAPIC_REG_REDTBL_BASE + pin * 2;
+    let lo = read_reg(lo_reg);
+    write_reg(lo_reg, lo & !(1 << 16));
+}
+
 /// Program the IOAPIC redirection-table entry for `pin` to deliver
 /// `vector` to the BSP (physical destination = APIC ID 0). Level/
 /// polarity follow the seL4 ABI convention: `level=1` means

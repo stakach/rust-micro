@@ -48,6 +48,14 @@ pub struct IrqEntry {
     /// True while a delivered IRQ has not yet been ack'd. seL4 masks
     /// the line at the controller; we just track the flag.
     pub pending: bool,
+    /// The IOAPIC redirection-table pin this IRQ was issued on (for the
+    /// `X86IRQIssueIRQHandlerIOAPIC` path), or `None` for legacy/PIC IRQs.
+    /// Recorded so a level-triggered line can be masked on delivery.
+    pub ioapic_pin: Option<u16>,
+    /// True if the IOAPIC line is level-triggered. A held-asserted level
+    /// source (e.g. PCI INTx) would re-fire immediately after EOI and storm
+    /// the CPU, so the kernel masks it on delivery and unmasks on Ack.
+    pub level_triggered: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -61,7 +69,7 @@ impl Default for IrqTable {
 
 impl IrqTable {
     pub const fn new() -> Self {
-        Self { entries: [IrqEntry { state: IrqState::Inactive, notification: None, badge: 0, pending: false }; MAX_IRQ] }
+        Self { entries: [IrqEntry { state: IrqState::Inactive, notification: None, badge: 0, pending: false, ioapic_pin: None, level_triggered: false }; MAX_IRQ] }
     }
     pub fn get(&self, irq: u16) -> Option<&IrqEntry> {
         self.entries.get(irq as usize)
@@ -97,6 +105,21 @@ pub fn set_notification(
     entry.state = IrqState::Signal;
     entry.notification = Some(notification_index);
     entry.badge = badge;
+    Ok(())
+}
+
+/// Record the IOAPIC pin + trigger mode for `irq` (from
+/// `X86IRQIssueIRQHandlerIOAPIC`). Leaves the binding state untouched — the handler
+/// is issued before `SetNotification`. Lets `handle_interrupt` mask a level line.
+pub fn set_ioapic_route(
+    table: &mut IrqTable,
+    irq: u16,
+    pin: u16,
+    level_triggered: bool,
+) -> Result<(), IrqError> {
+    let entry = table.get_mut(irq).ok_or(IrqError::Range)?;
+    entry.ioapic_pin = Some(pin);
+    entry.level_triggered = level_triggered;
     Ok(())
 }
 

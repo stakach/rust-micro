@@ -2245,6 +2245,12 @@ fn issue_x86_irq_handler(
                 crate::arch::x86_64::ioapic::program_redirection(
                     pin as u32, cpu_vec, level as u32, polarity as u32,
                 );
+                // Record the pin + trigger so a level-triggered line gets masked on
+                // delivery (and unmasked on Ack). Leaves the binding state Inactive
+                // until SetNotification.
+                let _ = crate::interrupt::set_ioapic_route(
+                    &mut s.irqs, vector as u16, pin as u16, level != 0,
+                );
             }
         }
         let _ = (pin, level, polarity);
@@ -2538,7 +2544,19 @@ fn decode_irq_handler(
             InvocationLabel::IRQAckIRQ => {
                 crate::interrupt::ack_irq(&mut s.irqs, irq).map_err(|_|
                     KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability)))
+                        seL4_Error::seL4_InvalidCapability)))?;
+                // Unmask the IOAPIC line the kernel masked on delivery (level-
+                // triggered lines only). The driver has serviced the device by now, so
+                // it's safe to let the line fire again.
+                #[cfg(target_arch = "x86_64")]
+                if let Some(entry) = s.irqs.get(irq) {
+                    if entry.level_triggered {
+                        if let Some(pin) = entry.ioapic_pin {
+                            crate::arch::x86_64::ioapic::unmask_pin(pin as u32);
+                        }
+                    }
+                }
+                Ok(())
             }
             InvocationLabel::IRQSetIRQHandler => {
                 // Two ABI shapes:

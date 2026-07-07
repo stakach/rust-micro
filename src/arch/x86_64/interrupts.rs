@@ -294,6 +294,17 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
             &mut (*s_ptr).scheduler,
             irq as u16,
         );
+        // Mask a level-triggered IOAPIC line BEFORE the EOI: a still-asserted level
+        // source (e.g. PCI INTx, held until the driver clears the device cause) would
+        // otherwise re-fire immediately after EOI and storm the CPU. The owning
+        // IRQHandler::Ack unmasks it once the driver has serviced the device.
+        if let Some(entry) = (*s_ptr).irqs.get(irq as u16) {
+            if entry.level_triggered {
+                if let Some(pin) = entry.ioapic_pin {
+                    super::ioapic::mask_pin(pin as u32);
+                }
+            }
+        }
     }
     super::pic::eoi(irq as u8);
 
