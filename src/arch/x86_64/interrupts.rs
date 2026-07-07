@@ -307,6 +307,13 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
         }
     }
     super::pic::eoi(irq as u8);
+    // In APIC mode EVERY interrupt reaches the CPU via the LAPIC, so it MUST be
+    // acknowledged with a LAPIC EOI — not just the (vestigial) 8259 EOI above. Without
+    // this the LAPIC's in-service bit for this vector stays set and blocks every later
+    // interrupt in the same priority class: the first IOAPIC/MSI device IRQ would
+    // deliver, then all subsequent ones (INTx, MSI, other pins) would be silently
+    // dropped. (The LAPIC timer tick already EOIs via lapic_timer_irq_dispatch.)
+    super::lapic::eoi();
 
     // Same context-switch tail as `pit_irq_dispatch`. Factored
     // here so PIT and generic IRQs use one path; PIT keeps its own
