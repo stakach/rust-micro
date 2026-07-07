@@ -137,7 +137,7 @@ pub const DEVICE_UTS: &[(u64, u8)] = &[
     (0xFEC00000, 12),
     (0xFED00000, 12),
     (0xFEE00000, 12),
-    (0x81060000, 17),
+    (0x81060000, 17), // e1000e (82574) NIC BAR0 (default q35 NIC)
 ];
 
 /// Phase 42 — backing memory for the rootserver's Untyped cap is
