@@ -123,6 +123,23 @@ const ROOTSERVER_STACK_PAGES: u64 = 4;
 /// rootserver's own CNode.
 pub const ROOTSERVER_CNODE_IDX: usize = 3;
 
+/// The device untypeds exposed to the root task, as `(paddr, size_bits)`. This is
+/// the SINGLE SOURCE OF TRUTH used both to stamp the untyped caps into the CSpace
+/// (slots 21..) and to build the matching `BootInfo.untypedList` — they MUST agree,
+/// or `bi.untyped` advertises a slot whose cap is missing/wrong (a device UT would
+/// alias the first user-image-frame slot → retype yields a bad cap → map #PFs).
+///   * 0x00080000 (512 KiB): low 1 MiB — BIOS/ACPI/legacy (sel4test ACPI discovery).
+///   * 0xFEC00000 / 0xFED00000 / 0xFEE00000 (4 KiB each): IOAPIC / HPET / LAPIC MMIO.
+///   * 0x81060000 (128 KiB): the e1000e NIC BAR0 (QEMU q35 assigns it here; the PCI
+///     hole is at 0x80000000+ with 1 GiB RAM). Exposed so a driver host maps its regs.
+pub const DEVICE_UTS: &[(u64, u8)] = &[
+    (0x00080000, 19),
+    (0xFEC00000, 12),
+    (0xFED00000, 12),
+    (0xFEE00000, 12),
+    (0x81060000, 17),
+];
+
 /// Phase 42 — backing memory for the rootserver's Untyped cap is
 /// reserved at boot from BOOTBOOT free memory rather than from
 /// kernel BSS (kernel-image BSS is constrained by the high-memory
@@ -555,17 +572,10 @@ pub unsafe fn launch_rootserver() -> ! {
         free_index: 0,
         is_device: false,
     });
-    // Phase 42 — device untypeds at slots 21..25, paralleling
-    // build_bootinfo's untypedList[1..5]. These cover the low 1 MiB
-    // (BIOS/ACPI/legacy) plus IOAPIC/HPET/LAPIC MMIO, so sel4test's
-    // platsupport can `vka_utspace_alloc_at` the right paddr and
-    // hand userspace a device Frame.
-    const DEVICE_UTS: &[(u64, u8)] = &[
-        (0x00080000, 19),
-        (0xFEC00000, 12),
-        (0xFED00000, 12),
-        (0xFEE00000, 12),
-    ];
+    // Phase 42 — device untypeds at slots 21.., paralleling
+    // build_bootinfo's untypedList[1..]. Single source of truth is the
+    // module-level DEVICE_UTS so the caps here and the BootInfo metadata
+    // can't drift (see DEVICE_UTS doc).
     for (i, &(paddr, sb)) in DEVICE_UTS.iter().enumerate() {
         s.cnodes[ROOTSERVER_CNODE_IDX].0[untyped_slot + 1 + i] =
             Cte::with_cap(&Cap::Untyped {
@@ -740,48 +750,18 @@ unsafe fn build_bootinfo(
         isDevice: 0,
         padding: [0; 6],
     };
-    // Phase 42 — device untypeds for the regions sel4platsupport
-    // expects to be able to map_paddr into:
-    //   * Upper-half low memory (0x80000–0xFFFFF): BIOS extension
-    //     area, ACPI RSDP, system BIOS. sel4test's bootstrap calls
-    //     `vka_utspace_alloc_at(0xE0000, …)` for ACPI table
-    //     discovery; without this it bails early. We can't expose
-    //     a device UT starting at paddr=0 yet because `Cap::Untyped`
-    //     stores its base via `PPtr<NonZeroU64>` and forcing the
-    //     niche to 1 leaks +1 into every child paddr in `retype`.
-    //     Starting at 0x80000 is enough to cover everything sel4test
-    //     touches in the conventional 1 MiB.
-    //   * 0xFEC00000 (4 KiB): IOAPIC MMIO.
-    //   * 0xFED00000 (4 KiB): HPET MMIO.
-    //   * 0xFEE00000 (4 KiB): LAPIC MMIO.
-    // Each is a separate, naturally-aligned device untyped so the
-    // user's allocator can bisect down to a 4 KiB device frame
-    // matching the requested paddr.
-    empty_untypeds[1] = seL4_UntypedDesc {
-        paddr: 0x00080000,
-        sizeBits: 19, // 512 KiB — covers 0x80000..0xFFFFF
-        isDevice: 1,
-        padding: [0; 6],
-    };
-    empty_untypeds[2] = seL4_UntypedDesc {
-        paddr: 0xFEC00000,
-        sizeBits: 12,
-        isDevice: 1,
-        padding: [0; 6],
-    };
-    empty_untypeds[3] = seL4_UntypedDesc {
-        paddr: 0xFED00000,
-        sizeBits: 12,
-        isDevice: 1,
-        padding: [0; 6],
-    };
-    empty_untypeds[4] = seL4_UntypedDesc {
-        paddr: 0xFEE00000,
-        sizeBits: 12,
-        isDevice: 1,
-        padding: [0; 6],
-    };
-    let untyped_count: Word = 5;
+    // Phase 42 — device untypeds (BIOS/ACPI low 1 MiB, IOAPIC/HPET/LAPIC
+    // MMIO, e1000e NIC BAR). Built from the SAME `DEVICE_UTS` the cap
+    // placement uses, so `untypedList` and the CSpace caps can never drift.
+    for (i, &(paddr, sb)) in DEVICE_UTS.iter().enumerate() {
+        empty_untypeds[1 + i] = seL4_UntypedDesc {
+            paddr,
+            sizeBits: sb,
+            isDevice: 1,
+            padding: [0; 6],
+        };
+    }
+    let untyped_count: Word = 1 + DEVICE_UTS.len() as Word;
 
     let n_cores = crate::bootboot::get_num_cores() as Word;
     // Phase 36e / 42 — canonical slot layout under MCS:
