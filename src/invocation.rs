@@ -637,6 +637,9 @@ fn decode_x86_iopt(
         if !unsafe { ctx.present() } {
             // Install this PT as the context (1st-level) root.
             unsafe { ctx.install_root(domain_id, base_paddr); }
+            // A device now has an IO-space context — turn on VT-d translation. Until now
+            // DMA was identity (TE off); from here it's confined to mapped IOVAs.
+            unsafe { iommu::enable_translation(); }
             let new_cap = Cap::IoPageTable {
                 ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
                 is_mapped: true,

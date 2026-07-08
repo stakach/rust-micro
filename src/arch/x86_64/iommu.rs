@@ -24,8 +24,10 @@ const CAP_REG: u64 = 0x08;
 const GCMD_REG: u64 = 0x18;
 const GSTS_REG: u64 = 0x1C;
 const RTADDR_REG: u64 = 0x20;
-const SRTP: u32 = 30; // Set Root Table Pointer
-const RTPS: u32 = 30; // Root Table Pointer Status
+const SRTP: u32 = 30; // Set Root Table Pointer (GCMD, one-shot)
+const RTPS: u32 = 30; // Root Table Pointer Status (GSTS)
+const TE: u32 = 31; // Translation Enable (GCMD, persistent)
+const TES: u32 = 31; // Translation Enable Status (GSTS)
 
 /// VT-d second-level page-table index bits (9) and 4 KiB page bits.
 pub const VTD_PT_INDEX_BITS: u64 = 9;
@@ -376,4 +378,35 @@ pub fn vtd_init() {
     crate::arch::log(" levels=4 root=0x");
     log_hex(root_paddr);
     crate::arch::log("\n");
+}
+
+/// Turn on VT-d DMA remapping (GCMD Translation-Enable). Idempotent + bounded.
+///
+/// `vtd_init` deliberately leaves TE OFF so device DMA is identity (untranslated) until
+/// a driver actually asks for confinement. This is called LAZILY the first time a device
+/// gets an IO-space context (see `decode_x86_iopt` install_root), so identity DMA keeps
+/// working right up until the moment a driver builds a confined mapping. Once TE is on,
+/// any device WITHOUT a present context entry has its DMA blocked (faulted) — which is
+/// the whole point: a driver can only DMA into the frames it was granted.
+pub unsafe fn enable_translation() {
+    if VTD_REGS == 0 {
+        return;
+    }
+    let regs = VTD_REGS;
+    let status = core::ptr::read_volatile((regs + GSTS_REG) as *const u32);
+    if (status >> TES) & 1 != 0 {
+        return; // already enabled
+    }
+    // Write TE only (SRTP bit 30 = 0 so the already-set root pointer isn't re-triggered).
+    core::ptr::write_volatile((regs + GCMD_REG) as *mut u32, 1 << TE);
+    let mut spins = 0u32;
+    while spins < 100_000 {
+        let s = core::ptr::read_volatile((regs + GSTS_REG) as *const u32);
+        if (s >> TES) & 1 != 0 {
+            crate::arch::log("IOMMU: translation ENABLED (TE)\n");
+            return;
+        }
+        spins += 1;
+    }
+    crate::arch::log("IOMMU: TE enable timed out\n");
 }
