@@ -138,6 +138,7 @@ pub const DEVICE_UTS: &[(u64, u8)] = &[
     (0xFED00000, 12),
     (0xFEE00000, 12),
     (0x81060000, 17), // e1000e (82574) NIC BAR0 (default q35 NIC)
+    (0x81085000, 12), // AHCI ABAR (BAR5) of the add-in `-device ahci` (00:3.0) — boot disk on port 0
 ];
 
 /// Phase 42 — backing memory for the rootserver's Untyped cap is
