@@ -85,4 +85,11 @@ tar --format=ustar \
 
 mcopy -i "$IMAGE" .tmp/initrd.tar ::bootboot/INITRD
 
+# P2: a real registry hive (nt-hive-core image) at ::SYSTEM.DAT for the Config Manager to
+# read off the FS. Guarded so builds without a staged hive still succeed.
+if [ -f .tmp/hive.dat ]; then
+  mcopy -i "$IMAGE" .tmp/hive.dat ::SYSTEM.DAT
+  echo "registry hive added: ::SYSTEM.DAT"
+fi
+
 echo "disk image ready: $IMAGE"
