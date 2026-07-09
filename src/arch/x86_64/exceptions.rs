@@ -328,6 +328,7 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         let tcb = s.scheduler.slab.get(next_id);
         let next_cr3 = tcb.cpu_context.cr3;
         let next_fs_base = tcb.cpu_context.fs_base;
+        let next_gs_base = tcb.cpu_context.gs_base;
         let next_ctx = tcb.user_context;
         if next_cr3 != 0 {
             // SMP: if this core went idle since its last dispatch, reload
@@ -357,6 +358,11 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         }
         crate::arch::x86_64::msr::wrmsr(
             crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+        // Restore the per-thread user %gs base into the swapped-out MSR so the resume's tail
+        // `swapgs` lands this thread's TEB in %gs (Windows gs:[0x30]) — mirrors the sysret-tail
+        // dispatch. Without this, resuming via this path (fault/int-0x2d) drops the TEB gs base.
+        crate::arch::x86_64::msr::wrmsr(
+            crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE, next_gs_base);
         #[cfg(feature = "smp")]
         crate::arch::x86_64::fpu_ctx::fpu_switch_to(
             &mut s.scheduler.slab, next_id);
