@@ -626,6 +626,33 @@ extern "C" fn handle_general_protection_fault_typed(
     let Some(faulter) = current else {
         unsafe { dispatch_next_or_idle("[#GP: no current, idling CPU]\n") }
     };
+    // `int 0x2d` — the x86 DebugService interrupt, which the CPU raises as a #GP (no IDT gate)
+    // with error code (0x2d << 3) | 2 = 0x16a. The DEBUG-build ntdll uses it for DbgPrint and,
+    // in RtlAssert, DbgPrompt ("Break/Ignore/Terminate/Pass?"). With no kernel debugger we
+    // handle it transparently: PRINT (EAX=1) is a no-op; PROMPT (EAX=2) answers 'Ignore' into
+    // the response buffer (RCX); then skip past `int 0x2d; int3` (3 bytes) and RESUME the thread
+    // (no fault delivered). This keeps assertions from spinning forever.
+    if error_code == 0x16a {
+        unsafe {
+            let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
+            let s = crate::kernel::KERNEL.get();
+            let t = s.scheduler.slab.get_mut(faulter);
+            t.user_context = snapshot;
+            let service = t.user_context.rax & 0xFFFF_FFFF;
+            if service == 2 {
+                let buf = t.user_context.rcx; // BREAKPOINT_PROMPT response buffer (user VA)
+                if buf != 0 {
+                    core::ptr::write_volatile(buf as *mut u8, b'I');
+                }
+                t.user_context.rax = 1; // one char returned
+            } else {
+                t.user_context.rax = 0;
+            }
+            t.user_context.rip = t.user_context.rip.wrapping_add(3);
+            t.use_iretq_resume = true;
+            dispatch_next_or_idle("[int 0x2d: no next thread, idling CPU]\n")
+        }
+    }
     unsafe {
         let snapshot = *crate::arch::x86_64::syscall_entry
             ::current_cpu_user_ctx_mut();
