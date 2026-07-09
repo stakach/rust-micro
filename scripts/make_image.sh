@@ -92,4 +92,15 @@ if [ -f .tmp/hive.dat ]; then
   echo "registry hive added: ::SYSTEM.DAT"
 fi
 
+# P3: real ReactOS x64 binaries (GPL, redistributable) for the executive to load via SEC_IMAGE.
+# Staged by scripts/fetch_reactos.sh; guarded so a fresh clone that hasn't fetched still builds.
+if [ -f .tmp/reactos/ros-smss.exe ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-smss.exe ::SMSS.EXE
+  echo "ReactOS smss added: ::SMSS.EXE"
+fi
+if [ -f .tmp/reactos/ros-ntdll.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::NTDLL.DLL
+  echo "ReactOS ntdll added: ::NTDLL.DLL"
+fi
+
 echo "disk image ready: $IMAGE"
