@@ -498,6 +498,18 @@ pub(crate) fn swap_iretq_context_if_preempted(
             crate::arch::x86_64::msr::IA32_FS_BASE,
             s.scheduler.slab.get(next).cpu_context.fs_base,
         );
+        // Likewise the incoming thread's user %gs base. The IRQ entry stubs do
+        // NOT swapgs (they save GPRs to the stack, not gs:[]), so the ACTIVE
+        // IA32_GS_BASE — not KERNEL_GS_BASE — is what the resumed user thread
+        // sees, exactly like FS_BASE above. Without this an IRQ-driven context
+        // switch leaves the PREVIOUS thread's gs active, so the new thread's
+        // `gs:[0x30]` (Windows NtCurrentTeb) reads a null/foreign TEB and #PFs.
+        // (Writing KERNEL_GS_BASE here would instead be swapped in by the next
+        // syscall entry, crashing the kernel on gs:[0x10] with a user gs base.)
+        crate::arch::x86_64::msr::wrmsr(
+            crate::arch::x86_64::msr::IA32_GS_BASE,
+            s.scheduler.slab.get(next).cpu_context.gs_base,
+        );
         // SMP: the running thread changed under this IRQ — make the
         // incoming thread's FPU state resident on this core.
         #[cfg(feature = "smp")]
