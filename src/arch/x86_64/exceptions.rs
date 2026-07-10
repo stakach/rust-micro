@@ -634,10 +634,12 @@ extern "C" fn handle_general_protection_fault_typed(
     };
     // `int 0x2d` — the x86 DebugService interrupt, which the CPU raises as a #GP (no IDT gate)
     // with error code (0x2d << 3) | 2 = 0x16a. The DEBUG-build ntdll uses it for DbgPrint and,
-    // in RtlAssert, DbgPrompt ("Break/Ignore/Terminate/Pass?"). With no kernel debugger we
-    // handle it transparently: PRINT (EAX=1) is a no-op; PROMPT (EAX=2) answers 'Ignore' into
-    // the response buffer (RCX); then skip past `int 0x2d; int3` (3 bytes) and RESUME the thread
-    // (no fault delivered). This keeps assertions from spinning forever.
+    // in RtlAssert, DbgPrompt ("Break/Ignore/Terminate/Pass?"). We act as the attached kernel
+    // debugger: PRINT (EAX=1) forwards the message string (RCX=ptr, RDX=len) to the kernel serial
+    // log as `[dbg] ...` — invaluable for bringing up a real ntdll loader, whose DPRINT1s report
+    // exactly why process init fails; PROMPT (EAX=2) answers 'Ignore' into the response buffer
+    // (RCX). Then skip past `int 0x2d; int3` (3 bytes) and RESUME the thread (no fault delivered).
+    // This keeps assertions from spinning forever.
     if error_code == 0x16a {
         unsafe {
             let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
@@ -645,6 +647,20 @@ extern "C" fn handle_general_protection_fault_typed(
             let t = s.scheduler.slab.get_mut(faulter);
             t.user_context = snapshot;
             let service = t.user_context.rax & 0xFFFF_FFFF;
+            if service == 1 {
+                let ptr = t.user_context.rcx;
+                let len = (t.user_context.rdx as usize).min(240);
+                if ptr != 0 {
+                    crate::arch::log("[dbg] ");
+                    for i in 0..len {
+                        let c = core::ptr::read_volatile((ptr as *const u8).add(i));
+                        if c == 0 { break; }
+                        let ch = [if (0x20..0x7f).contains(&c) || c == b'\n' { c } else { b'.' }];
+                        if let Ok(sst) = core::str::from_utf8(&ch) { crate::arch::log(sst); }
+                    }
+                    crate::arch::log("\n");
+                }
+            }
             if service == 2 {
                 let buf = t.user_context.rcx; // BREAKPOINT_PROMPT response buffer (user VA)
                 if buf != 0 {
