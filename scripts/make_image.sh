@@ -102,6 +102,10 @@ if [ -f .tmp/reactos/ros-ntdll.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::NTDLL.DLL
   echo "ReactOS ntdll added: ::NTDLL.DLL"
 fi
+if [ -f .tmp/reactos/ros-system.hiv ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-system.hiv ::ROSSYS.HIV
+  echo "ReactOS SYSTEM hive added: ::ROSSYS.HIV"
+fi
 if [ -f .tmp/reactos/imports.bin ]; then
   mcopy -i "$IMAGE" .tmp/reactos/imports.bin ::IMPORTS.BIN
   echo "ReactOS import table added: ::IMPORTS.BIN"

@@ -33,12 +33,16 @@ if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] \
   # .7z -> ISO (bsdtar reads 7-Zip), then ISO -> the binaries + NLS tables (bsdtar reads ISO9660).
   ( cd "$OUT" && bsdtar -xf reactos-x64.7z )
   ISO="$OUT/$(cd "$OUT" && ls *.iso | head -1)"
-  echo "extracting ntdll.dll + smss.exe + NLS code-page tables from $ISO ..."
+  echo "extracting ntdll.dll + smss.exe + NLS tables + SYSTEM hive from $ISO ..."
   bsdtar -xf "$ISO" -C "$OUT" \
     reactos/system32/ntdll.dll reactos/system32/smss.exe \
-    reactos/system32/c_1252.nls reactos/system32/c_437.nls reactos/system32/l_intl.nls
+    reactos/system32/c_1252.nls reactos/system32/c_437.nls reactos/system32/l_intl.nls \
+    reactos/system32/config/system
   cp -f "$OUT/reactos/system32/ntdll.dll" "$OUT/ros-ntdll.dll"
   cp -f "$OUT/reactos/system32/smss.exe"  "$OUT/ros-smss.exe"
+  # The real regf SYSTEM registry hive — nt-hive-regf parses it so the NT registry serves smss's
+  # real \Registry\Machine\System\...\Session Manager config (not a synthesized key).
+  cp -f "$OUT/reactos/system32/config/system" "$OUT/ros-system.hiv"
   # NLS: c_1252 = ANSI (CP1252) MB<->WideChar tables, c_437 = OEM (CP437), l_intl = Unicode case
   # table. LdrpInitializeProcess needs these via PEB->{Ansi,Oem,UnicodeCaseTable}CodePageData for
   # RtlInitNlsTables / RtlUnicodeToMultiByteN.
