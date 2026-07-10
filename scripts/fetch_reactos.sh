@@ -18,23 +18,33 @@ mkdir -p "$OUT"
 
 URL="https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-457-g63deca5-x64-msvc-win-dbg.7z"
 
-if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/imports.bin" ]; then
-  echo "ReactOS binaries + import table already staged in $OUT/"
+if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/imports.bin" ] \
+   && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ]; then
+  echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
   exit 0
 fi
 
-if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ]; then
+if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] \
+   || [ ! -f "$OUT/ros-c1252.nls" ] || [ ! -f "$OUT/ros-c437.nls" ] || [ ! -f "$OUT/ros-lintl.nls" ]; then
   if [ ! -f "$OUT/reactos-x64.7z" ]; then
     echo "downloading ReactOS x64 livecd (~29 MiB)..."
     curl -fL --retry 3 -o "$OUT/reactos-x64.7z" "$URL"
   fi
-  # .7z -> ISO (bsdtar reads 7-Zip), then ISO -> the two binaries (bsdtar reads ISO9660).
+  # .7z -> ISO (bsdtar reads 7-Zip), then ISO -> the binaries + NLS tables (bsdtar reads ISO9660).
   ( cd "$OUT" && bsdtar -xf reactos-x64.7z )
   ISO="$OUT/$(cd "$OUT" && ls *.iso | head -1)"
-  echo "extracting ntdll.dll + smss.exe from $ISO ..."
-  bsdtar -xf "$ISO" -C "$OUT" reactos/system32/ntdll.dll reactos/system32/smss.exe
-  cp "$OUT/reactos/system32/ntdll.dll" "$OUT/ros-ntdll.dll"
-  cp "$OUT/reactos/system32/smss.exe"  "$OUT/ros-smss.exe"
+  echo "extracting ntdll.dll + smss.exe + NLS code-page tables from $ISO ..."
+  bsdtar -xf "$ISO" -C "$OUT" \
+    reactos/system32/ntdll.dll reactos/system32/smss.exe \
+    reactos/system32/c_1252.nls reactos/system32/c_437.nls reactos/system32/l_intl.nls
+  cp -f "$OUT/reactos/system32/ntdll.dll" "$OUT/ros-ntdll.dll"
+  cp -f "$OUT/reactos/system32/smss.exe"  "$OUT/ros-smss.exe"
+  # NLS: c_1252 = ANSI (CP1252) MB<->WideChar tables, c_437 = OEM (CP437), l_intl = Unicode case
+  # table. LdrpInitializeProcess needs these via PEB->{Ansi,Oem,UnicodeCaseTable}CodePageData for
+  # RtlInitNlsTables / RtlUnicodeToMultiByteN.
+  cp -f "$OUT/reactos/system32/c_1252.nls" "$OUT/ros-c1252.nls"
+  cp -f "$OUT/reactos/system32/c_437.nls"  "$OUT/ros-c437.nls"
+  cp -f "$OUT/reactos/system32/l_intl.nls" "$OUT/ros-lintl.nls"
 fi
 
 # Resolve smss's ntdll imports against ntdll's export table -> imports.bin (the executive

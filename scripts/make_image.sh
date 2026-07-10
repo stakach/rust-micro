@@ -106,5 +106,19 @@ if [ -f .tmp/reactos/imports.bin ]; then
   mcopy -i "$IMAGE" .tmp/reactos/imports.bin ::IMPORTS.BIN
   echo "ReactOS import table added: ::IMPORTS.BIN"
 fi
+# NLS code-page tables — LdrpInitializeProcess builds RtlUnicodeToMultiByteN's tables from these
+# via PEB->{Ansi,Oem,UnicodeCaseTable}CodePageData.
+if [ -f .tmp/reactos/ros-c1252.nls ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-c1252.nls ::C_1252.NLS
+  echo "ReactOS ANSI NLS added: ::C_1252.NLS"
+fi
+if [ -f .tmp/reactos/ros-c437.nls ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-c437.nls ::C_437.NLS
+  echo "ReactOS OEM NLS added: ::C_437.NLS"
+fi
+if [ -f .tmp/reactos/ros-lintl.nls ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-lintl.nls ::L_INTL.NLS
+  echo "ReactOS case NLS added: ::L_INTL.NLS"
+fi
 
 echo "disk image ready: $IMAGE"
