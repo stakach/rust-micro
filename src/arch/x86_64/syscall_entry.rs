@@ -591,6 +591,17 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // Phase 38c-followup — rax is preserved across SYSCALL
             // (matches upstream seL4); errors are signalled out of
             // band (faults / IPC label), not via a rax sentinel.
+            //
+            // An unknown syscall number is the NORMAL path for a hosted Windows
+            // process (every ntdll Nt* stub uses a Windows SSN, not a seL4 one)
+            // — its fault handler services it. That makes this a HIGH-FREQUENCY
+            // event, so the per-syscall log is throttled: emit the first few for
+            // visibility, then go quiet so the serial console (the QEMU/TCG
+            // bottleneck) doesn't dominate wall-clock during a long user run.
+            use core::sync::atomic::{AtomicU32, Ordering as O};
+            static UNKNOWN_SEEN: AtomicU32 = AtomicU32::new(0);
+            let seen = UNKNOWN_SEEN.fetch_add(1, O::Relaxed);
+            if seen < 16 {
             arch::log("[unknown syscall nr=");
             let signed = number as i64;
             let abs = if signed < 0 { (-signed) as u64 } else { signed as u64 };
@@ -611,6 +622,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 }
             }
             arch::log("]\n");
+            } // end throttled log (seen < 16)
             // PAGEFAULT0004 — out-of-range numbers become a
             // seL4_Fault_UnknownSyscall to the thread's fault
             // handler (upstream handleUnknownSyscall). The faulter
