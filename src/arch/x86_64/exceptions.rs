@@ -662,7 +662,13 @@ extern "C" fn handle_general_protection_fault_typed(
                 }
             }
             if service == 2 {
-                let buf = t.user_context.rcx; // BREAKPOINT_PROMPT response buffer (user VA)
+                // BREAKPOINT_PROMPT (RtlAssert's "Break/Ignore/…?"). The x64 DebugService ABI at
+                // int 0x2d is (eax=service, rcx=Prompt.Buffer, edx=Prompt.Length, r8=Response.Buffer,
+                // r9=Response.Length) — verified by disassembling ntdll DbgPrompt. Answer 'Ignore'
+                // into the RESPONSE buffer (R8, NOT rcx which is the read-only prompt string) so
+                // RtlAssert reads it and returns; writing rcx left the response unset and RtlAssert
+                // re-prompted forever (a failing assert spun the whole process).
+                let buf = t.user_context.r8;
                 if buf != 0 {
                     core::ptr::write_volatile(buf as *mut u8, b'I');
                 }
