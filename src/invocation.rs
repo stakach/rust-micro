@@ -4516,6 +4516,16 @@ fn decode_tcb(
                 }
                 Ok(())
             }
+            // rust-micro extension — put the target thread into
+            // hosted-syscall mode. From now on every `syscall` it
+            // issues faults to its handler as UnknownSyscall instead
+            // of dispatching natively (see syscall_entry.rs). Takes no
+            // message args; mirrors TCBResume's minimal plumbing. The
+            // flag is write-once (never cleared).
+            InvocationLabel::TCBSetHostedSyscalls => {
+                s.scheduler.slab.get_mut(id).hosted_syscalls = true;
+                Ok(())
+            }
             // `seL4_TCB_Configure` — one-shot TCB setup. Two ABI
             // shapes coexist:
             //

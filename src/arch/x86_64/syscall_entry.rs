@@ -585,9 +585,25 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         a4: ctx.r9,
         a5: ctx.r15,
     };
-    let syscall = match Syscall::from_i32(number as i32) {
-        Some(s) => s,
-        None => {
+    // Hosted-syscall mode (per-thread opt-in): a thread flagged via
+    // seL4_TCB_SetHostedSyscalls has EVERY syscall delivered to its
+    // fault handler as UnknownSyscall, bypassing native seL4 dispatch.
+    // This is how hosted Windows (NT) processes issue their syscalls —
+    // rax holds a Windows SSN and rdx holds an arbitrary arg that can
+    // otherwise collide with the seL4 syscall-number range. Reading the
+    // bool here (via the current TcbId + slab) drops all borrows before
+    // the match, so it never conflicts with the None arm's own
+    // KERNEL.get()/scheduler.current() access. Threads with the flag
+    // unset are bit-identical to before (force_unknown == false).
+    let force_unknown = unsafe {
+        match KERNEL.get().scheduler.current() {
+            Some(cur) => KERNEL.get().scheduler.slab.get(cur).hosted_syscalls,
+            None => false,
+        }
+    };
+    let syscall = match (force_unknown, Syscall::from_i32(number as i32)) {
+        (false, Some(s)) => s,
+        _ => {
             // Phase 38c-followup — rax is preserved across SYSCALL
             // (matches upstream seL4); errors are signalled out of
             // band (faults / IPC label), not via a rax sentinel.

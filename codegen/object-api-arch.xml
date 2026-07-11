@@ -1260,4 +1260,29 @@
             </error>
         </method>
     </interface>
+
+    <!--
+        rust-micro extension (NOT upstream seL4). Appended LAST so it
+        takes the highest, otherwise-unused InvocationLabel number and
+        does NOT renumber any upstream label (which would break ABI
+        with the libsel4 sel4test links against). This is a TCB
+        invocation (dispatched off a Cap::Thread in decode_tcb); the
+        interface grouping here is cosmetic — the codegen numbers
+        every method in file order regardless of interface.
+    -->
+    <interface name="seL4_TCB_HostedSyscalls" manual_name="TCB Hosted Syscalls">
+        <method id="TCBSetHostedSyscalls" name="SetHostedSyscalls" manual_name="Set Hosted Syscalls" manual_label="tcb_sethostedsyscalls">
+            <brief>
+                Route every syscall this thread issues to its fault handler.
+            </brief>
+            <description>
+                Puts the target TCB into hosted-syscall mode: from then on
+                each <texttt text="syscall"/> instruction the thread executes
+                is delivered as a <texttt text="seL4_Fault_UnknownSyscall"/>
+                to its fault handler instead of being dispatched as a native
+                seL4 syscall. Used by hosted Windows (NT) processes. Cannot
+                be cleared.
+            </description>
+        </method>
+    </interface>
 </api>
