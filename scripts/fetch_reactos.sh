@@ -19,7 +19,7 @@ mkdir -p "$OUT"
 URL="https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-457-g63deca5-x64-msvc-win-dbg.7z"
 
 if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-csrss.exe" ] \
-   && [ -f "$OUT/ros-csrsrv.dll" ] \
+   && [ -f "$OUT/ros-csrsrv.dll" ] && [ -f "$OUT/ros-basesrv.dll" ] && [ -f "$OUT/ros-winsrv.dll" ] \
    && [ -f "$OUT/imports.bin" ] \
    && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ]; then
   echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
@@ -27,7 +27,7 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
 fi
 
 if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT/ros-csrss.exe" ] \
-   || [ ! -f "$OUT/ros-csrsrv.dll" ] \
+   || [ ! -f "$OUT/ros-csrsrv.dll" ] || [ ! -f "$OUT/ros-basesrv.dll" ] || [ ! -f "$OUT/ros-winsrv.dll" ] \
    || [ ! -f "$OUT/ros-c1252.nls" ] || [ ! -f "$OUT/ros-c437.nls" ] || [ ! -f "$OUT/ros-lintl.nls" ]; then
   if [ ! -f "$OUT/reactos-x64.7z" ]; then
     echo "downloading ReactOS x64 livecd (~29 MiB)..."
@@ -39,7 +39,7 @@ if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT
   echo "extracting ntdll.dll + smss.exe + NLS tables + SYSTEM hive from $ISO ..."
   bsdtar -xf "$ISO" -C "$OUT" \
     reactos/system32/ntdll.dll reactos/system32/smss.exe reactos/system32/csrss.exe \
-    reactos/system32/csrsrv.dll \
+    reactos/system32/csrsrv.dll reactos/system32/basesrv.dll reactos/system32/winsrv.dll \
     reactos/system32/c_1252.nls reactos/system32/c_437.nls reactos/system32/l_intl.nls \
     reactos/system32/config/system
   cp -f "$OUT/reactos/system32/ntdll.dll" "$OUT/ros-ntdll.dll"
@@ -50,6 +50,11 @@ if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT
   # csrsrv.dll — csrss.exe's static-import Server DLL (the Client-Server Runtime core, ~65 KiB).
   # The loader (LdrpWalkImportDescriptor) needs it or raises STATUS_DLL_NOT_FOUND.
   cp -f "$OUT/reactos/system32/csrsrv.dll" "$OUT/ros-csrsrv.dll"
+  # basesrv.dll (~50 KiB) + winsrv.dll (~400 KiB) — csrss's dynamically-loaded ServerDlls
+  # (CsrLoadServerDll, from its command line ServerDll=basesrv/winsrv). Needed or csrsrv raises
+  # STATUS_DLL_NOT_FOUND during CsrServerInitialization.
+  cp -f "$OUT/reactos/system32/basesrv.dll" "$OUT/ros-basesrv.dll"
+  cp -f "$OUT/reactos/system32/winsrv.dll" "$OUT/ros-winsrv.dll"
   # The real regf SYSTEM registry hive — nt-hive-regf parses it so the NT registry serves smss's
   # real \Registry\Machine\System\...\Session Manager config (not a synthesized key).
   cp -f "$OUT/reactos/system32/config/system" "$OUT/ros-system.hiv"

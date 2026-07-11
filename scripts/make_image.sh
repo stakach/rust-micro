@@ -102,6 +102,14 @@ if [ -f .tmp/reactos/ros-csrsrv.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-csrsrv.dll ::CSRSRV.DLL
   echo "ReactOS csrsrv added: ::CSRSRV.DLL"
 fi
+if [ -f .tmp/reactos/ros-basesrv.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-basesrv.dll ::BASESRV.DLL
+  echo "ReactOS basesrv added: ::BASESRV.DLL"
+fi
+if [ -f .tmp/reactos/ros-winsrv.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-winsrv.dll ::WINSRV.DLL
+  echo "ReactOS winsrv added: ::WINSRV.DLL"
+fi
 if [ -f .tmp/reactos/ros-smss.exe ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-smss.exe ::SMSS.EXE
   echo "ReactOS smss added: ::SMSS.EXE"
