@@ -337,6 +337,19 @@ impl KernelState {
             if self.next_cnode <= i {
                 self.next_cnode = i + 1;
             }
+        } else if i >= MAX_CNODES + MAX_SMALL_CNODES
+            && i < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES
+        {
+            // XL pool (e.g. the extern-rootserver executive's root
+            // CNode is backed by an XL page so cptrs can reach far past
+            // the 4096-slot big-pool ceiling). Mark it in-use so
+            // `alloc_xl_cnode` never recycles it out from under the
+            // rootserver.
+            let xi = i - (MAX_CNODES + MAX_SMALL_CNODES);
+            self.set_xl_cnode_in_use(xi, true);
+            if self.next_xl_cnode <= xi {
+                self.next_xl_cnode = xi + 1;
+            }
         }
     }
 

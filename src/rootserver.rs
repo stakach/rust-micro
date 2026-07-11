@@ -118,10 +118,34 @@ pub unsafe fn reset_page_pool() {
 const ROOTSERVER_STACK_PAGES: u64 = 4;
 
 /// Kernel-side CNode index reserved for the rootserver's CSpace.
-/// Matches the existing convention from the AY demo (CNodes 1, 2 went
-/// to sender/receiver). cnode_ptr(3) backs `Cap::CNode` slot 2 in the
-/// rootserver's own CNode.
+///
+/// * sel4test (built-in rootserver): the big-pool CNode at virtual
+///   index 3 (radix 12 = 4096 slots). Matches the AY-demo convention
+///   (CNodes 1, 2 went to sender/receiver); cnode_ptr(3) backs
+///   `Cap::CNode` slot 2 in the rootserver's own CNode.
+/// * extern-rootserver (the NT executive): the executive allocates
+///   caps monotonically into its root CNode and, when demand-paging
+///   large DLLs, blows well past the 4096-slot big-pool ceiling. Back
+///   its root CNode with the XL pool page (radix 17 = 131072 slots)
+///   instead. The executive never allocates XL CNodes itself (its
+///   spawned processes use CN_RADIX=5 → small pool), so xl[0] is free
+///   to dedicate to the root task. This virtual index stays inside
+///   `cnode_pool_count()` so revoke/delete pool scans still see it.
+#[cfg(not(feature = "extern-rootserver"))]
 pub const ROOTSERVER_CNODE_IDX: usize = 3;
+#[cfg(feature = "extern-rootserver")]
+pub const ROOTSERVER_CNODE_IDX: usize =
+    crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES;
+
+/// Radix (log2 of the slot count) of the rootserver's root CNode.
+/// Must match the storage width of the CNode page backing
+/// `ROOTSERVER_CNODE_IDX`, and is what the cap's `radix`/`guard_size`
+/// and `BootInfo.initThreadCNodeSizeBits`/`empty.end` are derived
+/// from — they MUST all agree or cptr resolution corrupts.
+#[cfg(not(feature = "extern-rootserver"))]
+pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::CNODE_RADIX;
+#[cfg(feature = "extern-rootserver")]
+pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::XL_CNODE_RADIX;
 
 /// The device untypeds exposed to the root task, as `(paddr, size_bits)`. This is
 /// the SINGLE SOURCE OF TRUTH used both to stamp the untyped caps into the CSpace
@@ -379,6 +403,17 @@ pub fn microtest_check_byte(b: u8) -> bool {
 /// thread, swaps CR3, and `sysretq`s into user mode. Never returns;
 /// the dispatcher's QEMU-exit hook fires once the rootserver prints
 /// `\n`.
+/// Write `cap` into slot `si` of the rootserver's root CNode,
+/// dispatching to whichever pool (big or XL) backs
+/// `ROOTSERVER_CNODE_IDX`. Replaces the old direct
+/// `s.cnodes[ROOTSERVER_CNODE_IDX].0[si] = …` writes, which only
+/// worked when the root CNode lived in the big pool.
+#[inline]
+unsafe fn rs_set(s: &mut KernelState, si: usize, cap: &Cap) {
+    *s.cnode_slot_mut(ROOTSERVER_CNODE_IDX, si)
+        .expect("rootserver cnode slot in range") = Cte::with_cap(cap);
+}
+
 pub unsafe fn launch_rootserver() -> ! {
     install_kernel_page_tables();
 
@@ -397,12 +432,18 @@ pub unsafe fn launch_rootserver() -> ! {
     let cnode_ptr = KernelState::cnode_ptr(ROOTSERVER_CNODE_IDX);
     let cnode_cap = Cap::CNode {
         ptr: cnode_ptr,
-        radix: crate::kernel::CNODE_RADIX,
-        guard_size: 64 - crate::kernel::CNODE_RADIX,
+        radix: ROOTSERVER_CNODE_RADIX,
+        guard_size: 64 - ROOTSERVER_CNODE_RADIX,
         guard: 0,
     };
-    // Wipe the CNode in case prior specs left state.
-    for slot in s.cnodes[ROOTSERVER_CNODE_IDX].0.iter_mut() {
+    // Wipe the CNode in case prior specs left state. Dispatched via
+    // `cnode_slots_at_mut` so it works whether the root CNode lives in
+    // the big pool (sel4test) or the XL pool (extern-rootserver).
+    for slot in s
+        .cnode_slots_at_mut(ROOTSERVER_CNODE_IDX)
+        .expect("rootserver cnode storage")
+        .iter_mut()
+    {
         slot.set_cap(&Cap::Null);
     }
     // Phase 43 — claim the rootserver's CNode in the in-use bitmap.
@@ -479,19 +520,19 @@ pub unsafe fn launch_rootserver() -> ! {
     // cap layout (subset of seL4's seL4_RootCNodeCapSlots). The
     // rootserver's own startup code can now invoke any of these by
     // CPtr.
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[1] = Cte::with_cap(&Cap::Thread {
+    rs_set(s, 1, &Cap::Thread {
         // `decode_tcb` recovers the TcbId via `tcb_ptr.addr() as u16`,
         // so we encode the TcbId directly (slab IDs start from 1
         // after the boot thread, so `PPtr::new` always succeeds).
         tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64).expect("nonzero tcb id"),
     });
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[2] = Cte::with_cap(&cnode_cap);
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[3] = Cte::with_cap(&Cap::PML4 {
+    rs_set(s, 2, &cnode_cap);
+    rs_set(s, 3, &Cap::PML4 {
         ptr: PPtr::<Pml4Storage>::new(img.pml4_paddr).expect("pml4 paddr"),
         mapped: true,
         asid: ROOTSERVER_ASID,
     });
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[9] = Cte::with_cap(&Cap::Frame {
+    rs_set(s, 9, &Cap::Frame {
         ptr: PPtr::<FrameStorage>::new(img.bootinfo_paddr).expect("bi paddr"),
         size: FrameSize::Small,
         rights: FrameRights::ReadOnly,
@@ -500,7 +541,7 @@ pub unsafe fn launch_rootserver() -> ! {
         is_device: false,
         map_type: crate::cap::FrameMapType::VSpace,
     });
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[10] = Cte::with_cap(&Cap::Frame {
+    rs_set(s, 10, &Cap::Frame {
         ptr: PPtr::<FrameStorage>::new(img.ipc_buffer_paddr).expect("ipc paddr"),
         size: FrameSize::Small,
         rights: FrameRights::ReadWrite,
@@ -510,15 +551,15 @@ pub unsafe fn launch_rootserver() -> ! {
         map_type: crate::cap::FrameMapType::VSpace,
     });
     // Phase 33b / 36e — IRQControl at canonical slot 4.
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[4] = Cte::with_cap(&Cap::IrqControl);
+    rs_set(s, 4, &Cap::IrqControl);
     // Phase 36e — ASIDControl at canonical slot 5.
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[5] = Cte::with_cap(&Cap::AsidControl);
+    rs_set(s, 5, &Cap::AsidControl);
     // Phase 37a — pre-allocated InitThreadASIDPool at canonical
     // slot 6. asid_base = 0 (rootserver gets the first 512 ASIDs).
     let asid_pool_va = (&raw const ROOTSERVER_ASID_POOL) as u64;
     let asid_pool_pa =
         crate::arch::x86_64::paging::kernel_virt_to_phys(asid_pool_va);
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[6] = Cte::with_cap(&Cap::AsidPool {
+    rs_set(s, 6, &Cap::AsidPool {
         ptr: PPtr::<crate::cap::AsidPoolStorage>::new(asid_pool_pa)
             .expect("asid pool paddr"),
         asid_base: 0,
@@ -528,19 +569,19 @@ pub unsafe fn launch_rootserver() -> ! {
     // calls `seL4_X86_IOPortControl_Issue` here when it falls back
     // to PIT (which it does whenever ACPI/HPET discovery fails),
     // so without this cap the timer driver silently bails.
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[7] = Cte::with_cap(&Cap::IOPortControl);
+    rs_set(s, 7, &Cap::IOPortControl);
     // Phase 43 — slot 11 is the canonical seL4_CapDomain. sel4test's
     // DOMAINS0001-3 invoke DomainSet_Set on it; the kernel's decode_
     // domain handler stamps the domain field on the target TCB
     // (NUM_DOMAINS=1, so only domain 0 is valid).
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[11] = Cte::with_cap(&Cap::Domain);
+    rs_set(s, 11, &Cap::Domain);
     // Phase 44 — master IO-space cap at canonical slot 8
     // (`seL4_CapIOSpace`), present only when a VT-d unit was found.
     // sel4test's IOPT tests CNode_Mint a per-device io_space cap from
     // this master (badge = (domainID << 16) | pciRequestID).
     #[cfg(target_arch = "x86_64")]
     if crate::arch::x86_64::iommu::iommu_present() {
-        s.cnodes[ROOTSERVER_CNODE_IDX].0[8] = Cte::with_cap(&Cap::IoSpace {
+        rs_set(s, 8, &Cap::IoSpace {
             domain_id: 0,
             pci_device: 0,
         });
@@ -549,7 +590,7 @@ pub unsafe fn launch_rootserver() -> ! {
     // Phase 37b — InitThreadSC at canonical slot 14. The
     // SchedContext object was allocated above and bound to the
     // rootserver TCB.
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[14] = Cte::with_cap(&Cap::SchedContext {
+    rs_set(s, 14, &Cap::SchedContext {
         ptr: KernelState::sched_context_ptr(init_sc_idx),
         size_bits: crate::object_type::MIN_SCHED_CONTEXT_BITS as u8,
     });
@@ -558,8 +599,8 @@ pub unsafe fn launch_rootserver() -> ! {
     let n_cores = crate::bootboot::get_num_cores() as usize;
     let schedcontrol_start: usize = 16;
     for core in 0..n_cores.min(4) {
-        s.cnodes[ROOTSERVER_CNODE_IDX].0[schedcontrol_start + core] =
-            Cte::with_cap(&Cap::SchedControl { core: core as u32 });
+        rs_set(s, schedcontrol_start + core,
+            &Cap::SchedControl { core: core as u32 });
     }
     // Phase 36e / 42 — Untyped at slot 20 (after the schedcontrol
     // region). bi.untyped points here. Backing memory is reserved
@@ -567,7 +608,7 @@ pub unsafe fn launch_rootserver() -> ! {
     let ut_paddr = ROOTSERVER_UT.base_paddr;
     let ut_size_bits = ROOTSERVER_UT.size_bits;
     let untyped_slot: usize = 20;
-    s.cnodes[ROOTSERVER_CNODE_IDX].0[untyped_slot] = Cte::with_cap(&Cap::Untyped {
+    rs_set(s, untyped_slot, &Cap::Untyped {
         ptr: PPtr::<UntypedStorage>::new(ut_paddr).expect("ut paddr"),
         block_bits: ut_size_bits,
         free_index: 0,
@@ -578,13 +619,12 @@ pub unsafe fn launch_rootserver() -> ! {
     // module-level DEVICE_UTS so the caps here and the BootInfo metadata
     // can't drift (see DEVICE_UTS doc).
     for (i, &(paddr, sb)) in DEVICE_UTS.iter().enumerate() {
-        s.cnodes[ROOTSERVER_CNODE_IDX].0[untyped_slot + 1 + i] =
-            Cte::with_cap(&Cap::Untyped {
-                ptr: PPtr::<UntypedStorage>::new(paddr.max(1)).expect("dev ut paddr"),
-                block_bits: sb,
-                free_index: 0,
-                is_device: true,
-            });
+        rs_set(s, untyped_slot + 1 + i, &Cap::Untyped {
+            ptr: PPtr::<UntypedStorage>::new(paddr.max(1)).expect("dev ut paddr"),
+            block_bits: sb,
+            free_index: 0,
+            is_device: true,
+        });
     }
 
     // Phase 42 — userImageFrames: install one `Cap::Frame` per page
@@ -604,16 +644,15 @@ pub unsafe fn launch_rootserver() -> ! {
         } else {
             crate::cap::FrameRights::ReadOnly
         };
-        s.cnodes[ROOTSERVER_CNODE_IDX].0[user_image_start as usize + i] =
-            Cte::with_cap(&Cap::Frame {
-                ptr: PPtr::<FrameStorage>::new(pm.paddr).expect("image page paddr"),
-                size: FrameSize::Small,
-                rights,
-                mapped: Some(pm.vaddr),
-                asid: ROOTSERVER_ASID,
-                is_device: false,
-                map_type: crate::cap::FrameMapType::VSpace,
-            });
+        rs_set(s, user_image_start as usize + i, &Cap::Frame {
+            ptr: PPtr::<FrameStorage>::new(pm.paddr).expect("image page paddr"),
+            size: FrameSize::Small,
+            rights,
+            mapped: Some(pm.vaddr),
+            asid: ROOTSERVER_ASID,
+            is_device: false,
+            map_type: crate::cap::FrameMapType::VSpace,
+        });
     }
     let user_image_end: Word = user_image_start + n_image_pages as Word;
 
@@ -774,7 +813,7 @@ unsafe fn build_bootinfo(
     let schedcontrol_end: Word = schedcontrol_start + n_cores.min(4);
     let untyped_start: Word = 20;
     let untyped_end: Word = untyped_start + untyped_count;
-    let cnode_slots: Word = 1u64 << crate::kernel::CNODE_RADIX;
+    let cnode_slots: Word = 1u64 << ROOTSERVER_CNODE_RADIX;
     seL4_BootInfo {
         extraLen: extra_bi_size,
         nodeID: 0,
@@ -811,7 +850,7 @@ unsafe fn build_bootinfo(
         userImagePaging: seL4_SlotRegion { start: 0, end: 0 },
         ioSpaceCaps: seL4_SlotRegion { start: 0, end: 0 },
         extraBIPages: seL4_SlotRegion { start: 0, end: 0 },
-        initThreadCNodeSizeBits: crate::kernel::CNODE_RADIX as Word,
+        initThreadCNodeSizeBits: ROOTSERVER_CNODE_RADIX as Word,
         initThreadDomain: 0,
         schedcontrol: seL4_SlotRegion {
             start: schedcontrol_start,
