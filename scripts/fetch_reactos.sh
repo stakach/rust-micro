@@ -18,13 +18,14 @@ mkdir -p "$OUT"
 
 URL="https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-457-g63deca5-x64-msvc-win-dbg.7z"
 
-if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/imports.bin" ] \
+if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-csrss.exe" ] \
+   && [ -f "$OUT/imports.bin" ] \
    && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ]; then
   echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
   exit 0
 fi
 
-if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] \
+if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT/ros-csrss.exe" ] \
    || [ ! -f "$OUT/ros-c1252.nls" ] || [ ! -f "$OUT/ros-c437.nls" ] || [ ! -f "$OUT/ros-lintl.nls" ]; then
   if [ ! -f "$OUT/reactos-x64.7z" ]; then
     echo "downloading ReactOS x64 livecd (~29 MiB)..."
@@ -35,11 +36,14 @@ if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] \
   ISO="$OUT/$(cd "$OUT" && ls *.iso | head -1)"
   echo "extracting ntdll.dll + smss.exe + NLS tables + SYSTEM hive from $ISO ..."
   bsdtar -xf "$ISO" -C "$OUT" \
-    reactos/system32/ntdll.dll reactos/system32/smss.exe \
+    reactos/system32/ntdll.dll reactos/system32/smss.exe reactos/system32/csrss.exe \
     reactos/system32/c_1252.nls reactos/system32/c_437.nls reactos/system32/l_intl.nls \
     reactos/system32/config/system
   cp -f "$OUT/reactos/system32/ntdll.dll" "$OUT/ros-ntdll.dll"
   cp -f "$OUT/reactos/system32/smss.exe"  "$OUT/ros-smss.exe"
+  # csrss.exe — the Win32 subsystem launcher smss starts (SmpLoadSubSystem). A thin PE (~7 KiB)
+  # whose real work is in its ServerDlls (csrsrv/basesrv/winsrv).
+  cp -f "$OUT/reactos/system32/csrss.exe" "$OUT/ros-csrss.exe"
   # The real regf SYSTEM registry hive — nt-hive-regf parses it so the NT registry serves smss's
   # real \Registry\Machine\System\...\Session Manager config (not a synthesized key).
   cp -f "$OUT/reactos/system32/config/system" "$OUT/ros-system.hiv"

@@ -94,6 +94,10 @@ fi
 
 # P3: real ReactOS x64 binaries (GPL, redistributable) for the executive to load via SEC_IMAGE.
 # Staged by scripts/fetch_reactos.sh; guarded so a fresh clone that hasn't fetched still builds.
+if [ -f .tmp/reactos/ros-csrss.exe ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-csrss.exe ::CSRSS.EXE
+  echo "ReactOS csrss added: ::CSRSS.EXE"
+fi
 if [ -f .tmp/reactos/ros-smss.exe ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-smss.exe ::SMSS.EXE
   echo "ReactOS smss added: ::SMSS.EXE"
