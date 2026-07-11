@@ -98,6 +98,10 @@ if [ -f .tmp/reactos/ros-csrss.exe ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-csrss.exe ::CSRSS.EXE
   echo "ReactOS csrss added: ::CSRSS.EXE"
 fi
+if [ -f .tmp/reactos/ros-csrsrv.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-csrsrv.dll ::CSRSRV.DLL
+  echo "ReactOS csrsrv added: ::CSRSRV.DLL"
+fi
 if [ -f .tmp/reactos/ros-smss.exe ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-smss.exe ::SMSS.EXE
   echo "ReactOS smss added: ::SMSS.EXE"
