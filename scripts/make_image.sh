@@ -116,6 +116,16 @@ if [ -f .tmp/reactos/ros-win32k.sys ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-win32k.sys ::WIN32K.SYS
   echo "ReactOS win32k added: ::WIN32K.SYS"
 fi
+# dxg.sys + dxgthk.sys — DirectX kernel graphics driver + thunk table. win32k's InitializeGreCSRSS
+# loads dxg.sys (the executive hosts it into win32k's VSpace at DxDdStartupDxGraphics time).
+if [ -f .tmp/reactos/ros-dxg.sys ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-dxg.sys ::DXG.SYS
+  echo "ReactOS dxg added: ::DXG.SYS"
+fi
+if [ -f .tmp/reactos/ros-dxgthk.sys ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-dxgthk.sys ::DXGTHK.SYS
+  echo "ReactOS dxgthk added: ::DXGTHK.SYS"
+fi
 # The Win32 client stack (gdi32/user32/kernel32) — winsrv.dll's static imports. Staged so csrss's
 # loader can resolve + demand-page them.
 if [ -f .tmp/reactos/ros-gdi32.dll ]; then

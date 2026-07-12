@@ -27,7 +27,8 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/ros-ntdll_vista.dll" ] \
    && [ -f "$OUT/imports.bin" ] \
    && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ] \
-   && [ -f "$OUT/ros-c20127.nls" ] && [ -f "$OUT/ros-win32k.sys" ]; then
+   && [ -f "$OUT/ros-c20127.nls" ] && [ -f "$OUT/ros-win32k.sys" ] \
+   && [ -f "$OUT/ros-dxg.sys" ] && [ -f "$OUT/ros-dxgthk.sys" ]; then
   echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
   exit 0
 fi
@@ -121,6 +122,24 @@ if [ ! -f "$OUT/ros-win32k.sys" ]; then
     echo "note: no cached ISO — win32k.sys not staged (the executive skips its win32k load)"
   fi
 fi
+
+# dxg.sys + dxgthk.sys — the DirectX kernel graphics driver + its thunk table. win32k's
+# InitializeGreCSRSS -> DxDdStartupDxGraphics loads dxg.sys (EngLoadImage -> ZwSetSystemInformation
+# SystemLoadGdiDriverInformation), which the executive hosts into win32k's VSpace; dxg imports
+# dxgthk's Eng* thunks. Under system32/drivers/ (unlike win32k which is directly in system32/).
+for drv in dxg dxgthk; do
+  if [ ! -f "$OUT/ros-$drv.sys" ]; then
+    DRV_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+    if [ -f "$DRV_ISO" ]; then
+      echo "extracting $drv.sys from $DRV_ISO ..."
+      bsdtar -xf "$DRV_ISO" -C "$OUT" "reactos/system32/drivers/$drv.sys"
+      cp -f "$OUT/reactos/system32/drivers/$drv.sys" "$OUT/ros-$drv.sys"
+      echo "staged: ros-$drv.sys ($(stat -f%z "$OUT/ros-$drv.sys") bytes)"
+    else
+      echo "note: no cached ISO — $drv.sys not staged"
+    fi
+  fi
+done
 
 # Resolve smss's ntdll imports against ntdll's export table -> imports.bin (the executive
 # applies this patch table to smss's IAT at runtime).
