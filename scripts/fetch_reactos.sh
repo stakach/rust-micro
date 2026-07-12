@@ -20,15 +20,27 @@ URL="https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-457-g63deca5-x64-m
 
 if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-csrss.exe" ] \
    && [ -f "$OUT/ros-csrsrv.dll" ] && [ -f "$OUT/ros-basesrv.dll" ] && [ -f "$OUT/ros-winsrv.dll" ] \
+   && [ -f "$OUT/ros-gdi32.dll" ] && [ -f "$OUT/ros-user32.dll" ] && [ -f "$OUT/ros-kernel32.dll" ] \
+   && [ -f "$OUT/ros-rpcrt4.dll" ] && [ -f "$OUT/ros-msvcrt.dll" ] && [ -f "$OUT/ros-advapi32.dll" ] \
+   && [ -f "$OUT/ros-ws2_32.dll" ] && [ -f "$OUT/ros-kernel32_vista.dll" ] \
+   && [ -f "$OUT/ros-advapi32_vista.dll" ] && [ -f "$OUT/ros-ws2help.dll" ] \
+   && [ -f "$OUT/ros-ntdll_vista.dll" ] \
    && [ -f "$OUT/imports.bin" ] \
-   && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ]; then
+   && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ] \
+   && [ -f "$OUT/ros-c20127.nls" ] && [ -f "$OUT/ros-win32k.sys" ]; then
   echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
   exit 0
 fi
 
 if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT/ros-csrss.exe" ] \
    || [ ! -f "$OUT/ros-csrsrv.dll" ] || [ ! -f "$OUT/ros-basesrv.dll" ] || [ ! -f "$OUT/ros-winsrv.dll" ] \
-   || [ ! -f "$OUT/ros-c1252.nls" ] || [ ! -f "$OUT/ros-c437.nls" ] || [ ! -f "$OUT/ros-lintl.nls" ]; then
+   || [ ! -f "$OUT/ros-gdi32.dll" ] || [ ! -f "$OUT/ros-user32.dll" ] || [ ! -f "$OUT/ros-kernel32.dll" ] \
+   || [ ! -f "$OUT/ros-rpcrt4.dll" ] || [ ! -f "$OUT/ros-msvcrt.dll" ] || [ ! -f "$OUT/ros-advapi32.dll" ] \
+   || [ ! -f "$OUT/ros-ws2_32.dll" ] || [ ! -f "$OUT/ros-kernel32_vista.dll" ] \
+   || [ ! -f "$OUT/ros-advapi32_vista.dll" ] || [ ! -f "$OUT/ros-ws2help.dll" ] \
+   || [ ! -f "$OUT/ros-ntdll_vista.dll" ] \
+   || [ ! -f "$OUT/ros-c1252.nls" ] || [ ! -f "$OUT/ros-c437.nls" ] || [ ! -f "$OUT/ros-lintl.nls" ] \
+   || [ ! -f "$OUT/ros-c20127.nls" ]; then
   if [ ! -f "$OUT/reactos-x64.7z" ]; then
     echo "downloading ReactOS x64 livecd (~29 MiB)..."
     curl -fL --retry 3 -o "$OUT/reactos-x64.7z" "$URL"
@@ -40,7 +52,13 @@ if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT
   bsdtar -xf "$ISO" -C "$OUT" \
     reactos/system32/ntdll.dll reactos/system32/smss.exe reactos/system32/csrss.exe \
     reactos/system32/csrsrv.dll reactos/system32/basesrv.dll reactos/system32/winsrv.dll \
+    reactos/system32/gdi32.dll reactos/system32/user32.dll reactos/system32/kernel32.dll \
+    reactos/system32/rpcrt4.dll reactos/system32/msvcrt.dll reactos/system32/advapi32.dll \
+    reactos/system32/ws2_32.dll reactos/system32/kernel32_vista.dll \
+    reactos/system32/advapi32_vista.dll reactos/system32/ws2help.dll \
+    reactos/system32/ntdll_vista.dll \
     reactos/system32/c_1252.nls reactos/system32/c_437.nls reactos/system32/l_intl.nls \
+    reactos/system32/c_20127.nls \
     reactos/system32/config/system
   cp -f "$OUT/reactos/system32/ntdll.dll" "$OUT/ros-ntdll.dll"
   cp -f "$OUT/reactos/system32/smss.exe"  "$OUT/ros-smss.exe"
@@ -55,6 +73,24 @@ if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT
   # STATUS_DLL_NOT_FOUND during CsrServerInitialization.
   cp -f "$OUT/reactos/system32/basesrv.dll" "$OUT/ros-basesrv.dll"
   cp -f "$OUT/reactos/system32/winsrv.dll" "$OUT/ros-winsrv.dll"
+  # gdi32.dll (~326 KiB) + user32.dll (~1.12 MiB) + kernel32.dll (~2.66 MiB) — the Win32 client
+  # stack that winsrv.dll statically imports. Staged so csrss's loader can resolve + demand-page them.
+  cp -f "$OUT/reactos/system32/gdi32.dll" "$OUT/ros-gdi32.dll"
+  cp -f "$OUT/reactos/system32/user32.dll" "$OUT/ros-user32.dll"
+  cp -f "$OUT/reactos/system32/kernel32.dll" "$OUT/ros-kernel32.dll"
+  # winsrv's transitive import closure (7 DLLs, ~1.77 MiB): rpcrt4/msvcrt/advapi32/ws2_32 +
+  # the vista API-set forwarders (kernel32_vista/advapi32_vista) + ws2help. Staged so csrss's
+  # loader can resolve + demand-page the whole Win32 client-stack import graph.
+  cp -f "$OUT/reactos/system32/rpcrt4.dll" "$OUT/ros-rpcrt4.dll"
+  cp -f "$OUT/reactos/system32/msvcrt.dll" "$OUT/ros-msvcrt.dll"
+  cp -f "$OUT/reactos/system32/advapi32.dll" "$OUT/ros-advapi32.dll"
+  cp -f "$OUT/reactos/system32/ws2_32.dll" "$OUT/ros-ws2_32.dll"
+  cp -f "$OUT/reactos/system32/kernel32_vista.dll" "$OUT/ros-kernel32_vista.dll"
+  cp -f "$OUT/reactos/system32/advapi32_vista.dll" "$OUT/ros-advapi32_vista.dll"
+  cp -f "$OUT/reactos/system32/ws2help.dll" "$OUT/ros-ws2help.dll"
+  # ntdll_vista.dll (~57 KiB) — ReactOS's Vista-ntdll-API shim; csrss's init dynamically loads it
+  # (or fails with STATUS_DLL_INIT_FAILED). Imports only ntdll (already staged).
+  cp -f "$OUT/reactos/system32/ntdll_vista.dll" "$OUT/ros-ntdll_vista.dll"
   # The real regf SYSTEM registry hive — nt-hive-regf parses it so the NT registry serves smss's
   # real \Registry\Machine\System\...\Session Manager config (not a synthesized key).
   cp -f "$OUT/reactos/system32/config/system" "$OUT/ros-system.hiv"
@@ -64,6 +100,26 @@ if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT
   cp -f "$OUT/reactos/system32/c_1252.nls" "$OUT/ros-c1252.nls"
   cp -f "$OUT/reactos/system32/c_437.nls"  "$OUT/ros-c437.nls"
   cp -f "$OUT/reactos/system32/l_intl.nls" "$OUT/ros-lintl.nls"
+  # c_20127 = US-ASCII (CP20127) MB<->WideChar table. csrss's Win32 client stack maps the named
+  # section \Nls\NlsSectionCP20127 during a DllMain; missing it → STATUS_DLL_INIT_FAILED.
+  cp -f "$OUT/reactos/system32/c_20127.nls" "$OUT/ros-c20127.nls"
+fi
+
+# win32k.sys (~2.1 MiB, PE32+) — the ReactOS GUI subsystem kernel driver. The ntos-executive
+# loads it via the driver-host PE path (nt-pe-loader + nt-compat-exports) to run its DriverEntry
+# and record its NtUser/NtGdi SSDT (Phase 2 of the graphics-subsystem plan). Extracted separately
+# + idempotently so an ALREADY-cached staging (the guard above short-circuits) still gains it on
+# the next run — no re-download needed (the ISO stays cached under $OUT/).
+if [ ! -f "$OUT/ros-win32k.sys" ]; then
+  W32K_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  if [ -f "$W32K_ISO" ]; then
+    echo "extracting win32k.sys from $W32K_ISO ..."
+    bsdtar -xf "$W32K_ISO" -C "$OUT" reactos/system32/win32k.sys
+    cp -f "$OUT/reactos/system32/win32k.sys" "$OUT/ros-win32k.sys"
+    echo "staged: ros-win32k.sys ($(stat -f%z "$OUT/ros-win32k.sys") bytes)"
+  else
+    echo "note: no cached ISO — win32k.sys not staged (the executive skips its win32k load)"
+  fi
 fi
 
 # Resolve smss's ntdll imports against ntdll's export table -> imports.bin (the executive

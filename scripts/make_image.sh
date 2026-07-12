@@ -110,6 +110,61 @@ if [ -f .tmp/reactos/ros-winsrv.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-winsrv.dll ::WINSRV.DLL
   echo "ReactOS winsrv added: ::WINSRV.DLL"
 fi
+# win32k.sys — the ReactOS GUI subsystem kernel driver (~2.1 MiB). Staged so the isolated
+# win32k-service component can load it + run its DriverEntry (Phase 2b).
+if [ -f .tmp/reactos/ros-win32k.sys ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-win32k.sys ::WIN32K.SYS
+  echo "ReactOS win32k added: ::WIN32K.SYS"
+fi
+# The Win32 client stack (gdi32/user32/kernel32) — winsrv.dll's static imports. Staged so csrss's
+# loader can resolve + demand-page them.
+if [ -f .tmp/reactos/ros-gdi32.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-gdi32.dll ::GDI32.DLL
+  echo "ReactOS gdi32 added: ::GDI32.DLL"
+fi
+if [ -f .tmp/reactos/ros-user32.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-user32.dll ::USER32.DLL
+  echo "ReactOS user32 added: ::USER32.DLL"
+fi
+if [ -f .tmp/reactos/ros-kernel32.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-kernel32.dll ::KERNEL32.DLL
+  echo "ReactOS kernel32 added: ::KERNEL32.DLL"
+fi
+# winsrv's transitive import closure (rpcrt4/msvcrt/advapi32/ws2_32 + the vista forwarders +
+# ws2help) — the disk 8.3 names are what storage_probe's dir_find reads; they can differ from the
+# real DLL name (the loader never touches the disk — the executive fakes the file by registry stem).
+if [ -f .tmp/reactos/ros-rpcrt4.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-rpcrt4.dll ::RPCRT4.DLL
+  echo "ReactOS rpcrt4 added: ::RPCRT4.DLL"
+fi
+if [ -f .tmp/reactos/ros-msvcrt.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-msvcrt.dll ::MSVCRT.DLL
+  echo "ReactOS msvcrt added: ::MSVCRT.DLL"
+fi
+if [ -f .tmp/reactos/ros-advapi32.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-advapi32.dll ::ADVAPI32.DLL
+  echo "ReactOS advapi32 added: ::ADVAPI32.DLL"
+fi
+if [ -f .tmp/reactos/ros-ws2_32.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-ws2_32.dll ::WS2_32.DLL
+  echo "ReactOS ws2_32 added: ::WS2_32.DLL"
+fi
+if [ -f .tmp/reactos/ros-kernel32_vista.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-kernel32_vista.dll ::K32VISTA.DLL
+  echo "ReactOS kernel32_vista added: ::K32VISTA.DLL"
+fi
+if [ -f .tmp/reactos/ros-advapi32_vista.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-advapi32_vista.dll ::A32VISTA.DLL
+  echo "ReactOS advapi32_vista added: ::A32VISTA.DLL"
+fi
+if [ -f .tmp/reactos/ros-ws2help.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-ws2help.dll ::WS2HELP.DLL
+  echo "ReactOS ws2help added: ::WS2HELP.DLL"
+fi
+if [ -f .tmp/reactos/ros-ntdll_vista.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll_vista.dll ::NTDLLVIS.DLL
+  echo "ReactOS ntdll_vista added: ::NTDLLVIS.DLL"
+fi
 if [ -f .tmp/reactos/ros-smss.exe ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-smss.exe ::SMSS.EXE
   echo "ReactOS smss added: ::SMSS.EXE"
@@ -139,6 +194,10 @@ fi
 if [ -f .tmp/reactos/ros-lintl.nls ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-lintl.nls ::L_INTL.NLS
   echo "ReactOS case NLS added: ::L_INTL.NLS"
+fi
+if [ -f .tmp/reactos/ros-c20127.nls ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-c20127.nls ::C_20127.NLS
+  echo "ReactOS US-ASCII NLS added: ::C_20127.NLS"
 fi
 
 echo "disk image ready: $IMAGE"
