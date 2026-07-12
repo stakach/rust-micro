@@ -29,7 +29,8 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ] \
    && [ -f "$OUT/ros-c20127.nls" ] && [ -f "$OUT/ros-win32k.sys" ] \
    && [ -f "$OUT/ros-dxg.sys" ] && [ -f "$OUT/ros-dxgthk.sys" ] \
-   && [ -f "$OUT/ros-ftfd.dll" ] && [ -f "$OUT/ros-framebuf.dll" ]; then
+   && [ -f "$OUT/ros-ftfd.dll" ] && [ -f "$OUT/ros-framebuf.dll" ] \
+   && [ -f "$OUT/ros-arial.ttf" ]; then
   echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
   exit 0
 fi
@@ -176,6 +177,22 @@ for drv in dxg dxgthk; do
     fi
   fi
 done
+
+# arial.ttf — a system font. win32k's desktop-graphics init font realize (TextIntRealizeFont) needs
+# at least one loaded font or it null-derefs ("no fonts loaded at all"). The registry Fonts key is
+# empty + \SystemRoot\Fonts doesn't exist in this host, so the executive feeds these bytes to
+# win32k's IntGdiAddFontMemResource at bring-up. On the ISO at reactos/Fonts/arial.ttf.
+if [ ! -f "$OUT/ros-arial.ttf" ]; then
+  FONT_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  if [ -f "$FONT_ISO" ]; then
+    echo "extracting arial.ttf from $FONT_ISO ..."
+    bsdtar -xf "$FONT_ISO" -C "$OUT" reactos/Fonts/arial.ttf
+    cp -f "$OUT/reactos/Fonts/arial.ttf" "$OUT/ros-arial.ttf"
+    echo "staged: ros-arial.ttf ($(stat -f%z "$OUT/ros-arial.ttf") bytes)"
+  else
+    echo "note: no cached ISO — arial.ttf not staged"
+  fi
+fi
 
 # Resolve smss's ntdll imports against ntdll's export table -> imports.bin (the executive
 # applies this patch table to smss's IAT at runtime).

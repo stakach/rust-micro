@@ -138,6 +138,12 @@ if [ -f .tmp/reactos/ros-framebuf.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-framebuf.dll ::FRAMEBUF.DLL
   echo "ReactOS framebuf added: ::FRAMEBUF.DLL"
 fi
+# arial.ttf — a system font. The executive feeds it to win32k's IntGdiAddFontMemResource at bring-up
+# so the desktop-graphics font realize finds a real font (no registry Fonts / \SystemRoot\Fonts here).
+if [ -f .tmp/reactos/ros-arial.ttf ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-arial.ttf ::ARIAL.TTF
+  echo "ReactOS arial font added: ::ARIAL.TTF"
+fi
 # The Win32 client stack (gdi32/user32/kernel32) — winsrv.dll's static imports. Staged so csrss's
 # loader can resolve + demand-page them.
 if [ -f .tmp/reactos/ros-gdi32.dll ]; then
