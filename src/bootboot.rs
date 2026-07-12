@@ -102,3 +102,45 @@ pub fn get_num_cores() -> u16 {
     let bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
     bootboot_r.numcores
 }
+
+/// Linear-framebuffer geometry as reported by BOOTBOOT. The
+/// framebuffer is a physically-contiguous region of device memory;
+/// `paddr` is its physical base (BOOTBOOT's `fb_ptr`, which the
+/// loader fills with the GOP/VESA physical LFB address — the kernel
+/// itself reaches the same pixels through the fixed higher-half
+/// mapping at `BOOTBOOT_FB`). Exposed to userspace (extern-rootserver)
+/// so a display component can map + drive the framebuffer.
+#[cfg(feature = "extern-rootserver")]
+#[derive(Copy, Clone, Debug)]
+pub struct FramebufferInfo {
+    /// Physical base address of the linear framebuffer.
+    pub paddr: u64,
+    /// Size in bytes (`fb_scanline * fb_height`, per BOOTBOOT).
+    pub size: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per scanline (pitch). May exceed `width * 4` for padding.
+    pub scanline: u32,
+    /// Pixel format: one of `FB_ARGB`/`FB_RGBA`/`FB_ABGR`/`FB_BGRA`.
+    pub fb_type: u8,
+}
+
+/// Read the BOOTBOOT framebuffer geometry. Returns `None` when the
+/// loader reported no usable framebuffer (zero base, size, or
+/// dimensions) — e.g. a truly headless boot with no GOP.
+#[cfg(feature = "extern-rootserver")]
+pub fn framebuffer_info() -> Option<FramebufferInfo> {
+    let bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
+    // `fb_ptr` is `*mut u8` in the packed struct; copy out of the
+    // packed field before use to avoid an unaligned reference.
+    let paddr = bootboot_r.fb_ptr as u64;
+    let size = bootboot_r.fb_size;
+    let width = bootboot_r.fb_width;
+    let height = bootboot_r.fb_height;
+    let scanline = bootboot_r.fb_scanline;
+    let fb_type = bootboot_r.fb_type;
+    if paddr == 0 || size == 0 || width == 0 || height == 0 {
+        return None;
+    }
+    Some(FramebufferInfo { paddr, size, width, height, scanline, fb_type })
+}

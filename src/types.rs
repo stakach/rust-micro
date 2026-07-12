@@ -295,6 +295,27 @@ pub struct seL4_BootInfo {
     pub schedcontrol: seL4_SlotRegion,
     pub untyped: seL4_SlotRegion,
     pub untypedList: [seL4_UntypedDesc; CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS],
+    // Phase 0a (extern-rootserver only) — BOOTBOOT linear-framebuffer
+    // geometry, published so the NT-personality rootserver can map +
+    // drive the display. These trailing fields are gated on
+    // `extern-rootserver` so the default (sel4test) kernel writes the
+    // exact upstream `seL4_BootInfo` layout, byte-for-byte. `fb_paddr`
+    // == 0 means no framebuffer was exposed. The framebuffer's physical
+    // memory is handed over as the LAST device untyped in `untypedList`
+    // (isDevice=1, paddr == fb_paddr); retype 4 KiB frames from it and
+    // map them to reach the pixels.
+    #[cfg(feature = "extern-rootserver")]
+    pub fb_paddr: seL4_Word,
+    #[cfg(feature = "extern-rootserver")]
+    pub fb_width: u32,
+    #[cfg(feature = "extern-rootserver")]
+    pub fb_height: u32,
+    #[cfg(feature = "extern-rootserver")]
+    pub fb_scanline: u32,
+    #[cfg(feature = "extern-rootserver")]
+    pub fb_size: u32,
+    #[cfg(feature = "extern-rootserver")]
+    pub fb_type: u32,
 }
 
 #[repr(C)]

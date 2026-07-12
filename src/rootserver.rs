@@ -165,6 +165,29 @@ pub const DEVICE_UTS: &[(u64, u8)] = &[
     (0x81085000, 12), // AHCI ABAR (BAR5) of the add-in `-device ahci` (00:3.0) — boot disk on port 0
 ];
 
+/// Phase 0a (extern-rootserver only) — the BOOTBOOT linear framebuffer,
+/// exposed to the NT rootserver as one extra DEVICE untyped appended
+/// after `DEVICE_UTS`. Returns `(paddr, block_bits, geometry)` where the
+/// untyped covers `[fb_paddr, fb_paddr + 2^block_bits)` — `block_bits`
+/// is the smallest power-of-two size (≥ the framebuffer's byte size, ≥
+/// one 4 KiB frame) so the rootserver can retype every framebuffer
+/// frame out of it. `fb_paddr` is 4 KiB-aligned (BOOTBOOT hands out a
+/// page-aligned LFB); the kernel's `untyped_retype` hands out frames at
+/// `base + i*4K` and imposes no base-vs-size alignment, so a covering
+/// power-of-two block is all that's required. `None` when BOOTBOOT
+/// reported no framebuffer.
+#[cfg(feature = "extern-rootserver")]
+fn fb_device_untyped() -> Option<(u64, u8, crate::bootboot::FramebufferInfo)> {
+    let fb = crate::bootboot::framebuffer_info()?;
+    // Smallest block_bits with 2^block_bits >= fb.size, floored at 12
+    // (a single 4 KiB frame). `size` is u32, so 32 bits is ample.
+    let mut block_bits: u8 = 12;
+    while (1u64 << block_bits) < fb.size as u64 {
+        block_bits += 1;
+    }
+    Some((fb.paddr, block_bits, fb))
+}
+
 /// Phase 42 — backing memory for the rootserver's Untyped cap is
 /// reserved at boot from BOOTBOOT free memory rather than from
 /// kernel BSS (kernel-image BSS is constrained by the high-memory
@@ -626,6 +649,23 @@ pub unsafe fn launch_rootserver() -> ! {
             is_device: true,
         });
     }
+    // Phase 0a — the BOOTBOOT framebuffer as one more device untyped,
+    // in the slot immediately after the DEVICE_UTS block. `n_extra_uts`
+    // (0 or 1) shifts `user_image_start` by the same amount build_bootinfo
+    // shifts `untyped_end`, so caps and BootInfo metadata can't drift.
+    // Fully gated so the default (sel4test) build path is unchanged.
+    #[cfg(feature = "extern-rootserver")]
+    let n_extra_uts: usize = if let Some((fb_paddr, fb_bits, _)) = fb_device_untyped() {
+        rs_set(s, untyped_slot + 1 + DEVICE_UTS.len(), &Cap::Untyped {
+            ptr: PPtr::<UntypedStorage>::new(fb_paddr.max(1)).expect("fb ut paddr"),
+            block_bits: fb_bits,
+            free_index: 0,
+            is_device: true,
+        });
+        1
+    } else {
+        0
+    };
 
     // Phase 42 — userImageFrames: install one `Cap::Frame` per page
     // the loader pre-mapped for the rootserver (image + stack + IPC
@@ -635,7 +675,11 @@ pub unsafe fn launch_rootserver() -> ! {
     // already-installed PTs (without this, allocman's PT_Map fails
     // with `seL4_DeleteFirst` whenever it tries to reuse a PD slot
     // the loader already populated).
+    #[cfg(not(feature = "extern-rootserver"))]
     let user_image_start: Word = (untyped_slot as Word) + 1 + DEVICE_UTS.len() as Word;
+    #[cfg(feature = "extern-rootserver")]
+    let user_image_start: Word =
+        (untyped_slot as Word) + 1 + DEVICE_UTS.len() as Word + n_extra_uts as Word;
     let n_image_pages = IMAGE_PAGE_COUNT;
     for i in 0..n_image_pages {
         let pm = IMAGE_PAGES[i];
@@ -801,7 +845,25 @@ unsafe fn build_bootinfo(
             padding: [0; 6],
         };
     }
+    #[cfg(not(feature = "extern-rootserver"))]
     let untyped_count: Word = 1 + DEVICE_UTS.len() as Word;
+    // Phase 0a — append the framebuffer device untyped (extern-rootserver).
+    // Kept in lockstep with the cap placed in launch_rootserver (same slot,
+    // same paddr/size_bits) so `untypedList[fb]` and the CSpace cap agree.
+    #[cfg(feature = "extern-rootserver")]
+    let untyped_count: Word = {
+        let mut untyped_count: Word = 1 + DEVICE_UTS.len() as Word;
+        if let Some((fb_paddr, fb_bits, _)) = fb_device_untyped() {
+            empty_untypeds[untyped_count as usize] = seL4_UntypedDesc {
+                paddr: fb_paddr,
+                sizeBits: fb_bits,
+                isDevice: 1,
+                padding: [0; 6],
+            };
+            untyped_count += 1;
+        }
+        untyped_count
+    };
 
     let n_cores = crate::bootboot::get_num_cores() as Word;
     // Phase 36e / 42 — canonical slot layout under MCS:
@@ -858,6 +920,20 @@ unsafe fn build_bootinfo(
         },
         untyped: seL4_SlotRegion { start: untyped_start, end: untyped_end },
         untypedList: empty_untypeds,
+        // Phase 0a — framebuffer geometry (extern-rootserver). All-zero
+        // when BOOTBOOT exposed no framebuffer.
+        #[cfg(feature = "extern-rootserver")]
+        fb_paddr: fb_device_untyped().map(|(p, _, _)| p).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        fb_width: fb_device_untyped().map(|(_, _, g)| g.width).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        fb_height: fb_device_untyped().map(|(_, _, g)| g.height).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        fb_scanline: fb_device_untyped().map(|(_, _, g)| g.scanline).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        fb_size: fb_device_untyped().map(|(_, _, g)| g.size).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        fb_type: fb_device_untyped().map(|(_, _, g)| g.fb_type as u32).unwrap_or(0),
     }
 }
 
