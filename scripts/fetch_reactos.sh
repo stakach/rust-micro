@@ -28,7 +28,8 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/imports.bin" ] \
    && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ] \
    && [ -f "$OUT/ros-c20127.nls" ] && [ -f "$OUT/ros-win32k.sys" ] \
-   && [ -f "$OUT/ros-dxg.sys" ] && [ -f "$OUT/ros-dxgthk.sys" ]; then
+   && [ -f "$OUT/ros-dxg.sys" ] && [ -f "$OUT/ros-dxgthk.sys" ] \
+   && [ -f "$OUT/ros-ftfd.dll" ]; then
   echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
   exit 0
 fi
@@ -127,6 +128,23 @@ fi
 # InitializeGreCSRSS -> DxDdStartupDxGraphics loads dxg.sys (EngLoadImage -> ZwSetSystemInformation
 # SystemLoadGdiDriverInformation), which the executive hosts into win32k's VSpace; dxg imports
 # dxgthk's Eng* thunks. Under system32/drivers/ (unlike win32k which is directly in system32/).
+# ftfd.dll — the FreeType font driver. win32k STATICALLY imports 34 FT_* functions from it
+# (win32k's import DLLs = ntoskrnl + hal + ftfd.dll); InitFontSupport → FT_Init_FreeType needs the
+# real ftfd or the font subsystem stays uninitialized. Unlike dxg (dynamic, via ZwSetSystemInformation)
+# ftfd is a static win32k import: the executive loads it at win32k bring-up + patches win32k's own IAT
+# for the FT_* entries against ftfd's export table. Directly in system32/ (like win32k.sys).
+if [ ! -f "$OUT/ros-ftfd.dll" ]; then
+  FTFD_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  if [ -f "$FTFD_ISO" ]; then
+    echo "extracting ftfd.dll from $FTFD_ISO ..."
+    bsdtar -xf "$FTFD_ISO" -C "$OUT" reactos/system32/ftfd.dll
+    cp -f "$OUT/reactos/system32/ftfd.dll" "$OUT/ros-ftfd.dll"
+    echo "staged: ros-ftfd.dll ($(stat -f%z "$OUT/ros-ftfd.dll") bytes)"
+  else
+    echo "note: no cached ISO — ftfd.dll not staged"
+  fi
+fi
+
 for drv in dxg dxgthk; do
   if [ ! -f "$OUT/ros-$drv.sys" ]; then
     DRV_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"

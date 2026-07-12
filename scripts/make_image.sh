@@ -126,6 +126,12 @@ if [ -f .tmp/reactos/ros-dxgthk.sys ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-dxgthk.sys ::DXGTHK.SYS
   echo "ReactOS dxgthk added: ::DXGTHK.SYS"
 fi
+# ftfd.dll — FreeType font driver. win32k statically imports 34 FT_* from it; the executive hosts it
+# into win32k's VSpace at bring-up + patches win32k's IAT (InitFontSupport → FT_Init_FreeType).
+if [ -f .tmp/reactos/ros-ftfd.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-ftfd.dll ::FTFD.DLL
+  echo "ReactOS ftfd added: ::FTFD.DLL"
+fi
 # The Win32 client stack (gdi32/user32/kernel32) — winsrv.dll's static imports. Staged so csrss's
 # loader can resolve + demand-page them.
 if [ -f .tmp/reactos/ros-gdi32.dll ]; then
