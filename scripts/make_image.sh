@@ -132,6 +132,12 @@ if [ -f .tmp/reactos/ros-ftfd.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-ftfd.dll ::FTFD.DLL
   echo "ReactOS ftfd added: ::FTFD.DLL"
 fi
+# framebuf.dll — generic linear-framebuffer display driver. win32k's desktop-graphics init loads it
+# via ZwSetSystemInformation; the executive hosts it into win32k's VSpace + feeds it the framebuffer.
+if [ -f .tmp/reactos/ros-framebuf.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-framebuf.dll ::FRAMEBUF.DLL
+  echo "ReactOS framebuf added: ::FRAMEBUF.DLL"
+fi
 # The Win32 client stack (gdi32/user32/kernel32) — winsrv.dll's static imports. Staged so csrss's
 # loader can resolve + demand-page them.
 if [ -f .tmp/reactos/ros-gdi32.dll ]; then

@@ -29,7 +29,7 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/ros-c1252.nls" ] && [ -f "$OUT/ros-c437.nls" ] && [ -f "$OUT/ros-lintl.nls" ] \
    && [ -f "$OUT/ros-c20127.nls" ] && [ -f "$OUT/ros-win32k.sys" ] \
    && [ -f "$OUT/ros-dxg.sys" ] && [ -f "$OUT/ros-dxgthk.sys" ] \
-   && [ -f "$OUT/ros-ftfd.dll" ]; then
+   && [ -f "$OUT/ros-ftfd.dll" ] && [ -f "$OUT/ros-framebuf.dll" ]; then
   echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
   exit 0
 fi
@@ -142,6 +142,24 @@ if [ ! -f "$OUT/ros-ftfd.dll" ]; then
     echo "staged: ros-ftfd.dll ($(stat -f%z "$OUT/ros-ftfd.dll") bytes)"
   else
     echo "note: no cached ISO — ftfd.dll not staged"
+  fi
+fi
+
+# framebuf.dll — the generic linear-framebuffer DISPLAY driver (12 KiB). win32k's desktop-graphics
+# init (co_IntInitializeDesktopGraphics → PDEVOBJ_Create) loads it via LDEVOBJ_pLoadDriver →
+# ZwSetSystemInformation(SystemLoadGdiDriverInformation), which the executive hosts into win32k's
+# VSpace (like dxg.sys). framebuf imports 11 Eng*/PALOBJ from win32k.sys and queries the video
+# miniport over EngDeviceIoControl; the executive intercepts those IOCTLs to feed it the BOOTBOOT
+# framebuffer, so framebuf enables the primary surface → PIXELS. Directly in system32/.
+if [ ! -f "$OUT/ros-framebuf.dll" ]; then
+  FB_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  if [ -f "$FB_ISO" ]; then
+    echo "extracting framebuf.dll from $FB_ISO ..."
+    bsdtar -xf "$FB_ISO" -C "$OUT" reactos/system32/framebuf.dll
+    cp -f "$OUT/reactos/system32/framebuf.dll" "$OUT/ros-framebuf.dll"
+    echo "staged: ros-framebuf.dll ($(stat -f%z "$OUT/ros-framebuf.dll") bytes)"
+  else
+    echo "note: no cached ISO — framebuf.dll not staged"
   fi
 fi
 
