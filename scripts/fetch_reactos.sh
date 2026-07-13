@@ -195,6 +195,25 @@ if [ ! -f "$OUT/ros-winlogon.exe" ]; then
   fi
 fi
 
+# userenv.dll (~166 KiB) + mpr.dll (~107 KiB) — two of winlogon.exe's static imports (the others,
+# advapi32/kernel32/msvcrt/ntdll/rpcrt4/user32, are already staged for csrss's Win32 stack). Needed
+# or winlogon's loader (LdrpWalkImportDescriptor) raises STATUS_DLL_NOT_FOUND. Their own imports
+# (advapi32/advapi32_vista/kernel32/msvcrt/ntdll/user32) are all already staged. Extracted
+# idempotently (like win32k.sys) so an already-cached staging gains them without a re-download.
+for lib in userenv mpr; do
+  if [ ! -f "$OUT/ros-$lib.dll" ]; then
+    LIB_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+    if [ -f "$LIB_ISO" ]; then
+      echo "extracting $lib.dll from $LIB_ISO ..."
+      bsdtar -xf "$LIB_ISO" -C "$OUT" "reactos/system32/$lib.dll"
+      cp -f "$OUT/reactos/system32/$lib.dll" "$OUT/ros-$lib.dll"
+      echo "staged: ros-$lib.dll ($(stat -f%z "$OUT/ros-$lib.dll") bytes)"
+    else
+      echo "note: no cached ISO — $lib.dll not staged"
+    fi
+  fi
+done
+
 # arial.ttf — a system font. win32k's desktop-graphics init font realize (TextIntRealizeFont) needs
 # at least one loaded font or it null-derefs ("no fonts loaded at all"). The registry Fonts key is
 # empty + \SystemRoot\Fonts doesn't exist in this host, so the executive feeds these bytes to

@@ -203,6 +203,16 @@ if [ -f .tmp/reactos/ros-winlogon.exe ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-winlogon.exe ::WINLOGON.EXE
   echo "ReactOS winlogon added: ::WINLOGON.EXE"
 fi
+# userenv.dll + mpr.dll — two of winlogon.exe's static imports (the rest are already staged for
+# csrss). Staged so winlogon's loader resolves its full import graph instead of DLL_NOT_FOUND.
+if [ -f .tmp/reactos/ros-userenv.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-userenv.dll ::USERENV.DLL
+  echo "ReactOS userenv added: ::USERENV.DLL"
+fi
+if [ -f .tmp/reactos/ros-mpr.dll ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-mpr.dll ::MPR.DLL
+  echo "ReactOS mpr added: ::MPR.DLL"
+fi
 if [ -f .tmp/reactos/ros-ntdll.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::NTDLL.DLL
   echo "ReactOS ntdll added: ::NTDLL.DLL"
