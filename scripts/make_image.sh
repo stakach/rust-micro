@@ -197,6 +197,12 @@ if [ -f .tmp/reactos/ros-smss.exe ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-smss.exe ::SMSS.EXE
   echo "ReactOS smss added: ::SMSS.EXE"
 fi
+# winlogon.exe — the Session Manager's initial command. Staged so smss's SmpExecuteInitialCommand
+# can find + launch it as the 3rd hosted process (the executive parses it PE32+ + spawns it).
+if [ -f .tmp/reactos/ros-winlogon.exe ]; then
+  mcopy -i "$IMAGE" .tmp/reactos/ros-winlogon.exe ::WINLOGON.EXE
+  echo "ReactOS winlogon added: ::WINLOGON.EXE"
+fi
 if [ -f .tmp/reactos/ros-ntdll.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::NTDLL.DLL
   echo "ReactOS ntdll added: ::NTDLL.DLL"

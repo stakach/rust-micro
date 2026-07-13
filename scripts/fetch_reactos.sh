@@ -30,6 +30,7 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/ros-c20127.nls" ] && [ -f "$OUT/ros-win32k.sys" ] \
    && [ -f "$OUT/ros-dxg.sys" ] && [ -f "$OUT/ros-dxgthk.sys" ] \
    && [ -f "$OUT/ros-ftfd.dll" ] && [ -f "$OUT/ros-framebuf.dll" ] \
+   && [ -f "$OUT/ros-winlogon.exe" ] \
    && [ -f "$OUT/ros-arial.ttf" ]; then
   echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
   exit 0
@@ -177,6 +178,22 @@ for drv in dxg dxgthk; do
     fi
   fi
 done
+
+# winlogon.exe (~225 KiB, PE32+) — the Session Manager's initial command (SmpExecuteInitialCommand).
+# smss's SmpParseCommandLine probes it (RtlDosSearchPath_U ×N); staged so smss can launch it as the
+# 3rd hosted process + run its ntdll loader (the winlogon bring-up). Extracted idempotently (like
+# win32k.sys) so an already-cached staging gains it on the next run without a re-download.
+if [ ! -f "$OUT/ros-winlogon.exe" ]; then
+  WL_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  if [ -f "$WL_ISO" ]; then
+    echo "extracting winlogon.exe from $WL_ISO ..."
+    bsdtar -xf "$WL_ISO" -C "$OUT" reactos/system32/winlogon.exe
+    cp -f "$OUT/reactos/system32/winlogon.exe" "$OUT/ros-winlogon.exe"
+    echo "staged: ros-winlogon.exe ($(stat -f%z "$OUT/ros-winlogon.exe") bytes)"
+  else
+    echo "note: no cached ISO — winlogon.exe not staged"
+  fi
+fi
 
 # arial.ttf — a system font. win32k's desktop-graphics init font realize (TextIntRealizeFont) needs
 # at least one loaded font or it null-derefs ("no fonts loaded at all"). The registry Fonts key is
