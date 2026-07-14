@@ -216,6 +216,15 @@ fi
 if [ -f .tmp/reactos/ros-ntdll.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::NTDLL.DLL
   echo "ReactOS ntdll added: ::NTDLL.DLL"
+  # P7 FS-backed-by-path proof: ALSO lay down the real install-tree path
+  # \reactos\system32\ntdll.dll so the storage host can resolve + read it BY PATH
+  # (a nested-directory walk), not just the flat root-level ::NTDLL.DLL. This is the
+  # first brick of hosting the complete \reactos tree from a real FS. Hybrid: the flat
+  # staged copy above remains as the fallback, so the boot stays green either way.
+  mmd -i "$IMAGE" ::reactos 2>/dev/null || true
+  mmd -i "$IMAGE" ::reactos/system32 2>/dev/null || true
+  mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::reactos/system32/ntdll.dll
+  echo "ReactOS ntdll staged BY PATH: ::reactos/system32/ntdll.dll"
 fi
 if [ -f .tmp/reactos/ros-system.hiv ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-system.hiv ::ROSSYS.HIV
