@@ -142,4 +142,18 @@ else
   echo "note: full \\reactos tree not staged (.tmp/reactos/.fulltree-ok absent) — flat ::NAME files only"
 fi
 
+# Driver-model migration: stage the synthetic driver test fixtures (nt-driver-test-fixtures)
+# BY-PATH under \reactos\system32\drivers so the executive launches them via the general dynamic
+# `load_driver(fs, path, class)` path (like npfs.sys) — NOT baked in via include_bytes!. These are
+# test drivers (PnP/MMIO NIC + KMDF lifecycle), not real ReactOS binaries, so they aren't in the
+# fetched \reactos tree. Ensure the drivers dir exists (in case the tree wasn't staged), then copy.
+FIXTURES=../crates/nt-driver-test-fixtures/fixtures
+for fx in PnpMmioInterruptTest.sys KmdfBasicTest.sys; do
+  if [ -f "$FIXTURES/$fx" ]; then
+    mmd -i "$IMAGE" ::reactos ::reactos/system32 ::reactos/system32/drivers 2>/dev/null || true
+    mcopy -o -i "$IMAGE" "$FIXTURES/$fx" "::reactos/system32/drivers/$fx"
+    echo "driver test fixture added: ::reactos/system32/drivers/$fx"
+  fi
+done
+
 echo "disk image ready: $IMAGE ($IMAGE_MIB MiB)"
