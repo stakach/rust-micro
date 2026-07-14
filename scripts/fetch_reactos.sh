@@ -33,8 +33,9 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/ros-dxg.sys" ] && [ -f "$OUT/ros-dxgthk.sys" ] \
    && [ -f "$OUT/ros-ftfd.dll" ] && [ -f "$OUT/ros-framebuf.dll" ] \
    && [ -f "$OUT/ros-winlogon.exe" ] \
-   && [ -f "$OUT/ros-arial.ttf" ]; then
-  echo "ReactOS binaries + import table + NLS tables already staged in $OUT/"
+   && [ -f "$OUT/ros-arial.ttf" ] \
+   && [ -f "$OUT/.fulltree-ok" ]; then
+  echo "ReactOS binaries + import table + NLS tables + full \\reactos tree already staged in $OUT/"
   exit 0
 fi
 
@@ -237,3 +238,33 @@ fi
 python3 "$(dirname "$0")/gen_reactos_imports.py" "$OUT/ros-smss.exe" "$OUT/ros-ntdll.dll" "$OUT/imports.bin"
 
 echo "staged: ros-ntdll.dll ($(stat -f%z "$OUT/ros-ntdll.dll") bytes), ros-smss.exe ($(stat -f%z "$OUT/ros-smss.exe") bytes), imports.bin"
+
+# P7-A: extract the FULL \reactos install tree (~171 MiB / ~1000 files), not just the curated
+# ~30 binaries, so make_image.sh can lay the entire tree onto a 256 MiB FAT32 image and the
+# executive loads ANY binary BY PATH from the real FS (\reactos\system32\X). One-time + idempotent
+# (guarded by the .fulltree-ok marker; the ISO stays cached under $OUT/). The first-run download is
+# still the ~29 MiB 7z above; only the on-disk extraction grows.
+if [ ! -f "$OUT/.fulltree-ok" ]; then
+  FT_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  if [ ! -f "$FT_ISO" ] && [ -f "$OUT/reactos-x64.7z" ]; then
+    ( cd "$OUT" && bsdtar -xf reactos-x64.7z )
+    FT_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  fi
+  if [ -f "$FT_ISO" ]; then
+    echo "extracting the FULL reactos/ tree from $FT_ISO (~171 MiB, ~1000 files; one-time)..."
+    # The ISO carries a Rock-Ridge hard-link (reactos/readme.txt) whose target bsdtar can't
+    # resolve during a scoped extraction; it's non-fatal (one doc file). Tolerate it and
+    # validate by file count instead of exit code, so a single bad link doesn't lose the tree.
+    bsdtar -xf "$FT_ISO" -C "$OUT" reactos 2>"$OUT/.ft-extract.log" || true
+    FT_FILES=$(find "$OUT/reactos" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$FT_FILES" -gt 900 ]; then
+      touch "$OUT/.fulltree-ok"
+      echo "full \\reactos tree staged under $OUT/reactos ($(du -sh "$OUT/reactos" 2>/dev/null | awk '{print $1}'), $FT_FILES files)"
+    else
+      echo "ERROR: full-tree extraction incomplete ($FT_FILES files) — see $OUT/.ft-extract.log" >&2
+      exit 1
+    fi
+  else
+    echo "note: no cached ISO — full \\reactos tree NOT staged (make_image falls back to flat ::NAME files)"
+  fi
+fi

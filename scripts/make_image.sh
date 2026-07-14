@@ -43,9 +43,13 @@ if [ ! -f "$ROOTSERVER" ]; then
   exit 1
 fi
 
-# Create a 64 MiB blank image and format as FAT32. macOS `dd` accepts the
-# same `bs=1M count=64` syntax as GNU dd.
-dd if=/dev/zero of="$IMAGE" bs=1M count=64 status=none
+# Create a 256 MiB blank image and format as FAT32. macOS `dd` accepts the same
+# `bs=1M count=256` syntax as GNU dd. P7-A: grown 64->256 MiB to hold the COMPLETE
+# \reactos install tree (~171 MiB) so the executive loads ANY binary BY PATH from the
+# real FS. It stays a superfloppy (no partition table — the storage host reads FAT32
+# from LBA 0); BOOTBOOT (UEFI) + our LBA48 AHCI reader both handle the larger volume.
+IMAGE_MIB="${IMAGE_MIB:-256}"
+dd if=/dev/zero of="$IMAGE" bs=1M count="$IMAGE_MIB" status=none
 mkfs.vfat -F 32 "$IMAGE" >/dev/null
 
 # mtools tries to detect floppy/cdrom devices; tell it to skip those checks
@@ -216,15 +220,6 @@ fi
 if [ -f .tmp/reactos/ros-ntdll.dll ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::NTDLL.DLL
   echo "ReactOS ntdll added: ::NTDLL.DLL"
-  # P7 FS-backed-by-path proof: ALSO lay down the real install-tree path
-  # \reactos\system32\ntdll.dll so the storage host can resolve + read it BY PATH
-  # (a nested-directory walk), not just the flat root-level ::NTDLL.DLL. This is the
-  # first brick of hosting the complete \reactos tree from a real FS. Hybrid: the flat
-  # staged copy above remains as the fallback, so the boot stays green either way.
-  mmd -i "$IMAGE" ::reactos 2>/dev/null || true
-  mmd -i "$IMAGE" ::reactos/system32 2>/dev/null || true
-  mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::reactos/system32/ntdll.dll
-  echo "ReactOS ntdll staged BY PATH: ::reactos/system32/ntdll.dll"
 fi
 if [ -f .tmp/reactos/ros-system.hiv ]; then
   mcopy -i "$IMAGE" .tmp/reactos/ros-system.hiv ::ROSSYS.HIV
@@ -253,4 +248,20 @@ if [ -f .tmp/reactos/ros-c20127.nls ]; then
   echo "ReactOS US-ASCII NLS added: ::C_20127.NLS"
 fi
 
-echo "disk image ready: $IMAGE"
+# P7-A: lay down the COMPLETE \reactos install tree so the executive resolves + reads ANY
+# binary BY PATH (\reactos\system32\X.dll) from the real FS via fat_open_path — not just the
+# curated flat ::NAME files above. Recursive mcopy of the whole tree (~171 MiB, ~1000 files;
+# adds a few seconds to the image build). The flat ::NAME files above remain during the loader
+# migration (hybrid), so the boot stays green if the tree is absent. Idempotent: fetch_reactos.sh
+# stages it under .tmp/reactos/reactos with a .fulltree-ok marker.
+if [ -f .tmp/reactos/.fulltree-ok ] && [ -d .tmp/reactos/reactos ]; then
+  echo "staging the full \\reactos tree onto the image (recursive; ~171 MiB)..."
+  t0=$(date +%s)
+  mcopy -s -i "$IMAGE" .tmp/reactos/reactos ::
+  t1=$(date +%s)
+  echo "full \\reactos tree added: ::reactos ($(find .tmp/reactos/reactos -type f | wc -l | tr -d ' ') files, $((t1 - t0))s)"
+else
+  echo "note: full \\reactos tree not staged (.tmp/reactos/.fulltree-ok absent) — flat ::NAME files only"
+fi
+
+echo "disk image ready: $IMAGE ($IMAGE_MIB MiB)"
