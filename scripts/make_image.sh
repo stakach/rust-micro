@@ -96,156 +96,34 @@ if [ -f .tmp/hive.dat ]; then
   echo "registry hive added: ::SYSTEM.DAT"
 fi
 
-# P3: real ReactOS x64 binaries (GPL, redistributable) for the executive to load via SEC_IMAGE.
-# Staged by scripts/fetch_reactos.sh; guarded so a fresh clone that hasn't fetched still builds.
-if [ -f .tmp/reactos/ros-csrss.exe ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-csrss.exe ::CSRSS.EXE
-  echo "ReactOS csrss added: ::CSRSS.EXE"
-fi
-if [ -f .tmp/reactos/ros-csrsrv.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-csrsrv.dll ::CSRSRV.DLL
-  echo "ReactOS csrsrv added: ::CSRSRV.DLL"
-fi
-if [ -f .tmp/reactos/ros-basesrv.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-basesrv.dll ::BASESRV.DLL
-  echo "ReactOS basesrv added: ::BASESRV.DLL"
-fi
-if [ -f .tmp/reactos/ros-winsrv.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-winsrv.dll ::WINSRV.DLL
-  echo "ReactOS winsrv added: ::WINSRV.DLL"
-fi
-# win32k.sys — the ReactOS GUI subsystem kernel driver (~2.1 MiB). Staged so the isolated
-# win32k-service component can load it + run its DriverEntry (Phase 2b).
-if [ -f .tmp/reactos/ros-win32k.sys ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-win32k.sys ::WIN32K.SYS
-  echo "ReactOS win32k added: ::WIN32K.SYS"
-fi
-# dxg.sys + dxgthk.sys — DirectX kernel graphics driver + thunk table. win32k's InitializeGreCSRSS
-# loads dxg.sys (the executive hosts it into win32k's VSpace at DxDdStartupDxGraphics time).
-if [ -f .tmp/reactos/ros-dxg.sys ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-dxg.sys ::DXG.SYS
-  echo "ReactOS dxg added: ::DXG.SYS"
-fi
-if [ -f .tmp/reactos/ros-dxgthk.sys ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-dxgthk.sys ::DXGTHK.SYS
-  echo "ReactOS dxgthk added: ::DXGTHK.SYS"
-fi
-# ftfd.dll — FreeType font driver. win32k statically imports 34 FT_* from it; the executive hosts it
-# into win32k's VSpace at bring-up + patches win32k's IAT (InitFontSupport → FT_Init_FreeType).
-if [ -f .tmp/reactos/ros-ftfd.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-ftfd.dll ::FTFD.DLL
-  echo "ReactOS ftfd added: ::FTFD.DLL"
-fi
-# framebuf.dll — generic linear-framebuffer display driver. win32k's desktop-graphics init loads it
-# via ZwSetSystemInformation; the executive hosts it into win32k's VSpace + feeds it the framebuffer.
-if [ -f .tmp/reactos/ros-framebuf.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-framebuf.dll ::FRAMEBUF.DLL
-  echo "ReactOS framebuf added: ::FRAMEBUF.DLL"
-fi
-# arial.ttf — a system font. The executive feeds it to win32k's IntGdiAddFontMemResource at bring-up
-# so the desktop-graphics font realize finds a real font (no registry Fonts / \SystemRoot\Fonts here).
-if [ -f .tmp/reactos/ros-arial.ttf ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-arial.ttf ::ARIAL.TTF
-  echo "ReactOS arial font added: ::ARIAL.TTF"
-fi
-# The Win32 client stack (gdi32/user32/kernel32) — winsrv.dll's static imports. Staged so csrss's
-# loader can resolve + demand-page them.
-if [ -f .tmp/reactos/ros-gdi32.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-gdi32.dll ::GDI32.DLL
-  echo "ReactOS gdi32 added: ::GDI32.DLL"
-fi
-if [ -f .tmp/reactos/ros-user32.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-user32.dll ::USER32.DLL
-  echo "ReactOS user32 added: ::USER32.DLL"
-fi
-if [ -f .tmp/reactos/ros-kernel32.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-kernel32.dll ::KERNEL32.DLL
-  echo "ReactOS kernel32 added: ::KERNEL32.DLL"
-fi
-# winsrv's transitive import closure (rpcrt4/msvcrt/advapi32/ws2_32 + the vista forwarders +
-# ws2help) — the disk 8.3 names are what storage_probe's dir_find reads; they can differ from the
-# real DLL name (the loader never touches the disk — the executive fakes the file by registry stem).
-if [ -f .tmp/reactos/ros-rpcrt4.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-rpcrt4.dll ::RPCRT4.DLL
-  echo "ReactOS rpcrt4 added: ::RPCRT4.DLL"
-fi
-if [ -f .tmp/reactos/ros-msvcrt.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-msvcrt.dll ::MSVCRT.DLL
-  echo "ReactOS msvcrt added: ::MSVCRT.DLL"
-fi
-if [ -f .tmp/reactos/ros-advapi32.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-advapi32.dll ::ADVAPI32.DLL
-  echo "ReactOS advapi32 added: ::ADVAPI32.DLL"
-fi
-if [ -f .tmp/reactos/ros-ws2_32.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-ws2_32.dll ::WS2_32.DLL
-  echo "ReactOS ws2_32 added: ::WS2_32.DLL"
-fi
-if [ -f .tmp/reactos/ros-kernel32_vista.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-kernel32_vista.dll ::K32VISTA.DLL
-  echo "ReactOS kernel32_vista added: ::K32VISTA.DLL"
-fi
-if [ -f .tmp/reactos/ros-advapi32_vista.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-advapi32_vista.dll ::A32VISTA.DLL
-  echo "ReactOS advapi32_vista added: ::A32VISTA.DLL"
-fi
-if [ -f .tmp/reactos/ros-ws2help.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-ws2help.dll ::WS2HELP.DLL
-  echo "ReactOS ws2help added: ::WS2HELP.DLL"
-fi
-if [ -f .tmp/reactos/ros-ntdll_vista.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll_vista.dll ::NTDLLVIS.DLL
-  echo "ReactOS ntdll_vista added: ::NTDLLVIS.DLL"
-fi
-if [ -f .tmp/reactos/ros-smss.exe ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-smss.exe ::SMSS.EXE
-  echo "ReactOS smss added: ::SMSS.EXE"
-fi
-# winlogon.exe — the Session Manager's initial command. Staged so smss's SmpExecuteInitialCommand
-# can find + launch it as the 3rd hosted process (the executive parses it PE32+ + spawns it).
-if [ -f .tmp/reactos/ros-winlogon.exe ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-winlogon.exe ::WINLOGON.EXE
-  echo "ReactOS winlogon added: ::WINLOGON.EXE"
-fi
-# userenv.dll + mpr.dll — two of winlogon.exe's static imports (the rest are already staged for
-# csrss). Staged so winlogon's loader resolves its full import graph instead of DLL_NOT_FOUND.
-if [ -f .tmp/reactos/ros-userenv.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-userenv.dll ::USERENV.DLL
-  echo "ReactOS userenv added: ::USERENV.DLL"
-fi
-if [ -f .tmp/reactos/ros-mpr.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-mpr.dll ::MPR.DLL
-  echo "ReactOS mpr added: ::MPR.DLL"
-fi
-if [ -f .tmp/reactos/ros-ntdll.dll ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-ntdll.dll ::NTDLL.DLL
-  echo "ReactOS ntdll added: ::NTDLL.DLL"
-fi
-if [ -f .tmp/reactos/ros-system.hiv ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-system.hiv ::ROSSYS.HIV
-  echo "ReactOS SYSTEM hive added: ::ROSSYS.HIV"
-fi
+# P7-A: the ReactOS binaries are NO LONGER staged as flat ::NAME files. The executive's storage
+# host reads every one of them BY PATH from the real \reactos install tree laid down below (smss,
+# csrss, csrsrv, basesrv, winsrv, ntdll, the Win32 client stack, the vista forwarders, NLS tables,
+# win32k/dxg/dxgthk/ftfd/framebuf, arial.ttf, winlogon, userenv, mpr, and the SYSTEM hive at
+# system32\config\system) — proven by the exec_full_stack_from_fs spec (verdict 0x200, zero flat
+# fallbacks). Only the two NON-tree, build-generated artifacts stay flat at the root: the synthetic
+# Config-Manager hive ::SYSTEM.DAT (above) and the smss import-resolution table ::IMPORTS.BIN.
+# (Set STAGE_FLAT_REACTOS=1 to also re-stage the flat ::NAME copies for A/B debugging.)
 if [ -f .tmp/reactos/imports.bin ]; then
   mcopy -i "$IMAGE" .tmp/reactos/imports.bin ::IMPORTS.BIN
   echo "ReactOS import table added: ::IMPORTS.BIN"
 fi
-# NLS code-page tables — LdrpInitializeProcess builds RtlUnicodeToMultiByteN's tables from these
-# via PEB->{Ansi,Oem,UnicodeCaseTable}CodePageData.
-if [ -f .tmp/reactos/ros-c1252.nls ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-c1252.nls ::C_1252.NLS
-  echo "ReactOS ANSI NLS added: ::C_1252.NLS"
-fi
-if [ -f .tmp/reactos/ros-c437.nls ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-c437.nls ::C_437.NLS
-  echo "ReactOS OEM NLS added: ::C_437.NLS"
-fi
-if [ -f .tmp/reactos/ros-lintl.nls ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-lintl.nls ::L_INTL.NLS
-  echo "ReactOS case NLS added: ::L_INTL.NLS"
-fi
-if [ -f .tmp/reactos/ros-c20127.nls ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/ros-c20127.nls ::C_20127.NLS
-  echo "ReactOS US-ASCII NLS added: ::C_20127.NLS"
+if [ "${STAGE_FLAT_REACTOS:-0}" = "1" ]; then
+  echo "STAGE_FLAT_REACTOS=1: also staging the legacy flat ::NAME ReactOS copies (debug)"
+  for pair in \
+    ros-csrss.exe:CSRSS.EXE ros-csrsrv.dll:CSRSRV.DLL ros-basesrv.dll:BASESRV.DLL \
+    ros-winsrv.dll:WINSRV.DLL ros-win32k.sys:WIN32K.SYS ros-dxg.sys:DXG.SYS \
+    ros-dxgthk.sys:DXGTHK.SYS ros-ftfd.dll:FTFD.DLL ros-framebuf.dll:FRAMEBUF.DLL \
+    ros-arial.ttf:ARIAL.TTF ros-gdi32.dll:GDI32.DLL ros-user32.dll:USER32.DLL \
+    ros-kernel32.dll:KERNEL32.DLL ros-rpcrt4.dll:RPCRT4.DLL ros-msvcrt.dll:MSVCRT.DLL \
+    ros-advapi32.dll:ADVAPI32.DLL ros-ws2_32.dll:WS2_32.DLL ros-kernel32_vista.dll:K32VISTA.DLL \
+    ros-advapi32_vista.dll:A32VISTA.DLL ros-ws2help.dll:WS2HELP.DLL ros-ntdll_vista.dll:NTDLLVIS.DLL \
+    ros-smss.exe:SMSS.EXE ros-winlogon.exe:WINLOGON.EXE ros-userenv.dll:USERENV.DLL \
+    ros-mpr.dll:MPR.DLL ros-ntdll.dll:NTDLL.DLL ros-system.hiv:ROSSYS.HIV \
+    ros-c1252.nls:C_1252.NLS ros-c437.nls:C_437.NLS ros-lintl.nls:L_INTL.NLS ros-c20127.nls:C_20127.NLS; do
+    src=".tmp/reactos/${pair%%:*}"; dst="::${pair##*:}"
+    [ -f "$src" ] && mcopy -i "$IMAGE" "$src" "$dst"
+  done
 fi
 
 # P7-A: lay down the COMPLETE \reactos install tree so the executive resolves + reads ANY
