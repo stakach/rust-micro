@@ -42,10 +42,53 @@ if [ ! -f "$IMAGE" ]; then
 fi
 
 DEBUG_FLAGS=()
-if [ "${1:-}" = "--debug" ]; then
-  DEBUG_FLAGS=(-d int,cpu_reset -no-reboot -no-shutdown)
-  shift
-fi
+# GRAPHICS=1 (or the `--display`/`--graphics` flag) boots with a real QEMU
+# display WINDOW instead of the headless `-nographic` gate, so you can SEE the
+# BOOTBOOT GOP framebuffer that win32k paints (the ReactOS desktop background).
+# Default stays headless so the CI/spec gate is unchanged.
+GRAPHICS="${GRAPHICS:-0}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --debug)
+      DEBUG_FLAGS=(-d int,cpu_reset -no-reboot -no-shutdown)
+      shift
+      ;;
+    --display|--graphics|--desktop)
+      GRAPHICS=1
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# Display vs headless. In graphics mode we (a) select a real display backend,
+# (b) keep a std VGA so OVMF's GOP framebuffer is shown, (c) keep -serial stdio
+# for the log, and (d) DROP the isa-debug-exit device so the kernel's final
+# `out 0x501` exit-write becomes a harmless no-op (the kernel then spins in
+# `loop {}`) — this leaves QEMU alive with the painted desktop on screen until
+# you close the window. Headless mode keeps the original behaviour exactly.
+DISPLAY_FLAGS=()
+EXIT_DEVICE=(-device isa-debug-exit,iobase=0x501,iosize=0x2)
+case "$GRAPHICS" in
+  1|true|yes|on)
+    DISP="${QEMU_DISPLAY:-}"
+    if [ -z "$DISP" ]; then
+      if [ "$(uname)" = "Darwin" ]; then
+        DISP=cocoa
+      else
+        DISP=gtk
+      fi
+    fi
+    DISPLAY_FLAGS=(-display "$DISP" -vga std -no-shutdown)
+    EXIT_DEVICE=()
+    echo "run_specs: graphics mode (display=$DISP) — close the QEMU window to quit" >&2
+    ;;
+  *)
+    DISPLAY_FLAGS=(-monitor none -nographic)
+    ;;
+esac
 
 # isa-debug-exit at iobase 0x501 turns OUT-port writes from the kernel into
 # QEMU exit codes (`out 0x501, n` -> qemu exits with (n<<1)|1). The kernel
@@ -69,9 +112,8 @@ exec qemu-system-x86_64 \
   -m 1024M \
   -smp 4 \
   -serial stdio \
-  -monitor none \
-  -nographic \
   -no-reboot \
-  -device isa-debug-exit,iobase=0x501,iosize=0x2 \
+  "${DISPLAY_FLAGS[@]}" \
+  "${EXIT_DEVICE[@]}" \
   "${DEBUG_FLAGS[@]}" \
   "$@"

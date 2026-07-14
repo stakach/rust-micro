@@ -8,6 +8,11 @@ an `isa-debug-exit` device so an in-kernel (or userspace) test runner can return
 a pass/fail exit code straight to the host shell. No external crates — the
 kernel depends only on `core`.
 
+> Looking for the full **ReactOS-hosting desktop demo** (this kernel booting
+> real ReactOS `smss`/`csrss`/`winlogon`/`win32k` to a painted Windows desktop)?
+> That lives in the parent [`userspace-ntos`](https://github.com/stakach/userspace-ntos)
+> repo — run its `./run.sh`. This README covers the kernel + its specs in isolation.
+
 There are **two** ways to validate the kernel, both covered below:
 
 1. **Kernel specs** — kernel-internal tests behind the `spec` feature, run on

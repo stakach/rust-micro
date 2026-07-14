@@ -16,7 +16,9 @@ cd "$(dirname "$0")/.."
 OUT=.tmp/reactos
 mkdir -p "$OUT"
 
-URL="https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-457-g63deca5-x64-msvc-win-dbg.7z"
+# Overridable via $REACTOS_7Z_URL. Defaults to a pinned GPL ReactOS x64 livecd
+# build (0.4.17-dev-478-g4117217); the binaries live directly in reactos/system32/.
+URL="${REACTOS_7Z_URL:-https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-478-g4117217-x64-msvc-win-dbg.7z}"
 
 if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-csrss.exe" ] \
    && [ -f "$OUT/ros-csrsrv.dll" ] && [ -f "$OUT/ros-basesrv.dll" ] && [ -f "$OUT/ros-winsrv.dll" ] \
