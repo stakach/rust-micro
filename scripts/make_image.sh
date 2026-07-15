@@ -148,9 +148,16 @@ fi
 # test drivers (PnP/MMIO NIC + KMDF lifecycle), not real ReactOS binaries, so they aren't in the
 # fetched \reactos tree. Ensure the drivers dir exists (in case the tree wasn't staged), then copy.
 FIXTURES=../crates/nt-driver-test-fixtures/fixtures
+# When the full \reactos tree is staged, ::reactos/system32/drivers ALREADY exists (from the
+# recursive mcopy above) — re-creating it with `mmd` is redundant AND has been observed to WEDGE
+# mtools (a lock/race on the freshly written 256 MiB image → the build hangs for minutes at `mmd`,
+# holding disk.img open). So only hand-create the dir when the tree was NOT staged, and run it once
+# (it was previously inside the per-fixture loop, i.e. twice).
+if [ ! -f .tmp/reactos/.fulltree-ok ] || [ ! -d .tmp/reactos/reactos ]; then
+  mmd -i "$IMAGE" ::reactos ::reactos/system32 ::reactos/system32/drivers 2>/dev/null || true
+fi
 for fx in PnpMmioInterruptTest.sys KmdfBasicTest.sys; do
   if [ -f "$FIXTURES/$fx" ]; then
-    mmd -i "$IMAGE" ::reactos ::reactos/system32 ::reactos/system32/drivers 2>/dev/null || true
     mcopy -o -i "$IMAGE" "$FIXTURES/$fx" "::reactos/system32/drivers/$fx"
     echo "driver test fixture added: ::reactos/system32/drivers/$fx"
   fi
