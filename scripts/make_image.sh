@@ -119,7 +119,7 @@ if [ "${STAGE_FLAT_REACTOS:-0}" = "1" ]; then
     ros-advapi32.dll:ADVAPI32.DLL ros-ws2_32.dll:WS2_32.DLL ros-kernel32_vista.dll:K32VISTA.DLL \
     ros-advapi32_vista.dll:A32VISTA.DLL ros-ws2help.dll:WS2HELP.DLL ros-ntdll_vista.dll:NTDLLVIS.DLL \
     ros-smss.exe:SMSS.EXE ros-winlogon.exe:WINLOGON.EXE ros-userenv.dll:USERENV.DLL \
-    ros-mpr.dll:MPR.DLL ros-ntdll.dll:NTDLL.DLL ros-system.hiv:ROSSYS.HIV \
+    ros-mpr.dll:MPR.DLL ros-system.hiv:ROSSYS.HIV \
     ros-c1252.nls:C_1252.NLS ros-c437.nls:C_437.NLS ros-lintl.nls:L_INTL.NLS ros-c20127.nls:C_20127.NLS; do
     src=".tmp/reactos/${pair%%:*}"; dst="::${pair##*:}"
     [ -f "$src" ] && mcopy -i "$IMAGE" "$src" "$dst"
@@ -163,20 +163,21 @@ for fx in PnpMmioInterruptTest.sys KmdfBasicTest.sys; do
   fi
 done
 
-# ntdll_plan.md Step 4.A: stage OUR Rust ntdll (crates/nt-ntdll-dll, built to ../.tmp/nt-ntdll.dll
-# by scripts/build_ntdll_dll.sh) BY PATH at \reactos\system32\nt-ntdll.dll — a distinct leaf so the
-# real ReactOS ntdll.dll stays the pi>=1 fallback. The executive, when SMSS_USE_OUR_NTDLL is set,
-# load_dll_from_fs's THIS file (not ntdll.dll) for smss (pi 0). Scripts-only; the executive picks it
-# up purely via the FS-by-path loader. Absent (DLL not built) → the executive's OFF/miss fallback
-# keeps the boot on the real ntdll, so the image build never fails on it.
+# ntdll_plan.md: OUR Rust ntdll (crates/nt-ntdll-dll, built to ../.tmp/nt-ntdll.dll by
+# scripts/build_ntdll_dll.sh) IS THE ntdll — it is staged under the SAME NAME as the ReactOS one
+# (\reactos\system32\ntdll.dll), OVERWRITING the real one from the recursive \reactos tree copy. No
+# fallback, no separate path (user directive 2026-07-16: "just give our dll the same name as the
+# reactos one; don't leave any fallback paths; don't even copy the reactos ntdll to the image").
+# Every process that loads "ntdll" gets ours; NO real ReactOS ntdll bytes persist on the image.
 OUR_NTDLL="../.tmp/nt-ntdll.dll"
 if [ -f "$OUR_NTDLL" ]; then
   # The dir exists from the recursive \reactos tree mcopy (or the mmd above); -o overwrites.
   mmd -i "$IMAGE" ::reactos ::reactos/system32 2>/dev/null || true
-  mcopy -o -i "$IMAGE" "$OUR_NTDLL" "::reactos/system32/nt-ntdll.dll"
-  echo "Step 4.A: our Rust ntdll staged: ::reactos/system32/nt-ntdll.dll ($(wc -c < "$OUR_NTDLL" | tr -d ' ') bytes)"
+  mcopy -o -i "$IMAGE" "$OUR_NTDLL" "::reactos/system32/ntdll.dll"
+  echo "our Rust ntdll staged AS ::reactos/system32/ntdll.dll ($(wc -c < "$OUR_NTDLL" | tr -d ' ') bytes) — real ReactOS ntdll NOT on image (no fallback)"
 else
-  echo "note: our Rust ntdll ($OUR_NTDLL) not built — Step 4.A substitution unavailable (build_ntdll_dll.sh)"
+  echo "ERROR: our Rust ntdll ($OUR_NTDLL) not built — run scripts/build_ntdll_dll.sh (it is now THE ntdll, no fallback)" >&2
+  exit 1
 fi
 
 echo "disk image ready: $IMAGE ($IMAGE_MIB MiB)"
