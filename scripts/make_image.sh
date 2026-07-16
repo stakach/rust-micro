@@ -163,4 +163,20 @@ for fx in PnpMmioInterruptTest.sys KmdfBasicTest.sys; do
   fi
 done
 
+# ntdll_plan.md Step 4.A: stage OUR Rust ntdll (crates/nt-ntdll-dll, built to ../.tmp/nt-ntdll.dll
+# by scripts/build_ntdll_dll.sh) BY PATH at \reactos\system32\nt-ntdll.dll — a distinct leaf so the
+# real ReactOS ntdll.dll stays the pi>=1 fallback. The executive, when SMSS_USE_OUR_NTDLL is set,
+# load_dll_from_fs's THIS file (not ntdll.dll) for smss (pi 0). Scripts-only; the executive picks it
+# up purely via the FS-by-path loader. Absent (DLL not built) → the executive's OFF/miss fallback
+# keeps the boot on the real ntdll, so the image build never fails on it.
+OUR_NTDLL="../.tmp/nt-ntdll.dll"
+if [ -f "$OUR_NTDLL" ]; then
+  # The dir exists from the recursive \reactos tree mcopy (or the mmd above); -o overwrites.
+  mmd -i "$IMAGE" ::reactos ::reactos/system32 2>/dev/null || true
+  mcopy -o -i "$IMAGE" "$OUR_NTDLL" "::reactos/system32/nt-ntdll.dll"
+  echo "Step 4.A: our Rust ntdll staged: ::reactos/system32/nt-ntdll.dll ($(wc -c < "$OUR_NTDLL" | tr -d ' ') bytes)"
+else
+  echo "note: our Rust ntdll ($OUR_NTDLL) not built — Step 4.A substitution unavailable (build_ntdll_dll.sh)"
+fi
+
 echo "disk image ready: $IMAGE ($IMAGE_MIB MiB)"
