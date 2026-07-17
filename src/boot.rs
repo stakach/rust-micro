@@ -413,7 +413,12 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
     // frames, page tables for hundreds of tests. 64 MiB of Untyped
     // is enough; the chunk is power-of-2 sized + power-of-2 aligned
     // so it satisfies seL4's Untyped invariants.
-    const ROOTSERVER_UT_SIZE_BITS: u32 = 27; // 128 MiB
+    // 256 MiB: (A) EAGER IMAGE-MAP front-loads every hosted process's whole DLL tree into frames
+    // UPFRONT at load time (instead of per-page demand), so the boot now advances all 5 processes to
+    // their frontiers within the TCG budget — which means it reaches the STEADY-STATE frame footprint
+    // (~5 processes × dozens of DLLs) that the timed-out boot never did. 128 MiB exhausted mid-lsass
+    // (fill_image_page wrote to unmapped scratch when alloc_frame silently failed). Raised 27→28.
+    const ROOTSERVER_UT_SIZE_BITS: u32 = 28; // 256 MiB
     const ROOTSERVER_UT_SIZE: u64 = 1u64 << ROOTSERVER_UT_SIZE_BITS;
     let ut_base = carve_chunk(&mut free, ROOTSERVER_UT_SIZE, ROOTSERVER_UT_SIZE_BITS)?;
 
