@@ -156,7 +156,7 @@ FIXTURES=../crates/nt-driver-test-fixtures/fixtures
 if [ ! -f .tmp/reactos/.fulltree-ok ] || [ ! -d .tmp/reactos/reactos ]; then
   mmd -i "$IMAGE" ::reactos ::reactos/system32 ::reactos/system32/drivers 2>/dev/null || true
 fi
-for fx in PnpMmioInterruptTest.sys KmdfBasicTest.sys; do
+for fx in PnpMmioInterruptTest.sys KmdfBasicTest.sys IrpFsdTest.sys; do
   if [ -f "$FIXTURES/$fx" ]; then
     mcopy -o -i "$IMAGE" "$FIXTURES/$fx" "::reactos/system32/drivers/$fx"
     echo "driver test fixture added: ::reactos/system32/drivers/$fx"
