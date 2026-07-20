@@ -171,8 +171,8 @@ done
 # Every process that loads "ntdll" gets ours; NO real ReactOS ntdll bytes persist on the image.
 OUR_NTDLL="../.tmp/nt-ntdll.dll"
 if [ -f "$OUR_NTDLL" ]; then
-  # The dir exists from the recursive \reactos tree mcopy (or the mmd above); -o overwrites.
-  mmd -i "$IMAGE" ::reactos ::reactos/system32 2>/dev/null || true
+  # The dir exists from the recursive tree copy or the fixture-staging fallback above. Do not
+  # redundantly recreate it here: mtools can wedge while reopening the freshly populated image.
   mcopy -o -i "$IMAGE" "$OUR_NTDLL" "::reactos/system32/ntdll.dll"
   echo "our Rust ntdll staged AS ::reactos/system32/ntdll.dll ($(wc -c < "$OUR_NTDLL" | tr -d ' ') bytes) — real ReactOS ntdll NOT on image (no fallback)"
 else
