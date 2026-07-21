@@ -113,9 +113,9 @@ pub unsafe fn reset_page_pool() {
 // ---------------------------------------------------------------------------
 
 /// Number of 4 KiB pages reserved for the rootserver's user stack.
-/// Sized for sel4test-driver-class workloads; the legacy Rust
-/// rootserver only uses a fraction.
-const ROOTSERVER_STACK_PAGES: u64 = 4;
+/// The NT executive has deep loader/component dispatch chains; keep enough headroom that adding a
+/// late gate cannot move an allocator call into the guard page through optimizer spill changes.
+const ROOTSERVER_STACK_PAGES: u64 = 8;
 
 /// Kernel-side CNode index reserved for the rootserver's CSpace.
 ///

@@ -991,6 +991,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     let tcb = s.scheduler.slab.get(next_id);
                     let next_cr3 = tcb.cpu_context.cr3;
                     let next_fs_base = tcb.cpu_context.fs_base;
+                    let next_gs_base = tcb.cpu_context.gs_base;
                     let next_ctx = tcb.user_context;
                     // Reload CR3 if we went idle since the last dispatch
                     // (missed shootdowns — MULTICORE0003) OR the vspace
@@ -1011,6 +1012,14 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     }
                     crate::arch::x86_64::msr::wrmsr(
                         crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+                    // This path entered the kernel through SYSCALL, so the active
+                    // GS base is the per-CPU area and KERNEL_GS_BASE holds the
+                    // outgoing user's value. Replace that shadow value before the
+                    // enter-user helper swaps back to the newly selected thread.
+                    crate::arch::x86_64::msr::wrmsr(
+                        crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
+                        next_gs_base,
+                    );
                     #[cfg(feature = "smp")]
                     crate::arch::x86_64::fpu_ctx::fpu_switch_to(
                         &mut s.scheduler.slab, next_id);

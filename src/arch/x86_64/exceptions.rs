@@ -260,6 +260,7 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
             let tcb = s.scheduler.slab.get(next_id);
             let next_cr3 = tcb.cpu_context.cr3;
             let next_fs_base = tcb.cpu_context.fs_base;
+            let next_gs_base = tcb.cpu_context.gs_base;
             let next_ctx = tcb.user_context;
             if next_cr3 != 0 {
                 let cur_cr3: u64;
@@ -272,6 +273,10 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
             }
             crate::arch::x86_64::msr::wrmsr(
                 crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+            crate::arch::x86_64::msr::wrmsr(
+                crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
+                next_gs_base,
+            );
             #[cfg(feature = "smp")]
             crate::arch::x86_64::fpu_ctx::fpu_switch_to(
                 &mut s.scheduler.slab, next_id);
@@ -900,6 +905,28 @@ extern "C" fn handle_page_fault_typed(
     log_hex64(error_code);
     crate::arch::log(" rip=0x");
     log_hex64(saved_rip);
+    if cr2 == 0x10 && saved_rip == 0x801a_0009 {
+        // User-mode exception entry already executed swapgs, so the
+        // shadow MSR is the exact GS base that was active at the fault.
+        let live_user_gs = unsafe {
+            crate::arch::x86_64::msr::rdmsr(
+                crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
+            )
+        };
+        let configured_gs = unsafe {
+            crate::kernel::KERNEL
+                .get()
+                .scheduler
+                .slab
+                .get(faulter)
+                .cpu_context
+                .gs_base
+        };
+        crate::arch::log(" user_gs=0x");
+        log_hex64(live_user_gs);
+        crate::arch::log(" configured_gs=0x");
+        log_hex64(configured_gs);
+    }
     crate::arch::log("]\n");
     let suspended = if crate::fault::deliver_fault(faulter, fault).is_err() {
         crate::arch::log("[no fault handler — suspending thread]\n");

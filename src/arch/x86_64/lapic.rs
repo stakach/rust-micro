@@ -228,6 +228,11 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
         // it manages the BKL + the idle HLT loop itself).
         core::mem::forget(_bkl);
         unsafe {
+            if from_user {
+                // LAPIC IRQ entry leaves the interrupted user's GS active;
+                // dispatch_next_or_idle expects the post-swapgs kernel regime.
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            }
             super::exceptions::dispatch_next_or_idle("");
         }
     }

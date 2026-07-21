@@ -375,6 +375,11 @@ pub(crate) fn swap_iretq_context_if_preempted(
                     prev_tcb.use_iretq_resume = true;
                 }
                 s.scheduler.set_current(None);
+                // IRQ entry does not swap GS. Normalize to the kernel GS
+                // regime expected by dispatch_next_or_idle: active GS is the
+                // per-CPU area and KERNEL_GS_BASE is the outgoing user value.
+                // Its enter-user tail will install the next value and swap back.
+                core::arch::asm!("swapgs", options(nostack, preserves_flags));
                 crate::arch::x86_64::exceptions::dispatch_next_or_idle("");
             }
         };
