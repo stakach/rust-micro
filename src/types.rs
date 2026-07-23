@@ -316,6 +316,12 @@ pub struct seL4_BootInfo {
     pub fb_size: u32,
     #[cfg(feature = "extern-rootserver")]
     pub fb_type: u32,
+    /// Number of leading caps in `userImageFrames` that correspond to
+    /// deduplicated PT_LOAD pages. The remaining caps describe root-task-only
+    /// stack, IPC-buffer and BootInfo mappings and must not be cloned as part
+    /// of the executable image.
+    #[cfg(feature = "extern-rootserver")]
+    pub userImageElfFrameCount: seL4_Word,
 }
 
 #[repr(C)]

@@ -253,6 +253,9 @@ pub struct RootserverImage {
     pub extra_bi_vaddr: u64,
     /// Physical address of the extended BootInfo page.
     pub extra_bi_paddr: u64,
+    /// Number of deduplicated PT_LOAD pages recorded before the root-task
+    /// stack, IPC buffer and BootInfo pages were appended.
+    pub elf_page_count: usize,
 }
 
 /// Errors the loader can surface.
@@ -302,6 +305,7 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
             image_top = seg_end;
         }
     }
+    let elf_page_count = n_seen;
 
     // Round the auxiliary base up to a 4 KiB boundary, then leave a
     // one-page guard so a stack overflow in the rootserver hits an
@@ -363,6 +367,7 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
         bootinfo_paddr: bi_phys,
         extra_bi_vaddr,
         extra_bi_paddr: extra_bi_phys,
+        elf_page_count,
     })
 }
 
@@ -738,6 +743,7 @@ pub unsafe fn launch_rootserver() -> ! {
         user_image_start,
         user_image_end,
         extra_bi_total_len,
+        img.elf_page_count as Word,
     );
     core::ptr::write(bi_ptr, bi);
 
@@ -823,6 +829,7 @@ unsafe fn build_bootinfo(
     user_image_start: Word,
     user_image_end: Word,
     extra_bi_size: Word,
+    elf_image_frame_count: Word,
 ) -> seL4_BootInfo {
     let mut empty_untypeds = [seL4_UntypedDesc::default();
         CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
@@ -934,6 +941,8 @@ unsafe fn build_bootinfo(
         fb_size: fb_device_untyped().map(|(_, _, g)| g.size).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         fb_type: fb_device_untyped().map(|(_, _, g)| g.fb_type as u32).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        userImageElfFrameCount: elf_image_frame_count,
     }
 }
 

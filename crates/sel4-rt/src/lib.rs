@@ -367,6 +367,9 @@ pub struct BootInfo {
     pub fb_scanline: u32,
     pub fb_size: u32,
     pub fb_type: u32,
+    /// Leading `user_image_frames` caps that back ELF PT_LOAD pages.
+    /// Later caps are mappings private to the initial root task.
+    pub user_image_elf_frame_count: u64,
 }
 
 // ---------------------------------------------------------------------------
