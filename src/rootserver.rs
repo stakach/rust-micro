@@ -115,7 +115,7 @@ pub unsafe fn reset_page_pool() {
 /// Number of 4 KiB pages reserved for the rootserver's user stack.
 /// The NT executive has deep loader/component dispatch chains; keep enough headroom that adding a
 /// late gate cannot move an allocator call into the guard page through optimizer spill changes.
-const ROOTSERVER_STACK_PAGES: u64 = 8;
+const ROOTSERVER_STACK_PAGES: u64 = 16;
 
 /// Kernel-side CNode index reserved for the rootserver's CSpace.
 ///
