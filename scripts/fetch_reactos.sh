@@ -34,7 +34,7 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/ros-ftfd.dll" ] && [ -f "$OUT/ros-framebuf.dll" ] \
    && [ -f "$OUT/ros-winlogon.exe" ] \
    && [ -f "$OUT/ros-arial.ttf" ] \
-   && [ -f "$OUT/.fulltree-ok" ]; then
+   && [ -f "$OUT/.fulltree-ok" ] && [ -f "$OUT/.profiles-ok" ]; then
   echo "ReactOS binaries + import table + NLS tables + full \\reactos tree already staged in $OUT/"
   exit 0
 fi
@@ -266,5 +266,40 @@ if [ ! -f "$OUT/.fulltree-ok" ]; then
     fi
   else
     echo "note: no cached ISO — full \\reactos tree NOT staged (make_image falls back to flat ::NAME files)"
+  fi
+fi
+
+# ★ THE USER-PROFILE TREE — `Profiles/` (77 entries), a TOP-LEVEL sibling of `reactos/` on the ISO.
+#
+# This was a real STAGING GAP: every extraction above is scoped to `reactos`, so the ISO's own
+# profile tree — `Profiles/Default User/...` and `Profiles/All Users/...`, the tree ReactOS ships
+# and `%SystemDrive%\Profiles` names — was silently dropped, and the image carried no profile
+# source at all. `userenv!CreateUserProfileExW` seeds a new user's profile by COPYING
+# `C:\Profiles\Default User` (profile.c:1000 -> CopyDirectory), so without it the interactive
+# logon died at `profile.c:1002  Error: 3` (ERROR_PATH_NOT_FOUND).
+#
+# It is laid onto the image at `::Profiles` (see make_image.sh) — the same place
+# HKLM\SOFTWARE\...\ProfileList\ProfilesDirectory (`%SystemDrive%\Profiles`) resolves to.
+# NOTE: the ISO carries NO `ntuser.dat` anywhere; on a real ReactOS the per-user hive is created by
+# `NtLoadKey` at first logon from `\reactos\system32\config\default`, which we stage separately.
+if [ ! -f "$OUT/.profiles-ok" ]; then
+  PROF_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  if [ ! -f "$PROF_ISO" ] && [ -f "$OUT/reactos-x64.7z" ]; then
+    ( cd "$OUT" && bsdtar -xf reactos-x64.7z )
+    PROF_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  fi
+  if [ -f "$PROF_ISO" ]; then
+    echo "extracting the ISO's user-profile tree (Profiles/) from $PROF_ISO ..."
+    bsdtar -xf "$PROF_ISO" -C "$OUT" Profiles 2>"$OUT/.profiles-extract.log" || true
+    PROF_DIRS=$(find "$OUT/Profiles" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$PROF_DIRS" -gt 40 ] && [ -d "$OUT/Profiles/Default User" ]; then
+      touch "$OUT/.profiles-ok"
+      echo "user-profile tree staged under $OUT/Profiles ($PROF_DIRS entries, incl. 'Default User')"
+    else
+      echo "ERROR: Profiles/ extraction incomplete ($PROF_DIRS entries) — see $OUT/.profiles-extract.log" >&2
+      exit 1
+    fi
+  else
+    echo "note: no cached ISO — Profiles/ NOT staged (CreateUserProfileW has no copy source)"
   fi
 fi

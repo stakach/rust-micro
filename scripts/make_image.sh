@@ -142,6 +142,20 @@ else
   echo "note: full \\reactos tree not staged (.tmp/reactos/.fulltree-ok absent) — flat ::NAME files only"
 fi
 
+# ★ THE USER-PROFILE TREE — the ISO's OWN `Profiles/` (a TOP-LEVEL sibling of `reactos/`, 76
+# entries), laid down at `::Profiles` — exactly what `%SystemDrive%\Profiles` resolves to, and so
+# exactly what HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory
+# names. `userenv!CreateUserProfileExW` seeds a new user's profile by COPYING
+# `C:\Profiles\Default User` (profile.c:1000 -> CopyDirectory); before this the tree was being
+# dropped by the scoped `reactos`-only extraction, so the interactive logon died at
+# `profile.c:1002  Error: 3`. Idempotent: fetch_reactos.sh stages it with a .profiles-ok marker.
+if [ -f .tmp/reactos/.profiles-ok ] && [ -d .tmp/reactos/Profiles ]; then
+  mcopy -s -i "$IMAGE" .tmp/reactos/Profiles ::
+  echo "user-profile tree added: ::Profiles ($(find .tmp/reactos/Profiles -mindepth 1 | wc -l | tr -d ' ') entries, incl. 'Default User')"
+else
+  echo "note: user-profile tree not staged (.tmp/reactos/.profiles-ok absent) — CreateUserProfileW has no copy source"
+fi
+
 # Driver-model migration: stage the synthetic driver test fixtures (nt-driver-test-fixtures)
 # BY-PATH under \reactos\system32\drivers so the executive launches them via the general dynamic
 # `load_driver(fs, path, class)` path (like npfs.sys) — NOT baked in via include_bytes!. These are
