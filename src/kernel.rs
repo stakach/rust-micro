@@ -48,12 +48,14 @@ pub const MAX_REPLIES: usize = 384;
 pub const CNODE_RADIX: u8 = 12;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 
-/// Maximum pre-allocated big CNodes. 48 × 4096 × 32 = 6 MiB of
-/// static BSS (kernel virt range capped at 8 MiB by link.ld's
-/// 0xff800000 bootboot reservation). Bumping further requires
-/// either growing the kernel virtual window or splitting into a
-/// small-CNode pool — see `MAX_SMALL_CNODES`.
+/// Maximum pre-allocated big CNodes. The built-in sel4test profile keeps the
+/// historical 48 x 4096 x 32 B = 6 MiB pool. The extern NT rootserver needs the
+/// static budget for its XL root CNode instead; its hosted components use
+/// radix-5 CNodes backed by the small pool, so a smaller big pool is sufficient.
+#[cfg(not(feature = "extern-rootserver"))]
 pub const MAX_CNODES: usize = 48;
+#[cfg(feature = "extern-rootserver")]
+pub const MAX_CNODES: usize = 24;
 
 /// One pre-allocated CNode: 32 slots × 32 bytes = 1 KiB.
 #[repr(C, align(32))]
@@ -84,24 +86,25 @@ impl Default for SmallCNodePage {
     fn default() -> Self { Self([Cte::null(); SMALL_CNODE_SLOTS]) }
 }
 
-/// XL CNode pool — test-process CSpace roots. sel4test's
-/// TEST_PROCESS_CSPACE_SIZE_BITS is patched to 13 (8,192 slots —
-/// SCHED0004 peaks ~6k; the upstream 17 would mean 131k-slot pages
-/// that made every cap-delete pool-scan crawl). Before this pool
-/// existed, a radix-13+ cap was silently backed by a 4,096-slot
-/// big-pool page and the first cptr past 4095 resolved out of
-/// bounds. Four entries cover the live test process plus
-/// teardown/spawn overlap.
-/// 1 × 131,072 × 32 B = 4 MiB — BOOTBOOT caps the whole kernel at
-/// 16 MiB, so one entry is what fits; test processes are spawned
-/// strictly sequentially (teardown precedes the next configure).
+/// XL CNode pool — test-process CSpace roots and, in the extern profile, the
+/// NT rootserver. sel4test's TEST_PROCESS_CSPACE_SIZE_BITS is patched to 13
+/// (8,192 slots — SCHED0004 peaks ~6k; the upstream 17 would mean 131k-slot
+/// pages that made every cap-delete pool-scan crawl). The NT rootserver keeps
+/// many live page-map caps for the booting OS frontier, so extern-rootserver
+/// trades big-CNode pool entries for a radix-18 XL page.
+///
+/// This is intentionally one entry: BOOTBOOT caps the whole kernel at 16 MiB,
+/// and test processes are spawned strictly sequentially.
+#[cfg(not(feature = "extern-rootserver"))]
 pub const XL_CNODE_RADIX: u8 = 17;
+#[cfg(feature = "extern-rootserver")]
+pub const XL_CNODE_RADIX: u8 = 18;
 pub const XL_CNODE_SLOTS: usize = 1 << XL_CNODE_RADIX;
 pub const MAX_XL_CNODES: usize = 1;
 /// Virtual cnode index space:
 ///   [0, MAX_CNODES)                      big (radix 12)
 ///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix ≤ 6)
-///   [.., +MAX_XL_CNODES)                 XL (radix ≤ 17)
+///   [.., +MAX_XL_CNODES)                 XL (radix 17 or 18)
 const _: () =
     assert!(MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES <= 254);
 
@@ -134,7 +137,7 @@ pub struct KernelState {
     /// exhaust the big pool. Virtual cnode_idx range:
     /// MAX_CNODES..MAX_CNODES+MAX_SMALL_CNODES.
     pub small_cnodes: [SmallCNodePage; MAX_SMALL_CNODES],
-    /// XL CNode pool (radix up to 17) — test-process CSpace roots.
+    /// XL CNode pool (radix 17 for sel4test, radix 18 for extern-rootserver).
     pub xl_cnodes: [XlCNodePage; MAX_XL_CNODES],
     /// Per-IRQ binding table.
     pub irqs: IrqTable,
@@ -396,8 +399,7 @@ impl KernelState {
         }
     }
 
-    /// Allocate an XL CNode (radix up to 17 — test-process CSpace
-    /// roots). Returns the VIRTUAL index past both other pools.
+    /// Allocate an XL CNode. Returns the VIRTUAL index past both other pools.
     pub fn alloc_xl_cnode(&mut self) -> Option<usize> {
         const BASE: usize = MAX_CNODES + MAX_SMALL_CNODES;
         for i in 0..self.next_xl_cnode.min(MAX_XL_CNODES) {
@@ -725,8 +727,9 @@ impl KernelState {
 // `same_obj_lives` used to answer "does any other cap reference this
 // pool object?" by sweeping EVERY slot of EVERY CNode pool page on
 // every cap delete — O(pool) per delete, and O(slots × pool) for a
-// CNode destroy. With honest radix-17 cspace backing (131k-slot
-// pages, needed by SCHED0004) those sweeps made the suite crawl.
+// CNode destroy. With honest large cspace backing (131k-slot pages for
+// sel4test, 262k for the extern NT rootserver) those sweeps made the suite
+// crawl.
 //
 // Instead: `Cte::set_cap` notes every cap overwrite in a per-object
 // refcount (gated on the slot actually living inside a kernel CNode

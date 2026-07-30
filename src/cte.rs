@@ -79,53 +79,52 @@ impl Cte {
     // -- Phase 30 — minimal MDB tracking ------------------------------------
     //
     // We store the cap's *parent* (the CTE it was derived from) packed
-    // into `mdb_words[0]` low 16 bits. seL4's full MDB is a doubly-
+    // into `mdb_words[0]` low bits. seL4's full MDB is a doubly-
     // linked list with prev/next + revocable/firstBadged flags; we
     // start with just the parent edge because that's enough to walk
     // descendants and exactly that walk is what `Revoke` needs. Phase
     // 30+ can grow the encoding to use the rest of `mdb_words`.
     //
-    // Encoding: low 25 bits of `mdb_words[0]` = packed `MdbId`
-    // (8-bit cnode_idx + 17-bit slot, see `MdbId::pack`; the slot
-    // width covers the XL pool's radix-17 pages). Sentinel
+    // Encoding: low 26 bits of `mdb_words[0]` = packed `MdbId`
+    // (8-bit cnode_idx + 18-bit slot, see `MdbId::pack`; the slot
+    // width covers the XL pool's radix-18 pages). Sentinel
     // `MdbId::SENTINEL` = "no parent" (a root cap, or one that
     // pre-dates the MDB).
 
     pub fn parent(&self) -> Option<MdbId> {
-        let raw = (self.mdb_words[0] & 0x1FF_FFFF) as u32;
+        let raw = (self.mdb_words[0] & MdbId::MASK as u64) as u32;
         if raw == MdbId::SENTINEL { None } else { Some(MdbId(raw)) }
     }
 
     pub fn set_parent(&mut self, parent: Option<MdbId>) {
         let raw = parent.map_or(MdbId::SENTINEL, |p| p.0);
         self.mdb_words[0] =
-            (self.mdb_words[0] & !0x1FF_FFFFu64) | (raw as u64);
+            (self.mdb_words[0] & !(MdbId::MASK as u64)) | (raw as u64);
     }
 }
 
 /// Packed (cnode_idx, slot) handle on a CTE somewhere in
 /// `KernelState`'s big / small / XL CNode pools. 8 bits cnode_idx
-/// (virtual index across all three pools) + 17 bits slot (covers
-/// the XL pool's radix-17 pages). NOTE: `pack` still takes the
-/// slot as u16, so parent links can only name slots ≤ 65,535 —
-/// fine for sel4test's ~6k-slot peak; widen the parameter if a
-/// workload ever derives caps INTO higher XL slots.
+/// (virtual index across all three pools) + 18 bits slot (covers
+/// the XL pool's radix-18 pages).
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct MdbId(pub u32);
 
 impl MdbId {
-    /// 25 all-ones means "no parent". Picked over (cnode=0xFF,
-    /// slot=0x1FFFF) so a real cap at the highest virtual cnode +
+    pub const MASK: u32 = 0x3FF_FFFF;
+
+    /// 26 all-ones means "no parent". Picked over (cnode=0xFF,
+    /// slot=0x3FFFF) so a real cap at the highest virtual cnode +
     /// last slot is still distinguishable.
-    pub const SENTINEL: u32 = 0x1FF_FFFF;
+    pub const SENTINEL: u32 = Self::MASK;
 
     /// `cnode_idx`: 0..256 (virtual, across all pools), `slot`:
-    /// 0..65,536 (u16 param — see struct-level NOTE).
-    pub const fn pack(cnode_idx: u8, slot: u16) -> Self {
-        Self(((cnode_idx as u32) << 17) | (slot as u32 & 0x1FFFF))
+    /// 0..262,144 (radix-18 XL root CNode).
+    pub const fn pack(cnode_idx: u8, slot: u32) -> Self {
+        Self(((cnode_idx as u32) << 18) | (slot & 0x3FFFF))
     }
-    pub const fn cnode_idx(self) -> u8 { (self.0 >> 17) as u8 }
-    pub const fn slot(self) -> u16 { (self.0 & 0x1FFFF) as u16 }
+    pub const fn cnode_idx(self) -> u8 { (self.0 >> 18) as u8 }
+    pub const fn slot(self) -> u32 { self.0 & 0x3FFFF }
 }
 
 const _: () = assert!(core::mem::size_of::<Cte>() == Cte::SIZE_BYTES);

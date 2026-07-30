@@ -1343,7 +1343,7 @@ fn decode_asid_control(
                     // Phase 30 — record the new pool's MDB parent as
                     // the source Untyped's slot.
                     let parent_id = crate::cte::MdbId::pack(
-                        cnode_idx as u8, usl as u16);
+                        cnode_idx as u8, usl as u32);
                     slots[dest_offset].set_parent(Some(parent_id));
                     child_count_inc(parent_id, 1);
                     // Commit the bumped Untyped state back into its slot.
@@ -2879,7 +2879,7 @@ fn decode_untyped_retype(
         // (src_cnode_idx, src_slot_index).
         let parent_id = crate::cte::MdbId::pack(
             src_cnode_idx as u8,
-            src_slot_index as u16,
+            src_slot_index as u32,
         );
         let result = crate::untyped::retype(
             &mut state, object_type, size_bits, num_objects,
@@ -2954,18 +2954,11 @@ fn decode_untyped_retype(
                             (*s_ptr).alloc_xl_cnode()
                                 .or_else(|| (*s_ptr).alloc_cnode())
                         } else {
-                            // radix ≤ 12, or BIGGER than the XL pool
-                            // can honestly back (sel4utils requests
-                            // radix 17 for test-process roots). The
-                            // big-pool fallback stamps the requested
-                            // radix over 4096-slot storage — a KNOWN
-                            // LIE that works until a test allocates
-                            // past slot 4095 (only SCHED0004 does;
-                            // it stays off-regex until cspace roots
-                            // get honest radix-17 backing plus
-                            // refcounted object-liveness so revoke
-                            // scans don't walk 131k slots per
-                            // delete).
+                            // radix <= 12, or bigger than the XL pool
+                            // can honestly back. The big-pool fallback
+                            // stamps the requested radix over 4096-slot
+                            // storage, which only works while callers
+                            // stay below slot 4096.
                             (*s_ptr).alloc_cnode()
                         };
                         match alloc {
@@ -3324,7 +3317,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 seL4_Error::seL4_RangeError,
             )));
         }
-        let source_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u16);
+        let source_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u32);
 
         // Tombstone bitmap: bit set means "this CTE has been
         // revoked-or-is-source". Held in a static (BKL-serialised)
@@ -3446,7 +3439,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 {
                     continue;
                 }
-                let id = crate::cte::MdbId::pack(ci as u8, si as u16);
+                let id = crate::cte::MdbId::pack(ci as u8, si as u32);
                 child_count_reset(id);
                 // Phase 43 — free pool slots so long sel4test
                 // runs don't exhaust the static pools. Only the
@@ -3473,7 +3466,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             }
         }
         // The source itself kept the cap but lost all its descendants.
-        let src_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u16);
+        let src_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u32);
         child_count_reset(src_id);
 
         // Silence unused: the structural fallback used to live
@@ -3732,7 +3725,7 @@ fn cnode_copy_or_mint(
             // Phase 30 — the new cap is derived from the source slot;
             // its MDB parent is the source CTE.
             let src_id = crate::cte::MdbId::pack(
-                src_cnode_idx as u8, src_res.slot_index as u16);
+                src_cnode_idx as u8, src_res.slot_index as u32);
             slot.set_parent(Some(src_id));
             child_count_inc(src_id, 1);
         }

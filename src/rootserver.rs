@@ -126,7 +126,7 @@ const ROOTSERVER_STACK_PAGES: u64 = 16;
 /// * extern-rootserver (the NT executive): the executive allocates
 ///   caps monotonically into its root CNode and, when demand-paging
 ///   large DLLs, blows well past the 4096-slot big-pool ceiling. Back
-///   its root CNode with the XL pool page (radix 17 = 131072 slots)
+///   its root CNode with the XL pool page (radix 18 = 262144 slots)
 ///   instead. The executive never allocates XL CNodes itself (its
 ///   spawned processes use CN_RADIX=5 → small pool), so xl[0] is free
 ///   to dedicate to the root task. This virtual index stays inside
