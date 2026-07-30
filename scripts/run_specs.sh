@@ -113,7 +113,7 @@ exec qemu-system-x86_64 \
   -smp 4 \
   -serial stdio \
   -no-reboot \
-  "${DISPLAY_FLAGS[@]}" \
-  "${EXIT_DEVICE[@]}" \
-  "${DEBUG_FLAGS[@]}" \
+  ${DISPLAY_FLAGS[@]+"${DISPLAY_FLAGS[@]}"} \
+  ${EXIT_DEVICE[@]+"${EXIT_DEVICE[@]}"} \
+  ${DEBUG_FLAGS[@]+"${DEBUG_FLAGS[@]}"} \
   "$@"
