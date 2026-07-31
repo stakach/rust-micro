@@ -4510,11 +4510,12 @@ fn decode_tcb(
                 Ok(())
             }
             // rust-micro extension — put the target thread into
-            // hosted-syscall mode. From now on every `syscall` it
-            // issues faults to its handler as UnknownSyscall instead
-            // of dispatching natively (see syscall_entry.rs). Takes no
-            // message args; mirrors TCBResume's minimal plumbing. The
-            // flag is write-once (never cleared).
+            // hosted-syscall mode. Raw Windows `syscall` instructions
+            // fault to the handler as UnknownSyscall instead of
+            // dispatching natively; syscall_entry.rs still lets the
+            // explicit userspace-ntos native ntdll Call envelope through.
+            // Takes no message args; mirrors TCBResume's minimal
+            // plumbing. The flag is write-once (never cleared).
             InvocationLabel::TCBSetHostedSyscalls => {
                 s.scheduler.slab.get_mut(id).hosted_syscalls = true;
                 Ok(())

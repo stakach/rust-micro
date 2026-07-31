@@ -361,18 +361,18 @@ pub struct Tcb {
     /// `WriteRegisters(resume=true)` (upstream `restart()` cancels
     /// the fault).
     pub pending_fault: u8,
-    /// Hosted-syscall mode (opt-in, per-thread). When `true`, every
-    /// `syscall` instruction this thread executes is delivered as a
-    /// `seL4_Fault_UnknownSyscall` to its fault handler instead of
-    /// being dispatched as a native seL4 syscall — regardless of the
-    /// value the thread placed in the seL4 number register (rdx).
-    /// Needed for hosted Windows (NT) processes, whose `syscall`
-    /// stubs put a Windows SSN in rax and arbitrary args in rdx that
-    /// can otherwise collide with the seL4 syscall-number range (e.g.
-    /// NtCurrentProcess() = -1 in rdx == Syscall::SysCall). Set once
-    /// via `seL4_TCB_SetHostedSyscalls`; never cleared. Threads that
-    /// make real seL4 syscalls (the executive, sel4test) leave this
-    /// `false` and are completely unaffected.
+    /// Hosted-syscall mode (opt-in, per-thread). When `true`, raw
+    /// Windows `syscall` instructions are delivered as
+    /// `seL4_Fault_UnknownSyscall` to the thread's fault handler
+    /// instead of being dispatched as native seL4 syscalls. Needed for
+    /// hosted Windows (NT) processes, whose stubs put a Windows SSN in
+    /// rax and arbitrary args in rdx that can collide with the seL4
+    /// syscall-number range (e.g. GWLP_WNDPROC = -4 ==
+    /// SysNBSendWait). The userspace-ntos native ntdll envelope is
+    /// allowed through as a real seL4 Call by syscall_entry.rs. Set
+    /// once via `seL4_TCB_SetHostedSyscalls`; never cleared. Threads
+    /// that make ordinary seL4 syscalls (the executive, sel4test)
+    /// leave this `false` and are completely unaffected.
     pub hosted_syscalls: bool,
     /// SMP-only saved FPU (x87/SSE) register file. Live state is held
     /// in the hardware while this thread owns a core's FPU; it is

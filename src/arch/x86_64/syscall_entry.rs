@@ -43,6 +43,14 @@ impl Drop for BklGuard {
 ///   IF=bit 9, DF=bit 10, TF=bit 8, AC=bit 18.
 const FMASK_VALUE: u64 = (1 << 9) | (1 << 10) | (1 << 8) | (1 << 18);
 
+/// userspace-ntos hybrid transport: hosted Windows threads normally
+/// turn every raw `syscall` into an UnknownSyscall NT fault, but our
+/// replacement ntdll issues one explicit seL4 `Call` envelope for
+/// Nt/Zw: cap slot CT_FAULT (6), msginfo label "NT" (0x4E54), length 6.
+const HOSTED_NT_NATIVE_CALL_CAP: u64 = 6;
+const HOSTED_NT_NATIVE_CALL_LABEL: u64 = 0x4E54;
+const HOSTED_NT_NATIVE_CALL_MSGINFO: u64 = (HOSTED_NT_NATIVE_CALL_LABEL << 12) | 6;
+
 /// Initialise the MSRs. Must run after the GDT is loaded (so the
 /// CS / SS selectors in IA32_STAR refer to a real GDT entry).
 pub fn init_syscall_msrs() {
@@ -585,22 +593,30 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         a4: ctx.r9,
         a5: ctx.r15,
     };
-    // Hosted-syscall mode (per-thread opt-in): a thread flagged via
-    // seL4_TCB_SetHostedSyscalls has EVERY syscall delivered to its
-    // fault handler as UnknownSyscall, bypassing native seL4 dispatch.
-    // This is how hosted Windows (NT) processes issue their syscalls —
-    // rax holds a Windows SSN and rdx holds an arbitrary arg that can
-    // otherwise collide with the seL4 syscall-number range. Reading the
-    // bool here (via the current TcbId + slab) drops all borrows before
-    // the match, so it never conflicts with the None arm's own
-    // KERNEL.get()/scheduler.current() access. Threads with the flag
-    // unset are bit-identical to before (force_unknown == false).
-    let force_unknown = unsafe {
+    // Hosted-syscall mode (per-thread opt-in): a hosted Windows thread
+    // routes raw Windows `syscall` instructions to its fault handler as
+    // UnknownSyscall, because rax holds an NT SSN and rdx is just arg2.
+    // Arg2 can otherwise collide with the seL4 syscall-number range
+    // (`GWLP_WNDPROC == -4 == SysNBSendWait`, `NtCurrentProcess() == -1
+    // == SysCall`, ...). Native-transport ntdll is the one exception:
+    // it deliberately uses a real seL4 Call to the thread's CT_FAULT cap
+    // with the "NT" request label, so let that envelope dispatch.
+    //
+    // Reading the bool here (via the current TcbId + slab) drops all
+    // borrows before the match, so it never conflicts with the None
+    // arm's own KERNEL.get()/scheduler.current() access. Threads with
+    // the flag unset remain bit-identical to before.
+    let hosted_syscalls = unsafe {
         match KERNEL.get().scheduler.current() {
             Some(cur) => KERNEL.get().scheduler.slab.get(cur).hosted_syscalls,
             None => false,
         }
     };
+    let is_nt_native_call =
+        (number as i32) == Syscall::SysCall as i32
+            && args.a0 == HOSTED_NT_NATIVE_CALL_CAP
+            && args.a1 == HOSTED_NT_NATIVE_CALL_MSGINFO;
+    let force_unknown = hosted_syscalls && !is_nt_native_call;
     let syscall = match (force_unknown, Syscall::from_i32(number as i32)) {
         (false, Some(s)) => s,
         _ => {
