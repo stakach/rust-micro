@@ -246,6 +246,66 @@ fn decode_frame(
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum FrameSlotUpdateResult {
+    Updated,
+    NoMatchingInvokedSlot,
+}
+
+unsafe fn update_invoked_frame_slot(
+    args: &SyscallArgs,
+    invoker: TcbId,
+    paddr: u64,
+    new_cap: Cap,
+) -> FrameSlotUpdateResult {
+    let s = KERNEL.get();
+    let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+    let Ok(res) =
+        crate::cspace::resolve_address_bits(s, &cspace_root, args.a0, crate::cspace::WORD_BITS)
+    else {
+        return FrameSlotUpdateResult::NoMatchingInvokedSlot;
+    };
+    if res.bits_remaining != 0 {
+        return FrameSlotUpdateResult::NoMatchingInvokedSlot;
+    }
+    let cnode_idx = KernelState::cnode_index(res.slot_ptr);
+    let Some(slot) = s.cnode_slot_mut(cnode_idx, res.slot_index) else {
+        return FrameSlotUpdateResult::NoMatchingInvokedSlot;
+    };
+    match slot.cap() {
+        Cap::Frame { ptr, .. } if ptr.addr() == paddr => {
+            slot.set_cap(&new_cap);
+            FrameSlotUpdateResult::Updated
+        }
+        _ => FrameSlotUpdateResult::NoMatchingInvokedSlot,
+    }
+}
+
+unsafe fn update_any_matching_frame_slot(
+    invoker: TcbId,
+    paddr: u64,
+    mapped_vaddr: Option<u64>,
+    new_cap: Cap,
+) {
+    let s = KERNEL.get();
+    let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+    let cnode_ptr = match cspace_root {
+        Cap::CNode { ptr, .. } => ptr,
+        _ => return,
+    };
+    let cnode_idx = KernelState::cnode_index(cnode_ptr);
+    if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
+        for slot in slots.iter_mut() {
+            if let Cap::Frame { ptr, mapped, .. } = slot.cap() {
+                if ptr.addr() == paddr && mapped == mapped_vaddr {
+                    slot.set_cap(&new_cap);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// `X86Page::Map(vaddr, rights, [vspace_cptr])` — install the frame
 /// at `vaddr` in a vspace. We only handle 4 KiB pages today;
 /// large/huge fall through with InvalidArgument.
@@ -256,8 +316,9 @@ fn decode_frame(
 /// into, used by the Phase 33d multi-vspace path).
 fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     use crate::arch::x86_64::usermode;
-    let (paddr, size, _device, current_mapped) = match target {
-        Cap::Frame { ptr, size, is_device, mapped, .. } => (ptr.addr(), size, is_device, mapped),
+    let (frame_ptr, paddr, size, _device, current_mapped) = match target {
+        Cap::Frame { ptr, size, is_device, mapped, .. } =>
+            (ptr, ptr.addr(), size, is_device, mapped),
         _ => unreachable!(),
     };
     let vaddr = args.a2;
@@ -382,38 +443,26 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         }
     }
 
-    // Update the cap to reflect the mapping. We need to find the
-    // source slot that holds this Frame cap and rewrite it. Walk
-    // the invoker's CSpace, matching paddr AND `mapped == None` so
-    // we update the FRESH (just-being-mapped) cap rather than a
-    // sibling like a userImageFrame that already has its own
-    // mapped vaddr — same hazard as in `decode_frame_unmap`.
+    // Update the invoked cap to reflect the mapping. Several caps can name the same physical frame
+    // while carrying different map state, so the cptr in the invocation is the source of truth; a
+    // paddr scan can mark a sibling cap and corrupt later derivations.
+    let updated = Cap::Frame {
+        ptr: frame_ptr,
+        size,
+        rights,
+        mapped: Some(vaddr),
+        asid: asid_for_cap,
+        is_device: _device,
+        map_type: crate::cap::FrameMapType::VSpace,
+    };
     unsafe {
-        let s = KERNEL.get();
-        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-        let cnode_ptr = match cspace_root {
-            Cap::CNode { ptr, .. } => ptr,
-            _ => return Ok(()),
-        };
-        let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
-            for slot in slots.iter_mut() {
-                if let Cap::Frame { ptr, mapped: None, .. } = slot.cap() {
-                    if ptr.addr() == paddr {
-                        let updated = Cap::Frame {
-                            ptr,
-                            size,
-                            rights,
-                            mapped: Some(vaddr),
-                            asid: asid_for_cap,
-                            is_device: _device,
-                            map_type: crate::cap::FrameMapType::VSpace,
-                        };
-                        slot.set_cap(&updated);
-                        break;
-                    }
-                }
-            }
+        if update_invoked_frame_slot(args, invoker, paddr, updated)
+            == FrameSlotUpdateResult::NoMatchingInvokedSlot
+        {
+            // Direct unit tests call `decode_invocation` with a standalone `Cap`, bypassing the
+            // syscall path that supplies a real target cptr. Keep that harness working without
+            // affecting production invocations, where `args.a0` resolves to the frame slot above.
+            update_any_matching_frame_slot(invoker, paddr, None, updated);
         }
     }
     Ok(())
@@ -448,10 +497,10 @@ fn pml4_paddr_for_asid(asid: u16) -> u64 {
     0
 }
 
-fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    let (paddr, size, mapped_vaddr, asid, map_type) = match target {
-        Cap::Frame { ptr, size, mapped, asid, map_type, .. } =>
-            (ptr.addr(), size, mapped, asid, map_type),
+fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    let (frame_ptr, paddr, size, rights, mapped_vaddr, asid, is_device, map_type) = match target {
+        Cap::Frame { ptr, size, rights, mapped, asid, is_device, map_type } =>
+            (ptr, ptr.addr(), size, rights, mapped, asid, is_device, map_type),
         _ => unreachable!(),
     };
 
@@ -488,41 +537,22 @@ fn decode_frame_unmap(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResu
     #[cfg(not(target_arch = "x86_64"))]
     { let _ = mapped_vaddr; let _ = size; }
 
-    // Walk the CSpace and zero the mapping in the matching cap.
-    // Match BOTH paddr AND mapped-vaddr — multiple caps in the same
-    // CSpace can share a paddr (e.g. a userImageFrame at one vaddr +
-    // a sel4test-allocated copy at a different vaddr), and we need
-    // to clear the specific cap the user invoked, not the first one
-    // we trip over while iterating. Without the mapped-vaddr match,
-    // sel4test's ELF loader Unmap would clear a userImageFrame's
-    // mapping while leaving the loader_frame_cap stuck on its old
-    // vaddr, and the next iteration's Map would reject with
-    // DeleteFirst.
+    // Clear the mapping state in the invoked cap. Falling back to a paddr scan here would have the
+    // same sibling-cap hazard as PageMap when the executive keeps separate mapped/client/source caps.
+    let unmapped = Cap::Frame {
+        ptr: frame_ptr,
+        size,
+        rights,
+        mapped: None,
+        asid: 0,
+        is_device,
+        map_type: crate::cap::FrameMapType::None,
+    };
     unsafe {
-        let s = KERNEL.get();
-        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-        let cnode_ptr = match cspace_root {
-            Cap::CNode { ptr, .. } => ptr,
-            _ => return Ok(()),
-        };
-        let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
-            for slot in slots.iter_mut() {
-                if let Cap::Frame { ptr, size, rights, is_device, mapped, .. } = slot.cap() {
-                    if ptr.addr() == paddr && mapped == mapped_vaddr {
-                        slot.set_cap(&Cap::Frame {
-                            ptr,
-                            size,
-                            rights,
-                            mapped: None,
-                            asid: 0,
-                            is_device,
-                            map_type: crate::cap::FrameMapType::None,
-                        });
-                        break;
-                    }
-                }
-            }
+        if update_invoked_frame_slot(args, invoker, paddr, unmapped)
+            == FrameSlotUpdateResult::NoMatchingInvokedSlot
+        {
+            update_any_matching_frame_slot(invoker, paddr, mapped_vaddr, unmapped);
         }
     }
     Ok(())
@@ -6279,7 +6309,7 @@ pub mod spec {
         use crate::cap::{FrameRights, FrameSize, FrameStorage};
 
         let invoker = setup_invoker(0);
-        // Plant a Frame cap at slot 1 of CNode 0. Pick a paddr
+        // Plant sibling Frame caps at slots 1 and 2 of CNode 0. Pick a paddr
         // safely past BOOTBOOT's identity range so map_user_4k
         // doesn't clash with the loader's 1 GiB pages, and a
         // vaddr in PML4[2] (= same place the user-mode demo uses).
@@ -6293,7 +6323,10 @@ pub mod spec {
             is_device: false,
             map_type: crate::cap::FrameMapType::None,
         };
-        unsafe { KERNEL.get().cnodes[0].0[1] = Cte::with_cap(&frame_cap); }
+        unsafe {
+            KERNEL.get().cnodes[0].0[1] = Cte::with_cap(&frame_cap);
+            KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&frame_cap);
+        }
 
         // Invoke X86PageGetAddress — kernel writes paddr into the
         // invoker's msg_regs[0].
@@ -6309,6 +6342,7 @@ pub mod spec {
         // Invoke X86PageMap — install at vaddr 0x100_0040_0000.
         let vaddr = 0x0000_0100_0040_0000u64;
         let args = SyscallArgs {
+            a0: 2,
             a1: (InvocationLabel::X86PageMap as u64) << 12,
             a2: vaddr,
             a3: FrameRights::ReadWrite.to_word(),
@@ -6316,9 +6350,14 @@ pub mod spec {
         };
         decode_invocation(frame_cap, &args, invoker).expect("map ok");
 
-        // Cap state was updated to record the mapping.
+        // The invoked sibling cap records the mapping; the source sibling remains unmapped and
+        // copyable for later derivations.
         unsafe {
             match KERNEL.get().cnodes[0].0[1].cap() {
+                Cap::Frame { mapped: None, .. } => {}
+                other => panic!("source sibling should stay unmapped, got {:?}", other),
+            }
+            match KERNEL.get().cnodes[0].0[2].cap() {
                 Cap::Frame { mapped: Some(v), rights: FrameRights::ReadWrite, .. }
                     if v == vaddr => {}
                 other => panic!("expected mapped frame, got {:?}", other),
@@ -6333,18 +6372,20 @@ pub mod spec {
         // Re-mapping at the SAME vaddr is a no-op (mirrors upstream
         // `decodeX86FrameMapInvocation`), so it should succeed.
         let args = SyscallArgs {
+            a0: 2,
             a1: (InvocationLabel::X86PageMap as u64) << 12,
             a2: vaddr,
             a3: FrameRights::ReadWrite.to_word(),
             ..Default::default()
         };
-        let now_cap = unsafe { KERNEL.get().cnodes[0].0[1].cap() };
+        let now_cap = unsafe { KERNEL.get().cnodes[0].0[2].cap() };
         decode_invocation(now_cap, &args, invoker).expect("remap same vaddr ok");
 
         // Re-mapping at a DIFFERENT vaddr is rejected with DeleteFirst —
         // userspace must Unmap first.
         let other_vaddr = vaddr + 0x1000;
         let args = SyscallArgs {
+            a0: 2,
             a1: (InvocationLabel::X86PageMap as u64) << 12,
             a2: other_vaddr,
             a3: FrameRights::ReadWrite.to_word(),
@@ -6358,12 +6399,17 @@ pub mod spec {
 
         // Unmap clears the mapping in the cap.
         let args = SyscallArgs {
+            a0: 2,
             a1: (InvocationLabel::X86PageUnmap as u64) << 12,
             ..Default::default()
         };
         decode_invocation(now_cap, &args, invoker).expect("unmap ok");
         unsafe {
             match KERNEL.get().cnodes[0].0[1].cap() {
+                Cap::Frame { mapped: None, .. } => {}
+                other => panic!("source sibling should remain unmapped, got {:?}", other),
+            }
+            match KERNEL.get().cnodes[0].0[2].cap() {
                 Cap::Frame { mapped: None, .. } => {}
                 other => panic!("expected unmapped frame, got {:?}", other),
             }

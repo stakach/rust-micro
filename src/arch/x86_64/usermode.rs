@@ -19,8 +19,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::gdt::{USER_CS, USER_DS};
 use super::paging::{
-    install_kernel_page_tables, kernel_virt_to_phys, read_cr3,
-    PTE_PRESENT, PTE_RW, PTE_USER,
+    install_kernel_page_tables, kernel_virt_to_phys, read_cr3, PTE_PRESENT, PTE_RW, PTE_USER,
 };
 use super::syscall_entry::{enter_user_via_sysret, set_syscall_kernel_rsp, UserContext};
 use crate::cap::{Badge, Cap, EndpointRights, PPtr};
@@ -230,8 +229,7 @@ pub static USERMODE_TEST_TRIGGERED: AtomicBool = AtomicBool::new(false);
 /// Number of `SysDebugPutChar` invocations seen since the two-
 /// thread test was armed. The syscall dispatcher exits QEMU once
 /// it observes both 'P' and 'M' (i.e. counter ≥ 2).
-pub static IPC_PRINTED: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(0);
+pub static IPC_PRINTED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 pub static IPC_DEMO_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn launch_two_thread_ipc_demo() -> ! {
@@ -249,14 +247,34 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         let sender_pml4 = super::paging::make_user_pml4();
         let receiver_pml4 = super::paging::make_user_pml4();
 
-        map_user_4k_into_pml4(sender_pml4, SENDER_CODE_VBASE,
-            kernel_virt_to_phys((&raw const SENDER_CODE_PAGE) as u64), false, false);
-        map_user_4k_into_pml4(sender_pml4, SENDER_STACK_VBASE,
-            kernel_virt_to_phys((&raw const SENDER_STACK_PAGE) as u64), true, false);
-        map_user_4k_into_pml4(receiver_pml4, RECEIVER_CODE_VBASE,
-            kernel_virt_to_phys((&raw const RECEIVER_CODE_PAGE) as u64), false, false);
-        map_user_4k_into_pml4(receiver_pml4, RECEIVER_STACK_VBASE,
-            kernel_virt_to_phys((&raw const RECEIVER_STACK_PAGE) as u64), true, false);
+        map_user_4k_into_pml4(
+            sender_pml4,
+            SENDER_CODE_VBASE,
+            kernel_virt_to_phys((&raw const SENDER_CODE_PAGE) as u64),
+            false,
+            false,
+        );
+        map_user_4k_into_pml4(
+            sender_pml4,
+            SENDER_STACK_VBASE,
+            kernel_virt_to_phys((&raw const SENDER_STACK_PAGE) as u64),
+            true,
+            false,
+        );
+        map_user_4k_into_pml4(
+            receiver_pml4,
+            RECEIVER_CODE_VBASE,
+            kernel_virt_to_phys((&raw const RECEIVER_CODE_PAGE) as u64),
+            false,
+            false,
+        );
+        map_user_4k_into_pml4(
+            receiver_pml4,
+            RECEIVER_STACK_VBASE,
+            kernel_virt_to_phys((&raw const RECEIVER_STACK_PAGE) as u64),
+            true,
+            false,
+        );
 
         // Build the kernel-side state: an endpoint, two CNodes
         // (one per thread) each containing the same endpoint cap
@@ -269,8 +287,10 @@ pub fn launch_two_thread_ipc_demo() -> ! {
             ptr: ep_ptr,
             badge: Badge(0xCAFE),
             rights: EndpointRights {
-                can_send: true, can_receive: true,
-                can_grant: true, can_grant_reply: true,
+                can_send: true,
+                can_receive: true,
+                can_grant: true,
+                can_grant_reply: true,
             },
         };
         // CNodes 1 and 2 each hold the endpoint cap at slot 1.
@@ -337,10 +357,8 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         // First-launch the sender.
         let ctx = s.scheduler.slab.get(sender).user_context;
         let _ = receiver; // suppress unused if receiver isn't reached on first hop
-        crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
-            s.scheduler.slab.get(sender));
-        crate::arch::x86_64::syscall_entry::apply_debug_state_for(
-            s.scheduler.slab.get(sender));
+        crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(s.scheduler.slab.get(sender));
+        crate::arch::x86_64::syscall_entry::apply_debug_state_for(s.scheduler.slab.get(sender));
         enter_user_via_sysret(&ctx);
     }
 }
@@ -361,14 +379,18 @@ pub unsafe fn launch_smp_ping_thread() -> crate::tcb::TcbId {
 
     let pml4 = super::paging::make_user_pml4();
     map_user_4k_into_pml4(
-        pml4, PING_CODE_VBASE,
+        pml4,
+        PING_CODE_VBASE,
         kernel_virt_to_phys((&raw const PING_CODE_PAGE) as u64),
-        false, false,
+        false,
+        false,
     );
     map_user_4k_into_pml4(
-        pml4, PING_STACK_VBASE,
+        pml4,
+        PING_STACK_VBASE,
         kernel_virt_to_phys((&raw const PING_STACK_PAGE) as u64),
-        true, false,
+        true,
+        false,
     );
 
     let s = KERNEL.get();
@@ -445,10 +467,16 @@ pub fn launch_user_mode_test() -> ! {
     unsafe {
         install_kernel_page_tables();
         copy_payload(&raw const PHASE13C_CODE, PHASE_13C_PAYLOAD);
-        map_user_4k(PHASE13C_CODE_VBASE,
-            kernel_virt_to_phys((&raw const PHASE13C_CODE) as u64), false);
-        map_user_4k(PHASE13C_STACK_VBASE,
-            kernel_virt_to_phys((&raw const PHASE13C_STACK) as u64), true);
+        map_user_4k(
+            PHASE13C_CODE_VBASE,
+            kernel_virt_to_phys((&raw const PHASE13C_CODE) as u64),
+            false,
+        );
+        map_user_4k(
+            PHASE13C_STACK_VBASE,
+            kernel_virt_to_phys((&raw const PHASE13C_STACK) as u64),
+            true,
+        );
         let rsp: u64;
         asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
         set_syscall_kernel_rsp(rsp);
@@ -484,8 +512,7 @@ pub fn launch_user_mode_test() -> ! {
 /// for `Cap::Frame::Map` — Frame::Map always installs in the
 /// invoker's vspace, which is whatever CR3 currently points at.
 pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool, execute_never: bool) {
-    let pml4 = super::paging::phys_to_lin(
-        read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
     map_user_4k_in(pml4, vaddr, paddr, writable, execute_never);
 }
 
@@ -508,25 +535,27 @@ pub unsafe fn unmap_user_4k_public(vaddr: u64) {
 /// vspace the cap was mapped in, not whatever happens to be current.
 pub unsafe fn unmap_user_4k_in_pml4(pml4_paddr: u64, vaddr: u64) {
     use super::paging::{PTE_PRESENT, PTE_PS};
-    let pml4 = super::paging::phys_to_lin(
-        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
     let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
     let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
-    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 { return; }
-    let pdpt = super::paging::phys_to_lin(
-        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+        return;
+    }
+    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
-    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 { return; }
-    let pd = super::paging::phys_to_lin(
-        pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
+        return;
+    }
+    let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pde = core::ptr::read_volatile(pd.add(pd_idx));
-    if pde & PTE_PRESENT == 0 || pde & PTE_PS != 0 { return; }
-    let pt = super::paging::phys_to_lin(
-        pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    if pde & PTE_PRESENT == 0 || pde & PTE_PS != 0 {
+        return;
+    }
+    let pt = super::paging::phys_to_lin(pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
 
     core::ptr::write_volatile(pt.add(pt_idx), 0);
     asm!("invlpg [{a}]", a = in(reg) vaddr, options(nostack, preserves_flags));
@@ -541,14 +570,12 @@ pub unsafe fn map_user_4k_into_pml4(
     writable: bool,
     execute_never: bool,
 ) {
-    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000)
-        as *mut u64;
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     map_user_4k_in(pml4, vaddr, paddr, writable, execute_never);
 }
 
 unsafe fn map_user_4k(vaddr: u64, paddr: u64, writable: bool) {
-    let pml4 = super::paging::phys_to_lin(
-        read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
     map_user_4k_in(pml4, vaddr, paddr, writable, false);
 }
 
@@ -568,7 +595,11 @@ unsafe fn map_user_4k_in(
     let leaf_flags = PTE_PRESENT
         | PTE_USER
         | if writable { PTE_RW } else { 0 }
-        | if execute_never { super::paging::PTE_NX } else { 0 };
+        | if execute_never {
+            super::paging::PTE_NX
+        } else {
+            0
+        };
 
     let pdpt = ensure_user_table(pml4.add(pml4_idx), mid_flags);
     let pd = ensure_user_table(pdpt.add(pdpt_idx), mid_flags);
@@ -621,8 +652,7 @@ unsafe fn ensure_user_table(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
         if updated != entry {
             core::ptr::write_volatile(entry_ptr, updated);
         }
-        return super::paging::phys_to_lin(
-            entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        return super::paging::phys_to_lin(entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
     }
     let table_v = super::paging::alloc_user_table_va();
     let table_p = kernel_virt_to_phys(table_v as u64);
@@ -644,8 +674,7 @@ unsafe fn ensure_user_table(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
 /// the higher-level structure first) or if the target entry is
 /// already present (caller should Unmap first).
 pub unsafe fn install_user_table(level: u32, vaddr: u64, table_paddr: u64) -> Result<(), u32> {
-    let pml4 = super::paging::phys_to_lin(
-        read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
     install_user_table_in(pml4, level, vaddr, table_paddr)
 }
 
@@ -665,8 +694,7 @@ pub unsafe fn install_user_table_in_paddr(
 ) -> Result<(), u32> {
     // BOOTBOOT identity-maps low memory 1:1 in the kernel half, so a
     // physical address < 1 GiB also names a kernel-virt address.
-    let pml4 = super::paging::phys_to_lin(
-        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     install_user_table_in(pml4, level, vaddr, table_paddr)
 }
 
@@ -676,23 +704,43 @@ pub unsafe fn install_user_table_in_paddr(
 const MAP_WALK_TRACE: bool = false;
 
 unsafe fn map_walk_log(level: &str, idx: usize, entry: u64) {
-    if !MAP_WALK_TRACE { return; }
+    if !MAP_WALK_TRACE {
+        return;
+    }
     crate::arch::log("[");
     crate::arch::log(level);
     crate::arch::log("[");
-    let mut buf = [b'0'; 4]; let mut v = idx as u64; let mut i = 4;
-    if v == 0 { crate::arch::log("0"); }
-    while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
-    if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
+    let mut buf = [b'0'; 4];
+    let mut v = idx as u64;
+    let mut i = 4;
+    if v == 0 {
+        crate::arch::log("0");
+    }
+    while v > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        crate::arch::log(s);
+    }
     crate::arch::log("]=0x");
-    let mut buf = [b'0'; 16]; let mut v = entry; let mut i = 16;
+    let mut buf = [b'0'; 16];
+    let mut v = entry;
+    let mut i = 16;
     while v > 0 && i > 0 {
         i -= 1;
         let nib = (v & 0xF) as u8;
-        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+        buf[i] = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + (nib - 10)
+        };
         v >>= 4;
     }
-    if let Ok(s) = core::str::from_utf8(&buf) { crate::arch::log(s); }
+    if let Ok(s) = core::str::from_utf8(&buf) {
+        crate::arch::log(s);
+    }
     crate::arch::log("]\n");
 }
 
@@ -707,8 +755,7 @@ pub unsafe fn map_user_4k_into_foreign_pml4(
     writable: bool,
     execute_never: bool,
 ) -> Result<(), u32> {
-    let pml4 = super::paging::phys_to_lin(
-        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
@@ -718,33 +765,30 @@ pub unsafe fn map_user_4k_into_foreign_pml4(
     if pml4e & PTE_PRESENT == 0 || pml4e & super::paging::PTE_PS != 0 {
         return Err(1);
     }
-    let pdpt = super::paging::phys_to_lin(
-        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
     map_walk_log("pdpt", pdpt_idx, pdpte);
     if pdpte & PTE_PRESENT == 0 || pdpte & super::paging::PTE_PS != 0 {
         return Err(2);
     }
-    let pd = super::paging::phys_to_lin(
-        pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pde = core::ptr::read_volatile(pd.add(pd_idx));
     map_walk_log("pd", pd_idx, pde);
     if pde & PTE_PRESENT == 0 || pde & super::paging::PTE_PS != 0 {
         return Err(3);
     }
-    let pt = super::paging::phys_to_lin(
-        pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pt = super::paging::phys_to_lin(pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let cur = core::ptr::read_volatile(pt.add(pt_idx));
     map_walk_log("pt", pt_idx, cur);
-    if cur & PTE_PRESENT != 0 {
-        return Err(4);
-    }
     let mut flags = PTE_PRESENT | PTE_USER;
     if writable {
         flags |= PTE_RW;
     }
     if execute_never {
         flags |= super::paging::PTE_NX;
+    }
+    if cur & PTE_PRESENT != 0 {
+        return Err(4);
     }
     core::ptr::write_volatile(pt.add(pt_idx), (frame_paddr & !0xFFF) | flags);
     Ok(())
@@ -766,8 +810,7 @@ pub unsafe fn map_user_2m_into_foreign_pml4(
     execute_never: bool,
 ) -> Result<(), u32> {
     use super::paging::PTE_PS;
-    let pml4 = super::paging::phys_to_lin(
-        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
@@ -775,14 +818,12 @@ pub unsafe fn map_user_2m_into_foreign_pml4(
     if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
         return Err(1);
     }
-    let pdpt = super::paging::phys_to_lin(
-        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
     if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
         return Err(2);
     }
-    let pd = super::paging::phys_to_lin(
-        pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let cur = core::ptr::read_volatile(pd.add(pd_idx));
     if cur & PTE_PRESENT != 0 {
         return Err(4);
@@ -795,10 +836,7 @@ pub unsafe fn map_user_2m_into_foreign_pml4(
         flags |= super::paging::PTE_NX;
     }
     // 2 MiB-aligned paddr: low 21 bits zero.
-    core::ptr::write_volatile(
-        pd.add(pd_idx),
-        (frame_paddr & !((1u64 << 21) - 1)) | flags,
-    );
+    core::ptr::write_volatile(pd.add(pd_idx), (frame_paddr & !((1u64 << 21) - 1)) | flags);
     Ok(())
 }
 
@@ -814,16 +852,14 @@ pub unsafe fn map_user_1g_into_foreign_pml4(
     execute_never: bool,
 ) -> Result<(), u32> {
     use super::paging::PTE_PS;
-    let pml4 = super::paging::phys_to_lin(
-        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
     if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
         return Err(1);
     }
-    let pdpt = super::paging::phys_to_lin(
-        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let cur = core::ptr::read_volatile(pdpt.add(pdpt_idx));
     if cur & PTE_PRESENT != 0 {
         return Err(4);
@@ -847,20 +883,21 @@ pub unsafe fn map_user_1g_into_foreign_pml4(
 /// PD entry isn't actually a 2 MiB leaf.
 pub unsafe fn unmap_user_2m_in_pml4(pml4_paddr: u64, vaddr: u64) {
     use super::paging::{PTE_PRESENT, PTE_PS};
-    let pml4 = super::paging::phys_to_lin(
-        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
 
     let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
-    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 { return; }
-    let pdpt = super::paging::phys_to_lin(
-        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+        return;
+    }
+    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
-    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 { return; }
-    let pd = super::paging::phys_to_lin(
-        pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
+        return;
+    }
+    let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pde = core::ptr::read_volatile(pd.add(pd_idx));
     if pde & PTE_PRESENT == 0 || pde & PTE_PS == 0 {
         // Not a 2 MiB leaf — nothing to do.
@@ -873,14 +910,14 @@ pub unsafe fn unmap_user_2m_in_pml4(pml4_paddr: u64, vaddr: u64) {
 /// Unmap a 1 GiB Huge frame from a specific vspace.
 pub unsafe fn unmap_user_1g_in_pml4(pml4_paddr: u64, vaddr: u64) {
     use super::paging::{PTE_PRESENT, PTE_PS};
-    let pml4 = super::paging::phys_to_lin(
-        pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
-    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 { return; }
-    let pdpt = super::paging::phys_to_lin(
-        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+        return;
+    }
+    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
     if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS == 0 {
         // Not a 1 GiB leaf — nothing to do.
@@ -915,22 +952,19 @@ unsafe fn install_user_table_in(
             if e & PTE_PRESENT == 0 || e & PTE_PS != 0 {
                 return Err(39); // need PDPT (= PML4 missing)
             }
-            (super::paging::phys_to_lin(
-                e & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pdpt_idx)
+            (super::paging::phys_to_lin(e & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pdpt_idx)
         }
         1 => {
             let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
             if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
                 return Err(39); // need PDPT (PML4 entry missing)
             }
-            let pdpt = super::paging::phys_to_lin(
-        pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+            let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
             let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
             if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
                 return Err(30); // need PD (PDPT entry missing)
             }
-            (super::paging::phys_to_lin(
-                pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pd_idx)
+            (super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64).add(pd_idx)
         }
         _ => return Err(0),
     };
