@@ -158,15 +158,16 @@ pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::XL_CNODE_RADIX;
 /// alias the first user-image-frame slot → retype yields a bad cap → map #PFs).
 ///   * 0x00080000 (512 KiB): low 1 MiB — BIOS/ACPI/legacy (sel4test ACPI discovery).
 ///   * 0xFEC00000 / 0xFED00000 / 0xFEE00000 (4 KiB each): IOAPIC / HPET / LAPIC MMIO.
-///   * 0x81060000 (128 KiB): the e1000e NIC BAR0 (QEMU q35 assigns it here; the PCI
-///     hole is at 0x80000000+ with 1 GiB RAM). Exposed so a driver host maps its regs.
+///   * 0x81040000 (128 KiB): the e1000 NIC BAR0 (QEMU q35 assigns the explicit
+///     `-device e1000` here; the PCI hole is at 0x80000000+ with 1 GiB RAM). Exposed
+///     so a driver host maps its regs.
 pub const DEVICE_UTS: &[(u64, u8)] = &[
     (0x00080000, 19),
     (0xFEC00000, 12),
     (0xFED00000, 12),
     (0xFEE00000, 12),
-    (0x81060000, 17), // e1000e (82574) NIC BAR0 (default q35 NIC)
-    (0x81085000, 12), // AHCI ABAR (BAR5) of the add-in `-device ahci` (00:3.0) — boot disk on port 0
+    (0x81040000, 17), // e1000 (82540EM) NIC BAR0
+    (0x81061000, 12), // AHCI ABAR (BAR5) of the add-in `-device ahci` (00:2.0) — boot disk on port 0
 ];
 
 /// Phase 0a (extern-rootserver only) — the BOOTBOOT linear framebuffer,
@@ -846,7 +847,7 @@ unsafe fn build_bootinfo(
         padding: [0; 6],
     };
     // Phase 42 — device untypeds (BIOS/ACPI low 1 MiB, IOAPIC/HPET/LAPIC
-    // MMIO, e1000e NIC BAR). Built from the SAME `DEVICE_UTS` the cap
+    // MMIO, e1000 NIC BAR). Built from the SAME `DEVICE_UTS` the cap
     // placement uses, so `untypedList` and the CSpace caps can never drift.
     for (i, &(paddr, sb)) in DEVICE_UTS.iter().enumerate() {
         empty_untypeds[1 + i] = seL4_UntypedDesc {

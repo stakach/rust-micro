@@ -108,6 +108,8 @@ exec qemu-system-x86_64 \
   -drive format=raw,file="$IMAGE",if=none,id=bootdisk \
   -device ahci,id=ahci0 \
   -device ide-hd,drive=bootdisk,bus=ahci0.0,bootindex=0 \
+  -netdev user,id=ntnet0 \
+  -device e1000,netdev=ntnet0 \
   -device intel-iommu,intremap=off \
   -m 1024M \
   -smp 4 \
