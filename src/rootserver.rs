@@ -10,7 +10,7 @@
 //!      file bytes into them, zero the BSS tail, and map them at
 //!      the segment's `vaddr` in the new PML4 with the segment's
 //!      W/X bits.
-//!   4. Allocate + map a user stack page.
+//!   4. Allocate + map a guarded user stack.
 //!
 //! The output is a `RootserverImage` carrying the PML4 paddr, entry
 //! RIP, and stack-top vaddr. Phase 29d/e use those to build the
@@ -113,9 +113,13 @@ pub unsafe fn reset_page_pool() {
 // ---------------------------------------------------------------------------
 
 /// Number of 4 KiB pages reserved for the rootserver's user stack.
-/// The NT executive has deep loader/component dispatch chains; keep enough headroom that adding a
-/// late gate cannot move an allocator call into the guard page through optimizer spill changes.
+#[cfg(not(feature = "extern-rootserver"))]
 const ROOTSERVER_STACK_PAGES: u64 = 16;
+/// The external NT executive root task has deep loader, service-dispatch, hosted-driver and
+/// user-callback chains. Keep its guarded root-task stack large enough that regular ReactOS process
+/// bring-up does not depend on optimizer spill placement.
+#[cfg(feature = "extern-rootserver")]
+const ROOTSERVER_STACK_PAGES: u64 = 64;
 
 /// Kernel-side CNode index reserved for the rootserver's CSpace.
 ///
@@ -1096,10 +1100,22 @@ pub mod spec {
             assert!(result.stack_top > image_top,
                 "stack_top {:#x} must be past image_top {:#x}",
                 result.stack_top, image_top);
+            let aux_base = (image_top + 0xFFF) & !0xFFF;
+            assert_eq!(
+                result.stack_top,
+                aux_base + 0x1000 + super::ROOTSERVER_STACK_PAGES * 0x1000,
+                "stack_top must include guard + configured rootserver stack pages",
+            );
             assert!(result.ipc_buffer_vaddr > result.stack_top,
                 "IPC buffer must sit above stack");
             assert!(result.bootinfo_vaddr > result.ipc_buffer_vaddr,
                 "BootInfo must sit above IPC buffer");
+            let aux_pages = super::IMAGE_PAGE_COUNT as u64 - result.elf_page_count as u64;
+            assert_eq!(
+                aux_pages,
+                super::ROOTSERVER_STACK_PAGES + 3,
+                "aux mappings must be stack pages plus IPC/BootInfo/extra-BI",
+            );
 
             // PML4 is non-zero and 4 KiB-aligned.
             assert!(result.pml4_paddr != 0);
