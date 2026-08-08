@@ -32,8 +32,13 @@ pub const MAX_ENDPOINTS: usize = 384;
 /// Maximum notifications in the in-kernel pool.
 pub const MAX_NTFNS: usize = 384;
 
-/// Maximum SchedContexts in the in-kernel pool (Phase 32c).
+/// Maximum SchedContexts in the in-kernel pool (Phase 32c). The extern NT rootserver can churn
+/// hundreds of short-lived hosted worker threads before the desktop is stable; keep the slab large
+/// enough for that stress until SchedContexts are backed directly by Untyped allocations.
+#[cfg(not(feature = "extern-rootserver"))]
 pub const MAX_SCHED_CONTEXTS: usize = 384;
+#[cfg(feature = "extern-rootserver")]
+pub const MAX_SCHED_CONTEXTS: usize = 1024;
 
 /// Maximum Reply objects in the in-kernel pool (Phase 34e).
 pub const MAX_REPLIES: usize = 384;
