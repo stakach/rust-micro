@@ -35,11 +35,10 @@ fn get_apic_base() -> u64 {
         );
         ((high as u64) << 32) | (low as u64)
     };
-    
+
     // APIC base address is in bits 63:12, but we mask to get the base address
     apic_base_msr & 0xFFFFF000
 }
-
 
 pub fn halt_cpu() {
     unsafe {
@@ -52,7 +51,7 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
     let mut ebx: u32;
     let mut ecx: u32;
     let mut edx: u32;
-    
+
     unsafe {
         asm!(
             "push rbx",
@@ -67,21 +66,21 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
             out("eax") eax,
         );
     }
-    
+
     (eax, ebx, ecx, edx)
 }
 
 pub fn check_cpu_features() {
     let (_, _, _ecx, edx) = cpuid(0x1);
-    
+
     if (edx & (1 << 5)) == 0 {
         panic!("MSR support required but not available");
     }
-    
+
     if (edx & (1 << 9)) == 0 {
         panic!("APIC support required but not available");
     }
-    
+
     if (edx & (1 << 25)) == 0 {
         panic!("SSE support required but not available");
     }

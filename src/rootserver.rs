@@ -30,18 +30,15 @@ use crate::arch::x86_64::syscall_entry::{
     enter_user_via_sysret, set_syscall_kernel_rsp, UserContext,
 };
 use crate::arch::x86_64::usermode::map_user_4k_into_pml4;
-use crate::cap::{
-    Cap, FrameRights, FrameSize, FrameStorage, PPtr, Pml4Storage,
-    UntypedStorage,
-};
+use crate::cap::{Cap, FrameRights, FrameSize, FrameStorage, PPtr, Pml4Storage, UntypedStorage};
 use crate::cte::Cte;
 use crate::elf::{self, LoadSegment};
 use crate::kernel::{KernelState, KERNEL};
 use crate::rootserver_image::rootserver_elf;
 use crate::tcb::{Tcb, ThreadStateType};
 use crate::types::{
-    seL4_BootInfo, seL4_SlotPos, seL4_SlotRegion, seL4_UntypedDesc,
-    seL4_Word as Word, CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS,
+    seL4_BootInfo, seL4_SlotPos, seL4_SlotRegion, seL4_UntypedDesc, seL4_Word as Word,
+    CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,9 +83,12 @@ pub unsafe fn install_user_page_region(base_paddr: u64, size: u64) {
 unsafe fn alloc_page() -> u64 {
     let region = &raw mut USER_PAGE_REGION;
     let used = (*region).used;
-    assert!(used + 4096 <= (*region).size,
+    assert!(
+        used + 4096 <= (*region).size,
         "rootserver user-page region exhausted: {}/{} bytes used",
-        used, (*region).size);
+        used,
+        (*region).size
+    );
     let paddr = (*region).base_paddr + used;
     (*region).used = used + 4096;
     // Zero the page through the kernel-half linear map.
@@ -138,8 +138,7 @@ const ROOTSERVER_STACK_PAGES: u64 = 64;
 #[cfg(not(feature = "extern-rootserver"))]
 pub const ROOTSERVER_CNODE_IDX: usize = 3;
 #[cfg(feature = "extern-rootserver")]
-pub const ROOTSERVER_CNODE_IDX: usize =
-    crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES;
+pub const ROOTSERVER_CNODE_IDX: usize = crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES;
 
 /// Radix (log2 of the slot count) of the rootserver's root CNode.
 /// Must match the storage width of the CNode page backing
@@ -269,6 +268,10 @@ pub enum LoadError {
     Elf(elf::ElfError),
     /// A segment's vaddr or memsz isn't 4 KiB-aligned the way we need.
     UnalignedSegment,
+    /// The fixed image-frame publication table is too small for the staged rootserver.
+    ImagePageTableFull {
+        capacity: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +295,11 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     // behalf."
     let seen: &mut [PageMapping; IMAGE_PAGES_CAP] = unsafe { &mut IMAGE_PAGES };
     for s in seen.iter_mut() {
-        *s = PageMapping { vaddr: 0, paddr: 0, writable: false };
+        *s = PageMapping {
+            vaddr: 0,
+            paddr: 0,
+            writable: false,
+        };
     }
     let mut n_seen: usize = 0;
 
@@ -332,13 +339,21 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     for i in 0..ROOTSERVER_STACK_PAGES {
         let stack_phys = alloc_page();
         let vaddr = stack_base + i * page;
-        map_user_4k_into_pml4(pml4, vaddr, stack_phys, /* writable */ true, /* NX */ true);
+        map_user_4k_into_pml4(
+            pml4, vaddr, stack_phys, /* writable */ true, /* NX */ true,
+        );
         record_image_page(seen, &mut n_seen, vaddr, stack_phys, true)?;
     }
 
     // Allocate + map the IPC buffer page (data → NX).
     let ipcbuf_phys = alloc_page();
-    map_user_4k_into_pml4(pml4, ipc_buffer_vaddr, ipcbuf_phys, true, /* NX */ true);
+    map_user_4k_into_pml4(
+        pml4,
+        ipc_buffer_vaddr,
+        ipcbuf_phys,
+        true,
+        /* NX */ true,
+    );
     record_image_page(seen, &mut n_seen, ipc_buffer_vaddr, ipcbuf_phys, true)?;
 
     // Allocate + map the BootInfo page (read-only — userspace reads
@@ -356,7 +371,13 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     // headers we currently emit.
     let extra_bi_vaddr = bootinfo_vaddr + page;
     let extra_bi_phys = alloc_page();
-    map_user_4k_into_pml4(pml4, extra_bi_vaddr, extra_bi_phys, false, /* NX */ true);
+    map_user_4k_into_pml4(
+        pml4,
+        extra_bi_vaddr,
+        extra_bi_phys,
+        false,
+        /* NX */ true,
+    );
     record_image_page(seen, &mut n_seen, extra_bi_vaddr, extra_bi_phys, false)?;
 
     // Publish the count for the BootInfo builder.
@@ -529,12 +550,12 @@ pub unsafe fn launch_rootserver() -> ! {
     // and budget are large enough that the rootserver effectively
     // never runs out of budget — we treat it as the boot thread,
     // not a budget-constrained worker.
-    let init_sc_idx = s.alloc_sched_context()
-        .expect("init thread SC pool slot");
+    let init_sc_idx = s.alloc_sched_context().expect("init thread SC pool slot");
     {
         let sc = &mut s.sched_contexts[init_sc_idx];
         *sc = crate::sched_context::SchedContext::new(
-            /* period */ 1_000_000, /* budget */ 1_000_000);
+            /* period */ 1_000_000, /* budget */ 1_000_000,
+        );
         sc.refills[0] = crate::sched_context::Refill {
             release_time: 0,
             amount: 1_000_000,
@@ -553,36 +574,52 @@ pub unsafe fn launch_rootserver() -> ! {
     // cap layout (subset of seL4's seL4_RootCNodeCapSlots). The
     // rootserver's own startup code can now invoke any of these by
     // CPtr.
-    rs_set(s, 1, &Cap::Thread {
-        // `decode_tcb` recovers the TcbId via `tcb_ptr.addr() as u16`,
-        // so we encode the TcbId directly (slab IDs start from 1
-        // after the boot thread, so `PPtr::new` always succeeds).
-        tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64).expect("nonzero tcb id"),
-    });
+    rs_set(
+        s,
+        1,
+        &Cap::Thread {
+            // `decode_tcb` recovers the TcbId via `tcb_ptr.addr() as u16`,
+            // so we encode the TcbId directly (slab IDs start from 1
+            // after the boot thread, so `PPtr::new` always succeeds).
+            tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64).expect("nonzero tcb id"),
+        },
+    );
     rs_set(s, 2, &cnode_cap);
-    rs_set(s, 3, &Cap::PML4 {
-        ptr: PPtr::<Pml4Storage>::new(img.pml4_paddr).expect("pml4 paddr"),
-        mapped: true,
-        asid: ROOTSERVER_ASID,
-    });
-    rs_set(s, 9, &Cap::Frame {
-        ptr: PPtr::<FrameStorage>::new(img.bootinfo_paddr).expect("bi paddr"),
-        size: FrameSize::Small,
-        rights: FrameRights::ReadOnly,
-        mapped: Some(img.bootinfo_vaddr),
-        asid: ROOTSERVER_ASID,
-        is_device: false,
-        map_type: crate::cap::FrameMapType::VSpace,
-    });
-    rs_set(s, 10, &Cap::Frame {
-        ptr: PPtr::<FrameStorage>::new(img.ipc_buffer_paddr).expect("ipc paddr"),
-        size: FrameSize::Small,
-        rights: FrameRights::ReadWrite,
-        mapped: Some(img.ipc_buffer_vaddr),
-        asid: ROOTSERVER_ASID,
-        is_device: false,
-        map_type: crate::cap::FrameMapType::VSpace,
-    });
+    rs_set(
+        s,
+        3,
+        &Cap::PML4 {
+            ptr: PPtr::<Pml4Storage>::new(img.pml4_paddr).expect("pml4 paddr"),
+            mapped: true,
+            asid: ROOTSERVER_ASID,
+        },
+    );
+    rs_set(
+        s,
+        9,
+        &Cap::Frame {
+            ptr: PPtr::<FrameStorage>::new(img.bootinfo_paddr).expect("bi paddr"),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadOnly,
+            mapped: Some(img.bootinfo_vaddr),
+            asid: ROOTSERVER_ASID,
+            is_device: false,
+            map_type: crate::cap::FrameMapType::VSpace,
+        },
+    );
+    rs_set(
+        s,
+        10,
+        &Cap::Frame {
+            ptr: PPtr::<FrameStorage>::new(img.ipc_buffer_paddr).expect("ipc paddr"),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadWrite,
+            mapped: Some(img.ipc_buffer_vaddr),
+            asid: ROOTSERVER_ASID,
+            is_device: false,
+            map_type: crate::cap::FrameMapType::VSpace,
+        },
+    );
     // Phase 33b / 36e — IRQControl at canonical slot 4.
     rs_set(s, 4, &Cap::IrqControl);
     // Phase 36e — ASIDControl at canonical slot 5.
@@ -590,13 +627,15 @@ pub unsafe fn launch_rootserver() -> ! {
     // Phase 37a — pre-allocated InitThreadASIDPool at canonical
     // slot 6. asid_base = 0 (rootserver gets the first 512 ASIDs).
     let asid_pool_va = (&raw const ROOTSERVER_ASID_POOL) as u64;
-    let asid_pool_pa =
-        crate::arch::x86_64::paging::kernel_virt_to_phys(asid_pool_va);
-    rs_set(s, 6, &Cap::AsidPool {
-        ptr: PPtr::<crate::cap::AsidPoolStorage>::new(asid_pool_pa)
-            .expect("asid pool paddr"),
-        asid_base: 0,
-    });
+    let asid_pool_pa = crate::arch::x86_64::paging::kernel_virt_to_phys(asid_pool_va);
+    rs_set(
+        s,
+        6,
+        &Cap::AsidPool {
+            ptr: PPtr::<crate::cap::AsidPoolStorage>::new(asid_pool_pa).expect("asid pool paddr"),
+            asid_base: 0,
+        },
+    );
     // Phase 42 — IOPortControl at canonical slot 7
     // (`seL4_CapIOPortControl`). sel4test's pc99 timer driver
     // calls `seL4_X86_IOPortControl_Issue` here when it falls back
@@ -614,26 +653,37 @@ pub unsafe fn launch_rootserver() -> ! {
     // this master (badge = (domainID << 16) | pciRequestID).
     #[cfg(target_arch = "x86_64")]
     if crate::arch::x86_64::iommu::iommu_present() {
-        rs_set(s, 8, &Cap::IoSpace {
-            domain_id: 0,
-            pci_device: 0,
-        });
+        rs_set(
+            s,
+            8,
+            &Cap::IoSpace {
+                domain_id: 0,
+                pci_device: 0,
+            },
+        );
     }
     // Slots 12, 13, 15: empty (no SMMU / SMC support).
     // Phase 37b — InitThreadSC at canonical slot 14. The
     // SchedContext object was allocated above and bound to the
     // rootserver TCB.
-    rs_set(s, 14, &Cap::SchedContext {
-        ptr: KernelState::sched_context_ptr(init_sc_idx),
-        size_bits: crate::object_type::MIN_SCHED_CONTEXT_BITS as u8,
-    });
+    rs_set(
+        s,
+        14,
+        &Cap::SchedContext {
+            ptr: KernelState::sched_context_ptr(init_sc_idx),
+            size_bits: crate::object_type::MIN_SCHED_CONTEXT_BITS as u8,
+        },
+    );
     // Phase 36e — per-CPU SchedControl caps in the schedcontrol
     // region [16, 16+ncores). bi.schedcontrol points at this range.
     let n_cores = crate::bootboot::get_num_cores() as usize;
     let schedcontrol_start: usize = 16;
     for core in 0..n_cores.min(4) {
-        rs_set(s, schedcontrol_start + core,
-            &Cap::SchedControl { core: core as u32 });
+        rs_set(
+            s,
+            schedcontrol_start + core,
+            &Cap::SchedControl { core: core as u32 },
+        );
     }
     // Phase 36e / 42 — Untyped at slot 20 (after the schedcontrol
     // region). bi.untyped points here. Backing memory is reserved
@@ -641,23 +691,31 @@ pub unsafe fn launch_rootserver() -> ! {
     let ut_paddr = ROOTSERVER_UT.base_paddr;
     let ut_size_bits = ROOTSERVER_UT.size_bits;
     let untyped_slot: usize = 20;
-    rs_set(s, untyped_slot, &Cap::Untyped {
-        ptr: PPtr::<UntypedStorage>::new(ut_paddr).expect("ut paddr"),
-        block_bits: ut_size_bits,
-        free_index: 0,
-        is_device: false,
-    });
+    rs_set(
+        s,
+        untyped_slot,
+        &Cap::Untyped {
+            ptr: PPtr::<UntypedStorage>::new(ut_paddr).expect("ut paddr"),
+            block_bits: ut_size_bits,
+            free_index: 0,
+            is_device: false,
+        },
+    );
     // Phase 42 — device untypeds at slots 21.., paralleling
     // build_bootinfo's untypedList[1..]. Single source of truth is the
     // module-level DEVICE_UTS so the caps here and the BootInfo metadata
     // can't drift (see DEVICE_UTS doc).
     for (i, &(paddr, sb)) in DEVICE_UTS.iter().enumerate() {
-        rs_set(s, untyped_slot + 1 + i, &Cap::Untyped {
-            ptr: PPtr::<UntypedStorage>::new(paddr.max(1)).expect("dev ut paddr"),
-            block_bits: sb,
-            free_index: 0,
-            is_device: true,
-        });
+        rs_set(
+            s,
+            untyped_slot + 1 + i,
+            &Cap::Untyped {
+                ptr: PPtr::<UntypedStorage>::new(paddr.max(1)).expect("dev ut paddr"),
+                block_bits: sb,
+                free_index: 0,
+                is_device: true,
+            },
+        );
     }
     // Phase 0a — the BOOTBOOT framebuffer as one more device untyped,
     // in the slot immediately after the DEVICE_UTS block. `n_extra_uts`
@@ -666,12 +724,16 @@ pub unsafe fn launch_rootserver() -> ! {
     // Fully gated so the default (sel4test) build path is unchanged.
     #[cfg(feature = "extern-rootserver")]
     let n_extra_uts: usize = if let Some((fb_paddr, fb_bits, _)) = fb_device_untyped() {
-        rs_set(s, untyped_slot + 1 + DEVICE_UTS.len(), &Cap::Untyped {
-            ptr: PPtr::<UntypedStorage>::new(fb_paddr.max(1)).expect("fb ut paddr"),
-            block_bits: fb_bits,
-            free_index: 0,
-            is_device: true,
-        });
+        rs_set(
+            s,
+            untyped_slot + 1 + DEVICE_UTS.len(),
+            &Cap::Untyped {
+                ptr: PPtr::<UntypedStorage>::new(fb_paddr.max(1)).expect("fb ut paddr"),
+                block_bits: fb_bits,
+                free_index: 0,
+                is_device: true,
+            },
+        );
         1
     } else {
         0
@@ -698,15 +760,19 @@ pub unsafe fn launch_rootserver() -> ! {
         } else {
             crate::cap::FrameRights::ReadOnly
         };
-        rs_set(s, user_image_start as usize + i, &Cap::Frame {
-            ptr: PPtr::<FrameStorage>::new(pm.paddr).expect("image page paddr"),
-            size: FrameSize::Small,
-            rights,
-            mapped: Some(pm.vaddr),
-            asid: ROOTSERVER_ASID,
-            is_device: false,
-            map_type: crate::cap::FrameMapType::VSpace,
-        });
+        rs_set(
+            s,
+            user_image_start as usize + i,
+            &Cap::Frame {
+                ptr: PPtr::<FrameStorage>::new(pm.paddr).expect("image page paddr"),
+                size: FrameSize::Small,
+                rights,
+                mapped: Some(pm.vaddr),
+                asid: ROOTSERVER_ASID,
+                is_device: false,
+                map_type: crate::cap::FrameMapType::VSpace,
+            },
+        );
     }
     let user_image_end: Word = user_image_start + n_image_pages as Word;
 
@@ -836,8 +902,7 @@ unsafe fn build_bootinfo(
     extra_bi_size: Word,
     elf_image_frame_count: Word,
 ) -> seL4_BootInfo {
-    let mut empty_untypeds = [seL4_UntypedDesc::default();
-        CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
+    let mut empty_untypeds = [seL4_UntypedDesc::default(); CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
     // Phase 42 — slot 20: the rootserver's RAM Untyped (allocman
     // carves all TCBs / CNodes / frames / page tables out of this).
     empty_untypeds[0] = seL4_UntypedDesc {
@@ -909,7 +974,10 @@ unsafe fn build_bootinfo(
             }
         },
         ipcBuffer: ipc_buffer_vaddr as *mut crate::types::seL4_IPCBuffer,
-        empty: seL4_SlotRegion { start: user_image_end, end: cnode_slots },
+        empty: seL4_SlotRegion {
+            start: user_image_end,
+            end: cnode_slots,
+        },
         sharedFrames: seL4_SlotRegion { start: 0, end: 0 },
         userImageFrames: seL4_SlotRegion {
             start: user_image_start,
@@ -930,7 +998,10 @@ unsafe fn build_bootinfo(
             start: schedcontrol_start,
             end: schedcontrol_end,
         },
-        untyped: seL4_SlotRegion { start: untyped_start, end: untyped_end },
+        untyped: seL4_SlotRegion {
+            start: untyped_start,
+            end: untyped_end,
+        },
         untypedList: empty_untypeds,
         // Phase 0a — framebuffer geometry (extern-rootserver). All-zero
         // when BOOTBOOT exposed no framebuffer.
@@ -945,7 +1016,9 @@ unsafe fn build_bootinfo(
         #[cfg(feature = "extern-rootserver")]
         fb_size: fb_device_untyped().map(|(_, _, g)| g.size).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_type: fb_device_untyped().map(|(_, _, g)| g.fb_type as u32).unwrap_or(0),
+        fb_type: fb_device_untyped()
+            .map(|(_, _, g)| g.fb_type as u32)
+            .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         userImageElfFrameCount: elf_image_frame_count,
     }
@@ -970,16 +1043,25 @@ pub struct PageMapping {
     pub writable: bool,
 }
 
-/// Capacity of the per-rootserver page-mapping table. Sized for
-/// sel4test-driver-class workloads (~3.6 MiB image ≈ 900 pages plus
-/// stack/IPC/BootInfo aux pages).
+/// Capacity of the per-rootserver page-mapping table.
+///
+/// The default path stays sized for sel4test-driver-class workloads (~3.6 MiB image ≈ 900 pages
+/// plus stack/IPC/BootInfo aux pages). The extern-rootserver path carries the NT executive as the
+/// root task; its mapped image is intentionally larger and its userImageFrames table must publish
+/// every pre-mapped ELF/stack/IPC/BootInfo page to sel4utils.
+#[cfg(not(feature = "extern-rootserver"))]
 pub const IMAGE_PAGES_CAP: usize = 2048;
+#[cfg(feature = "extern-rootserver")]
+pub const IMAGE_PAGES_CAP: usize = 4096;
 
 /// All user-image pages the loader installed in the rootserver's
 /// PML4. Populated by `load()`, consumed by `install_rootserver_initial_caps`
 /// to materialise `userImageFrames`.
-pub static mut IMAGE_PAGES: [PageMapping; IMAGE_PAGES_CAP] =
-    [PageMapping { vaddr: 0, paddr: 0, writable: false }; IMAGE_PAGES_CAP];
+pub static mut IMAGE_PAGES: [PageMapping; IMAGE_PAGES_CAP] = [PageMapping {
+    vaddr: 0,
+    paddr: 0,
+    writable: false,
+}; IMAGE_PAGES_CAP];
 pub static mut IMAGE_PAGE_COUNT: usize = 0;
 
 unsafe fn load_segment(
@@ -1053,9 +1135,15 @@ fn record_image_page(
     writable: bool,
 ) -> Result<(), LoadError> {
     if *n_seen >= seen.len() {
-        return Err(LoadError::UnalignedSegment); // pool small
+        return Err(LoadError::ImagePageTableFull {
+            capacity: seen.len(),
+        });
     }
-    seen[*n_seen] = PageMapping { vaddr, paddr, writable };
+    seen[*n_seen] = PageMapping {
+        vaddr,
+        paddr,
+        writable,
+    };
     *n_seen += 1;
     Ok(())
 }
@@ -1096,21 +1184,30 @@ pub mod spec {
             let mut image_top: u64 = 0;
             for seg in img.load_segments() {
                 let end = seg.vaddr + seg.mem_size;
-                if end > image_top { image_top = end; }
+                if end > image_top {
+                    image_top = end;
+                }
             }
-            assert!(result.stack_top > image_top,
+            assert!(
+                result.stack_top > image_top,
                 "stack_top {:#x} must be past image_top {:#x}",
-                result.stack_top, image_top);
+                result.stack_top,
+                image_top
+            );
             let aux_base = (image_top + 0xFFF) & !0xFFF;
             assert_eq!(
                 result.stack_top,
                 aux_base + 0x1000 + super::ROOTSERVER_STACK_PAGES * 0x1000,
                 "stack_top must include guard + configured rootserver stack pages",
             );
-            assert!(result.ipc_buffer_vaddr > result.stack_top,
-                "IPC buffer must sit above stack");
-            assert!(result.bootinfo_vaddr > result.ipc_buffer_vaddr,
-                "BootInfo must sit above IPC buffer");
+            assert!(
+                result.ipc_buffer_vaddr > result.stack_top,
+                "IPC buffer must sit above stack"
+            );
+            assert!(
+                result.bootinfo_vaddr > result.ipc_buffer_vaddr,
+                "BootInfo must sit above IPC buffer"
+            );
             let aux_pages = super::IMAGE_PAGE_COUNT as u64 - result.elf_page_count as u64;
             assert_eq!(
                 aux_pages,
@@ -1136,6 +1233,7 @@ pub mod spec {
                 seg_pages + 1,
                 pages_alloc,
             );
+            super::reset_page_pool();
             arch::log("  ✓ rootserver loads + segments map into a fresh PML4\n");
         }
     }

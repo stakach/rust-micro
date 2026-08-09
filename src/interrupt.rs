@@ -64,12 +64,23 @@ pub struct IrqTable {
 }
 
 impl Default for IrqTable {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IrqTable {
     pub const fn new() -> Self {
-        Self { entries: [IrqEntry { state: IrqState::Inactive, notification: None, badge: 0, pending: false, ioapic_pin: None, level_triggered: false }; MAX_IRQ] }
+        Self {
+            entries: [IrqEntry {
+                state: IrqState::Inactive,
+                notification: None,
+                badge: 0,
+                pending: false,
+                ioapic_pin: None,
+                level_triggered: false,
+            }; MAX_IRQ],
+        }
     }
     pub fn get(&self, irq: u16) -> Option<&IrqEntry> {
         self.entries.get(irq as usize)
@@ -219,7 +230,10 @@ pub mod spec {
         // Bind IRQ 7 to notification 1, then have `t` wait on it.
         set_notification(&mut table, 7, 1, 0).unwrap();
         wait(&mut ntfns[1], &mut sched, t);
-        assert_eq!(sched.slab.get(t).state, ThreadStateType::BlockedOnNotification);
+        assert_eq!(
+            sched.slab.get(t).state,
+            ThreadStateType::BlockedOnNotification
+        );
 
         // Fire the IRQ — the dispatcher signals notification 1 and
         // unblocks the waiter.
@@ -267,7 +281,10 @@ pub mod spec {
     #[inline(never)]
     fn out_of_range_irq_rejected() {
         let mut table = IrqTable::new();
-        assert_eq!(set_notification(&mut table, 9999, 0, 0), Err(IrqError::Range));
+        assert_eq!(
+            set_notification(&mut table, 9999, 0, 0),
+            Err(IrqError::Range)
+        );
         assert_eq!(clear_handler(&mut table, 9999), Err(IrqError::Range));
         assert_eq!(ack_irq(&mut table, 9999), Err(IrqError::Range));
         arch::log("  ✓ out-of-range IRQ rejected\n");

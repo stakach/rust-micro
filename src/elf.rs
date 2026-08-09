@@ -106,9 +106,15 @@ pub struct LoadSegment {
 }
 
 impl LoadSegment {
-    pub fn writable(&self) -> bool { (self.flags & PF_W) != 0 }
-    pub fn executable(&self) -> bool { (self.flags & PF_X) != 0 }
-    pub fn readable(&self) -> bool { (self.flags & PF_R) != 0 }
+    pub fn writable(&self) -> bool {
+        (self.flags & PF_W) != 0
+    }
+    pub fn executable(&self) -> bool {
+        (self.flags & PF_X) != 0
+    }
+    pub fn readable(&self) -> bool {
+        (self.flags & PF_R) != 0
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -133,9 +139,8 @@ pub fn parse(bytes: &[u8]) -> Result<Image<'_>, ElfError> {
     }
     let h_ptr = bytes.as_ptr() as *const Elf64Ehdr;
 
-    let ident: [u8; 16] = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_ident))
-    };
+    let ident: [u8; 16] =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_ident)) };
     if ident[EI_MAG0] != ELFMAG0
         || ident[EI_MAG1] != ELFMAG1
         || ident[EI_MAG2] != ELFMAG2
@@ -153,34 +158,23 @@ pub fn parse(bytes: &[u8]) -> Result<Image<'_>, ElfError> {
         return Err(ElfError::BadVersion);
     }
 
-    let e_machine = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_machine))
-    };
+    let e_machine = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_machine)) };
     if e_machine != EM_X86_64 {
         return Err(ElfError::NotX86_64);
     }
-    let e_type = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_type))
-    };
+    let e_type = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_type)) };
     if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError::NotExecutable);
     }
-    let e_phentsize = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_phentsize))
-    };
+    let e_phentsize =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_phentsize)) };
     if e_phentsize as usize != core::mem::size_of::<Elf64Phdr>() {
         return Err(ElfError::BadPhdrSize);
     }
 
-    let entry = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_entry))
-    };
-    let phoff = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_phoff))
-    };
-    let phnum = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_phnum))
-    };
+    let entry = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_entry)) };
+    let phoff = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_phoff)) };
+    let phnum = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_phnum)) };
 
     let need_end = phoff
         .checked_add(phnum as u64 * e_phentsize as u64)
@@ -189,7 +183,12 @@ pub fn parse(bytes: &[u8]) -> Result<Image<'_>, ElfError> {
         return Err(ElfError::NotEnoughBytes);
     }
 
-    Ok(Image { bytes, entry, phoff, phnum })
+    Ok(Image {
+        bytes,
+        entry,
+        phoff,
+        phnum,
+    })
 }
 
 impl<'a> Image<'a> {
@@ -197,7 +196,11 @@ impl<'a> Image<'a> {
     /// program-header types — the kernel only loads loadable
     /// segments and the rest (e.g. `PT_GNU_STACK`) are ignored.
     pub fn load_segments(&self) -> LoadSegments<'a> {
-        LoadSegments { bytes: self.bytes, phoff: self.phoff, remaining: self.phnum }
+        LoadSegments {
+            bytes: self.bytes,
+            phoff: self.phoff,
+            remaining: self.phnum,
+        }
     }
 }
 
@@ -219,12 +222,8 @@ impl<'a> Iterator for LoadSegments<'a> {
             if off + phdr_size > self.bytes.len() {
                 return None;
             }
-            let p_ptr = unsafe {
-                self.bytes.as_ptr().add(off) as *const Elf64Phdr
-            };
-            let p_type = unsafe {
-                core::ptr::read_unaligned(core::ptr::addr_of!((*p_ptr).p_type))
-            };
+            let p_ptr = unsafe { self.bytes.as_ptr().add(off) as *const Elf64Phdr };
+            let p_type = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*p_ptr).p_type)) };
             if p_type != PT_LOAD {
                 continue;
             }
@@ -285,17 +284,18 @@ pub mod spec {
 
     #[inline(never)]
     fn parses_embedded_rootserver() {
-        let img = parse(crate::rootserver_image::rootserver_elf())
-            .expect("rootserver ELF parses");
+        let img = parse(crate::rootserver_image::rootserver_elf()).expect("rootserver ELF parses");
         // Phase 39 made the rootserver a runtime-loaded ELF; we no
         // longer pin the entry to a specific vaddr range (e.g.
         // sel4test-driver lays out at PML4[0] near 0x40_0000 while
         // our Rust rootserver targets PML4[2] near 0x100_0040_0000).
         // We just sanity-check the entry is in canonical user space
         // (top byte zero — non-canonical hits a #GP at sysretq).
-        assert!(img.entry < 0x0000_8000_0000_0000,
+        assert!(
+            img.entry < 0x0000_8000_0000_0000,
             "rootserver entry {:#x} must be in lower-half user space",
-            img.entry);
+            img.entry
+        );
         arch::log("  ✓ embedded rootserver ELF parses + entry in user space\n");
     }
 
@@ -312,15 +312,15 @@ pub mod spec {
             // loader honours whatever flags the segment carries.)
             assert!(seg.readable(), "PT_LOAD segments must be readable");
             // The text segment covers the entry address.
-            if seg.vaddr <= img.entry
-                && seg.vaddr + seg.mem_size > img.entry
-                && seg.executable()
-            {
+            if seg.vaddr <= img.entry && seg.vaddr + seg.mem_size > img.entry && seg.executable() {
                 saw_text = true;
             }
         }
         assert!(count >= 1, "rootserver ELF must have at least one PT_LOAD");
-        assert!(saw_text, "must have an executable PT_LOAD covering the entry");
+        assert!(
+            saw_text,
+            "must have an executable PT_LOAD covering the entry"
+        );
         arch::log("  ✓ rootserver ELF segments are well-formed\n");
     }
 }

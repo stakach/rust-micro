@@ -116,8 +116,8 @@ pub unsafe extern "C" fn ipi_irq_entry() {
 
 #[no_mangle]
 extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
-    use core::sync::atomic::Ordering;
     use crate::smp::IpiKind;
+    use core::sync::atomic::Ordering;
 
     crate::smp::bkl_acquire();
     struct BklGuard;
@@ -131,8 +131,7 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
     // Capture the interrupted context up front — mirrors the LAPIC
     // tick path so the swap tail can save the preempted thread.
     let from_user = (ctx.cs & 3) == 3;
-    let interrupted =
-        unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+    let interrupted = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
     let me = crate::arch::get_cpu_id();
 
     // Drain pending IPIs and dispatch by kind. We snapshot the
@@ -159,7 +158,9 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
             // unwinding needed since we never resume an AP after
             // this.
             loop {
-                unsafe { core::arch::asm!("hlt"); }
+                unsafe {
+                    core::arch::asm!("hlt");
+                }
             }
         }
     });
@@ -256,9 +257,7 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
     // stub's pops + `iretq` resume the new thread. A no-op when nothing
     // changed (`next == interrupted`) or when we interrupted the idle
     // loop (`from_user` false).
-    super::interrupts::swap_iretq_context_if_preempted(
-        ctx, from_user, interrupted,
-    );
+    super::interrupts::swap_iretq_context_if_preempted(ctx, from_user, interrupted);
 }
 
 /// Send a fixed-mode IPI to a specific physical APIC ID. Mirrors
@@ -406,8 +405,7 @@ fn rdtsc() -> u64 {
 pub fn calibrate_timer_with_pit() -> u32 {
     use super::pit;
     const CAL_MS: u32 = 50;
-    const PIT_COUNT: u16 =
-        ((pit::PIT_INPUT_HZ as u64 * CAL_MS as u64) / 1000) as u16;
+    const PIT_COUNT: u16 = ((pit::PIT_INPUT_HZ as u64 * CAL_MS as u64) / 1000) as u16;
     unsafe {
         // Run the LAPIC timer masked at max count — we only read
         // the current-count register, the LVT never fires.
@@ -506,9 +504,7 @@ pub unsafe extern "C" fn lapic_timer_irq_entry() {
 /// the tick parked it. EOI goes to the LAPIC (not the PIC — this
 /// vector never transits the 8259).
 #[no_mangle]
-extern "C" fn lapic_timer_irq_dispatch(
-    ctx: &mut super::interrupts::IretqContext,
-) {
+extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext) {
     use core::sync::atomic::Ordering;
 
     crate::smp::bkl_acquire();
@@ -541,8 +537,7 @@ extern "C" fn lapic_timer_irq_dispatch(
     }
 
     let from_user = (ctx.cs & 3) == 3;
-    let interrupted =
-        unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+    let interrupted = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
 
     if delta_ms > 0 {
         unsafe {
@@ -553,9 +548,7 @@ extern "C" fn lapic_timer_irq_dispatch(
 
     eoi();
 
-    super::interrupts::swap_iretq_context_if_preempted(
-        ctx, from_user, interrupted,
-    );
+    super::interrupts::swap_iretq_context_if_preempted(ctx, from_user, interrupted);
 }
 
 // ---------------------------------------------------------------------------
@@ -669,8 +662,13 @@ pub mod spec {
         // here.
         fn pattern(divide_log2: u8) -> u32 {
             match divide_log2 {
-                0 => 0b0000, 1 => 0b0001, 2 => 0b0010, 3 => 0b0011,
-                4 => 0b1000, 5 => 0b1001, 6 => 0b1010,
+                0 => 0b0000,
+                1 => 0b0001,
+                2 => 0b0010,
+                3 => 0b0011,
+                4 => 0b1000,
+                5 => 0b1001,
+                6 => 0b1010,
                 _ => 0b1011,
             }
         }

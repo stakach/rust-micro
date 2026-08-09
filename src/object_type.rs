@@ -154,7 +154,9 @@ pub enum SizeError {
 /// is ignored.
 pub fn size_in_bits(ty: ObjectType, user_size_bits: u32) -> Result<u32, SizeError> {
     match ty {
-        ObjectType::Untyped => bounds_check(user_size_bits, MIN_UNTYPED_SIZE_BITS, MAX_UNTYPED_SIZE_BITS),
+        ObjectType::Untyped => {
+            bounds_check(user_size_bits, MIN_UNTYPED_SIZE_BITS, MAX_UNTYPED_SIZE_BITS)
+        }
         ObjectType::CapTable => {
             bounds_check(user_size_bits, MIN_CNODE_SIZE_BITS, MAX_CNODE_SIZE_BITS)?;
             // The CTE is 2^5 bytes; total bytes = 2^(user_size_bits +
@@ -168,16 +170,17 @@ pub fn size_in_bits(ty: ObjectType, user_size_bits: u32) -> Result<u32, SizeErro
         // `user_size_bits` (= log2(bytes), at least
         // `MIN_SCHED_CONTEXT_BITS`). seL4's minimum is 8 (256 B);
         // the budget rises with size because each refill is ~16 B.
-        ObjectType::SchedContext => {
-            bounds_check(user_size_bits, MIN_SCHED_CONTEXT_BITS, MAX_SCHED_CONTEXT_BITS)
-        }
+        ObjectType::SchedContext => bounds_check(
+            user_size_bits,
+            MIN_SCHED_CONTEXT_BITS,
+            MAX_SCHED_CONTEXT_BITS,
+        ),
         ObjectType::Reply => Ok(REPLY_SIZE_BITS),
         ObjectType::Arch(t) => match t {
             X86_4K => Ok(12),
             X86_LARGE_PAGE => Ok(21),
             // PT/PD/PDPT/PML4/IOPT are each one 4 KiB page of bitfield entries.
-            X86_PAGE_TABLE | X86_PAGE_DIRECTORY | X86_PDPT | X86_PML4
-            | X86_IO_PAGE_TABLE => Ok(12),
+            X86_PAGE_TABLE | X86_PAGE_DIRECTORY | X86_PDPT | X86_PML4 | X86_IO_PAGE_TABLE => Ok(12),
             _ => Err(SizeError::Unsupported),
         },
     }
@@ -218,8 +221,14 @@ pub mod spec {
     }
 
     fn sizes() {
-        assert_eq!(size_in_bits(ObjectType::Endpoint, 0), Ok(ENDPOINT_SIZE_BITS));
-        assert_eq!(size_in_bits(ObjectType::Notification, 0), Ok(NOTIFICATION_SIZE_BITS));
+        assert_eq!(
+            size_in_bits(ObjectType::Endpoint, 0),
+            Ok(ENDPOINT_SIZE_BITS)
+        );
+        assert_eq!(
+            size_in_bits(ObjectType::Notification, 0),
+            Ok(NOTIFICATION_SIZE_BITS)
+        );
         assert_eq!(size_in_bits(ObjectType::Tcb, 0), Ok(TCB_SIZE_BITS));
         // CapTable: total = user_size_bits + 5 (CTE = 32 bytes).
         // Radix 4 → 16 slots → 16 * 32 = 512 bytes → 9 bits.
@@ -252,10 +261,7 @@ pub mod spec {
             Ok(MIN_SCHED_CONTEXT_BITS)
         );
         // Phase 34e — Reply now has a 32-byte object size.
-        assert_eq!(
-            size_in_bits(ObjectType::Reply, 0),
-            Ok(REPLY_SIZE_BITS)
-        );
+        assert_eq!(size_in_bits(ObjectType::Reply, 0), Ok(REPLY_SIZE_BITS));
         arch::log("  ✓ size_in_bits rejects out-of-range and unsupported\n");
     }
 }

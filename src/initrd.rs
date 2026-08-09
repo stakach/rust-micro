@@ -60,7 +60,8 @@ pub fn find_file<'a>(initrd: &'a [u8], name: &str) -> Option<&'a [u8]> {
 
         // Size field: octal ASCII, NUL- or space-terminated.
         let size_field = &header[124..136];
-        let size_str_end = size_field.iter()
+        let size_str_end = size_field
+            .iter()
             .position(|&b| b == 0 || b == b' ')
             .unwrap_or(size_field.len());
         let size_str = match core::str::from_utf8(&size_field[..size_str_end]) {
@@ -112,8 +113,11 @@ pub mod spec {
         let elf = find_file(initrd, "boot/rootserver")
             .expect("boot/rootserver must be present in initrd");
         // ELF magic.
-        assert_eq!(&elf[0..4], b"\x7fELF",
-            "boot/rootserver must start with ELF magic");
+        assert_eq!(
+            &elf[0..4],
+            b"\x7fELF",
+            "boot/rootserver must start with ELF magic"
+        );
         arch::log("  ✓ initrd carries boot/rootserver as an ELF\n");
     }
 
@@ -142,8 +146,7 @@ pub mod spec {
 
         // Second entry at offset 2*BLOCK: name = "b/c", size = 5
         archive[2 * BLOCK..2 * BLOCK + 3].copy_from_slice(b"b/c");
-        archive[2 * BLOCK + 124..2 * BLOCK + 134]
-            .copy_from_slice(b"0000000005");
+        archive[2 * BLOCK + 124..2 * BLOCK + 134].copy_from_slice(b"0000000005");
         archive[2 * BLOCK + 156] = b'0';
         archive[3 * BLOCK..3 * BLOCK + 5].copy_from_slice(b"hello");
         // Trailer: rest stays zero (already), which terminates parse.

@@ -37,7 +37,11 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub const fn new() -> Self {
-        Self { state: EpState::Idle, head: None, tail: None }
+        Self {
+            state: EpState::Idle,
+            head: None,
+            tail: None,
+        }
     }
 }
 
@@ -142,8 +146,11 @@ pub struct SendOptions {
 impl SendOptions {
     pub const fn blocking(badge: Word) -> Self {
         Self {
-            blocking: true, do_call: false, badge,
-            can_grant: true, can_donate: false,
+            blocking: true,
+            do_call: false,
+            badge,
+            can_grant: true,
+            can_donate: false,
         }
     }
 }
@@ -155,7 +162,9 @@ pub struct RecvOptions {
 }
 
 impl RecvOptions {
-    pub const fn blocking() -> Self { Self { blocking: true } }
+    pub const fn blocking() -> Self {
+        Self { blocking: true }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -241,8 +250,8 @@ pub fn send_ipc(
         }
         // A receiver is queued — wake the head and transfer.
         EpState::Recv => {
-            let receiver = queue_pop_head(ep, sched)
-                .expect("Recv state must have at least one waiter");
+            let receiver =
+                queue_pop_head(ep, sched).expect("Recv state must have at least one waiter");
             deliver_message(sched, sender, receiver, opts.badge);
             // Cap transfer requires the sender's cap to carry grant
             // rights (or grant-reply for Reply paths). Without this
@@ -310,15 +319,15 @@ pub fn receive_ipc(
         }
         // Sender queued — pair them off.
         EpState::Send => {
-            let sender = queue_pop_head(ep, sched)
-                .expect("Send state must have at least one waiter");
+            let sender =
+                queue_pop_head(ep, sched).expect("Send state must have at least one waiter");
             // The sender's `ipc_badge` field was set on the original
             // send call — re-use it instead of consulting the cap.
             let badge = sched.slab.get(sender).ipc_badge;
             // Capture and clear the queued can_grant flag so re-queue
             // doesn't smuggle stale state.
-            let sender_can_grant = core::mem::replace(
-                &mut sched.slab.get_mut(sender).blocked_can_grant, false);
+            let sender_can_grant =
+                core::mem::replace(&mut sched.slab.get_mut(sender).blocked_can_grant, false);
             deliver_message(sched, sender, receiver, badge);
             if sender_can_grant {
                 transfer_extra_caps(sched, sender, receiver);
@@ -331,8 +340,8 @@ pub fn receive_ipc(
             // receiver's reply slot to it. Without this the sender
             // resumes from `seL4_Call` reading stale `user_context`
             // and the test sees garbage in MR(0).
-            let was_call = core::mem::replace(
-                &mut sched.slab.get_mut(sender).blocked_is_call, false);
+            let was_call =
+                core::mem::replace(&mut sched.slab.get_mut(sender).blocked_is_call, false);
             if was_call {
                 finish_call(sched, sender, receiver);
             } else {
@@ -358,7 +367,7 @@ pub fn receive_ipc(
 /// would short-circuit `make_runnable`'s enqueue, since `Restart`
 /// is "runnable" but the thread is not yet on the ready queue.)
 pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
-    use crate::kernel::{KERNEL, KernelState};
+    use crate::kernel::{KernelState, KERNEL};
     let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
     for i in 0..crate::kernel::MAX_ENDPOINTS {
         let ep = unsafe { &mut (*s_ptr).endpoints[i] };
@@ -389,7 +398,7 @@ pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
 /// be moved to a new slot to preserve the invariant. SetPriority
 /// calls this AFTER it's written the new `tcb.priority`.
 pub fn reposition_in_wait_queue(sched: &mut Scheduler, thread: TcbId) {
-    use crate::kernel::{KERNEL, KernelState};
+    use crate::kernel::{KernelState, KERNEL};
     let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
     for i in 0..crate::kernel::MAX_ENDPOINTS {
         let ep = unsafe { &mut (*s_ptr).endpoints[i] };
@@ -449,9 +458,7 @@ pub fn cancel_ipc(ep: &mut Endpoint, sched: &mut Scheduler, thread: TcbId) {
 /// Shared by endpoint IPC and the Reply-cap / ReplyRecv paths so
 /// long messages (>SCRATCH words) round-trip in BOTH directions —
 /// IPC0002 / IPC0003 reply with up to seL4_MsgMaxLength words.
-pub(crate) fn deliver_message(
-    sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word,
-) {
+pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: TcbId, badge: Word) {
     // We need both TCBs mutable simultaneously. Borrow each entry
     // separately by index — the Slab guarantees they're distinct
     // memory because TcbIds are unique.
@@ -471,11 +478,13 @@ pub(crate) fn deliver_message(
     // registers (rdx/r10/r8/r9 below) and don't need the buffer.
     let recv_buf_paddr = r.ipc_buffer_paddr;
     if length > 4 && recv_buf_paddr != 0 {
-        let buf = (crate::arch::x86_64::paging::phys_to_lin(
-            recv_buf_paddr) as *mut u64).wrapping_add(1); // skip tag word
+        let buf =
+            (crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr) as *mut u64).wrapping_add(1); // skip tag word
         let staged_max = (length as usize).min(regs.len());
         for i in 4..staged_max {
-            unsafe { core::ptr::write_volatile(buf.add(i), regs[i]); }
+            unsafe {
+                core::ptr::write_volatile(buf.add(i), regs[i]);
+            }
         }
         // Long-message tail: words SCRATCH_MSG_LEN..length live in
         // the sender's IPC buffer page and bypass the on-TCB
@@ -485,13 +494,13 @@ pub(crate) fn deliver_message(
         // were allocated as user Frames whose phys range is in our
         // mapped low-mem region.
         if length as usize > regs.len() && snd_buf_paddr != 0 {
-            let snd_buf = (crate::arch::x86_64::paging::phys_to_lin(
-                snd_buf_paddr) as *const u64).wrapping_add(1);
-            for i in regs.len()..(length as usize)
-                .min(crate::types::seL4_MsgMaxLength)
-            {
+            let snd_buf = (crate::arch::x86_64::paging::phys_to_lin(snd_buf_paddr) as *const u64)
+                .wrapping_add(1);
+            for i in regs.len()..(length as usize).min(crate::types::seL4_MsgMaxLength) {
                 let w = unsafe { core::ptr::read_volatile(snd_buf.add(i)) };
-                unsafe { core::ptr::write_volatile(buf.add(i), w); }
+                unsafe {
+                    core::ptr::write_volatile(buf.add(i), w);
+                }
             }
         }
     }
@@ -514,8 +523,8 @@ pub(crate) fn deliver_message(
         // Upstream seL4 x86_64 IPC return ABI: msg_regs[0..3] map to
         // r10/r8/r9/r15 (matches `x64_sys_recv` in libsel4).
         r.user_context.r10 = r.msg_regs[0];
-        r.user_context.r8  = r.msg_regs[1];
-        r.user_context.r9  = r.msg_regs[2];
+        r.user_context.r8 = r.msg_regs[1];
+        r.user_context.r9 = r.msg_regs[2];
         r.user_context.r15 = r.msg_regs[3];
     }
 }
@@ -533,7 +542,9 @@ pub fn transfer_extra_caps(
     receiver: TcbId,
 ) {
     let count = sched.slab.get(sender).pending_extra_caps_count as usize;
-    if count == 0 { return; }
+    if count == 0 {
+        return;
+    }
     let recv_buf_paddr = sched.slab.get(receiver).ipc_buffer_paddr;
     if recv_buf_paddr == 0 {
         // No buffer to consult — drop the staged caps.
@@ -543,13 +554,11 @@ pub fn transfer_extra_caps(
 
     // Read receive descriptor from receiver's IPC buffer.
     let (recv_cnode_cptr, recv_index, recv_depth) = unsafe {
-        let buf = crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr)
-            as *const u64;
+        let buf = crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr) as *const u64;
         (
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET)),
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET)),
-            core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_DEPTH_OFFSET))
-                as u32,
+            core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_DEPTH_OFFSET)) as u32,
         )
     };
 
@@ -558,8 +567,7 @@ pub fn transfer_extra_caps(
         recv_cspace
     } else {
         match unsafe {
-            crate::cspace::lookup_cap(crate::kernel::KERNEL.get(),
-                &recv_cspace, recv_cnode_cptr)
+            crate::cspace::lookup_cap(crate::kernel::KERNEL.get(), &recv_cspace, recv_cnode_cptr)
         } {
             Ok(c) => c,
             Err(_) => {
@@ -576,9 +584,7 @@ pub fn transfer_extra_caps(
     // depth 64, so the index must be resolved, not indexed raw.
     let (base_cnode_idx, base_slot) = unsafe {
         let s = crate::kernel::KERNEL.get();
-        match crate::cspace::resolve_address_bits(
-            s, &target_cnode_cap, recv_index, recv_depth)
-        {
+        match crate::cspace::resolve_address_bits(s, &target_cnode_cap, recv_index, recv_depth) {
             Ok(res) if res.bits_remaining == 0 => (
                 crate::kernel::KernelState::cnode_index(res.slot_ptr),
                 res.slot_index,
@@ -606,9 +612,13 @@ pub fn transfer_extra_caps(
         let mut placed = 0u8;
         for i in 0..count {
             let dest_idx = base_slot + i;
-            if dest_idx >= slots.len() { break; }
+            if dest_idx >= slots.len() {
+                break;
+            }
             // Don't clobber an existing cap.
-            if !slots[dest_idx].cap().is_null() { continue; }
+            if !slots[dest_idx].cap().is_null() {
+                continue;
+            }
             // A Frame cap transferred over IPC is DERIVED as an
             // UNMAPPED copy: seL4 frame caps record their mapping
             // (asid + vaddr), and X86PageMap rejects mapping a frame
@@ -641,8 +651,8 @@ pub fn transfer_extra_caps(
         #[cfg(target_arch = "x86_64")]
         {
             let r = s.scheduler.slab.get_mut(receiver);
-            r.user_context.rsi = (r.user_context.rsi & !(0x3 << 7))
-                | (((placed as u64) & 0x3) << 7);
+            r.user_context.rsi =
+                (r.user_context.rsi & !(0x3 << 7)) | (((placed as u64) & 0x3) << 7);
         }
     }
     sched.slab.get_mut(sender).pending_extra_caps_count = 0;
@@ -695,7 +705,7 @@ pub mod spec {
     /// that production code consults.
     #[inline(never)]
     fn extra_cap_transfer_via_ipc() {
-        use crate::cap::{Cap, Badge, EndpointObj, EndpointRights, PPtr};
+        use crate::cap::{Badge, Cap, EndpointObj, EndpointRights, PPtr};
 
         #[repr(C, align(4096))]
         struct IpcPage([u64; 512]);
@@ -715,25 +725,20 @@ pub mod spec {
             // paddr so the ipc-path's `phys_to_lin` round-trips back
             // to the same kernel-virt address via the linear map.
             s.scheduler.slab.get_mut(sender).ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys(
-                    (&raw mut SENDER_BUF) as u64);
+                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut SENDER_BUF) as u64);
             s.scheduler.slab.get_mut(receiver).ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys(
-                    (&raw mut RECEIVER_BUF) as u64);
+                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut RECEIVER_BUF) as u64);
         }
 
         // Receiver names slot 5 of its own CSpace as the receive
         // target. `receiveCNode = 0` ⇒ "use cspace_root".
         unsafe {
             let buf = (&raw mut RECEIVER_BUF) as *mut u64;
-            core::ptr::write_volatile(
-                buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET), 0);
-            core::ptr::write_volatile(
-                buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET), 5);
+            core::ptr::write_volatile(buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET), 0);
+            core::ptr::write_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET), 5);
             // Full-word depth: the cspace_root below is radix 5 +
             // guard 59 = 64, so index 5 resolves to slot 5.
-            core::ptr::write_volatile(
-                buf.add(crate::ipc_buffer::RECEIVE_DEPTH_OFFSET), 64);
+            core::ptr::write_volatile(buf.add(crate::ipc_buffer::RECEIVE_DEPTH_OFFSET), 64);
         }
 
         // Sender stages a fake Endpoint cap. We don't go through
@@ -743,8 +748,10 @@ pub mod spec {
             ptr: PPtr::<EndpointObj>::new(0x4000).unwrap(),
             badge: Badge(0xBEEF),
             rights: EndpointRights {
-                can_send: true, can_receive: true,
-                can_grant: false, can_grant_reply: false,
+                can_send: true,
+                can_receive: true,
+                can_grant: false,
+                can_grant_reply: false,
             },
         };
         s.scheduler.slab.get_mut(sender).pending_extra_caps[0] = to_transfer;
@@ -754,7 +761,9 @@ pub mod spec {
         // `transfer_extra_caps` can resolve the receive CNode.
         let cspace = Cap::CNode {
             ptr: crate::kernel::KernelState::cnode_ptr(0),
-            radix: 5, guard_size: 59, guard: 0,
+            radix: 5,
+            guard_size: 59,
+            guard: 0,
         };
         s.scheduler.slab.get_mut(receiver).cspace_root = cspace;
         // Make sure slot 5 starts empty.
@@ -769,13 +778,14 @@ pub mod spec {
                 assert_eq!(ptr.addr(), 0x4000);
                 assert_eq!(badge.0, 0xBEEF);
             }
-            other => panic!(
-                "expected Endpoint at slot 5, got {:?}", other),
+            other => panic!("expected Endpoint at slot 5, got {:?}", other),
         }
         s.cnodes[0].0[5].set_cap(&Cap::Null);
         assert_eq!(
-            s.scheduler.slab.get(sender).pending_extra_caps_count, 0,
-            "transfer should drain the staged caps");
+            s.scheduler.slab.get(sender).pending_extra_caps_count,
+            0,
+            "transfer should drain the staged caps"
+        );
 
         // Cleanup.
         s.scheduler.slab.free(sender);
@@ -808,11 +818,9 @@ pub mod spec {
         let receiver = sched.admit(runnable(50));
         unsafe {
             sched.slab.get_mut(sender).ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys(
-                    (&raw mut SENDER_BUF) as u64);
+                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut SENDER_BUF) as u64);
             sched.slab.get_mut(receiver).ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys(
-                    (&raw mut RECEIVER_BUF) as u64);
+                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut RECEIVER_BUF) as u64);
         }
 
         // Stage an 8-word message. Words 0..3 in msg_regs (the
@@ -843,21 +851,27 @@ pub mod spec {
         unsafe {
             let r = sched.slab.get(receiver);
             for (i, &expect) in [
-                0x1000u64, 0x1001, 0x1002, 0x1003,
-                0x1004, 0x1005, 0x1006, 0x1007,
-            ].iter().enumerate() {
-                assert_eq!(r.msg_regs[i], expect,
+                0x1000u64, 0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1006, 0x1007,
+            ]
+            .iter()
+            .enumerate()
+            {
+                assert_eq!(
+                    r.msg_regs[i], expect,
                     "msg_regs[{}] was {:#x} expected {:#x}",
-                    i, r.msg_regs[i], expect);
+                    i, r.msg_regs[i], expect
+                );
             }
             assert_eq!(r.ipc_length, 8);
             for i in 4..8 {
                 let buf = (&raw mut RECEIVER_BUF) as *mut u64;
                 let got = core::ptr::read_volatile(buf.add(1 + i));
                 let expect = 0x1000u64 + i as u64;
-                assert_eq!(got, expect,
+                assert_eq!(
+                    got, expect,
                     "RECEIVER_BUF[{}] was {:#x} expected {:#x}",
-                    i, got, expect);
+                    i, got, expect
+                );
             }
         }
         arch::log("  ✓ 8-word IPC routes 4..length through ipc_buffer\n");
@@ -875,7 +889,10 @@ pub mod spec {
         let r = receive_ipc(&mut ep, &mut sched, receiver, RecvOptions::blocking());
         assert_eq!(r, IpcOutcome::Blocked);
         assert_eq!(ep.state, EpState::Recv);
-        assert_eq!(sched.slab.get(receiver).state, ThreadStateType::BlockedOnReceive);
+        assert_eq!(
+            sched.slab.get(receiver).state,
+            ThreadStateType::BlockedOnReceive
+        );
 
         // Sender stamps a message and sends.
         {
@@ -919,9 +936,18 @@ pub mod spec {
             s.msg_regs[0] = 0x11;
             s.ipc_badge = 0xABCD;
         }
-        let r = send_ipc(&mut ep, &mut sched, sender, SendOptions {
-            blocking: true, do_call: false, badge: 0xABCD, can_grant: true, can_donate: false,
-        });
+        let r = send_ipc(
+            &mut ep,
+            &mut sched,
+            sender,
+            SendOptions {
+                blocking: true,
+                do_call: false,
+                badge: 0xABCD,
+                can_grant: true,
+                can_donate: false,
+            },
+        );
         assert_eq!(r, IpcOutcome::Blocked);
         assert_eq!(ep.state, EpState::Send);
 
@@ -961,9 +987,18 @@ pub mod spec {
         let mut sched = Scheduler::new();
         let mut ep = Endpoint::new();
         let sender = sched.admit(runnable(50));
-        let r = send_ipc(&mut ep, &mut sched, sender, SendOptions {
-            blocking: false, do_call: false, badge: 0, can_grant: true, can_donate: false,
-        });
+        let r = send_ipc(
+            &mut ep,
+            &mut sched,
+            sender,
+            SendOptions {
+                blocking: false,
+                do_call: false,
+                badge: 0,
+                can_grant: true,
+                can_donate: false,
+            },
+        );
         assert_eq!(r, IpcOutcome::Skipped);
         assert_eq!(ep.state, EpState::Idle);
         // Sender stays runnable.

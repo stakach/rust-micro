@@ -1,4 +1,4 @@
-use super::interrupts::{IDT, IdtEntry, interrupt, interrupt_with_error};
+use super::interrupts::{interrupt, interrupt_with_error, IdtEntry, IDT};
 
 /// RAII guard for the BKL — releases on drop. Same shape as the
 /// one in `syscall_entry.rs`; duplicated rather than moved into
@@ -237,16 +237,12 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
         // path sees the right state — without this, sysretq would
         // restore from whatever was saved on the last syscall and
         // the helper page-faults on return from the fault reply.
-        let pcc_snapshot = *crate::arch::x86_64::syscall_entry
-            ::current_cpu_user_ctx_mut();
+        let pcc_snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
         s.scheduler.slab.get_mut(current).user_context = pcc_snapshot;
         let _ = saved_rip; // already in pcc_snapshot.rcx
         let _ = crate::fault::deliver_fault(
             current,
-            crate::fault::FaultMessage::UserException {
-                number: 7,
-                code: 0,
-            },
+            crate::fault::FaultMessage::UserException { number: 7, code: 0 },
         );
 
         // The faulter is now BlockedOnReply (or suspended if no
@@ -271,33 +267,28 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
                         options(nostack, preserves_flags));
                 }
             }
-            crate::arch::x86_64::msr::wrmsr(
-                crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+            crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
             crate::arch::x86_64::msr::wrmsr(
                 crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
                 next_gs_base,
             );
             #[cfg(feature = "smp")]
-            crate::arch::x86_64::fpu_ctx::fpu_switch_to(
-                &mut s.scheduler.slab, next_id);
-            crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
-                s.scheduler.slab.get(next_id));
+            crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next_id);
+            crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(s.scheduler.slab.get(next_id));
             crate::arch::x86_64::syscall_entry::apply_debug_state_for(
-                s.scheduler.slab.get(next_id));
-            let pcc = crate::arch::x86_64::syscall_entry
-                ::current_cpu_user_ctx_mut();
+                s.scheduler.slab.get(next_id),
+            );
+            let pcc = crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
             *pcc = next_ctx;
             // Honour use_iretq_resume on this resume path too. Don't clear
             // it — it tracks the save flavor (see swap_iretq_context...).
             if s.scheduler.slab.get(next_id).use_iretq_resume {
                 drop(_bkl);
-                crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
-                    pcc as *const _);
+                crate::arch::x86_64::syscall_entry::enter_user_via_iretq(pcc as *const _);
             }
             // Release BKL via Drop on _bkl, then sysret.
             drop(_bkl);
-            crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
-                pcc as *const _);
+            crate::arch::x86_64::syscall_entry::enter_user_via_sysret(pcc as *const _);
             // unreachable
         }
         // No runnable thread — idle this CPU until an IRQ wakes it.
@@ -307,7 +298,9 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
         #[cfg(feature = "smp")]
         crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
         drop(_bkl);
-        loop { core::arch::asm!("sti", "hlt"); }
+        loop {
+            core::arch::asm!("sti", "hlt");
+        }
     }
 }
 
@@ -327,92 +320,92 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
     // thread once the schedule rotated away from a non-empty domain).
     let mut logged = false;
     loop {
-    if let Some(next_id) = s.scheduler.choose_thread() {
-        s.scheduler.set_current(Some(next_id));
-        crate::sched_context::complete_yield_if_pending(next_id);
-        let tcb = s.scheduler.slab.get(next_id);
-        let next_cr3 = tcb.cpu_context.cr3;
-        let next_fs_base = tcb.cpu_context.fs_base;
-        let next_gs_base = tcb.cpu_context.gs_base;
-        let next_ctx = tcb.user_context;
-        if next_cr3 != 0 {
-            // SMP: if this core went idle since its last dispatch, reload
-            // CR3 unconditionally to flush a possibly-stale TLB. While
-            // idle, `shootdown_tlb` skipped this core, so another core
-            // may have mutated the shared page tables underneath it
-            // (MULTICORE0002 — a migrated thread saw stale code/stack
-            // pages and ran wild). When NOT coming from idle, only reload
-            // on an actual vspace change — flushing every dispatch makes
-            // the yield-stress test crawl (MULTICORE0004).
-            // The from-idle CR3 reload is only needed under real SMP (a
-            // core that idled on a vspace can miss a cross-core
-            // shootdown). In the default single-node build it's pure
-            // overhead AND perturbs the flaky suspend/resume timing
-            // (SCHED0000), so gate it behind `smp`.
-            #[cfg(feature = "smp")]
-            let was_idle = crate::smp::take_went_idle();
-            #[cfg(not(feature = "smp"))]
-            let was_idle = false;
-            let cur_cr3: u64;
-            core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+        if let Some(next_id) = s.scheduler.choose_thread() {
+            s.scheduler.set_current(Some(next_id));
+            crate::sched_context::complete_yield_if_pending(next_id);
+            let tcb = s.scheduler.slab.get(next_id);
+            let next_cr3 = tcb.cpu_context.cr3;
+            let next_fs_base = tcb.cpu_context.fs_base;
+            let next_gs_base = tcb.cpu_context.gs_base;
+            let next_ctx = tcb.user_context;
+            if next_cr3 != 0 {
+                // SMP: if this core went idle since its last dispatch, reload
+                // CR3 unconditionally to flush a possibly-stale TLB. While
+                // idle, `shootdown_tlb` skipped this core, so another core
+                // may have mutated the shared page tables underneath it
+                // (MULTICORE0002 — a migrated thread saw stale code/stack
+                // pages and ran wild). When NOT coming from idle, only reload
+                // on an actual vspace change — flushing every dispatch makes
+                // the yield-stress test crawl (MULTICORE0004).
+                // The from-idle CR3 reload is only needed under real SMP (a
+                // core that idled on a vspace can miss a cross-core
+                // shootdown). In the default single-node build it's pure
+                // overhead AND perturbs the flaky suspend/resume timing
+                // (SCHED0000), so gate it behind `smp`.
+                #[cfg(feature = "smp")]
+                let was_idle = crate::smp::take_went_idle();
+                #[cfg(not(feature = "smp"))]
+                let was_idle = false;
+                let cur_cr3: u64;
+                core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                 options(nomem, nostack, preserves_flags));
-            if was_idle || next_cr3 != cur_cr3 {
-                core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
+                if was_idle || next_cr3 != cur_cr3 {
+                    core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
                     options(nostack, preserves_flags));
+                }
             }
-        }
-        crate::arch::x86_64::msr::wrmsr(
-            crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
-        // Restore the per-thread user %gs base into the swapped-out MSR so the resume's tail
-        // `swapgs` lands this thread's TEB in %gs (Windows gs:[0x30]) — mirrors the sysret-tail
-        // dispatch. Without this, resuming via this path (fault/int-0x2d) drops the TEB gs base.
-        crate::arch::x86_64::msr::wrmsr(
-            crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE, next_gs_base);
-        #[cfg(feature = "smp")]
-        crate::arch::x86_64::fpu_ctx::fpu_switch_to(
-            &mut s.scheduler.slab, next_id);
-        crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(
-            s.scheduler.slab.get(next_id));
-        crate::arch::x86_64::syscall_entry::apply_debug_state_for(
-            s.scheduler.slab.get(next_id));
-        let pcc = crate::arch::x86_64::syscall_entry
-            ::current_cpu_user_ctx_mut();
-        *pcc = next_ctx;
-        if s.scheduler.slab.get(next_id).use_iretq_resume {
+            crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+            // Restore the per-thread user %gs base into the swapped-out MSR so the resume's tail
+            // `swapgs` lands this thread's TEB in %gs (Windows gs:[0x30]) — mirrors the sysret-tail
+            // dispatch. Without this, resuming via this path (fault/int-0x2d) drops the TEB gs base.
+            crate::arch::x86_64::msr::wrmsr(
+                crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
+                next_gs_base,
+            );
+            #[cfg(feature = "smp")]
+            crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next_id);
+            crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(s.scheduler.slab.get(next_id));
+            crate::arch::x86_64::syscall_entry::apply_debug_state_for(
+                s.scheduler.slab.get(next_id),
+            );
+            let pcc = crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
+            *pcc = next_ctx;
+            if s.scheduler.slab.get(next_id).use_iretq_resume {
+                crate::smp::bkl_release();
+                crate::arch::x86_64::syscall_entry::enter_user_via_iretq(pcc as *const _);
+            }
             crate::smp::bkl_release();
-            crate::arch::x86_64::syscall_entry::enter_user_via_iretq(
-                pcc as *const _);
+            crate::arch::x86_64::syscall_entry::enter_user_via_sysret(pcc as *const _);
         }
+        if !logged {
+            crate::arch::log(idle_tag);
+            logged = true;
+        }
+        // SMP: about to idle with no runnable thread — flush this core's
+        // live FPU state back to its owner TCB. A thread can be migrated
+        // off an *idle* core (where `remote_tcb_stall` finds current==None
+        // and does no stall/flush); without this, the destination core
+        // would restore stale TCB state and FPU0002 corrupts (flaky).
+        #[cfg(feature = "smp")]
+        crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
+        // Idle: drop the lock so the timer ISR can run, halt until an
+        // interrupt, then re-acquire and loop back to choose_thread.
+        // Mark went-idle so the next dispatch flushes a possibly-stale TLB.
+        // Park on the kernel root page table first — a user vspace left in
+        // CR3 here can be freed by another core's teardown, after which our
+        // next interrupt would read an unmapped IDT and triple-fault. Only a
+        // concern under real SMP; the default single-node build can't have a
+        // peer free the vspace under an idling core.
+        #[cfg(feature = "smp")]
+        crate::arch::x86_64::paging::park_on_kernel_root();
+        crate::smp::mark_went_idle();
         crate::smp::bkl_release();
-        crate::arch::x86_64::syscall_entry::enter_user_via_sysret(
-            pcc as *const _);
-    }
-    if !logged { crate::arch::log(idle_tag); logged = true; }
-    // SMP: about to idle with no runnable thread — flush this core's
-    // live FPU state back to its owner TCB. A thread can be migrated
-    // off an *idle* core (where `remote_tcb_stall` finds current==None
-    // and does no stall/flush); without this, the destination core
-    // would restore stale TCB state and FPU0002 corrupts (flaky).
-    #[cfg(feature = "smp")]
-    crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
-    // Idle: drop the lock so the timer ISR can run, halt until an
-    // interrupt, then re-acquire and loop back to choose_thread.
-    // Mark went-idle so the next dispatch flushes a possibly-stale TLB.
-    // Park on the kernel root page table first — a user vspace left in
-    // CR3 here can be freed by another core's teardown, after which our
-    // next interrupt would read an unmapped IDT and triple-fault. Only a
-    // concern under real SMP; the default single-node build can't have a
-    // peer free the vspace under an idling core.
-    #[cfg(feature = "smp")]
-    crate::arch::x86_64::paging::park_on_kernel_root();
-    crate::smp::mark_went_idle();
-    crate::smp::bkl_release();
-    // `cli` after `hlt`: restore the kernel's IF=0 invariant before the
-    // BKL-held re-acquire + loop-back below, so the timer IRQ can't
-    // re-enter bkl_acquire while we hold the lock (the silent DOMAINS
-    // hang — see the syscall idle loop in syscall_entry.rs).
-    core::arch::asm!("sti", "hlt", "cli");
-    crate::smp::bkl_acquire();
+        // `cli` after `hlt`: restore the kernel's IF=0 invariant before the
+        // BKL-held re-acquire + loop-back below, so the timer IRQ can't
+        // re-enter bkl_acquire while we hold the lock (the silent DOMAINS
+        // hang — see the syscall idle loop in syscall_entry.rs).
+        core::arch::asm!("sti", "hlt", "cli");
+        crate::smp::bkl_acquire();
     }
 }
 
@@ -506,8 +499,7 @@ extern "C" fn handle_invalid_opcode_typed(saved_rip: u64, saved_cs: u64) {
     unsafe {
         // Mirror the per-CPU snapshot (full fault-time state) into
         // the faulter and mark iretq resume.
-        let snapshot = *crate::arch::x86_64::syscall_entry
-            ::current_cpu_user_ctx_mut();
+        let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
         let s = crate::kernel::KERNEL.get();
         let t = s.scheduler.slab.get_mut(faulter);
         t.user_context = snapshot;
@@ -517,9 +509,12 @@ extern "C" fn handle_invalid_opcode_typed(saved_rip: u64, saved_cs: u64) {
         if crate::fault::deliver_fault(
             faulter,
             crate::fault::FaultMessage::UserException { number: 6, code: 0 },
-        ).is_err() {
+        )
+        .is_err()
+        {
             crate::arch::log("[#UD: no fault handler — suspending thread]\n");
-            s.scheduler.block(faulter, crate::tcb::ThreadStateType::Inactive);
+            s.scheduler
+                .block(faulter, crate::tcb::ThreadStateType::Inactive);
         }
         dispatch_next_or_idle("[#UD: no next thread, idling CPU]\n")
     }
@@ -621,10 +616,7 @@ pub unsafe extern "C" fn general_protection_fault_handler() {
     );
 }
 
-extern "C" fn handle_general_protection_fault_typed(
-    error_code: u64,
-    saved_cs: u64,
-) {
+extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u64) {
     let from_user = (saved_cs & 3) == 3;
     if !from_user {
         crate::arch::log("EXCEPTION: kernel general protection fault, err=0x");
@@ -659,9 +651,17 @@ extern "C" fn handle_general_protection_fault_typed(
                     crate::arch::log("[dbg] ");
                     for i in 0..len {
                         let c = core::ptr::read_volatile((ptr as *const u8).add(i));
-                        if c == 0 { break; }
-                        let ch = [if (0x20..0x7f).contains(&c) || c == b'\n' { c } else { b'.' }];
-                        if let Ok(sst) = core::str::from_utf8(&ch) { crate::arch::log(sst); }
+                        if c == 0 {
+                            break;
+                        }
+                        let ch = [if (0x20..0x7f).contains(&c) || c == b'\n' {
+                            c
+                        } else {
+                            b'.'
+                        }];
+                        if let Ok(sst) = core::str::from_utf8(&ch) {
+                            crate::arch::log(sst);
+                        }
                     }
                     crate::arch::log("\n");
                 }
@@ -687,8 +687,7 @@ extern "C" fn handle_general_protection_fault_typed(
         }
     }
     unsafe {
-        let snapshot = *crate::arch::x86_64::syscall_entry
-            ::current_cpu_user_ctx_mut();
+        let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
         let s = crate::kernel::KERNEL.get();
         let t = s.scheduler.slab.get_mut(faulter);
         t.user_context = snapshot;
@@ -703,9 +702,12 @@ extern "C" fn handle_general_protection_fault_typed(
                 number: 13,
                 code: error_code as u32,
             },
-        ).is_err() {
+        )
+        .is_err()
+        {
             crate::arch::log("[#GP: no fault handler — suspending thread]\n");
-            s.scheduler.block(faulter, crate::tcb::ThreadStateType::Inactive);
+            s.scheduler
+                .block(faulter, crate::tcb::ThreadStateType::Inactive);
         }
         dispatch_next_or_idle("[#GP: no next thread, idling CPU]\n")
     }
@@ -820,12 +822,7 @@ pub unsafe extern "C" fn page_fault_entry() {
 }
 
 #[no_mangle]
-extern "C" fn handle_page_fault_typed(
-    cr2: u64,
-    error_code: u64,
-    saved_cs: u64,
-    saved_rip: u64,
-) {
+extern "C" fn handle_page_fault_typed(cr2: u64, error_code: u64, saved_cs: u64, saved_rip: u64) {
     // Phase 28b / 42 — BKL across the fault handler. Fault delivery
     // touches the kernel scheduler + fault EP cap chain, all of
     // which are shared kernel state.
@@ -851,7 +848,11 @@ extern "C" fn handle_page_fault_typed(
         #[cfg(feature = "spec")]
         crate::arch::qemu_exit(255);
         #[cfg(not(feature = "spec"))]
-        loop { unsafe { asm!("hlt"); } }
+        loop {
+            unsafe {
+                asm!("hlt");
+            }
+        }
     }
 
     // User-mode page fault — try to deliver to the thread's
@@ -866,9 +867,7 @@ extern "C" fn handle_page_fault_typed(
         // before we trapped, so by the time we acquired the BKL
         // and looked, the slot was empty. Don't refault forever;
         // dispatch the next runnable thread or idle.
-        unsafe {
-            dispatch_next_or_idle("[USER #PF no current, no runnable — idle]\n")
-        }
+        unsafe { dispatch_next_or_idle("[USER #PF no current, no runnable — idle]\n") }
     }
     let faulter = current.unwrap();
     // The entry stub captured the complete fault-time register
@@ -880,8 +879,7 @@ extern "C" fn handle_page_fault_typed(
     //   * a later resume (fault reply / WriteRegisters) re-enters
     //     at the exact fault point with all GPRs intact.
     unsafe {
-        let snapshot = *crate::arch::x86_64::syscall_entry
-            ::current_cpu_user_ctx_mut();
+        let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
         let t = crate::kernel::KERNEL.get().scheduler.slab.get_mut(faulter);
         t.user_context = snapshot;
         t.use_iretq_resume = true;
@@ -894,10 +892,20 @@ extern "C" fn handle_page_fault_typed(
     };
     crate::arch::log("[user #PF: tcb=");
     {
-        let mut buf = [b'0'; 6]; let mut v = faulter.0 as u64; let mut i = 6;
-        if v == 0 { crate::arch::log("0"); }
-        while v > 0 && i > 0 { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; }
-        if let Ok(s) = core::str::from_utf8(&buf[i..]) { crate::arch::log(s); }
+        let mut buf = [b'0'; 6];
+        let mut v = faulter.0 as u64;
+        let mut i = 6;
+        if v == 0 {
+            crate::arch::log("0");
+        }
+        while v > 0 && i > 0 {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+            crate::arch::log(s);
+        }
     }
     crate::arch::log(" cr2=0x");
     log_hex64(cr2);
@@ -909,9 +917,7 @@ extern "C" fn handle_page_fault_typed(
         // User-mode exception entry already executed swapgs, so the
         // shadow MSR is the exact GS base that was active at the fault.
         let live_user_gs = unsafe {
-            crate::arch::x86_64::msr::rdmsr(
-                crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
-            )
+            crate::arch::x86_64::msr::rdmsr(crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE)
         };
         let configured_gs = unsafe {
             crate::kernel::KERNEL
@@ -931,10 +937,10 @@ extern "C" fn handle_page_fault_typed(
     let suspended = if crate::fault::deliver_fault(faulter, fault).is_err() {
         crate::arch::log("[no fault handler — suspending thread]\n");
         unsafe {
-            crate::kernel::KERNEL.get().scheduler.block(
-                faulter,
-                crate::tcb::ThreadStateType::Inactive,
-            );
+            crate::kernel::KERNEL
+                .get()
+                .scheduler
+                .block(faulter, crate::tcb::ThreadStateType::Inactive);
         }
         true
     } else {
@@ -950,9 +956,7 @@ extern "C" fn handle_page_fault_typed(
     // halts this CPU). Pick the next runnable thread and enter it
     // directly, bypassing iretq.
     if suspended {
-        unsafe {
-            dispatch_next_or_idle("[user #PF: no next thread, idling CPU]\n")
-        }
+        unsafe { dispatch_next_or_idle("[user #PF: no next thread, idling CPU]\n") }
     }
     // (suspended is always true above; this branch is dead but kept
     // for clarity should the deliver_fault path change.)
@@ -1055,8 +1059,10 @@ unsafe fn snapshot_into_tcb(faulter: crate::tcb::TcbId) {
 unsafe fn deliver_debug_fault(faulter: crate::tcb::TcbId, fault: crate::fault::FaultMessage) {
     if crate::fault::deliver_fault(faulter, fault).is_err() {
         crate::arch::log("[debug fault — no handler, suspending]\n");
-        crate::kernel::KERNEL.get().scheduler.block(
-            faulter, crate::tcb::ThreadStateType::Inactive);
+        crate::kernel::KERNEL
+            .get()
+            .scheduler
+            .block(faulter, crate::tcb::ThreadStateType::Inactive);
     }
 }
 
@@ -1066,7 +1072,9 @@ extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
     crate::smp::bkl_acquire();
     if (saved_cs & 3) != 3 {
         // Kernel-mode #DB — clear status and resume.
-        unsafe { debug::write_dr6(0xFFFF_0FF0); }
+        unsafe {
+            debug::write_dr6(0xFFFF_0FF0);
+        }
         crate::smp::bkl_release();
         return;
     }
@@ -1074,37 +1082,53 @@ extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
         Some(t) => t,
         None => unsafe { dispatch_next_or_idle("[#DB no current]\n") },
     };
-    unsafe { snapshot_into_tcb(faulter); }
+    unsafe {
+        snapshot_into_tcb(faulter);
+    }
     let dr6 = unsafe { debug::read_dr6() };
     let s = unsafe { crate::kernel::KERNEL.get() };
 
     // Active hardware breakpoint? (B0..B3 = DR6 bits 0..3)
     let active = (0..4).find(|&b| dr6 & (1 << b) != 0);
     if let Some(bp) = active {
-        unsafe { debug::write_dr6(dr6 & !(1u64 << bp)); }
+        unsafe {
+            debug::write_dr6(dr6 & !(1u64 << bp));
+        }
         let (vaddr, reason) = {
             let st = &s.scheduler.slab.get(faulter).debug;
             (st.dr[bp], debug::breakpoint_reason(st, bp))
         };
         unsafe {
-            deliver_debug_fault(faulter, crate::fault::FaultMessage::DebugException {
-                fault_ip: saved_rip, reason, trigger_addr: vaddr, bp_num: bp as u64,
-            });
+            deliver_debug_fault(
+                faulter,
+                crate::fault::FaultMessage::DebugException {
+                    fault_ip: saved_rip,
+                    reason,
+                    trigger_addr: vaddr,
+                    bp_num: bp as u64,
+                },
+            );
             dispatch_next_or_idle("[#DB hw bp]\n")
         }
     } else if dr6 & debug::DR6_SINGLE_STEP != 0 {
-        unsafe { debug::write_dr6(dr6 & !debug::DR6_SINGLE_STEP); }
+        unsafe {
+            debug::write_dr6(dr6 & !debug::DR6_SINGLE_STEP);
+        }
         // Set RF so an instruction breakpoint at the resume IP isn't
         // re-raised (auto-cleared by the CPU after one instruction).
         s.scheduler.slab.get_mut(faulter).user_context.rflags |= debug::FLAGS_RF;
-        let ready = debug::single_step_counter_ready(
-            &mut s.scheduler.slab.get_mut(faulter).debug);
+        let ready = debug::single_step_counter_ready(&mut s.scheduler.slab.get_mut(faulter).debug);
         if ready {
             unsafe {
-                deliver_debug_fault(faulter, crate::fault::FaultMessage::DebugException {
-                    fault_ip: saved_rip, reason: debug::SEL4_SINGLE_STEP,
-                    trigger_addr: 0, bp_num: 0,
-                });
+                deliver_debug_fault(
+                    faulter,
+                    crate::fault::FaultMessage::DebugException {
+                        fault_ip: saved_rip,
+                        reason: debug::SEL4_SINGLE_STEP,
+                        trigger_addr: 0,
+                        bp_num: 0,
+                    },
+                );
                 dispatch_next_or_idle("[#DB single-step]\n")
             }
         } else {
@@ -1113,7 +1137,9 @@ extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
         }
     } else {
         // Spurious — clear and resume.
-        unsafe { debug::write_dr6(0xFFFF_0FF0); }
+        unsafe {
+            debug::write_dr6(0xFFFF_0FF0);
+        }
         unsafe { dispatch_next_or_idle("[#DB spurious]\n") }
     }
 }
@@ -1131,13 +1157,19 @@ extern "C" fn handle_int3_typed(saved_cs: u64, saved_rip: u64) {
         Some(t) => t,
         None => unsafe { dispatch_next_or_idle("[INT3 no current]\n") },
     };
-    unsafe { snapshot_into_tcb(faulter); }
     unsafe {
-        deliver_debug_fault(faulter, crate::fault::FaultMessage::DebugException {
-            fault_ip: saved_rip,
-            reason: debug::SEL4_SOFTWARE_BREAK_REQUEST,
-            trigger_addr: 0, bp_num: 0,
-        });
+        snapshot_into_tcb(faulter);
+    }
+    unsafe {
+        deliver_debug_fault(
+            faulter,
+            crate::fault::FaultMessage::DebugException {
+                fault_ip: saved_rip,
+                reason: debug::SEL4_SOFTWARE_BREAK_REQUEST,
+                trigger_addr: 0,
+                bp_num: 0,
+            },
+        );
         dispatch_next_or_idle("[INT3]\n")
     }
 }
@@ -1146,7 +1178,11 @@ fn log_hex64(v: u64) {
     let mut buf = [b'0'; 16];
     for i in 0..16 {
         let nyb = ((v >> ((15 - i) * 4)) & 0xF) as u8;
-        buf[i] = if nyb < 10 { b'0' + nyb } else { b'a' + (nyb - 10) };
+        buf[i] = if nyb < 10 {
+            b'0' + nyb
+        } else {
+            b'a' + (nyb - 10)
+        };
     }
     if let Ok(s) = core::str::from_utf8(&buf) {
         crate::arch::log(s);
@@ -1184,10 +1220,10 @@ fn fatal_exception(exception_num: u64, error_code: u64) -> ! {
     crate::arch::log("\nError code: ");
     print_hex(error_code);
     crate::arch::log("\nSystem halted due to unrecoverable error\n");
-    
+
     #[cfg(feature = "spec")]
     crate::arch::qemu_exit(255);
-    
+
     #[cfg(not(feature = "spec"))]
     loop {
         unsafe {
@@ -1201,13 +1237,13 @@ fn print_hex(value: u64) {
     let mut buf = [0u8; 18];
     buf[0] = b'0';
     buf[1] = b'x';
-    
+
     for i in 0..16 {
         let shift = 60 - (i * 4);
         let digit = ((value >> shift) & 0xF) as usize;
         buf[i + 2] = hex_chars[digit];
     }
-    
+
     if let Ok(s) = core::str::from_utf8(&buf) {
         crate::arch::log(s);
     }

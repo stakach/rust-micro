@@ -143,11 +143,7 @@ fn queue_remove(ntfn: &mut Notification, sched: &mut Scheduler, t: TcbId) {
 /// seL4. Returns `Some(thread)` if a thread was woken (so the
 /// caller can stash it in the scheduler), or `None` if the badge
 /// was simply parked / merged.
-pub fn signal(
-    ntfn: &mut Notification,
-    sched: &mut Scheduler,
-    badge: Word,
-) -> Option<TcbId> {
+pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Option<TcbId> {
     match ntfn.state {
         NtfnState::Idle => {
             // Bound-TCB short-circuit: if a TCB is bound to this
@@ -168,45 +164,45 @@ pub fn signal(
                 if sched.slab.try_get(bt).is_none() {
                     ntfn.bound_tcb = None;
                 } else {
-                // Phase 43 — passive-server SC donation. If the
-                // bound TCB has no SC of its own (it was unbound) but
-                // the notification carries a bound_sc, donate it so
-                // the wake actually schedules. BIND006 needs this.
-                if sched.slab.get(bt).sc.is_none() {
-                    if let Some(sc_idx) = ntfn.bound_sc {
-                        sched.slab.get_mut(bt).sc = Some(sc_idx);
-                    }
-                }
-                // Phase 43 — BIND005 enforcement: a TCB with no SC
-                // (no own + no donation) MUST NOT run. Fall through
-                // to leaving the notification Active so the badge is
-                // parked until SC is later bound (SchedContextBind on
-                // the TCB will pick it up).
-                if sched.slab.get(bt).sc.is_none() {
-                    ntfn.state = NtfnState::Active;
-                    ntfn.pending_badge |= badge;
-                    return None;
-                }
-                let state = sched.slab.get(bt).state;
-                if matches!(state, ThreadStateType::BlockedOnReceive) {
-                    // Walk all endpoints to find which queue holds
-                    // `bt` and dequeue from there. We don't track
-                    // the endpoint id on the TCB, so a linear scan
-                    // is the simplest way to keep the queue links
-                    // consistent.
-                    crate::endpoint::cancel_ipc_anywhere(sched, bt);
-                    {
-                        let tcb = sched.slab.get_mut(bt);
-                        tcb.ipc_badge = badge;
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            tcb.user_context.rdi = badge;
-                            tcb.user_context.rsi = 0;
+                    // Phase 43 — passive-server SC donation. If the
+                    // bound TCB has no SC of its own (it was unbound) but
+                    // the notification carries a bound_sc, donate it so
+                    // the wake actually schedules. BIND006 needs this.
+                    if sched.slab.get(bt).sc.is_none() {
+                        if let Some(sc_idx) = ntfn.bound_sc {
+                            sched.slab.get_mut(bt).sc = Some(sc_idx);
                         }
                     }
-                    sched.make_runnable(bt);
-                    return Some(bt);
-                }
+                    // Phase 43 — BIND005 enforcement: a TCB with no SC
+                    // (no own + no donation) MUST NOT run. Fall through
+                    // to leaving the notification Active so the badge is
+                    // parked until SC is later bound (SchedContextBind on
+                    // the TCB will pick it up).
+                    if sched.slab.get(bt).sc.is_none() {
+                        ntfn.state = NtfnState::Active;
+                        ntfn.pending_badge |= badge;
+                        return None;
+                    }
+                    let state = sched.slab.get(bt).state;
+                    if matches!(state, ThreadStateType::BlockedOnReceive) {
+                        // Walk all endpoints to find which queue holds
+                        // `bt` and dequeue from there. We don't track
+                        // the endpoint id on the TCB, so a linear scan
+                        // is the simplest way to keep the queue links
+                        // consistent.
+                        crate::endpoint::cancel_ipc_anywhere(sched, bt);
+                        {
+                            let tcb = sched.slab.get_mut(bt);
+                            tcb.ipc_badge = badge;
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                tcb.user_context.rdi = badge;
+                                tcb.user_context.rsi = 0;
+                            }
+                        }
+                        sched.make_runnable(bt);
+                        return Some(bt);
+                    }
                 } // end of else branch (bt slab slot was Some)
             }
             ntfn.state = NtfnState::Active;
@@ -218,8 +214,8 @@ pub fn signal(
             None
         }
         NtfnState::Waiting => {
-            let t = queue_pop_head(ntfn, sched)
-                .expect("Waiting state must have at least one waiter");
+            let t =
+                queue_pop_head(ntfn, sched).expect("Waiting state must have at least one waiter");
             // Hand the badge directly to the woken thread. Write it
             // into both `ipc_badge` (for the syscall_entry tail's
             // was_recv_path fan-out, when the wake happens during
@@ -275,11 +271,7 @@ pub enum WaitOutcome {
     Blocked,
 }
 
-pub fn wait(
-    ntfn: &mut Notification,
-    sched: &mut Scheduler,
-    thread: TcbId,
-) -> WaitOutcome {
+pub fn wait(ntfn: &mut Notification, sched: &mut Scheduler, thread: TcbId) -> WaitOutcome {
     match ntfn.state {
         NtfnState::Active => {
             let badge = ntfn.pending_badge;
@@ -304,8 +296,7 @@ pub fn wait(
                     sched.slab.get_mut(thread).sc = None;
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        crate::kernel::KERNEL.get()
-                            .sched_contexts[bsc as usize].bound_tcb = None;
+                        crate::kernel::KERNEL.get().sched_contexts[bsc as usize].bound_tcb = None;
                     }
                 }
             }
@@ -337,17 +328,22 @@ pub fn cancel_wait(ntfn: &mut Notification, sched: &mut Scheduler, thread: TcbId
 /// wait-queue currently holds it, using the new priority. Mirrors
 /// `endpoint::reposition_in_wait_queue` for notifications.
 pub fn reposition_in_wait_queue(sched: &mut Scheduler, thread: TcbId) {
-    use crate::kernel::{KERNEL, KernelState};
+    use crate::kernel::{KernelState, KERNEL};
     let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
     for i in 0..crate::kernel::MAX_NTFNS {
         let ntfn = unsafe { &mut (*s_ptr).notifications[i] };
         let mut found = false;
         let mut cur = ntfn.head;
         while let Some(c) = cur {
-            if c == thread { found = true; break; }
+            if c == thread {
+                found = true;
+                break;
+            }
             cur = sched.slab.try_get(c).and_then(|t| t.ep_next);
         }
-        if !found { continue; }
+        if !found {
+            continue;
+        }
         queue_remove(ntfn, sched, thread);
         queue_push(ntfn, sched, thread);
         return;
@@ -359,17 +355,22 @@ pub fn reposition_in_wait_queue(sched: &mut Scheduler, thread: TcbId) {
 /// used by TCB destruction to flush stale ids before the slab slot
 /// is reclaimed.
 pub fn cancel_wait_anywhere(sched: &mut Scheduler, thread: TcbId) {
-    use crate::kernel::{KERNEL, KernelState};
+    use crate::kernel::{KernelState, KERNEL};
     let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
     for i in 0..crate::kernel::MAX_NTFNS {
         let ntfn = unsafe { &mut (*s_ptr).notifications[i] };
         let mut found = false;
         let mut cur = ntfn.head;
         while let Some(c) = cur {
-            if c == thread { found = true; break; }
+            if c == thread {
+                found = true;
+                break;
+            }
             cur = sched.slab.try_get(c).and_then(|t| t.ep_next);
         }
-        if !found { continue; }
+        if !found {
+            continue;
+        }
         queue_remove(ntfn, sched, thread);
         if ntfn.head.is_none() {
             ntfn.state = NtfnState::Idle;
@@ -456,7 +457,10 @@ pub mod spec {
         let r = wait(&mut ntfn, &mut sched, t);
         assert_eq!(r, WaitOutcome::Blocked);
         assert_eq!(ntfn.state, NtfnState::Waiting);
-        assert_eq!(sched.slab.get(t).state, ThreadStateType::BlockedOnNotification);
+        assert_eq!(
+            sched.slab.get(t).state,
+            ThreadStateType::BlockedOnNotification
+        );
         // Now signal — head waiter wakes with the badge.
         let woken = signal(&mut ntfn, &mut sched, 0x42);
         assert_eq!(woken, Some(t));
@@ -490,7 +494,10 @@ pub mod spec {
         let mut ntfn = Notification::new();
         let t = sched.admit(runnable(50));
         wait(&mut ntfn, &mut sched, t);
-        assert_eq!(sched.slab.get(t).state, ThreadStateType::BlockedOnNotification);
+        assert_eq!(
+            sched.slab.get(t).state,
+            ThreadStateType::BlockedOnNotification
+        );
         cancel_wait(&mut ntfn, &mut sched, t);
         assert_eq!(sched.slab.get(t).state, ThreadStateType::Restart);
         assert_eq!(ntfn.state, NtfnState::Idle);

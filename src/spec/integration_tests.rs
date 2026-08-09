@@ -10,14 +10,12 @@
 
 use crate::arch;
 use crate::cap::{
-    Badge, Cap, CNodeStorage, EndpointObj, EndpointRights, NotificationObj,
-    NotificationRights, PPtr,
+    Badge, CNodeStorage, Cap, EndpointObj, EndpointRights, NotificationObj, NotificationRights,
+    PPtr,
 };
 use crate::cspace::{lookup_cap, CSpace};
 use crate::cte::Cte;
-use crate::endpoint::{
-    receive_ipc, send_ipc, Endpoint, IpcOutcome, RecvOptions, SendOptions,
-};
+use crate::endpoint::{receive_ipc, send_ipc, Endpoint, IpcOutcome, RecvOptions, SendOptions};
 use crate::interrupt::{handle_interrupt, set_notification, IrqTable};
 use crate::notification::{wait, Notification, WaitOutcome};
 use crate::object_type::ObjectType;
@@ -25,7 +23,7 @@ use crate::scheduler::Scheduler;
 use crate::structures::arch::Pte;
 use crate::tcb::{Tcb, TcbId, ThreadStateType};
 use crate::untyped::{retype, UntypedState};
-use crate::vspace::{frame_map_4k, decompose_vaddr, CacheAttr, VmRights, ENTRIES_PER_TABLE};
+use crate::vspace::{decompose_vaddr, frame_map_4k, CacheAttr, VmRights, ENTRIES_PER_TABLE};
 
 pub fn test_integration() {
     arch::log("Running integration (sel4test subset) tests...\n");
@@ -49,7 +47,9 @@ pub fn test_integration() {
 #[inline(never)]
 fn untyped_to_cnode_to_lookup() {
     let cnode_base: u64 = 0x0000_0000_0040_0000;
-    let mut ut = UntypedState::new(cnode_base, /* block_bits */ 14, /* device */ false);
+    let mut ut = UntypedState::new(
+        cnode_base, /* block_bits */ 14, /* device */ false,
+    );
 
     // Retype 1 CNode of radix 5 (32 slots → 1 KiB).
     let mut produced: Option<Cap> = None;
@@ -78,11 +78,20 @@ fn untyped_to_cnode_to_lookup() {
     }
     impl<'a> CSpace for OneCNode<'a> {
         fn cnode_at(&self, p: PPtr<CNodeStorage>, _: usize) -> Option<&[Cte]> {
-            if p == self.ptr { Some(self.slots) } else { None }
+            if p == self.ptr {
+                Some(self.slots)
+            } else {
+                None
+            }
         }
     }
     let cspace = OneCNode { ptr, slots: &slots };
-    let root = Cap::CNode { ptr, radix, guard_size: 64 - radix, guard: 0 };
+    let root = Cap::CNode {
+        ptr,
+        radix,
+        guard_size: 64 - radix,
+        guard: 0,
+    };
     let found = lookup_cap(&cspace, &root, 7).expect("lookup ok");
     assert_eq!(found, target);
     arch::log("  ✓ Untyped → CNode → write slot → lookup_cap end-to-end\n");
@@ -149,7 +158,10 @@ fn irq_drives_thread_unblock() {
     set_notification(&mut irqs, 12, 2, 0).unwrap();
     // Driver waits on the notification — blocks.
     wait(&mut ntfns[2], &mut sched, driver);
-    assert_eq!(sched.slab.get(driver).state, ThreadStateType::BlockedOnNotification);
+    assert_eq!(
+        sched.slab.get(driver).state,
+        ThreadStateType::BlockedOnNotification
+    );
 
     // Hardware fires IRQ 12 → handle_interrupt signals notification 2
     // → driver wakes.
@@ -218,7 +230,14 @@ fn untyped_to_frame_map() {
     // the same allocation discipline the real x86 PageTable retype
     // uses, just via a different cap type.
     let mut produced: Option<Cap> = None;
-    retype(&mut ut, ObjectType::CapTable, /* radix */ 9, 1, |c| produced = Some(c)).unwrap();
+    retype(
+        &mut ut,
+        ObjectType::CapTable,
+        /* radix */ 9,
+        1,
+        |c| produced = Some(c),
+    )
+    .unwrap();
     let pt_paddr = match produced.unwrap() {
         Cap::CNode { ptr, .. } => ptr.addr(),
         _ => panic!("expected CNode cap as PT stand-in"),
@@ -261,9 +280,9 @@ fn running(prio: u8) -> Tcb {
     let mut t = Tcb::default();
     t.priority = prio;
     t.state = ThreadStateType::Running;
-        // MCS is_schedulable needs an SC; placeholder index so
-        // these specs' threads stay schedulable/enqueued.
-        t.sc = Some(0);
+    // MCS is_schedulable needs an SC; placeholder index so
+    // these specs' threads stay schedulable/enqueued.
+    t.sc = Some(0);
     t
 }
 

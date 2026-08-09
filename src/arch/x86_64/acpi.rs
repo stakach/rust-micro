@@ -26,10 +26,10 @@ pub struct Rsdp {
     pub checksum: u8,
     pub oem_id: [u8; 6],
     pub revision: u8,
-    pub rsdt_address: u32,  // physical addr of RSDT (revision 0)
+    pub rsdt_address: u32, // physical addr of RSDT (revision 0)
     // Below fields exist only in rev ≥ 2 (XSDP):
     pub length: u32,
-    pub xsdt_address: u64,  // physical addr of XSDT
+    pub xsdt_address: u64, // physical addr of XSDT
     pub extended_checksum: u8,
     pub _reserved: [u8; 3],
 }
@@ -46,9 +46,7 @@ pub fn validate_rsdp(rsdp_addr: u64) -> Result<&'static Rsdp, AcpiError> {
         return Err(AcpiError::BadSignature);
     }
     // Revision 0 only checksums the first 20 bytes.
-    let rev0_bytes = unsafe {
-        core::slice::from_raw_parts(rsdp_addr as *const u8, 20)
-    };
+    let rev0_bytes = unsafe { core::slice::from_raw_parts(rsdp_addr as *const u8, 20) };
     if checksum8(rev0_bytes) != 0 {
         return Err(AcpiError::BadChecksum);
     }
@@ -78,9 +76,7 @@ pub fn validate_sdt(addr: u64) -> Result<&'static SdtHeader, AcpiError> {
         return Err(AcpiError::NoTable);
     }
     let hdr = unsafe { &*(addr as *const SdtHeader) };
-    let bytes = unsafe {
-        core::slice::from_raw_parts(addr as *const u8, hdr.length as usize)
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, hdr.length as usize) };
     if checksum8(bytes) != 0 {
         return Err(AcpiError::BadChecksum);
     }
@@ -104,11 +100,24 @@ pub const MADT_SIGNATURE: &[u8; 4] = b"APIC";
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum MadtEntry {
     /// CPU local APIC. 8259 PIC-style processor entry.
-    LocalApic { processor_id: u8, apic_id: u8, flags: u32 },
+    LocalApic {
+        processor_id: u8,
+        apic_id: u8,
+        flags: u32,
+    },
     /// I/O APIC.
-    IoApic { ioapic_id: u8, address: u32, gsi_base: u32 },
+    IoApic {
+        ioapic_id: u8,
+        address: u32,
+        gsi_base: u32,
+    },
     /// Interrupt source override (e.g. PIT-on-IRQ-0 maps to GSI 2).
-    IntSourceOverride { bus: u8, source: u8, gsi: u32, flags: u16 },
+    IntSourceOverride {
+        bus: u8,
+        source: u8,
+        gsi: u32,
+        flags: u16,
+    },
     /// Anything else we don't decode yet.
     Other { kind: u8, len: u8 },
 }
@@ -133,20 +142,33 @@ pub fn iter_madt_entries<F: FnMut(MadtEntry)>(madt: &MadtHeader, mut f: F) -> us
                 let processor_id = read_unaligned((entry_addr + 2) as *const u8);
                 let apic_id = read_unaligned((entry_addr + 3) as *const u8);
                 let flags = read_unaligned((entry_addr + 4) as *const u32);
-                MadtEntry::LocalApic { processor_id, apic_id, flags }
+                MadtEntry::LocalApic {
+                    processor_id,
+                    apic_id,
+                    flags,
+                }
             },
             1 => unsafe {
                 let ioapic_id = read_unaligned((entry_addr + 2) as *const u8);
                 let address = read_unaligned((entry_addr + 4) as *const u32);
                 let gsi_base = read_unaligned((entry_addr + 8) as *const u32);
-                MadtEntry::IoApic { ioapic_id, address, gsi_base }
+                MadtEntry::IoApic {
+                    ioapic_id,
+                    address,
+                    gsi_base,
+                }
             },
             2 => unsafe {
                 let bus = read_unaligned((entry_addr + 2) as *const u8);
                 let source = read_unaligned((entry_addr + 3) as *const u8);
                 let gsi = read_unaligned((entry_addr + 4) as *const u32);
                 let flags = read_unaligned((entry_addr + 8) as *const u16);
-                MadtEntry::IntSourceOverride { bus, source, gsi, flags }
+                MadtEntry::IntSourceOverride {
+                    bus,
+                    source,
+                    gsi,
+                    flags,
+                }
             },
             _ => MadtEntry::Other { kind, len },
         };
@@ -199,9 +221,8 @@ pub fn find_dmar(sdt_addr: u64) -> Result<u64, AcpiError> {
 /// structures each `type(u16) length(u16) ...`; DRHD has the 64-bit
 /// register base at struct-offset +8.
 pub fn dmar_first_drhd_base(dmar_addr: u64) -> Option<u64> {
-    let total_len = unsafe {
-        read_unaligned(&raw const (*(dmar_addr as *const SdtHeader)).length)
-    } as usize;
+    let total_len =
+        unsafe { read_unaligned(&raw const (*(dmar_addr as *const SdtHeader)).length) } as usize;
     let mut off = core::mem::size_of::<SdtHeader>() + 12; // +host_addr_width/flags/resv
     while off + 4 <= total_len {
         let ty: u16 = unsafe { read_unaligned((dmar_addr + off as u64) as *const u16) };
@@ -211,9 +232,7 @@ pub fn dmar_first_drhd_base(dmar_addr: u64) -> Option<u64> {
         }
         if ty == 0 {
             // DRHD — register base at +8.
-            let base: u64 = unsafe {
-                read_unaligned((dmar_addr + (off + 8) as u64) as *const u64)
-            };
+            let base: u64 = unsafe { read_unaligned((dmar_addr + (off + 8) as u64) as *const u64) };
             return Some(base);
         }
         off += len as usize;
@@ -321,15 +340,12 @@ pub mod spec {
         // The header is packed — pull values out via raw pointer
         // reads to avoid taking unaligned references.
         let madt_ptr = madt as *const MadtHeader;
-        let sig: [u8; 4] = unsafe {
-            core::ptr::read_unaligned(madt_ptr.cast::<SdtHeader>())
-                .signature
-        };
+        let sig: [u8; 4] =
+            unsafe { core::ptr::read_unaligned(madt_ptr.cast::<SdtHeader>()).signature };
         assert_eq!(sig, *b"APIC");
         let lapic_addr: u32 = unsafe {
             core::ptr::read_unaligned(
-                (madt_ptr as *const u8).add(core::mem::size_of::<SdtHeader>())
-                    as *const u32,
+                (madt_ptr as *const u8).add(core::mem::size_of::<SdtHeader>()) as *const u32,
             )
         };
         assert_eq!(lapic_addr, 0xFEE0_0000);

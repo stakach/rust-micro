@@ -215,10 +215,18 @@ impl seL4_CapRights_t {
             | ((can_grant_reply & 1) << 3);
         Self { words: [w] }
     }
-    pub const fn can_write(self) -> bool { (self.words[0] & 1) != 0 }
-    pub const fn can_read(self) -> bool { (self.words[0] >> 1) & 1 != 0 }
-    pub const fn can_grant(self) -> bool { (self.words[0] >> 2) & 1 != 0 }
-    pub const fn can_grant_reply(self) -> bool { (self.words[0] >> 3) & 1 != 0 }
+    pub const fn can_write(self) -> bool {
+        (self.words[0] & 1) != 0
+    }
+    pub const fn can_read(self) -> bool {
+        (self.words[0] >> 1) & 1 != 0
+    }
+    pub const fn can_grant(self) -> bool {
+        (self.words[0] >> 2) & 1 != 0
+    }
+    pub const fn can_grant_reply(self) -> bool {
+        (self.words[0] >> 3) & 1 != 0
+    }
 }
 
 /// `seL4_CapRights_new(0, 0, 1, 1)` from libsel4.

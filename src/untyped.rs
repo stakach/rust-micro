@@ -15,8 +15,8 @@
 //! validation in `decodeUntypedInvocation`.
 
 use crate::cap::{
-    Cap, CNodeStorage, EndpointObj, EndpointRights, NotificationObj,
-    NotificationRights, PPtr, Tcb, UntypedStorage, Badge,
+    Badge, CNodeStorage, Cap, EndpointObj, EndpointRights, NotificationObj, NotificationRights,
+    PPtr, Tcb, UntypedStorage,
 };
 use crate::object_type::{size_in_bits, ObjectType, SizeError};
 use crate::region::align_up;
@@ -36,7 +36,12 @@ pub struct UntypedState {
 
 impl UntypedState {
     pub const fn new(base: u64, block_bits: u32, is_device: bool) -> Self {
-        Self { base, block_bits, free_index_bytes: 0, is_device }
+        Self {
+            base,
+            block_bits,
+            free_index_bytes: 0,
+            is_device,
+        }
     }
     pub const fn total_bytes(&self) -> u64 {
         1u64 << self.block_bits
@@ -60,7 +65,12 @@ impl UntypedState {
     }
     pub fn from_cap(cap: &Cap) -> Option<Self> {
         match cap {
-            Cap::Untyped { ptr, block_bits, free_index, is_device } => Some(Self {
+            Cap::Untyped {
+                ptr,
+                block_bits,
+                free_index,
+                is_device,
+            } => Some(Self {
                 base: ptr.addr(),
                 block_bits: *block_bits as u32,
                 free_index_bytes: *free_index,
@@ -169,8 +179,7 @@ pub fn retype(
         let total_bytes = num_objects * per_object;
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let lin = crate::arch::x86_64::paging::phys_to_lin(
-                untyped.base + aligned_offset);
+            let lin = crate::arch::x86_64::paging::phys_to_lin(untyped.base + aligned_offset);
             core::ptr::write_bytes(lin as *mut u8, 0, total_bytes as usize);
         }
     }
@@ -199,8 +208,7 @@ fn make_object_cap(
 ) -> Result<Cap, RetypeError> {
     match ty {
         ObjectType::Untyped => {
-            let ptr = PPtr::<UntypedStorage>::new(obj_addr)
-                .ok_or(RetypeError::InvalidArgument)?;
+            let ptr = PPtr::<UntypedStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
             Ok(Cap::Untyped {
                 ptr,
                 block_bits: user_size_bits as u8,
@@ -209,8 +217,7 @@ fn make_object_cap(
             })
         }
         ObjectType::CapTable => {
-            let ptr = PPtr::<CNodeStorage>::new(obj_addr)
-                .ok_or(RetypeError::InvalidArgument)?;
+            let ptr = PPtr::<CNodeStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
             Ok(Cap::CNode {
                 ptr,
                 radix: user_size_bits as u8,
@@ -219,13 +226,11 @@ fn make_object_cap(
             })
         }
         ObjectType::Tcb => {
-            let tcb = PPtr::<Tcb>::new(obj_addr)
-                .ok_or(RetypeError::InvalidArgument)?;
+            let tcb = PPtr::<Tcb>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
             Ok(Cap::Thread { tcb })
         }
         ObjectType::Endpoint => {
-            let ptr = PPtr::<EndpointObj>::new(obj_addr)
-                .ok_or(RetypeError::InvalidArgument)?;
+            let ptr = PPtr::<EndpointObj>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
             Ok(Cap::Endpoint {
                 ptr,
                 badge: Badge(0),
@@ -238,8 +243,7 @@ fn make_object_cap(
             })
         }
         ObjectType::Notification => {
-            let ptr = PPtr::<NotificationObj>::new(obj_addr)
-                .ok_or(RetypeError::InvalidArgument)?;
+            let ptr = PPtr::<NotificationObj>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
             Ok(Cap::Notification {
                 ptr,
                 badge: Badge(0),
@@ -254,9 +258,12 @@ fn make_object_cap(
             // `user_size_bits` is recorded in the cap so the kernel
             // can find the underlying `SchedContext` storage.
             use crate::cap::SchedContextStorage;
-            let ptr = PPtr::<SchedContextStorage>::new(obj_addr)
-                .ok_or(RetypeError::InvalidArgument)?;
-            Ok(Cap::SchedContext { ptr, size_bits: user_size_bits as u8 })
+            let ptr =
+                PPtr::<SchedContextStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::SchedContext {
+                ptr,
+                size_bits: user_size_bits as u8,
+            })
         }
         ObjectType::Reply => {
             // Phase 34e — fixed-size kernel object (32 bytes).
@@ -266,19 +273,21 @@ fn make_object_cap(
             // PPtr for one keyed off the kernel pool slot, same
             // pattern as Endpoint / SchedContext.
             use crate::cap::ReplyStorage;
-            let ptr = PPtr::<ReplyStorage>::new(obj_addr)
-                .ok_or(RetypeError::InvalidArgument)?;
-            Ok(Cap::Reply { ptr, can_grant: true })
+            let ptr = PPtr::<ReplyStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::Reply {
+                ptr,
+                can_grant: true,
+            })
         }
         ObjectType::Arch(t) => {
             // x86_64 frame types — see object_type::X86_* constants.
             use crate::cap::{
-                FrameRights, FrameSize, FrameStorage, PageDirectoryStorage,
-                PageTableStorage, PdptStorage, Pml4Storage,
+                FrameRights, FrameSize, FrameStorage, PageDirectoryStorage, PageTableStorage,
+                PdptStorage, Pml4Storage,
             };
             use crate::object_type::{
-                X86_4K, X86_IO_PAGE_TABLE, X86_LARGE_PAGE, X86_PAGE_DIRECTORY,
-                X86_PAGE_TABLE, X86_PDPT, X86_PML4,
+                X86_4K, X86_IO_PAGE_TABLE, X86_LARGE_PAGE, X86_PAGE_DIRECTORY, X86_PAGE_TABLE,
+                X86_PDPT, X86_PML4,
             };
             match t {
                 X86_4K | X86_LARGE_PAGE => {
@@ -287,8 +296,8 @@ fn make_object_cap(
                         X86_LARGE_PAGE => FrameSize::Large,
                         _ => unreachable!(),
                     };
-                    let ptr = PPtr::<FrameStorage>::new(obj_addr)
-                        .ok_or(RetypeError::InvalidArgument)?;
+                    let ptr =
+                        PPtr::<FrameStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
                     Ok(Cap::Frame {
                         ptr,
                         size,
@@ -315,22 +324,38 @@ fn make_object_cap(
                 X86_PAGE_TABLE => {
                     let ptr = PPtr::<PageTableStorage>::new(obj_addr)
                         .ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::PageTable { ptr, mapped: None, asid: 0 })
+                    Ok(Cap::PageTable {
+                        ptr,
+                        mapped: None,
+                        asid: 0,
+                    })
                 }
                 X86_PAGE_DIRECTORY => {
                     let ptr = PPtr::<PageDirectoryStorage>::new(obj_addr)
                         .ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::PageDirectory { ptr, mapped: None, asid: 0 })
+                    Ok(Cap::PageDirectory {
+                        ptr,
+                        mapped: None,
+                        asid: 0,
+                    })
                 }
                 X86_PDPT => {
-                    let ptr = PPtr::<PdptStorage>::new(obj_addr)
-                        .ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::Pdpt { ptr, mapped: None, asid: 0 })
+                    let ptr =
+                        PPtr::<PdptStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+                    Ok(Cap::Pdpt {
+                        ptr,
+                        mapped: None,
+                        asid: 0,
+                    })
                 }
                 X86_PML4 => {
-                    let ptr = PPtr::<Pml4Storage>::new(obj_addr)
-                        .ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::PML4 { ptr, mapped: false, asid: 0 })
+                    let ptr =
+                        PPtr::<Pml4Storage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+                    Ok(Cap::PML4 {
+                        ptr,
+                        mapped: false,
+                        asid: 0,
+                    })
                 }
                 _ => Err(RetypeError::InvalidArgument),
             }
@@ -357,7 +382,7 @@ fn checked_pow2(bits: u32) -> Result<u64, RetypeError> {
 pub mod spec {
     use super::*;
     use crate::arch;
-    use crate::cap::{Cap, CNodeStorage, EndpointObj, EndpointRights, PPtr, Badge};
+    use crate::cap::{Badge, CNodeStorage, Cap, EndpointObj, EndpointRights, PPtr};
     use crate::cspace::{lookup_cap, CSpace};
     use crate::cte::Cte;
 
@@ -385,8 +410,7 @@ pub mod spec {
         let mut ut = UntypedState::new(base, 14, false);
 
         let mut produced = Cap::Null;
-        retype(&mut ut, ObjectType::Reply, 0, 1, |c| produced = c)
-            .expect("retype Reply");
+        retype(&mut ut, ObjectType::Reply, 0, 1, |c| produced = c).expect("retype Reply");
         match produced {
             Cap::Reply { ptr, can_grant } => {
                 let _: PPtr<ReplyStorage> = ptr;
@@ -409,10 +433,14 @@ pub mod spec {
         let mut ut = UntypedState::new(base, 14, false);
 
         let mut produced = Cap::Null;
-        retype(&mut ut, ObjectType::SchedContext,
-            crate::object_type::MIN_SCHED_CONTEXT_BITS, 1,
-            |c| produced = c)
-            .expect("retype SchedContext");
+        retype(
+            &mut ut,
+            ObjectType::SchedContext,
+            crate::object_type::MIN_SCHED_CONTEXT_BITS,
+            1,
+            |c| produced = c,
+        )
+        .expect("retype SchedContext");
         match produced {
             Cap::SchedContext { ptr, size_bits } => {
                 let _: PPtr<SchedContextStorage> = ptr;
@@ -430,9 +458,7 @@ pub mod spec {
     }
 
     fn retype_into_paging_structs() {
-        use crate::object_type::{
-            X86_PAGE_DIRECTORY, X86_PAGE_TABLE, X86_PDPT, X86_PML4,
-        };
+        use crate::object_type::{X86_PAGE_DIRECTORY, X86_PAGE_TABLE, X86_PDPT, X86_PML4};
         // 16 KiB untyped — enough for 4 separate 4 KiB paging
         // structures (PT, PD, PDPT, PML4).
         let base = 0x0070_0000;
@@ -442,9 +468,14 @@ pub mod spec {
         // PT first.
         retype(&mut ut, ObjectType::Arch(X86_PAGE_TABLE), 0, 1, |c| {
             produced[0] = c
-        }).expect("retype PT");
+        })
+        .expect("retype PT");
         match produced[0] {
-            Cap::PageTable { ptr, mapped: None, asid: 0 } => {
+            Cap::PageTable {
+                ptr,
+                mapped: None,
+                asid: 0,
+            } => {
                 assert_eq!(ptr.addr(), base);
             }
             ref other => panic!("expected fresh Cap::PageTable, got {:?}", other),
@@ -454,9 +485,14 @@ pub mod spec {
         // since the size_in_bits is 12; expect placement at base+0x1000.
         retype(&mut ut, ObjectType::Arch(X86_PAGE_DIRECTORY), 0, 1, |c| {
             produced[1] = c
-        }).expect("retype PD");
+        })
+        .expect("retype PD");
         match produced[1] {
-            Cap::PageDirectory { ptr, mapped: None, asid: 0 } => {
+            Cap::PageDirectory {
+                ptr,
+                mapped: None,
+                asid: 0,
+            } => {
                 assert_eq!(ptr.addr(), base + 0x1000);
             }
             ref other => panic!("expected fresh Cap::PageDirectory, got {:?}", other),
@@ -465,9 +501,14 @@ pub mod spec {
         // Then PDPT.
         retype(&mut ut, ObjectType::Arch(X86_PDPT), 0, 1, |c| {
             produced[2] = c
-        }).expect("retype PDPT");
+        })
+        .expect("retype PDPT");
         match produced[2] {
-            Cap::Pdpt { ptr, mapped: None, asid: 0 } => {
+            Cap::Pdpt {
+                ptr,
+                mapped: None,
+                asid: 0,
+            } => {
                 assert_eq!(ptr.addr(), base + 0x2000);
             }
             ref other => panic!("expected fresh Cap::Pdpt, got {:?}", other),
@@ -476,9 +517,14 @@ pub mod spec {
         // Then PML4.
         retype(&mut ut, ObjectType::Arch(X86_PML4), 0, 1, |c| {
             produced[3] = c
-        }).expect("retype PML4");
+        })
+        .expect("retype PML4");
         match produced[3] {
-            Cap::PML4 { ptr, mapped: false, asid: 0 } => {
+            Cap::PML4 {
+                ptr,
+                mapped: false,
+                asid: 0,
+            } => {
                 assert_eq!(ptr.addr(), base + 0x3000);
             }
             ref other => panic!("expected fresh Cap::PML4, got {:?}", other),
@@ -506,8 +552,12 @@ pub mod spec {
                     assert_eq!(ptr.addr(), 0x0010_0000 + (i as u64) * 16);
                     assert_eq!(*badge, Badge(0));
                     // Newly retyped endpoints have all rights.
-                    assert!(rights.can_send && rights.can_receive
-                            && rights.can_grant && rights.can_grant_reply);
+                    assert!(
+                        rights.can_send
+                            && rights.can_receive
+                            && rights.can_grant
+                            && rights.can_grant_reply
+                    );
                 }
                 _ => panic!("expected endpoint, got {:?}", cap),
             }
@@ -527,8 +577,10 @@ pub mod spec {
 
         // Retype 1 CNode of radix 4 (16 slots, 512 bytes total = 9 bits).
         let mut produced: Option<Cap> = None;
-        retype(&mut ut, ObjectType::CapTable, 4, 1, |cap| produced = Some(cap))
-            .expect("retype to CNode");
+        retype(&mut ut, ObjectType::CapTable, 4, 1, |cap| {
+            produced = Some(cap)
+        })
+        .expect("retype to CNode");
         let cnode_cap = produced.unwrap();
         let (ptr, radix) = match cnode_cap {
             Cap::CNode { ptr, radix, .. } => (ptr, radix),
@@ -545,8 +597,10 @@ pub mod spec {
             ptr: PPtr::<EndpointObj>::new(0xFFFF_8000_BABE_0000).unwrap(),
             badge: Badge(0xC0FFEE),
             rights: EndpointRights {
-                can_send: true, can_receive: true,
-                can_grant: false, can_grant_reply: false,
+                can_send: true,
+                can_receive: true,
+                can_grant: false,
+                can_grant_reply: false,
             },
         };
         slots[3] = Cte::with_cap(&target);
@@ -557,7 +611,11 @@ pub mod spec {
         }
         impl<'a> CSpace for OneNode<'a> {
             fn cnode_at(&self, ptr: PPtr<CNodeStorage>, _: usize) -> Option<&[Cte]> {
-                if ptr == self.ptr { Some(self.slots) } else { None }
+                if ptr == self.ptr {
+                    Some(self.slots)
+                } else {
+                    None
+                }
             }
         }
         let cspace = OneNode { ptr, slots: &slots };
@@ -566,7 +624,12 @@ pub mod spec {
         // and look up slot 3. With radix=4 / guard_size=60 / guard=0
         // and n_bits=64, levelBits=64, so the index uses the low 4
         // bits of the cptr. CPtr=3 picks slot 3.
-        let root = Cap::CNode { ptr, radix: 4, guard_size: 60, guard: 0 };
+        let root = Cap::CNode {
+            ptr,
+            radix: 4,
+            guard_size: 60,
+            guard: 0,
+        };
         let found = lookup_cap(&cspace, &root, 3).expect("lookup ok");
         assert_eq!(found, target);
         arch::log("  ✓ retype → CNode → write slot → lookup_cap end-to-end\n");
@@ -592,8 +655,7 @@ pub mod spec {
         // size has no slack, but 5 KiB does — request something we
         // know overflows.
         let mut ut = UntypedState::new(0x0040_0000, 12, false);
-        let err = retype(&mut ut, ObjectType::Endpoint, 0, /* num */ 257, |_| {})
-            .unwrap_err();
+        let err = retype(&mut ut, ObjectType::Endpoint, 0, /* num */ 257, |_| {}).unwrap_err();
         assert_eq!(err, RetypeError::NotEnoughMemory);
         // Untyped state untouched on failure.
         assert_eq!(ut.free_index_bytes, 0);
@@ -615,7 +677,11 @@ pub mod spec {
         let mut child = None;
         retype(&mut ut, ObjectType::Untyped, 8, 1, |c| child = Some(c)).unwrap();
         match child.unwrap() {
-            Cap::Untyped { is_device: true, block_bits: 8, .. } => {}
+            Cap::Untyped {
+                is_device: true,
+                block_bits: 8,
+                ..
+            } => {}
             other => panic!("expected device sub-untyped, got {:?}", other),
         }
         arch::log("  ✓ device memory restricts to Untyped descendants only\n");

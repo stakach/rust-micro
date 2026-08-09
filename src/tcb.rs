@@ -401,11 +401,15 @@ impl Default for Tcb {
             ipc_length: 0,
             msg_regs: [0; SCRATCH_MSG_LEN],
             ipc_badge: 0,
-            cpu_context: CpuContext { ksp: 0, cr3: 0, fs_base: 0, gs_base: 0 },
+            cpu_context: CpuContext {
+                ksp: 0,
+                cr3: 0,
+                fs_base: 0,
+                gs_base: 0,
+            },
             cspace_root: crate::cap::Cap::Null,
             #[cfg(target_arch = "x86_64")]
-            user_context:
-                crate::arch::x86_64::syscall_entry::UserContext::new_zero(),
+            user_context: crate::arch::x86_64::syscall_entry::UserContext::new_zero(),
             reply_to: None,
             vspace_root: crate::cap::Cap::Null,
             bound_notification: None,
@@ -473,7 +477,9 @@ pub struct TcbSlab {
 
 impl TcbSlab {
     pub const fn new() -> Self {
-        Self { entries: [None; MAX_TCBS] }
+        Self {
+            entries: [None; MAX_TCBS],
+        }
     }
 
     /// Insert a TCB at the next free slot. Returns the assigned id,
@@ -488,9 +494,7 @@ impl TcbSlab {
                 // valid FINIT image; this just adopts the canonical
                 // boot-captured one for fidelity.
                 #[cfg(feature = "smp")]
-                crate::arch::x86_64::fpu_ctx::stamp_template(
-                    &mut slot.as_mut().unwrap().fpu_state,
-                );
+                crate::arch::x86_64::fpu_ctx::stamp_template(&mut slot.as_mut().unwrap().fpu_state);
                 return Some(TcbId(i as u16));
             }
         }

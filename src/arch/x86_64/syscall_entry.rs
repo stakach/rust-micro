@@ -61,7 +61,10 @@ pub fn init_syscall_msrs() {
         // sets these on the BSP but not on APs; per-CPU setup
         // makes APs match.
         let efer = rdmsr(IA32_EFER);
-        wrmsr(IA32_EFER, efer | EFER_SCE | crate::arch::x86_64::msr::EFER_NXE);
+        wrmsr(
+            IA32_EFER,
+            efer | EFER_SCE | crate::arch::x86_64::msr::EFER_NXE,
+        );
 
         // IA32_STAR layout:
         //   bits 31..0  = legacy SYSCALL target EIP (32-bit; unused
@@ -89,10 +92,18 @@ pub fn init_syscall_msrs() {
 }
 
 /// Read-back accessors used by the spec.
-pub fn lstar() -> u64 { unsafe { rdmsr(IA32_LSTAR) } }
-pub fn star() -> u64 { unsafe { rdmsr(IA32_STAR) } }
-pub fn fmask() -> u64 { unsafe { rdmsr(IA32_FMASK) } }
-pub fn efer() -> u64 { unsafe { rdmsr(IA32_EFER) } }
+pub fn lstar() -> u64 {
+    unsafe { rdmsr(IA32_LSTAR) }
+}
+pub fn star() -> u64 {
+    unsafe { rdmsr(IA32_STAR) }
+}
+pub fn fmask() -> u64 {
+    unsafe { rdmsr(IA32_FMASK) }
+}
+pub fn efer() -> u64 {
+    unsafe { rdmsr(IA32_EFER) }
+}
 
 // ---------------------------------------------------------------------------
 // Naked SYSCALL entry stub.
@@ -122,8 +133,8 @@ pub fn efer() -> u64 { unsafe { rdmsr(IA32_EFER) } }
 pub struct UserContext {
     pub rax: u64,
     pub rbx: u64,
-    pub rcx: u64,  // doubles as RIP slot for sysretq path (SYSCALL
-                   // destroys RCX so we save the return RIP here)
+    pub rcx: u64, // doubles as RIP slot for sysretq path (SYSCALL
+    // destroys RCX so we save the return RIP here)
     pub rdx: u64,
     pub rsi: u64,
     pub rdi: u64,
@@ -152,9 +163,24 @@ pub struct UserContext {
 impl UserContext {
     pub const fn new_zero() -> Self {
         Self {
-            rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
-            r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-            rsp: 0, rip: 0, rflags: 0,
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rsp: 0,
+            rip: 0,
+            rflags: 0,
         }
     }
 
@@ -162,9 +188,9 @@ impl UserContext {
     /// executing at `entry` with `rsp` and arg-0 = `arg0`.
     pub const fn for_entry(entry: u64, rsp: u64, arg0: u64) -> Self {
         let mut c = Self::new_zero();
-        c.rcx = entry;        // sysretq reloads RIP from rcx
-        c.r11 = 0x202;        // RFLAGS: bit 1 reserved=1, IF=1
-        c.rip = entry;        // iretq path reads from .rip directly
+        c.rcx = entry; // sysretq reloads RIP from rcx
+        c.r11 = 0x202; // RFLAGS: bit 1 reserved=1, IF=1
+        c.rip = entry; // iretq path reads from .rip directly
         c.rflags = 0x202;
         c.rsp = rsp;
         c.rdi = arg0;
@@ -195,9 +221,24 @@ const PER_CPU_INIT: PerCpuSyscallArea = PerCpuSyscallArea {
     kernel_rsp: 0,
     _pad: 0,
     user_ctx: UserContext {
-        rax: 0, rbx: 0, rcx: 0, rdx: 0, rsi: 0, rdi: 0, rbp: 0,
-        r8: 0, r9: 0, r10: 0, r11: 0, r12: 0, r13: 0, r14: 0, r15: 0,
-        rsp: 0, rip: 0, rflags: 0,
+        rax: 0,
+        rbx: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        rbp: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
+        rflags: 0,
     },
 };
 
@@ -346,38 +387,38 @@ pub unsafe extern "C" fn enter_user_via_iretq(ctx: *const UserContext) -> ! {
         // We push in reverse order (top-of-stack last in mem terms).
         "mov rax, 0x23",
         "push rax",
-        "mov rax, [rdi + 120]",   // RSP
+        "mov rax, [rdi + 120]", // RSP
         "push rax",
-        "mov rax, [rdi + 136]",   // RFLAGS
+        "mov rax, [rdi + 136]", // RFLAGS
         // seL4 invariant: user threads ALWAYS run with IF=1. The swap
         // path sanitizes the same way (interrupts.rs). Without this, a
         // thread whose saved RFLAGS has IF=0 (e.g. a reused TCB slot
         // carrying stale flags) resumes with interrupts disabled — the
         // timer IRQ never fires, the kernel clock freezes, and any
         // timing-dependent test wedges (DOMAINS0004's busy-sleep).
-        "and rax, 0xDD5",         // keep user-controllable flags only
-        "or rax, 0x202",          // force IF=1 (+ reserved bit 1)
+        "and rax, 0xDD5", // keep user-controllable flags only
+        "or rax, 0x202",  // force IF=1 (+ reserved bit 1)
         "push rax",
         "mov rax, 0x2B",
         "push rax",
-        "mov rax, [rdi + 128]",   // RIP
+        "mov rax, [rdi + 128]", // RIP
         "push rax",
         // Restore GPRs from ctx (but skip RDI — we still need it).
         "mov rax, [rdi + 0]",
         "mov rbx, [rdi + 8]",
-        "mov rcx, [rdi + 16]",    // user-set RCX (independent of RIP)
+        "mov rcx, [rdi + 16]", // user-set RCX (independent of RIP)
         "mov rdx, [rdi + 24]",
         "mov rsi, [rdi + 32]",
         "mov rbp, [rdi + 48]",
         "mov r8,  [rdi + 56]",
         "mov r9,  [rdi + 64]",
         "mov r10, [rdi + 72]",
-        "mov r11, [rdi + 80]",    // user-set R11
+        "mov r11, [rdi + 80]", // user-set R11
         "mov r12, [rdi + 88]",
         "mov r13, [rdi + 96]",
         "mov r14, [rdi + 104]",
         "mov r15, [rdi + 112]",
-        "mov rdi, [rdi + 40]",    // restore RDI last (we just used it)
+        "mov rdi, [rdi + 40]", // restore RDI last (we just used it)
         // Mirror the swapgs round-trip the sysretq path does so
         // the active/KERNEL gs invariant stays balanced.
         "swapgs",
@@ -398,14 +439,14 @@ pub unsafe extern "C" fn enter_user_via_sysret(ctx: *const UserContext) -> ! {
         // as the SYSCALL entry stub's restore tail.
         "mov rax, [rdi + 0]",
         "mov rbx, [rdi + 8]",
-        "mov rcx, [rdi + 16]",   // user RIP — sysretq reads this
+        "mov rcx, [rdi + 16]", // user RIP — sysretq reads this
         "mov rdx, [rdi + 24]",
         "mov rsi, [rdi + 32]",
         "mov rbp, [rdi + 48]",
         "mov r8,  [rdi + 56]",
         "mov r9,  [rdi + 64]",
         "mov r10, [rdi + 72]",
-        "mov r11, [rdi + 80]",   // user RFLAGS — sysretq reads this
+        "mov r11, [rdi + 80]", // user RFLAGS — sysretq reads this
         // seL4 invariant: user always resumes with IF=1 (see the iretq
         // path + the swap). Guards against a stale/garbage saved RFLAGS
         // freezing the kernel clock by leaving interrupts disabled.
@@ -415,7 +456,7 @@ pub unsafe extern "C" fn enter_user_via_sysret(ctx: *const UserContext) -> ! {
         "mov r13, [rdi + 96]",
         "mov r14, [rdi + 104]",
         "mov r15, [rdi + 112]",
-        "mov rsp, [rdi + 120]",  // user RSP (sysretq doesn't restore)
+        "mov rsp, [rdi + 120]", // user RSP (sysretq doesn't restore)
         // rdi was the ctx pointer we needed; restore its user value
         // last, after we've used it for everything else.
         "mov rdi, [rdi + 40]",
@@ -541,7 +582,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     crate::smp::SYSCALL_COUNT_PER_CPU[arch::get_cpu_id() as usize]
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-
     // Phase 28f — recover the calling CPU's UserContext from the
     // per-CPU array. The asm stub wrote it via `gs:[16 + ...]`;
     // we look it up by APIC ID here.
@@ -612,10 +652,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             None => false,
         }
     };
-    let is_nt_native_call =
-        (number as i32) == Syscall::SysCall as i32
-            && args.a0 == HOSTED_NT_NATIVE_CALL_CAP
-            && args.a1 == HOSTED_NT_NATIVE_CALL_MSGINFO;
+    let is_nt_native_call = (number as i32) == Syscall::SysCall as i32
+        && args.a0 == HOSTED_NT_NATIVE_CALL_CAP
+        && args.a1 == HOSTED_NT_NATIVE_CALL_MSGINFO;
     let force_unknown = hosted_syscalls && !is_nt_native_call;
     let syscall = match (force_unknown, Syscall::from_i32(number as i32)) {
         (false, Some(s)) => s,
@@ -634,32 +673,38 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             static UNKNOWN_SEEN: AtomicU32 = AtomicU32::new(0);
             let seen = UNKNOWN_SEEN.fetch_add(1, O::Relaxed);
             if seen < 16 {
-            arch::log("[unknown syscall nr=");
-            let signed = number as i64;
-            let abs = if signed < 0 { (-signed) as u64 } else { signed as u64 };
-            if signed < 0 { arch::log("-"); }
-            let mut buf = [0u8; 20];
-            let mut i = buf.len();
-            let mut n = abs;
-            if n == 0 {
-                arch::log("0");
-            } else {
-                while n > 0 {
-                    i -= 1;
-                    buf[i] = b'0' + (n % 10) as u8;
-                    n /= 10;
+                arch::log("[unknown syscall nr=");
+                let signed = number as i64;
+                let abs = if signed < 0 {
+                    (-signed) as u64
+                } else {
+                    signed as u64
+                };
+                if signed < 0 {
+                    arch::log("-");
                 }
-                if let Ok(s) = core::str::from_utf8(&buf[i..]) {
-                    arch::log(s);
+                let mut buf = [0u8; 20];
+                let mut i = buf.len();
+                let mut n = abs;
+                if n == 0 {
+                    arch::log("0");
+                } else {
+                    while n > 0 {
+                        i -= 1;
+                        buf[i] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                    }
+                    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+                        arch::log(s);
+                    }
                 }
-            }
-            arch::log("]\n");
+                arch::log("]\n");
             } // end throttled log (seen < 16)
-            // PAGEFAULT0004 — out-of-range numbers become a
-            // seL4_Fault_UnknownSyscall to the thread's fault
-            // handler (upstream handleUnknownSyscall). The faulter
-            // blocks; enter the next runnable thread. With no
-            // handler, suspend it (upstream prints + suspends).
+              // PAGEFAULT0004 — out-of-range numbers become a
+              // seL4_Fault_UnknownSyscall to the thread's fault
+              // handler (upstream handleUnknownSyscall). The faulter
+              // blocks; enter the next runnable thread. With no
+              // handler, suspend it (upstream prints + suspends).
             unsafe {
                 let s = KERNEL.get();
                 if let Some(cur) = s.scheduler.current() {
@@ -668,16 +713,19 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                         crate::fault::FaultMessage::UnknownSyscall {
                             number: number as u64,
                         },
-                    ).is_err() {
+                    )
+                    .is_err()
+                    {
                         arch::log("[unknown syscall: no fault handler — suspending]\n");
-                        s.scheduler.block(
-                            cur, crate::tcb::ThreadStateType::Inactive);
+                        s.scheduler
+                            .block(cur, crate::tcb::ThreadStateType::Inactive);
                     }
                     // Never returns; releases the BKL itself (the
                     // BklGuard's Drop won't run, same as the other
                     // enter_user_* paths below).
                     crate::arch::x86_64::exceptions::dispatch_next_or_idle(
-                        "[unknown syscall: no next thread, idling CPU]\n");
+                        "[unknown syscall: no next thread, idling CPU]\n",
+                    );
                 }
             }
             return;
@@ -692,9 +740,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     if super::usermode::USERMODE_TEST_TRIGGERED.load(Ordering::Relaxed)
         && matches!(syscall, Syscall::SysDebugPutChar)
     {
-        arch::log(
-            "\n[user-mode round-trip succeeded — exiting QEMU]\n",
-        );
+        arch::log("\n[user-mode round-trip succeeded — exiting QEMU]\n");
         crate::arch::qemu_exit(0);
     }
     // Phase 14d: the two-thread IPC demo expects to see at least
@@ -705,9 +751,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     {
         let prev = super::usermode::IPC_PRINTED.fetch_add(1, Ordering::Relaxed);
         if prev + 1 >= 2 {
-            arch::log(
-                "\n[two-thread IPC succeeded — exiting QEMU]\n",
-            );
+            arch::log("\n[two-thread IPC succeeded — exiting QEMU]\n");
             crate::arch::qemu_exit(0);
         }
     }
@@ -737,13 +781,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     {
         let b = args.a0 as u8;
         if b == b'\n' {
-            let prev = crate::rootserver::ROOTSERVER_PRINTED
-                .fetch_add(1, Ordering::Relaxed);
-            if prev + 1 >= 3 && !crate::rootserver::MCS_DEMO_ACTIVE
-                .load(Ordering::Relaxed)
-            {
-                crate::rootserver::MCS_DEMO_ACTIVE
-                    .store(true, Ordering::Relaxed);
+            let prev = crate::rootserver::ROOTSERVER_PRINTED.fetch_add(1, Ordering::Relaxed);
+            if prev + 1 >= 3 && !crate::rootserver::MCS_DEMO_ACTIVE.load(Ordering::Relaxed) {
+                crate::rootserver::MCS_DEMO_ACTIVE.store(true, Ordering::Relaxed);
             }
         } else if crate::rootserver::MCS_DEMO_ACTIVE.load(Ordering::Relaxed) {
             if b == b'H' {
@@ -831,13 +871,14 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // Restore per-thread FS_BASE so userspace TLS (`%fs:0`)
             // sees this thread's TLS after a context-switch syscall
             // tail. Same-thread case is a no-op write.
-            crate::arch::x86_64::msr::wrmsr(
-                crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+            crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
             // Restore the per-thread user %gs base into the swapped-out
             // MSR so the tail `swapgs` lands the next thread's TEB in
             // %gs (Windows `%gs:0x30`). Threads with no gs base carry 0.
             crate::arch::x86_64::msr::wrmsr(
-                crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE, next_gs_base);
+                crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
+                next_gs_base,
+            );
             // Phase 15a: fan IPC delivery state from the receiving
             // TCB into its user-visible registers. Mirrors upstream
             // seL4's IPC return ABI (`x64_sys_recv`):
@@ -857,10 +898,10 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             let was_recv_path = matches!(
                 syscall,
                 Syscall::SysRecv
-                | Syscall::SysNBRecv
-                | Syscall::SysReplyRecv
-                | Syscall::SysWait
-                | Syscall::SysNBWait,
+                    | Syscall::SysNBRecv
+                    | Syscall::SysReplyRecv
+                    | Syscall::SysWait
+                    | Syscall::SysNBWait,
             ) && Some(next) == s.scheduler.current();
             // The "matches" above guards against the sender side:
             // when a blocked sender wakes up, we don't want to
@@ -879,8 +920,8 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 new_ctx.rsi = mi;
                 new_ctx.rdi = tcb.ipc_badge;
                 new_ctx.r10 = tcb.msg_regs[0];
-                new_ctx.r8  = tcb.msg_regs[1];
-                new_ctx.r9  = tcb.msg_regs[2];
+                new_ctx.r8 = tcb.msg_regs[1];
+                new_ctx.r9 = tcb.msg_regs[2];
                 new_ctx.r15 = tcb.msg_regs[3];
                 // Fan words 4..length out to the receiver's IPC buffer page (mirrors the
                 // receiver-blocked-first path in endpoint::transfer_msg) so a handler dispatched via
@@ -890,7 +931,8 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 let length = tcb.ipc_length as usize;
                 if length > 4 && recv_buf_paddr != 0 {
                     let buf = (crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr)
-                        as *mut u64).wrapping_add(1); // skip the tag word
+                        as *mut u64)
+                        .wrapping_add(1); // skip the tag word
                     let n = length.min(tcb.msg_regs.len());
                     for i in 4..n {
                         core::ptr::write_volatile(buf.add(i), tcb.msg_regs[i]);
@@ -991,8 +1033,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 // dispatch below, so the timer can't re-enter while we
                 // hold the lock either.
                 crate::smp::bkl_release();
-                core::arch::asm!("sti", "hlt", "cli",
-                    options(nostack, preserves_flags));
+                core::arch::asm!("sti", "hlt", "cli", options(nostack, preserves_flags));
                 // After waking, re-evaluate. If something is now
                 // runnable, dispatch it via enter_user_via_sysret.
                 let s = KERNEL.get();
@@ -1027,7 +1068,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                         }
                     }
                     crate::arch::x86_64::msr::wrmsr(
-                        crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+                        crate::arch::x86_64::msr::IA32_FS_BASE,
+                        next_fs_base,
+                    );
                     // This path entered the kernel through SYSCALL, so the active
                     // GS base is the per-CPU area and KERNEL_GS_BASE holds the
                     // outgoing user's value. Replace that shadow value before the
@@ -1037,8 +1080,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                         next_gs_base,
                     );
                     #[cfg(feature = "smp")]
-                    crate::arch::x86_64::fpu_ctx::fpu_switch_to(
-                        &mut s.scheduler.slab, next_id);
+                    crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next_id);
                     apply_fpu_gate_for(s.scheduler.slab.get(next_id));
                     apply_debug_state_for(s.scheduler.slab.get(next_id));
                     let pcc = current_cpu_user_ctx_mut();
@@ -1101,13 +1143,12 @@ pub mod spec {
     #[inline(never)]
     fn per_cpu_kernel_gs_base_set() {
         let cpu = crate::arch::get_cpu_id() as usize;
-        let expected =
-            unsafe { (&raw const super::PER_CPU_SYSCALL[cpu]) as u64 };
-        let actual = unsafe {
-            super::rdmsr(super::IA32_KERNEL_GS_BASE)
-        };
-        assert_eq!(actual, expected,
-            "BSP's IA32_KERNEL_GS_BASE should point at its PER_CPU_SYSCALL slot");
+        let expected = unsafe { (&raw const super::PER_CPU_SYSCALL[cpu]) as u64 };
+        let actual = unsafe { super::rdmsr(super::IA32_KERNEL_GS_BASE) };
+        assert_eq!(
+            actual, expected,
+            "BSP's IA32_KERNEL_GS_BASE should point at its PER_CPU_SYSCALL slot"
+        );
         arch::log("  ✓ IA32_KERNEL_GS_BASE points at this CPU's slot\n");
     }
 
@@ -1166,8 +1207,10 @@ pub mod spec {
         super::rust_syscall_dispatch(-12i64 as u64, 0);
 
         let ctx = super::current_cpu_user_ctx_mut();
-        assert_eq!(ctx.rax, 0xDEAD_BEEF,
-                   "dispatcher must preserve user's rax (upstream ABI)");
+        assert_eq!(
+            ctx.rax, 0xDEAD_BEEF,
+            "dispatcher must preserve user's rax (upstream ABI)"
+        );
         arch::log("  ✓ rust_syscall_dispatch handles SysDebugPutChar\n");
     }
 
@@ -1183,8 +1226,10 @@ pub mod spec {
         ctx.rax = 0xFEED_CAFE;
         super::rust_syscall_dispatch(99u64, 0);
         let ctx = super::current_cpu_user_ctx_mut();
-        assert_eq!(ctx.rax, 0xFEED_CAFE,
-                   "kernel preserves rax even on unknown-syscall exit");
+        assert_eq!(
+            ctx.rax, 0xFEED_CAFE,
+            "kernel preserves rax even on unknown-syscall exit"
+        );
         arch::log("  ✓ rust_syscall_dispatch flags unknown syscalls\n");
     }
 }

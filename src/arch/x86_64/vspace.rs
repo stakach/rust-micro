@@ -143,7 +143,12 @@ pub fn make_pde_pt(pt_paddr: Word, rights: VmRights, executable: bool) -> PdePt 
 }
 
 /// Build a PD entry mapping a 2 MiB large page directly.
-pub fn make_pde_large(paddr: Word, rights: VmRights, cache: CacheAttr, executable: bool) -> PdeLarge {
+pub fn make_pde_large(
+    paddr: Word,
+    rights: VmRights,
+    cache: CacheAttr,
+    executable: bool,
+) -> PdeLarge {
     let (pat, pcd, pwt) = split_cache(cache);
     PdeLarge::zeroed()
         .with_present(1)
@@ -274,8 +279,7 @@ pub mod spec {
         // off-by-one would fail loudly.
         // PML4=0x12, PDPT=0xAB, PD=0x34, PT=0xCD, off=0x123.
         // 0x12 << 39 | 0xAB << 30 | 0x34 << 21 | 0xCD << 12 | 0x123
-        let v: Word = (0x12u64 << 39) | (0xABu64 << 30)
-            | (0x34u64 << 21) | (0xCDu64 << 12) | 0x123;
+        let v: Word = (0x12u64 << 39) | (0xABu64 << 30) | (0x34u64 << 21) | (0xCDu64 << 12) | 0x123;
         let i = decompose_vaddr(v);
         assert_eq!(i.pml4, 0x12);
         assert_eq!(i.pdpt, 0xAB);
@@ -335,8 +339,15 @@ pub mod spec {
         let mut pt = [Pte::zeroed(); ENTRIES_PER_TABLE];
         let vaddr: Word = 0x0000_1234_5678_9000;
         let paddr: Word = 0x0000_0000_4000_0000;
-        frame_map_4k(&mut pt, vaddr, paddr, VmRights::UserRW, CacheAttr::Writeback, true)
-            .unwrap();
+        frame_map_4k(
+            &mut pt,
+            vaddr,
+            paddr,
+            VmRights::UserRW,
+            CacheAttr::Writeback,
+            true,
+        )
+        .unwrap();
         let idx = decompose_vaddr(vaddr).pt as usize;
         assert_eq!(pt[idx].present(), 1);
         assert_eq!(pt[idx].page_base_address(), paddr);
@@ -354,17 +365,38 @@ pub mod spec {
         let mut pt = [Pte::zeroed(); ENTRIES_PER_TABLE];
         // vaddr unaligned.
         assert_eq!(
-            frame_map_4k(&mut pt, 0x1001, 0x2000, VmRights::UserRW, CacheAttr::Writeback, true),
+            frame_map_4k(
+                &mut pt,
+                0x1001,
+                0x2000,
+                VmRights::UserRW,
+                CacheAttr::Writeback,
+                true
+            ),
             Err(MapError::AlignmentError),
         );
         // paddr unaligned.
         assert_eq!(
-            frame_map_4k(&mut pt, 0x1000, 0x2008, VmRights::UserRW, CacheAttr::Writeback, true),
+            frame_map_4k(
+                &mut pt,
+                0x1000,
+                0x2008,
+                VmRights::UserRW,
+                CacheAttr::Writeback,
+                true
+            ),
             Err(MapError::AlignmentError),
         );
         // Non-canonical vaddr.
         assert_eq!(
-            frame_map_4k(&mut pt, 0x0000_8000_0000_0000, 0x2000, VmRights::UserRW, CacheAttr::Writeback, true),
+            frame_map_4k(
+                &mut pt,
+                0x0000_8000_0000_0000,
+                0x2000,
+                VmRights::UserRW,
+                CacheAttr::Writeback,
+                true
+            ),
             Err(MapError::OutOfRange),
         );
         arch::log("  ✓ frame_map_4k rejects unaligned and non-canonical addrs\n");
@@ -374,10 +406,24 @@ pub mod spec {
     fn frame_map_rejects_double_map() {
         let mut pt = [Pte::zeroed(); ENTRIES_PER_TABLE];
         let vaddr: Word = 0x1000;
-        frame_map_4k(&mut pt, vaddr, 0x2000, VmRights::UserRW, CacheAttr::Writeback, true)
-            .unwrap();
+        frame_map_4k(
+            &mut pt,
+            vaddr,
+            0x2000,
+            VmRights::UserRW,
+            CacheAttr::Writeback,
+            true,
+        )
+        .unwrap();
         assert_eq!(
-            frame_map_4k(&mut pt, vaddr, 0x3000, VmRights::UserRW, CacheAttr::Writeback, true),
+            frame_map_4k(
+                &mut pt,
+                vaddr,
+                0x3000,
+                VmRights::UserRW,
+                CacheAttr::Writeback,
+                true
+            ),
             Err(MapError::AlreadyMapped),
         );
         arch::log("  ✓ frame_map_4k rejects double-map without unmap first\n");

@@ -4,12 +4,12 @@ pub mod serial;
 pub mod qemu;
 
 pub mod cpu;
-pub mod interrupts;
 pub mod exceptions;
+pub mod interrupts;
 
 pub use cpu::{get_cpu_id, halt_cpu};
-pub use interrupts::init_interrupts;
 pub use exceptions::init_exceptions;
+pub use interrupts::init_interrupts;
 
 /// aarch64 has no GDT — segments aren't a thing. The arch trait
 /// keeps the symbol so portable bootstrap code can call

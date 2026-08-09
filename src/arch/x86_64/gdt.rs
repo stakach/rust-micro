@@ -64,7 +64,9 @@ struct GdtTable {
     entries: [u64; GDT_ENTRIES],
 }
 
-static mut GDT: GdtTable = GdtTable { entries: [0; GDT_ENTRIES] };
+static mut GDT: GdtTable = GdtTable {
+    entries: [0; GDT_ENTRIES],
+};
 
 /// Minimal x86_64 TSS layout (104 bytes). Only `rsp0` is meaningful
 /// for syscall entry; the IST entries and iomap base sit at zero
@@ -123,12 +125,7 @@ struct GdtPointer {
 // hand-encoded constant clearer for a one-time setup.
 // ---------------------------------------------------------------------------
 
-const fn segment_descriptor(
-    limit: u32,
-    base: u32,
-    access: u8,
-    flags: u8,
-) -> u64 {
+const fn segment_descriptor(limit: u32, base: u32, access: u8, flags: u8) -> u64 {
     let mut d: u64 = 0;
     d |= (limit as u64) & 0xFFFF;
     d |= ((base as u64) & 0xFFFF) << 16;
@@ -166,19 +163,15 @@ const ACCESS_USER_DS: u8 = 0xF2;
 const FLAGS_CODE64: u8 = 0xA;
 const FLAGS_DATA: u8 = 0xC;
 
-const KERNEL_CS_DESC: u64 =
-    segment_descriptor(0xFFFFF, 0, ACCESS_KERN_CS, FLAGS_CODE64);
-const KERNEL_DS_DESC: u64 =
-    segment_descriptor(0xFFFFF, 0, ACCESS_KERN_DS, FLAGS_DATA);
+const KERNEL_CS_DESC: u64 = segment_descriptor(0xFFFFF, 0, ACCESS_KERN_CS, FLAGS_CODE64);
+const KERNEL_DS_DESC: u64 = segment_descriptor(0xFFFFF, 0, ACCESS_KERN_DS, FLAGS_DATA);
 const USER32_CS_DESC: u64 =
     // 32-bit user code segment placeholder. SYSRET's CS=STAR_USER+16
     // logic gates off the L bit, but if it's mistakenly used we want
     // a sensible 32-bit code segment. Flags: G=1, D=1, L=0 → 0xC0.
     segment_descriptor(0xFFFFF, 0, ACCESS_USER_CS, 0xC);
-const USER_DS_DESC: u64 =
-    segment_descriptor(0xFFFFF, 0, ACCESS_USER_DS, FLAGS_DATA);
-const USER_CS_DESC: u64 =
-    segment_descriptor(0xFFFFF, 0, ACCESS_USER_CS, FLAGS_CODE64);
+const USER_DS_DESC: u64 = segment_descriptor(0xFFFFF, 0, ACCESS_USER_DS, FLAGS_DATA);
+const USER_CS_DESC: u64 = segment_descriptor(0xFFFFF, 0, ACCESS_USER_CS, FLAGS_CODE64);
 
 // 16-byte TSS system descriptor. Two consecutive 8-byte slots: low
 // half encodes the limit + low 32 bits of base + access + flags,

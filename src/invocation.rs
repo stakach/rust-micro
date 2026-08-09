@@ -14,7 +14,7 @@
 //! word of the IPC MessageInfo carries the label in its high bits.
 //! We expose helpers on the generated `InvocationLabel` enum.
 
-use crate::cap::{Cap, CNodeStorage, PPtr};
+use crate::cap::{CNodeStorage, Cap, PPtr};
 use crate::cspace::lookup_cap;
 use crate::cte::Cte;
 use crate::error::{KException, KResult, SyscallError};
@@ -30,36 +30,39 @@ use crate::types::{seL4_Error, seL4_Word as Word};
 /// with the `decode_invocation` match arms.
 fn inv_cap_tag(c: &Cap) -> &'static str {
     match c {
-        Cap::Untyped { .. }       => "Ut",
-        Cap::CNode { .. }         => "Cn",
-        Cap::Thread { .. }        => "Tcb",
-        Cap::IrqControl           => "IrC",
-        Cap::IrqHandler { .. }    => "IrH",
-        Cap::Frame { .. }         => "Fr",
-        Cap::PageTable { .. }     => "PT",
+        Cap::Untyped { .. } => "Ut",
+        Cap::CNode { .. } => "Cn",
+        Cap::Thread { .. } => "Tcb",
+        Cap::IrqControl => "IrC",
+        Cap::IrqHandler { .. } => "IrH",
+        Cap::Frame { .. } => "Fr",
+        Cap::PageTable { .. } => "PT",
         Cap::PageDirectory { .. } => "PD",
-        Cap::Pdpt { .. }          => "PDPT",
-        Cap::PML4 { .. }          => "PML4",
-        Cap::AsidControl          => "AsC",
-        Cap::AsidPool { .. }      => "AsP",
-        Cap::SchedContext { .. }  => "SC",
-        Cap::SchedControl { .. }  => "SCtl",
-        Cap::Reply { .. }         => "Rep",
-        Cap::Endpoint { .. }      => "Ep",
-        Cap::Notification { .. }  => "Ntfn",
-        Cap::IOPort { .. }        => "IoP",
-        Cap::IOPortControl        => "IoPC",
-        Cap::IoSpace { .. }       => "IoS",
-        Cap::IoPageTable { .. }   => "IoPT",
-        Cap::Null                 => "Null",
-        _                         => "??",
+        Cap::Pdpt { .. } => "PDPT",
+        Cap::PML4 { .. } => "PML4",
+        Cap::AsidControl => "AsC",
+        Cap::AsidPool { .. } => "AsP",
+        Cap::SchedContext { .. } => "SC",
+        Cap::SchedControl { .. } => "SCtl",
+        Cap::Reply { .. } => "Rep",
+        Cap::Endpoint { .. } => "Ep",
+        Cap::Notification { .. } => "Ntfn",
+        Cap::IOPort { .. } => "IoP",
+        Cap::IOPortControl => "IoPC",
+        Cap::IoSpace { .. } => "IoS",
+        Cap::IoPageTable { .. } => "IoPT",
+        Cap::Null => "Null",
+        _ => "??",
     }
 }
 
 /// Print a small u64 in decimal via `crate::arch::log`. Avoids
 /// pulling in `format!` in #[no_std].
 fn log_dec(mut v: u64) {
-    if v == 0 { crate::arch::log("0"); return; }
+    if v == 0 {
+        crate::arch::log("0");
+        return;
+    }
     let mut buf = [b'0'; 8];
     let mut i = 8;
     while v > 0 && i > 0 {
@@ -78,7 +81,9 @@ fn log_dec(mut v: u64) {
 const INV_TRACE: bool = false;
 
 fn inv_log_entry(target: &Cap, label_n: u64, xc: u8) {
-    if !INV_TRACE { return; }
+    if !INV_TRACE {
+        return;
+    }
     crate::arch::log("<inv cap=");
     crate::arch::log(inv_cap_tag(target));
     crate::arch::log(" label=");
@@ -89,7 +94,9 @@ fn inv_log_entry(target: &Cap, label_n: u64, xc: u8) {
 }
 
 fn inv_log_exit(result: &KResult<()>) {
-    if !INV_TRACE { return; }
+    if !INV_TRACE {
+        return;
+    }
     match result {
         Ok(()) => crate::arch::log("<inv ok>\n"),
         Err(KException::SyscallError(SyscallError { code })) => {
@@ -105,8 +112,14 @@ fn inv_log_exit(result: &KResult<()>) {
 /// visible even when target lookup fails (which short-circuits
 /// `decode_invocation`'s own tracing).
 pub fn handle_send_log_entry(cptr: u64, mi_word: u64, call: bool) {
-    if !INV_TRACE { return; }
-    crate::arch::log(if call { "<send call cptr=" } else { "<send cptr=" });
+    if !INV_TRACE {
+        return;
+    }
+    crate::arch::log(if call {
+        "<send call cptr="
+    } else {
+        "<send cptr="
+    });
     log_hex(cptr);
     let info = crate::types::seL4_MessageInfo_t { words: [mi_word] };
     crate::arch::log(" label=");
@@ -119,7 +132,9 @@ pub fn handle_send_log_entry(cptr: u64, mi_word: u64, call: bool) {
 }
 
 pub fn handle_send_log_lookup_err(e: &KException) {
-    if !INV_TRACE { return; }
+    if !INV_TRACE {
+        return;
+    }
     match e {
         KException::SyscallError(SyscallError { code }) => {
             crate::arch::log("<send-lookup-ERR=");
@@ -132,13 +147,20 @@ pub fn handle_send_log_lookup_err(e: &KException) {
 
 fn log_hex(mut v: u64) {
     crate::arch::log("0x");
-    if v == 0 { crate::arch::log("0"); return; }
+    if v == 0 {
+        crate::arch::log("0");
+        return;
+    }
     let mut buf = [b'0'; 16];
     let mut i = 16;
     while v > 0 && i > 0 {
         i -= 1;
         let nib = (v & 0xF) as u8;
-        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+        buf[i] = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + (nib - 10)
+        };
         v >>= 4;
     }
     if let Ok(s) = core::str::from_utf8(&buf[i..]) {
@@ -148,13 +170,20 @@ fn log_hex(mut v: u64) {
 
 /// Like `log_hex` but without the `0x` prefix — for inline use.
 pub fn log_hex_u64(mut v: u64) {
-    if v == 0 { crate::arch::log("0"); return; }
+    if v == 0 {
+        crate::arch::log("0");
+        return;
+    }
     let mut buf = [b'0'; 16];
     let mut i = 16;
     while v > 0 && i > 0 {
         i -= 1;
         let nib = (v & 0xF) as u8;
-        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+        buf[i] = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + (nib - 10)
+        };
         v >>= 4;
     }
     if let Ok(s) = core::str::from_utf8(&buf[i..]) {
@@ -164,16 +193,17 @@ pub fn log_hex_u64(mut v: u64) {
 
 /// Decode an invocation against a non-Endpoint cap. Called from
 /// the IPC dispatcher when SysSend/SysCall targets a non-IPC cap.
-pub fn decode_invocation(
-    target: Cap,
-    args: &SyscallArgs,
-    invoker: TcbId,
-) -> KResult<()> {
+pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     // Decode the invocation label from MessageInfo.
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let label_n = info.label();
     let xc_count = unsafe {
-        KERNEL.get().scheduler.slab.get(invoker).pending_extra_caps_count
+        KERNEL
+            .get()
+            .scheduler
+            .slab
+            .get(invoker)
+            .pending_extra_caps_count
     };
     inv_log_entry(&target, label_n, xc_count);
 
@@ -181,7 +211,8 @@ pub fn decode_invocation(
         Some(l) => l,
         None => {
             let r = Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidArgument)));
+                seL4_Error::seL4_InvalidArgument,
+            )));
             inv_log_exit(&r);
             return r;
         }
@@ -202,9 +233,10 @@ pub fn decode_invocation(
         Cap::SchedControl { core } => decode_sched_control(core, label, args, invoker),
         Cap::Reply { .. } => decode_reply(target, args, invoker),
         Cap::Domain => decode_domain(label, args, invoker),
-        Cap::IOPort { first_port, last_port } => {
-            decode_io_port(first_port, last_port, label, args, invoker)
-        }
+        Cap::IOPort {
+            first_port,
+            last_port,
+        } => decode_io_port(first_port, last_port, label, args, invoker),
         Cap::IOPortControl => decode_io_port_control(label, args, invoker),
         // Phase 44 — VT-d. IoPageTable caps take Map/Unmap; IoSpace
         // caps have no invocations of their own.
@@ -317,8 +349,13 @@ unsafe fn update_any_matching_frame_slot(
 fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     use crate::arch::x86_64::usermode;
     let (frame_ptr, paddr, size, _device, current_mapped) = match target {
-        Cap::Frame { ptr, size, is_device, mapped, .. } =>
-            (ptr, ptr.addr(), size, is_device, mapped),
+        Cap::Frame {
+            ptr,
+            size,
+            is_device,
+            mapped,
+            ..
+        } => (ptr, ptr.addr(), size, is_device, mapped),
         _ => unreachable!(),
     };
     let vaddr = args.a2;
@@ -355,7 +392,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     let align_bits: u32 = match size {
         crate::cap::FrameSize::Small => 12,
         crate::cap::FrameSize::Large => 21,
-        crate::cap::FrameSize::Huge  => 30,
+        crate::cap::FrameSize::Huge => 30,
     };
     let align_mask = (1u64 << align_bits) - 1;
     if vaddr & align_mask != 0 {
@@ -379,16 +416,22 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             inv_tcb.pending_extra_caps_count = 0;
             match cap {
                 Some(Cap::PML4 { ptr, asid, .. }) => Some((ptr.addr(), asid)),
-                _ => return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_InvalidCapability))),
+                _ => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
             }
         } else if args.a4 != 0 {
             let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
             let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a4)?;
             match pml4_cap {
                 Cap::PML4 { ptr, asid, .. } => Some((ptr.addr(), asid)),
-                _ => return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_InvalidCapability))),
+                _ => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
             }
         } else {
             None
@@ -404,23 +447,33 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             //   missing=3: PD entry empty   → need PT   (level 21)
             //   missing=4: leaf slot busy   → DeleteFirst
             let map_result = match size {
-                crate::cap::FrameSize::Small => {
-                    usermode::map_user_4k_into_foreign_pml4(
-                        pml4_paddr, vaddr, paddr, writable, execute_never)
-                }
-                crate::cap::FrameSize::Large => {
-                    usermode::map_user_2m_into_foreign_pml4(
-                        pml4_paddr, vaddr, paddr, writable, execute_never)
-                }
-                crate::cap::FrameSize::Huge => {
-                    usermode::map_user_1g_into_foreign_pml4(
-                        pml4_paddr, vaddr, paddr, writable, execute_never)
-                }
+                crate::cap::FrameSize::Small => usermode::map_user_4k_into_foreign_pml4(
+                    pml4_paddr,
+                    vaddr,
+                    paddr,
+                    writable,
+                    execute_never,
+                ),
+                crate::cap::FrameSize::Large => usermode::map_user_2m_into_foreign_pml4(
+                    pml4_paddr,
+                    vaddr,
+                    paddr,
+                    writable,
+                    execute_never,
+                ),
+                crate::cap::FrameSize::Huge => usermode::map_user_1g_into_foreign_pml4(
+                    pml4_paddr,
+                    vaddr,
+                    paddr,
+                    writable,
+                    execute_never,
+                ),
             };
             if let Err(missing) = map_result {
                 if missing == 4 {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst)));
+                        seL4_Error::seL4_DeleteFirst,
+                    )));
                 }
                 let level: u64 = match missing {
                     1 => 39, // PML4 entry empty → need PDPT
@@ -432,14 +485,16 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
                 // Must encompass mr2, so length >= 3.
                 inv_tcb.ipc_length = 3;
                 return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_FailedLookup)));
+                    seL4_Error::seL4_FailedLookup,
+                )));
             }
         } else if matches!(size, crate::cap::FrameSize::Small) {
             usermode::map_user_4k_public(vaddr, paddr, writable, execute_never);
         } else {
             // Legacy microtest path doesn't support Large/Huge.
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidArgument)));
+                seL4_Error::seL4_InvalidArgument,
+            )));
         }
     }
 
@@ -477,7 +532,9 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
 /// way; deferring until we have multi-process workloads.
 #[cfg(target_arch = "x86_64")]
 fn pml4_paddr_for_asid(asid: u16) -> u64 {
-    if asid == 0 { return 0; }
+    if asid == 0 {
+        return 0;
+    }
     unsafe {
         let s = KERNEL.get();
         for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
@@ -499,8 +556,24 @@ fn pml4_paddr_for_asid(asid: u16) -> u64 {
 
 fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     let (frame_ptr, paddr, size, rights, mapped_vaddr, asid, is_device, map_type) = match target {
-        Cap::Frame { ptr, size, rights, mapped, asid, is_device, map_type } =>
-            (ptr, ptr.addr(), size, rights, mapped, asid, is_device, map_type),
+        Cap::Frame {
+            ptr,
+            size,
+            rights,
+            mapped,
+            asid,
+            is_device,
+            map_type,
+        } => (
+            ptr,
+            ptr.addr(),
+            size,
+            rights,
+            mapped,
+            asid,
+            is_device,
+            map_type,
+        ),
         _ => unreachable!(),
     };
 
@@ -510,7 +583,9 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
     #[cfg(target_arch = "x86_64")]
     if map_type == crate::cap::FrameMapType::IoSpace {
         if let Some(io_address) = mapped_vaddr {
-            unsafe { unmap_io_page(asid, io_address, paddr); }
+            unsafe {
+                unmap_io_page(asid, io_address, paddr);
+            }
         }
     } else if let Some(vaddr) = mapped_vaddr {
         unsafe {
@@ -518,16 +593,13 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
             if pml4_paddr != 0 {
                 match size {
                     crate::cap::FrameSize::Small => {
-                        crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
-                            pml4_paddr, vaddr);
+                        crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(pml4_paddr, vaddr);
                     }
                     crate::cap::FrameSize::Large => {
-                        crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
-                            pml4_paddr, vaddr);
+                        crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(pml4_paddr, vaddr);
                     }
                     crate::cap::FrameSize::Huge => {
-                        crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
-                            pml4_paddr, vaddr);
+                        crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(pml4_paddr, vaddr);
                     }
                 }
                 crate::smp::shootdown_tlb(vaddr);
@@ -535,7 +607,10 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    { let _ = mapped_vaddr; let _ = size; }
+    {
+        let _ = mapped_vaddr;
+        let _ = size;
+    }
 
     // Clear the mapping state in the invoked cap. Falling back to a paddr scan here would have the
     // same sibling-cap hazard as PageMap when the executive keeps separate mapped/client/source caps.
@@ -614,14 +689,21 @@ fn decode_x86_iopt(
         use crate::arch::x86_64::iommu;
 
         let (base_paddr, is_mapped, level, mapped_address, ioasid) = match target {
-            Cap::IoPageTable { ptr, is_mapped, level, mapped_address, ioasid } =>
-                (ptr.addr(), is_mapped, level, mapped_address, ioasid),
+            Cap::IoPageTable {
+                ptr,
+                is_mapped,
+                level,
+                mapped_address,
+                ioasid,
+            } => (ptr.addr(), is_mapped, level, mapped_address, ioasid),
             _ => unreachable!(),
         };
 
         if label == InvocationLabel::X86IOPageTableUnmap {
             // deleteIOPageTable (iospace.c:397) then clear isMapped.
-            unsafe { delete_io_page_table(base_paddr, is_mapped, level, mapped_address, ioasid); }
+            unsafe {
+                delete_io_page_table(base_paddr, is_mapped, level, mapped_address, ioasid);
+            }
             let new_cap = Cap::IoPageTable {
                 ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
                 is_mapped: false,
@@ -635,7 +717,8 @@ fn decode_x86_iopt(
 
         if label != InvocationLabel::X86IOPageTableMap {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_IllegalOperation)));
+                seL4_Error::seL4_IllegalOperation,
+            )));
         }
 
         // X86IOPageTableMap. extraCaps[0] = io_space, arg0 = io_address.
@@ -644,32 +727,45 @@ fn decode_x86_iopt(
 
         if is_mapped {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         }
         let (pci_request_id, domain_id) = match io_space {
-            Cap::IoSpace { pci_device, domain_id } => (pci_device, domain_id),
-            _ => return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability))),
+            Cap::IoSpace {
+                pci_device,
+                domain_id,
+            } => (pci_device, domain_id),
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
         };
         // asidInvalid == 0.
         if pci_request_id == 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         }
 
         let ctx = unsafe { iommu::lookup_vtd_context_slot(pci_request_id, true) };
         let Some(ctx) = ctx else {
             // No IOMMU / pool exhausted.
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         };
 
         if !unsafe { ctx.present() } {
             // Install this PT as the context (1st-level) root.
-            unsafe { ctx.install_root(domain_id, base_paddr); }
+            unsafe {
+                ctx.install_root(domain_id, base_paddr);
+            }
             // A device now has an IO-space context — turn on VT-d translation. Until now
             // DMA was identity (TE off); from here it's confined to mapped IOVAs.
-            unsafe { iommu::enable_translation(); }
+            unsafe {
+                iommu::enable_translation();
+            }
             let new_cap = Cap::IoPageTable {
                 ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
                 is_mapped: true,
@@ -686,14 +782,18 @@ fn decode_x86_iopt(
         let lu = unsafe { iommu::lookup_iopt_slot(top, io_address) };
         if !lu.ok {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let new_level = iommu::num_iopt_levels() - lu.level;
         if unsafe { iommu::slot_addr(lu.slot) } != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_DeleteFirst)));
+                seL4_Error::seL4_DeleteFirst,
+            )));
         }
-        unsafe { iommu::slot_install(lu.slot, base_paddr, true, true); }
+        unsafe {
+            iommu::slot_install(lu.slot, base_paddr, true, true);
+        }
         let new_cap = Cap::IoPageTable {
             ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
             is_mapped: true,
@@ -708,7 +808,8 @@ fn decode_x86_iopt(
     {
         let _ = (target, label, args, invoker);
         Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_IllegalOperation)))
+            seL4_Error::seL4_IllegalOperation,
+        )))
     }
 }
 
@@ -742,7 +843,11 @@ unsafe fn delete_io_page_table(
         ctx.clear();
     } else {
         let lu = iommu::lookup_iopt_slot_levels(
-            top, mapped_address >> iommu::PAGE_BITS, (level - 1) as u64, (level - 1) as u64);
+            top,
+            mapped_address >> iommu::PAGE_BITS,
+            (level - 1) as u64,
+            (level - 1) as u64,
+        );
         if !lu.ok || lu.level != 0 {
             return;
         }
@@ -777,29 +882,33 @@ unsafe fn unmap_io_page(pci_request_id: u16, io_address: u64, frame_paddr: u64) 
 
 /// `X86Page::MapIO` — decodeX86IOMapInvocation (iospace.c:296). Maps a
 /// 4 KiB frame into an IO space's leaf VT-d PTE.
-fn decode_x86_iomap(
-    target: Cap,
-    args: &SyscallArgs,
-    invoker: TcbId,
-) -> KResult<()> {
+fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     #[cfg(target_arch = "x86_64")]
     {
         use crate::arch::x86_64::iommu;
 
         let (frame_paddr, size, frame_rights, frame_mapped, frame_device) = match target {
-            Cap::Frame { ptr, size, rights, mapped, is_device, .. } =>
-                (ptr.addr(), size, rights, mapped, is_device),
+            Cap::Frame {
+                ptr,
+                size,
+                rights,
+                mapped,
+                is_device,
+                ..
+            } => (ptr.addr(), size, rights, mapped, is_device),
             _ => unreachable!(),
         };
 
         // Must be a 4 KiB page, currently unmapped.
         if !matches!(size, crate::cap::FrameSize::Small) {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         }
         if frame_mapped.is_some() {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         }
 
         // arg0 = rights mask, arg1 = io_address.
@@ -809,33 +918,41 @@ fn decode_x86_iomap(
         let io_space = take_single_extra_cap(invoker);
         let pci_request_id = match io_space {
             Cap::IoSpace { pci_device, .. } => pci_device,
-            _ => return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability))),
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
         };
         if pci_request_id == 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         }
 
         let ctx = unsafe { iommu::lookup_vtd_context_slot(pci_request_id, false) };
         let Some(ctx) = ctx else {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         };
         if !unsafe { ctx.present() } {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
 
         let top = unsafe { ctx.asr() };
         let lu = unsafe { iommu::lookup_iopt_slot(top, io_address) };
         if !lu.ok || lu.level != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         if unsafe { iommu::slot_addr(lu.slot) } != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_DeleteFirst)));
+                seL4_Error::seL4_DeleteFirst,
+            )));
         }
 
         // write/read = (rights mask) AND (frame rights).
@@ -847,9 +964,12 @@ fn decode_x86_iomap(
             && !matches!(frame_rights, crate::cap::FrameRights::KernelOnly);
         if !write && !read {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidArgument)));
+                seL4_Error::seL4_InvalidArgument,
+            )));
         }
-        unsafe { iommu::slot_install(lu.slot, frame_paddr, write, read); }
+        unsafe {
+            iommu::slot_install(lu.slot, frame_paddr, write, read);
+        }
 
         // Record the IO mapping on the frame cap.
         let new_cap = Cap::Frame {
@@ -868,7 +988,8 @@ fn decode_x86_iomap(
     {
         let _ = (target, args, invoker);
         Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_IllegalOperation)))
+            seL4_Error::seL4_IllegalOperation,
+        )))
     }
 }
 
@@ -887,7 +1008,10 @@ fn rewrite_frame_cap_in_cspace(invoker: TcbId, base_paddr: u64, new_cap: &Cap) {
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
         if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
             for slot in slots.iter_mut() {
-                if let Cap::Frame { ptr, mapped: None, .. } = slot.cap() {
+                if let Cap::Frame {
+                    ptr, mapped: None, ..
+                } = slot.cap()
+                {
                     if ptr.addr() == base_paddr {
                         slot.set_cap(new_cap);
                         return;
@@ -901,11 +1025,7 @@ fn rewrite_frame_cap_in_cspace(invoker: TcbId, base_paddr: u64, new_cap: &Cap) {
 /// `X86Page::GetAddress` — return the frame's physical address in
 /// the caller's `msg_regs[0]`. The syscall return path fans this
 /// out to user-mode `rdx` (Phase 15a).
-fn decode_frame_get_address(
-    target: Cap,
-    _args: &SyscallArgs,
-    invoker: TcbId,
-) -> KResult<()> {
+fn decode_frame_get_address(target: Cap, _args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     let paddr = match target {
         Cap::Frame { ptr, .. } => ptr.addr(),
         _ => unreachable!(),
@@ -986,12 +1106,7 @@ fn decode_pdpt(
 /// ABI: a2 = vaddr, a3 = vspace cap_ptr (0 = current CR3 —
 /// backward-compatible default; non-zero = invoker-owned PML4 cap
 /// added by Phase 33d for multi-vspace setup).
-fn map_paging_struct(
-    target: Cap,
-    args: &SyscallArgs,
-    invoker: TcbId,
-    level: u32,
-) -> KResult<()> {
+fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32) -> KResult<()> {
     use crate::arch::x86_64::usermode;
     let (paddr, current_mapped) = paging_struct_state(&target);
     if current_mapped.is_some() {
@@ -1033,17 +1148,22 @@ fn map_paging_struct(
             inv_tcb.pending_extra_caps_count = 0;
             match cap {
                 Some(Cap::PML4 { ptr, .. }) => Some(ptr.addr()),
-                _ => return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_InvalidCapability))),
+                _ => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
             }
         } else if args.a3 != 0 {
             let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
-            let pml4_cap = crate::cspace::lookup_cap(
-                KERNEL.get(), &cspace_root, args.a3)?;
+            let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a3)?;
             match pml4_cap {
                 Cap::PML4 { ptr, .. } => Some(ptr.addr()),
-                _ => return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_InvalidCapability))),
+                _ => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
             }
         } else {
             None
@@ -1053,9 +1173,14 @@ fn map_paging_struct(
             usermode::install_user_table_in_paddr(pml4_paddr, level, vaddr, paddr)
         } else {
             #[cfg(not(feature = "spec"))]
-            { usermode::install_user_table(level, vaddr, paddr) }
+            {
+                usermode::install_user_table(level, vaddr, paddr)
+            }
             #[cfg(feature = "spec")]
-            { let _ = (level, vaddr, paddr); Ok(()) }
+            {
+                let _ = (level, vaddr, paddr);
+                Ok(())
+            }
         }
     };
     if let Err(missing_level) = installed {
@@ -1119,14 +1244,24 @@ fn rewrite_paging_cap_in_cspace(invoker: TcbId, cap: &Cap, new_mapped: Option<u6
         for slot in slots.iter_mut() {
             let updated = match slot.cap() {
                 Cap::PageTable { ptr, asid, .. } if ptr.addr() == target_paddr => {
-                    Some(Cap::PageTable { ptr, mapped: new_mapped, asid })
+                    Some(Cap::PageTable {
+                        ptr,
+                        mapped: new_mapped,
+                        asid,
+                    })
                 }
                 Cap::PageDirectory { ptr, asid, .. } if ptr.addr() == target_paddr => {
-                    Some(Cap::PageDirectory { ptr, mapped: new_mapped, asid })
+                    Some(Cap::PageDirectory {
+                        ptr,
+                        mapped: new_mapped,
+                        asid,
+                    })
                 }
-                Cap::Pdpt { ptr, asid, .. } if ptr.addr() == target_paddr => {
-                    Some(Cap::Pdpt { ptr, mapped: new_mapped, asid })
-                }
+                Cap::Pdpt { ptr, asid, .. } if ptr.addr() == target_paddr => Some(Cap::Pdpt {
+                    ptr,
+                    mapped: new_mapped,
+                    asid,
+                }),
                 _ => None,
             };
             if let Some(cap) = updated {
@@ -1184,8 +1319,7 @@ const MAX_ASID_POOLS: usize = 1 << 3;
 /// pool) is permanently set. MakePool allocates the lowest clear bit
 /// in 1..8 (→ DeleteFirst when full, VSPACE0004); freeing an AsidPool
 /// cap clears its bit (so the index recycles).
-static ASID_POOL_INUSE: core::sync::atomic::AtomicU16 =
-    core::sync::atomic::AtomicU16::new(1);
+static ASID_POOL_INUSE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
 
 /// Per-pool count of ASIDs handed out, indexed by pool index
 /// (`asid_base / 512`, always 0..8). Assign returns `seL4_DeleteFirst`
@@ -1195,8 +1329,7 @@ static ASID_POOL_INUSE: core::sync::atomic::AtomicU16 =
 /// wrapping offset.
 #[allow(clippy::declare_interior_mutable_const)]
 static ASID_POOL_USED: [core::sync::atomic::AtomicU16; MAX_ASID_POOLS] = {
-    const Z: core::sync::atomic::AtomicU16 =
-        core::sync::atomic::AtomicU16::new(0);
+    const Z: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
     [Z; MAX_ASID_POOLS]
 };
 
@@ -1240,11 +1373,7 @@ pub fn reset_asid_state() {
     NEXT_ASID_OFFSET.store(2, Ordering::Relaxed);
 }
 
-fn decode_asid_control(
-    label: InvocationLabel,
-    args: &SyscallArgs,
-    invoker: TcbId,
-) -> KResult<()> {
+fn decode_asid_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     use core::sync::atomic::Ordering;
     match label {
         InvocationLabel::X86ASIDControlMakePool => {
@@ -1268,15 +1397,15 @@ fn decode_asid_control(
                     let inv = s.scheduler.slab.get(invoker);
                     if inv.pending_extra_caps_count < 2 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     let untyped = inv.pending_extra_caps[0];
                     let root = inv.pending_extra_caps[1];
                     s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
                     (untyped, root, args.a2 as usize, args.a3 as u32)
                 } else {
-                    let untyped = crate::cspace::lookup_cap(
-                        s, &invoker_cspace, args.a2)?;
+                    let untyped = crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?;
                     (untyped, invoker_cspace, args.a4 as usize, 0u32)
                 };
 
@@ -1284,33 +1413,44 @@ fn decode_asid_control(
                 // must fail (VSPACE0004). Check up front so we don't
                 // consume the untyped on a doomed call; the index is
                 // actually claimed below once all validation passes.
-                if (ASID_POOL_INUSE.load(Ordering::Relaxed)
-                    & ((1u16 << MAX_ASID_POOLS) - 1))
+                if (ASID_POOL_INUSE.load(Ordering::Relaxed) & ((1u16 << MAX_ASID_POOLS) - 1))
                     == ((1u16 << MAX_ASID_POOLS) - 1)
                 {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst)));
+                        seL4_Error::seL4_DeleteFirst,
+                    )));
                 }
 
                 let mut state = match crate::untyped::UntypedState::from_cap(&untyped) {
                     Some(s) => s,
-                    None => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
+                    None => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 };
 
                 // Resolve the dest slot within the dest CNode cap at
                 // `depth` (upstream) or directly (legacy depth==0).
                 let cnode_ptr = match dest_cnode_cap {
                     Cap::CNode { ptr, .. } => ptr,
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 };
                 let (cnode_idx, dest_offset) = if upstream && depth != 0 {
                     let res = crate::cspace::resolve_address_bits(
-                        s, &dest_cnode_cap, dest_index as u64, depth)?;
+                        s,
+                        &dest_cnode_cap,
+                        dest_index as u64,
+                        depth,
+                    )?;
                     if res.bits_remaining != 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_FailedLookup)));
+                            seL4_Error::seL4_FailedLookup,
+                        )));
                     }
                     (KernelState::cnode_index(res.slot_ptr), res.slot_index)
                 } else {
@@ -1319,12 +1459,16 @@ fn decode_asid_control(
 
                 let slots = match s.cnode_slots_at_mut(cnode_idx) {
                     Some(s) => s,
-                    None => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
+                    None => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 };
                 if dest_offset >= slots.len() || !slots[dest_offset].cap().is_null() {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst)));
+                        seL4_Error::seL4_DeleteFirst,
+                    )));
                 }
 
                 // Carve 4 KiB out of the Untyped for the pool storage.
@@ -1334,7 +1478,8 @@ fn decode_asid_control(
                 let block_total = 1u64 << state.block_bits;
                 if aligned + 0x1000 > block_total {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_NotEnoughMemory)));
+                        seL4_Error::seL4_NotEnoughMemory,
+                    )));
                 }
                 let pool_paddr = state.base + aligned;
                 state.free_index_bytes = aligned + 0x1000;
@@ -1344,15 +1489,20 @@ fn decode_asid_control(
                 // 512-ASID limit (VSPACE0005). asid_base = index * 512.
                 let pool_index = match alloc_asid_pool_index() {
                     Some(i) => i,
-                    None => return Err(KException::SyscallError(
-                        SyscallError::new(seL4_Error::seL4_DeleteFirst))),
+                    None => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_DeleteFirst,
+                        )))
+                    }
                 };
                 let asid_base = (pool_index as u16) * 512;
 
                 let pool_cap = Cap::AsidPool {
-                    ptr: PPtr::<crate::cap::AsidPoolStorage>::new(pool_paddr)
-                        .ok_or_else(|| KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidArgument)))?,
+                    ptr: PPtr::<crate::cap::AsidPoolStorage>::new(pool_paddr).ok_or_else(|| {
+                        KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidArgument,
+                        ))
+                    })?,
                     asid_base,
                 };
                 slots[dest_offset].set_cap(&pool_cap);
@@ -1372,8 +1522,7 @@ fn decode_asid_control(
                 if let Some(usl) = untyped_slot {
                     // Phase 30 — record the new pool's MDB parent as
                     // the source Untyped's slot.
-                    let parent_id = crate::cte::MdbId::pack(
-                        cnode_idx as u8, usl as u32);
+                    let parent_id = crate::cte::MdbId::pack(cnode_idx as u8, usl as u32);
                     slots[dest_offset].set_parent(Some(parent_id));
                     child_count_inc(parent_id, 1);
                     // Commit the bumped Untyped state back into its slot.
@@ -1418,55 +1567,73 @@ fn decode_asid_pool(
                     let inv_tcb = s.scheduler.slab.get(invoker);
                     if inv_tcb.pending_extra_caps_count == 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     let cap = inv_tcb.pending_extra_caps[0];
                     let buf_paddr = inv_tcb.ipc_buffer_paddr;
                     s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
                     if buf_paddr == 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
-                    let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr)
-                        as *const u64;
-                    let cptr = core::ptr::read_volatile(
-                        buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET));
-                    let res = crate::cspace::resolve_address_bits(
-                        s, &invoker_cspace, cptr, 64)?;
+                    let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr) as *const u64;
+                    let cptr =
+                        core::ptr::read_volatile(buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET));
+                    let res = crate::cspace::resolve_address_bits(s, &invoker_cspace, cptr, 64)?;
                     if res.bits_remaining != 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_FailedLookup)));
+                            seL4_Error::seL4_FailedLookup,
+                        )));
                     }
                     (KernelState::cnode_index(res.slot_ptr), res.slot_index, cap)
                 } else {
                     let cnode_ptr = match invoker_cspace {
                         Cap::CNode { ptr, .. } => ptr,
-                        _ => return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability))),
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
                     };
                     let cnode_idx = KernelState::cnode_index(cnode_ptr);
                     let slot_idx = args.a2 as usize;
                     let slots = match s.cnode_slots_at(cnode_idx) {
                         Some(s) => s,
-                        None => return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability))),
+                        None => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
                     };
                     if slot_idx >= slots.len() {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_RangeError)));
+                            seL4_Error::seL4_RangeError,
+                        )));
                     }
                     (cnode_idx, slot_idx, slots[slot_idx].cap())
                 };
                 let (ptr, mapped) = match vspace_cap {
-                    Cap::PML4 { ptr, mapped, asid: 0 } => (ptr, mapped),
+                    Cap::PML4 {
+                        ptr,
+                        mapped,
+                        asid: 0,
+                    } => (ptr, mapped),
                     // Already assigned to an ASID — upstream
                     // decodeX86ASIDPoolAssign returns InvalidCapability
                     // (VSPACE0002 assigns the already-mapped
                     // page_directory and expects exactly that).
-                    Cap::PML4 { .. } => return Err(KException::SyscallError(
-                        SyscallError::new(seL4_Error::seL4_InvalidCapability))),
-                    _ => return Err(KException::SyscallError(
-                        SyscallError::new(seL4_Error::seL4_InvalidCapability))),
+                    Cap::PML4 { .. } => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 };
                 // Allocate the next ASID in this pool.
                 //   * MakePool'd pools (asid_base != 0): use a per-pool
@@ -1483,12 +1650,14 @@ fn decode_asid_pool(
                 let _ = pool_paddr;
                 let assigned = if asid_base != 0 {
                     let idx = (asid_base / 512) as usize;
-                    let used = ASID_POOL_USED.get(idx)
+                    let used = ASID_POOL_USED
+                        .get(idx)
                         .map(|u| u.load(Ordering::Relaxed))
                         .unwrap_or(0);
                     if used >= 512 {
-                        return Err(KException::SyscallError(
-                            SyscallError::new(seL4_Error::seL4_DeleteFirst)));
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_DeleteFirst,
+                        )));
                     }
                     if let Some(u) = ASID_POOL_USED.get(idx) {
                         u.store(used + 1, Ordering::Relaxed);
@@ -1496,13 +1665,16 @@ fn decode_asid_pool(
                     asid_base.saturating_add(used)
                 } else {
                     asid_base.saturating_add(
-                        (NEXT_ASID_OFFSET.fetch_add(
-                            1, core::sync::atomic::Ordering::Relaxed,
-                        ) & 0x1FF) as u16,
+                        (NEXT_ASID_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                            & 0x1FF) as u16,
                     )
                 };
                 if let Some(slot) = s.cnode_slot_mut(slot_cnode_idx, slot_idx) {
-                    slot.set_cap(&Cap::PML4 { ptr, mapped, asid: assigned });
+                    slot.set_cap(&Cap::PML4 {
+                        ptr,
+                        mapped,
+                        asid: assigned,
+                    });
                 }
                 Ok(())
             }
@@ -1521,8 +1693,7 @@ fn decode_asid_pool(
 /// A duplicate ASID confuses `pml4_paddr_for_asid`'s linear scan: it
 /// returns the first match, and a test-process Frame::Unmap could
 /// land on the rootserver's PML4 instead of the test process's.
-static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(2);
+static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
 
 // ---------------------------------------------------------------------------
 // Phase 36d — Reply cap invocations. Send on a Cap::Reply wakes
@@ -1541,8 +1712,11 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         let idx = KernelState::reply_index(reply_ptr);
         let caller = match s.replies[idx].bound_tcb {
             Some(c) => c,
-            None => return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability))),
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
         };
         // Stage the reply message on the invoker so the existing
         // transfer machinery (used by handle_reply too) sees the
@@ -1563,8 +1737,9 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             let me = s.scheduler.slab.get_mut(invoker);
             let length = me.ipc_length as usize;
             if length > 4 && me.ipc_buffer_paddr != 0 {
-                let buf = (crate::arch::x86_64::paging::phys_to_lin(
-                    me.ipc_buffer_paddr) as *const u64).wrapping_add(1);
+                let buf = (crate::arch::x86_64::paging::phys_to_lin(me.ipc_buffer_paddr)
+                    as *const u64)
+                    .wrapping_add(1);
                 let max = length.min(me.msg_regs.len());
                 for i in 4..max {
                     me.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -1581,8 +1756,7 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         // fan-out below would stomp its live registers. Apply
         // upstream handleFaultReply semantics instead.
         if s.scheduler.slab.get(caller).pending_fault != 0 {
-            let restart = crate::fault::apply_fault_reply(
-                s, caller, label, length as usize, &regs);
+            let restart = crate::fault::apply_fault_reply(s, caller, label, length as usize, &regs);
             s.scheduler.slab.get_mut(invoker).active_sc = None;
             s.replies[idx].bound_tcb = None;
             // Only clear the legacy reply_to stash if it names THIS
@@ -1600,8 +1774,8 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             if restart {
                 s.scheduler.make_runnable(caller);
             } else {
-                s.scheduler.block(
-                    caller, crate::tcb::ThreadStateType::Inactive);
+                s.scheduler
+                    .block(caller, crate::tcb::ThreadStateType::Inactive);
             }
             return Ok(());
         }
@@ -1655,9 +1829,7 @@ fn decode_sched_context(
     invoker: TcbId,
 ) -> KResult<()> {
     let sc_id = match target {
-        Cap::SchedContext { ptr, .. } => {
-            KernelState::sched_context_index(ptr) as u16
-        }
+        Cap::SchedContext { ptr, .. } => KernelState::sched_context_index(ptr) as u16,
         _ => unreachable!(),
     };
     match label {
@@ -1673,7 +1845,8 @@ fn decode_sched_context(
                     let inv_tcb = s.scheduler.slab.get_mut(invoker);
                     if inv_tcb.pending_extra_caps_count == 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     let c = inv_tcb.pending_extra_caps[0];
                     inv_tcb.pending_extra_caps_count = 0;
@@ -1698,14 +1871,15 @@ fn decode_sched_context(
                         // (SCHED_CONTEXT_0003), not DeleteFirst.
                         if s.scheduler.slab.get(tcb_id).sc.is_some() {
                             return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_IllegalOperation)));
+                                seL4_Error::seL4_IllegalOperation,
+                            )));
                         }
                         if s.sched_contexts[sc_id as usize].bound_tcb.is_some() {
                             return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_IllegalOperation)));
+                                seL4_Error::seL4_IllegalOperation,
+                            )));
                         }
-                        let was_runnable =
-                            s.scheduler.slab.get(tcb_id).is_runnable();
+                        let was_runnable = s.scheduler.slab.get(tcb_id).is_runnable();
                         s.scheduler.slab.get_mut(tcb_id).sc = Some(sc_id);
                         s.sched_contexts[sc_id as usize].bound_tcb = Some(tcb_id);
                         // The SC carries the core it was configured for
@@ -1739,19 +1913,16 @@ fn decode_sched_context(
                         let mut woke_for_badge = false;
                         if let Some(bn_idx) = bn {
                             let ntfn = &mut s.notifications[bn_idx as usize];
-                            if matches!(ntfn.state,
-                                crate::notification::NtfnState::Active)
-                            {
+                            if matches!(ntfn.state, crate::notification::NtfnState::Active) {
                                 let badge = ntfn.pending_badge;
                                 ntfn.pending_badge = 0;
-                                ntfn.state =
-                                    crate::notification::NtfnState::Idle;
+                                ntfn.state = crate::notification::NtfnState::Idle;
                                 let was_blocked_recv = matches!(
                                     s.scheduler.slab.get(tcb_id).state,
-                                    crate::tcb::ThreadStateType::BlockedOnReceive);
+                                    crate::tcb::ThreadStateType::BlockedOnReceive
+                                );
                                 if was_blocked_recv {
-                                    crate::endpoint::cancel_ipc_anywhere(
-                                        &mut s.scheduler, tcb_id);
+                                    crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, tcb_id);
                                 }
                                 let tcb_t = s.scheduler.slab.get_mut(tcb_id);
                                 tcb_t.ipc_badge = badge;
@@ -1780,12 +1951,15 @@ fn decode_sched_context(
                         // (SCHED_CONTEXT_0003). We track the SC->ntfn
                         // link on the notification (bound_sc), so scan
                         // for an existing binding of this SC.
-                        if s.notifications.iter().enumerate().any(|(i, n)|
-                            i != ntfn_idx && n.bound_sc == Some(sc_id))
+                        if s.notifications
+                            .iter()
+                            .enumerate()
+                            .any(|(i, n)| i != ntfn_idx && n.bound_sc == Some(sc_id))
                             || s.notifications[ntfn_idx].bound_sc == Some(sc_id)
                         {
                             return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_IllegalOperation)));
+                                seL4_Error::seL4_IllegalOperation,
+                            )));
                         }
                         let ntfn = &mut s.notifications[ntfn_idx];
                         // Bind SC to this notification so future
@@ -1796,16 +1970,18 @@ fn decode_sched_context(
                             let tcb = s.scheduler.slab.get_mut(bt);
                             if tcb.sc.is_none() {
                                 tcb.sc = Some(sc_id);
-                                s.sched_contexts[sc_id as usize]
-                                    .bound_tcb = Some(bt);
+                                s.sched_contexts[sc_id as usize].bound_tcb = Some(bt);
                             }
                         }
                         // Mark the SC as bound to the notification so
                         // unbind can find it.
                         ntfn.bound_sc = Some(sc_id);
                     }
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 }
             }
             Ok(())
@@ -1847,7 +2023,8 @@ fn decode_sched_context(
                     let inv = s.scheduler.slab.get_mut(invoker);
                     if inv.pending_extra_caps_count == 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     let c = inv.pending_extra_caps[0];
                     inv.pending_extra_caps_count = 0;
@@ -1859,12 +2036,10 @@ fn decode_sched_context(
                 match obj_cap {
                     Cap::Thread { tcb } => {
                         let tcb_id = crate::tcb::TcbId(tcb.addr() as u16);
-                        if s.sched_contexts[sc_id as usize].bound_tcb
-                            != Some(tcb_id)
-                        {
-                            return Err(KException::SyscallError(
-                                SyscallError::new(
-                                    seL4_Error::seL4_IllegalOperation)));
+                        if s.sched_contexts[sc_id as usize].bound_tcb != Some(tcb_id) {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_IllegalOperation,
+                            )));
                         }
                         s.scheduler.on_sc_lost(tcb_id);
                         s.scheduler.slab.get_mut(tcb_id).sc = None;
@@ -1873,14 +2048,17 @@ fn decode_sched_context(
                     Cap::Notification { ptr, .. } => {
                         let ntfn_idx = KernelState::ntfn_index(ptr);
                         if s.notifications[ntfn_idx].bound_sc != Some(sc_id) {
-                            return Err(KException::SyscallError(
-                                SyscallError::new(
-                                    seL4_Error::seL4_IllegalOperation)));
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_IllegalOperation,
+                            )));
                         }
                         s.notifications[ntfn_idx].bound_sc = None;
                     }
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 }
             }
             Ok(())
@@ -1900,32 +2078,35 @@ fn decode_sched_context(
                 let bound = s.sched_contexts[sc_id as usize].bound_tcb;
                 let target_id = match bound {
                     Some(t) => t,
-                    None => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_IllegalOperation))),
+                    None => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_IllegalOperation,
+                        )))
+                    }
                 };
                 if target_id == invoker {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_IllegalOperation)));
+                        seL4_Error::seL4_IllegalOperation,
+                    )));
                 }
                 let target_prio = s.scheduler.slab.get(target_id).priority;
                 let inv_mcp = s.scheduler.slab.get(invoker).mcp;
                 if target_prio > inv_mcp {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_IllegalOperation)));
+                        seL4_Error::seL4_IllegalOperation,
+                    )));
                 }
                 // Upstream: a prior yielder against this SC gets its
                 // consumed-report completed before the new yield.
                 if let Some(prev) = s.sched_contexts[sc_id as usize].yield_from {
-                    crate::sched_context::complete_yield_to(
-                        s, prev, sc_id as usize);
+                    crate::sched_context::complete_yield_to(s, prev, sc_id as usize);
                 }
                 // schedContext_resume-ish: a budget-parked target
                 // with a mature refill becomes runnable again.
                 let now = crate::sched_context::current_time();
                 if s.scheduler.slab.get(target_id).state
                     == crate::tcb::ThreadStateType::BlockedOnBudget
-                    && crate::sched_context::refill_ready(
-                        &s.sched_contexts[sc_id as usize], now)
+                    && crate::sched_context::refill_ready(&s.sched_contexts[sc_id as usize], now)
                     && s.sched_contexts[sc_id as usize].count > 0
                 {
                     s.scheduler.make_runnable(target_id);
@@ -1953,7 +2134,8 @@ fn decode_sched_context(
                 // lower priority than us — it can't preempt, so the
                 // yield is a no-op): report consumed now.
                 let consumed_us = s.sched_contexts[sc_id as usize]
-                    .consumed.saturating_mul(1000);
+                    .consumed
+                    .saturating_mul(1000);
                 s.sched_contexts[sc_id as usize].consumed = 0;
                 let inv = s.scheduler.slab.get_mut(invoker);
                 inv.msg_regs[0] = consumed_us;
@@ -2016,7 +2198,9 @@ fn decode_sched_control(
                     let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
                     let cap = if inv_tcb.pending_extra_caps_count > 0 {
                         Some(inv_tcb.pending_extra_caps[0])
-                    } else { None };
+                    } else {
+                        None
+                    };
                     inv_tcb.pending_extra_caps_count = 0;
                     (cap, args.a2, args.a3)
                 }
@@ -2034,26 +2218,26 @@ fn decode_sched_control(
                 // SCHED_CONTEXT_0001 expects InvalidCapability before
                 // any RangeError.
                 let sc_idx = match sc_cap_opt {
-                    Some(Cap::SchedContext { ptr, .. }) => {
-                        KernelState::sched_context_index(ptr)
+                    Some(Cap::SchedContext { ptr, .. }) => KernelState::sched_context_index(ptr),
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
                     }
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
                 };
                 // Validate budget/period (SCHED_CONTEXT_0001). Upstream
                 // checks the raw µs against MIN_BUDGET_US (= 2*10 on
                 // x86/non-TK1); the legacy/spec ABI is already in ticks.
                 let bad = if upstream {
                     const MIN_BUDGET_US: u64 = 2 * 10;
-                    raw_budget < MIN_BUDGET_US
-                        || raw_period == 0
-                        || raw_budget > raw_period
+                    raw_budget < MIN_BUDGET_US || raw_period == 0 || raw_budget > raw_period
                 } else {
                     raw_budget == 0 || raw_period == 0 || raw_budget > raw_period
                 };
                 if bad {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_RangeError)));
+                        seL4_Error::seL4_RangeError,
+                    )));
                 }
                 let (budget, period) = if upstream {
                     let to_ticks = |us: u64| (us / 1000).max(1);
@@ -2130,11 +2314,7 @@ fn decode_sched_control(
 // IRQ invocations.
 // ---------------------------------------------------------------------------
 
-fn decode_irq_control(
-    label: InvocationLabel,
-    args: &SyscallArgs,
-    invoker: TcbId,
-) -> KResult<()> {
+fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     match label {
         InvocationLabel::IRQIssueIRQHandler => {
             // a2 = IRQ number, a3 = dest slot index
@@ -2145,16 +2325,20 @@ fn decode_irq_control(
                 let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
                 let cnode_ptr = match cspace_root {
                     Cap::CNode { ptr, .. } => ptr,
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    ))),
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 };
                 let cnode_idx = KernelState::cnode_index(cnode_ptr);
                 let slots = match s.cnode_slots_at_mut(cnode_idx) {
                     Some(s) => s,
-                    None => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    ))),
+                    None => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 };
                 if dest_index >= slots.len() {
                     return Err(KException::SyscallError(SyscallError::new(
@@ -2210,11 +2394,7 @@ fn decode_irq_control(
 /// programs the IOAPIC redirection-table entry so the requested
 /// pin actually delivers `vector` to the BSP (otherwise the line
 /// stays masked and the user's handler never fires).
-fn issue_x86_irq_handler(
-    args: &SyscallArgs,
-    invoker: TcbId,
-    msi: bool,
-) -> KResult<()> {
+fn issue_x86_irq_handler(args: &SyscallArgs, invoker: TcbId, msi: bool) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
         let inv_tcb = s.scheduler.slab.get_mut(invoker);
@@ -2229,28 +2409,35 @@ fn issue_x86_irq_handler(
             inv_tcb.pending_extra_caps[0]
         } else {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         };
         inv_tcb.pending_extra_caps_count = 0;
 
         if !matches!(dest_root, Cap::CNode { .. }) {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         }
         let res = crate::cspace::resolve_address_bits(s, &dest_root, dest_cptr, depth)?;
         if res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let cnode_idx = KernelState::cnode_index(res.slot_ptr);
         let slot = match s.cnode_slot_mut(cnode_idx, res.slot_index) {
             Some(s) => s,
-            None => return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability))),
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
         };
         if !slot.cap().is_null() {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_DeleteFirst)));
+                seL4_Error::seL4_DeleteFirst,
+            )));
         }
         // Phase 42 — store the user-visible "vector" as the IRQ
         // table index in the cap. seL4_IRQHandler_Ack /
@@ -2273,16 +2460,21 @@ fn issue_x86_irq_handler(
         if !msi {
             #[cfg(target_arch = "x86_64")]
             {
-                let cpu_vec = (vector as u32)
-                    + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
+                let cpu_vec = (vector as u32) + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
                 crate::arch::x86_64::ioapic::program_redirection(
-                    pin as u32, cpu_vec, level as u32, polarity as u32,
+                    pin as u32,
+                    cpu_vec,
+                    level as u32,
+                    polarity as u32,
                 );
                 // Record the pin + trigger so a level-triggered line gets masked on
                 // delivery (and unmasked on Ack). Leaves the binding state Inactive
                 // until SetNotification.
                 let _ = crate::interrupt::set_ioapic_route(
-                    &mut s.irqs, vector as u16, pin as u16, level != 0,
+                    &mut s.irqs,
+                    vector as u16,
+                    pin as u16,
+                    level != 0,
                 );
             }
         }
@@ -2339,11 +2531,17 @@ unsafe fn io_out32(port: u16, v: u32) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn io_in8(_p: u16) -> u8 { 0 }
+unsafe fn io_in8(_p: u16) -> u8 {
+    0
+}
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn io_in16(_p: u16) -> u16 { 0 }
+unsafe fn io_in16(_p: u16) -> u16 {
+    0
+}
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn io_in32(_p: u16) -> u32 { 0 }
+unsafe fn io_in32(_p: u16) -> u32 {
+    0
+}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn io_out8(_p: u16, _v: u8) {}
 #[cfg(not(target_arch = "x86_64"))]
@@ -2366,7 +2564,8 @@ fn decode_io_port(
     let port = (args.a2 & 0xFFFF) as u16;
     if port < first_port || port > last_port {
         return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_RangeError)));
+            seL4_Error::seL4_RangeError,
+        )));
     }
     unsafe {
         let s = KERNEL.get();
@@ -2400,7 +2599,8 @@ fn decode_io_port(
             }
             _ => {
                 return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_IllegalOperation)));
+                    seL4_Error::seL4_IllegalOperation,
+                )));
             }
         }
     }
@@ -2416,12 +2616,8 @@ fn decode_io_port(
 ///     index and force an immediate switch.
 /// CONFIG_NUM_DOMAINS=4 / CONFIG_NUM_DOMAIN_SCHEDULES=100 in the matched
 /// libsel4 (DOMAINS=ON). DOMAINS0000-0005,9999 exercise these.
-fn decode_domain(
-    label: InvocationLabel,
-    args: &SyscallArgs,
-    invoker: TcbId,
-) -> KResult<()> {
-    use crate::scheduler::{NUM_DOMAINS, NUM_DOM_SCHEDULES, DSCHED_MAX_DURATION};
+fn decode_domain(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    use crate::scheduler::{DSCHED_MAX_DURATION, NUM_DOMAINS, NUM_DOM_SCHEDULES};
     let err = |e| Err(KException::SyscallError(SyscallError::new(e)));
     match label {
         InvocationLabel::DomainSetSet => {
@@ -2473,11 +2669,10 @@ fn decode_domain(
                 if index as usize == s.scheduler.dom_sched_start && duration == 0 {
                     return err(seL4_Error::seL4_InvalidArgument);
                 }
-                s.scheduler.dom_sched[index as usize] =
-                    crate::scheduler::DomScheduleEntry {
-                        domain: domain as u8,
-                        duration,
-                    };
+                s.scheduler.dom_sched[index as usize] = crate::scheduler::DomScheduleEntry {
+                    domain: domain as u8,
+                    duration,
+                };
             }
             Ok(())
         }
@@ -2514,7 +2709,8 @@ fn decode_io_port_control(
 ) -> KResult<()> {
     if !matches!(label, InvocationLabel::X86IOPortControlIssue) {
         return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_IllegalOperation)));
+            seL4_Error::seL4_IllegalOperation,
+        )));
     }
     // Upstream `seL4_X86_IOPortControl_Issue` ABI:
     //   a2 (mr0) = first_port
@@ -2526,7 +2722,8 @@ fn decode_io_port_control(
     let last = (args.a3 & 0xFFFF) as u16;
     if first > last {
         return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_InvalidArgument)));
+            seL4_Error::seL4_InvalidArgument,
+        )));
     }
     unsafe {
         let s = KERNEL.get();
@@ -2539,28 +2736,38 @@ fn decode_io_port_control(
             c
         } else {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         };
         if !matches!(dest_root, Cap::CNode { .. }) {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability)));
+                seL4_Error::seL4_InvalidCapability,
+            )));
         }
         let res = crate::cspace::resolve_address_bits(s, &dest_root, dest_index, depth)?;
         if res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let cnode_idx = KernelState::cnode_index(res.slot_ptr);
         let slot = match s.cnode_slot_mut(cnode_idx, res.slot_index) {
             Some(s) => s,
-            None => return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability))),
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
         };
         if !slot.cap().is_null() {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_DeleteFirst)));
+                seL4_Error::seL4_DeleteFirst,
+            )));
         }
-        slot.set_cap(&Cap::IOPort { first_port: first, last_port: last });
+        slot.set_cap(&Cap::IOPort {
+            first_port: first,
+            last_port: last,
+        });
     }
     Ok(())
 }
@@ -2575,9 +2782,9 @@ fn decode_irq_handler(
         let s = KERNEL.get();
         match label {
             InvocationLabel::IRQAckIRQ => {
-                crate::interrupt::ack_irq(&mut s.irqs, irq).map_err(|_|
-                    KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability)))?;
+                crate::interrupt::ack_irq(&mut s.irqs, irq).map_err(|_| {
+                    KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+                })?;
                 // Unmask the IOAPIC line the kernel masked on delivery (level-
                 // triggered lines only). The driver has serviced the device by now, so
                 // it's safe to let the line fire again.
@@ -2603,7 +2810,8 @@ fn decode_irq_handler(
                 let ntfn_cap = if upstream {
                     if inv_tcb.pending_extra_caps_count == 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     let c = inv_tcb.pending_extra_caps[0];
                     inv_tcb.pending_extra_caps_count = 0;
@@ -2614,8 +2822,11 @@ fn decode_irq_handler(
                 };
                 let (ntfn_ptr, ntfn_badge) = match ntfn_cap {
                     Cap::Notification { ptr, badge, .. } => (ptr, badge.0),
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 };
                 let ntfn_idx = KernelState::ntfn_index(ntfn_ptr) as u16;
                 // Replace any existing handler binding and install
@@ -2623,17 +2834,22 @@ fn decode_irq_handler(
                 // recorded on the IRQ entry so handle_interrupt can
                 // signal with it (sel4test minted BIT(N) per timer).
                 let _ = crate::interrupt::clear_handler(&mut s.irqs, irq);
-                crate::interrupt::set_notification(&mut s.irqs, irq, ntfn_idx, ntfn_badge)
-                    .map_err(|_| KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability)))
+                crate::interrupt::set_notification(&mut s.irqs, irq, ntfn_idx, ntfn_badge).map_err(
+                    |_| {
+                        KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        ))
+                    },
+                )
             }
             InvocationLabel::IRQClearIRQHandler => {
-                crate::interrupt::clear_handler(&mut s.irqs, irq)
-                    .map_err(|_| KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability)))
+                crate::interrupt::clear_handler(&mut s.irqs, irq).map_err(|_| {
+                    KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+                })
             }
             _ => Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_IllegalOperation))),
+                seL4_Error::seL4_IllegalOperation,
+            ))),
         }
     }
 }
@@ -2674,11 +2890,7 @@ fn decode_untyped(
 ///       ipc_buf[4] = node_offset (slot offset of first child)
 ///       ipc_buf[5] = num_objects
 ///       extraCaps[0] = root (the destination CNode cap)
-fn decode_untyped_retype(
-    target: Cap,
-    args: &SyscallArgs,
-    invoker: TcbId,
-) -> KResult<()> {
+fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
 
@@ -2694,15 +2906,21 @@ fn decode_untyped_retype(
         log_dec(inv_tcb.msg_regs[5]);
         crate::arch::log(" base=0x");
         log_hex_u64(unsafe {
-            crate::untyped::UntypedState::from_cap(&target).map(|s| s.base).unwrap_or(0)
+            crate::untyped::UntypedState::from_cap(&target)
+                .map(|s| s.base)
+                .unwrap_or(0)
         });
         crate::arch::log(" fi=0x");
         log_hex_u64(unsafe {
-            crate::untyped::UntypedState::from_cap(&target).map(|s| s.free_index_bytes).unwrap_or(0)
+            crate::untyped::UntypedState::from_cap(&target)
+                .map(|s| s.free_index_bytes)
+                .unwrap_or(0)
         });
         crate::arch::log(" bb=");
         log_dec(unsafe {
-            crate::untyped::UntypedState::from_cap(&target).map(|s| s.block_bits as u64).unwrap_or(0)
+            crate::untyped::UntypedState::from_cap(&target)
+                .map(|s| s.block_bits as u64)
+                .unwrap_or(0)
         });
         crate::arch::log("]\n");
     }
@@ -2720,9 +2938,7 @@ fn decode_untyped_retype(
     // with later device-UT bisects targeting the same offsets.
     let (object_type, size_bits, num_objects, node_index, node_depth, node_offset, root_cap_opt) =
         if upstream {
-            let invoker_tcb = unsafe {
-                KERNEL.get().scheduler.slab.get(invoker)
-            };
+            let invoker_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
             let node_offset = invoker_tcb.msg_regs[4] as usize;
             let num = invoker_tcb.msg_regs[5];
             let root_cap = if invoker_tcb.pending_extra_caps_count > 0 {
@@ -2752,7 +2968,11 @@ fn decode_untyped_retype(
         };
     // Drain pending_extra_caps so they don't leak into the next IPC.
     unsafe {
-        KERNEL.get().scheduler.slab.get_mut(invoker)
+        KERNEL
+            .get()
+            .scheduler
+            .slab
+            .get_mut(invoker)
             .pending_extra_caps_count = 0;
     }
 
@@ -2795,15 +3015,17 @@ fn decode_untyped_retype(
                 // as the destination CNode.
                 root_cap
             } else {
-                let res = crate::cspace::resolve_address_bits(
-                    s, &root_cap, node_index, node_depth)?;
+                let res =
+                    crate::cspace::resolve_address_bits(s, &root_cap, node_index, node_depth)?;
                 if res.bits_remaining != 0 {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_FailedLookup)));
+                        seL4_Error::seL4_FailedLookup,
+                    )));
                 }
                 let cnode_idx = KernelState::cnode_index(res.slot_ptr);
                 s.cnode_slot(cnode_idx, res.slot_index)
-                    .map(|c| c.cap()).unwrap_or(Cap::Null)
+                    .map(|c| c.cap())
+                    .unwrap_or(Cap::Null)
             }
         } else {
             s.scheduler.slab.get(invoker).cspace_root
@@ -2837,10 +3059,12 @@ fn decode_untyped_retype(
         // caps.)
         let invoker_root = s.scheduler.slab.get(invoker).cspace_root;
         let src_res = crate::cspace::resolve_address_bits(
-            s, &invoker_root, args.a0,
+            s,
+            &invoker_root,
+            args.a0,
             crate::cspace::WORD_BITS,
-        ).map_err(|_| KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_FailedLookup)))?;
+        )
+        .map_err(|_| KException::SyscallError(SyscallError::new(seL4_Error::seL4_FailedLookup)))?;
         let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
         let src_slot_index = src_res.slot_index;
         // Borrow as raw slice so we don't lock the whole `s` —
@@ -2849,8 +3073,11 @@ fn decode_untyped_retype(
         let cnode_slots: &mut [Cte] = {
             let raw = match s.cnode_slots_at_mut(cnode_idx) {
                 Some(s) => s as *mut [Cte],
-                None => return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_InvalidCapability))),
+                None => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
             };
             &mut *raw
         };
@@ -2897,8 +3124,7 @@ fn decode_untyped_retype(
         // a sibling field of `*s`. Use a raw pointer to bypass
         // the aliasing check; the BKL guarantees we're the only
         // writer.
-        let scheduler_ptr: *mut crate::scheduler::Scheduler =
-            &raw mut s.scheduler;
+        let scheduler_ptr: *mut crate::scheduler::Scheduler = &raw mut s.scheduler;
         // Need a mutable handle on `s` to allocate from the
         // endpoint / notification / cnode pools too. We reborrow
         // via `KERNEL.get()` to avoid the existing `&mut s.cnodes`
@@ -2907,13 +3133,9 @@ fn decode_untyped_retype(
         // Phase 30 — record each carved child's parent CTE in the
         // MDB. We resolved the source untyped's location above
         // (src_cnode_idx, src_slot_index).
-        let parent_id = crate::cte::MdbId::pack(
-            src_cnode_idx as u8,
-            src_slot_index as u32,
-        );
-        let result = crate::untyped::retype(
-            &mut state, object_type, size_bits, num_objects,
-            |cap| {
+        let parent_id = crate::cte::MdbId::pack(src_cnode_idx as u8, src_slot_index as u32);
+        let result =
+            crate::untyped::retype(&mut state, object_type, size_bits, num_objects, |cap| {
                 let cap_to_store = match cap {
                     Cap::Thread { .. } => {
                         let id = (*scheduler_ptr).admit(crate::tcb::Tcb {
@@ -2934,23 +3156,20 @@ fn decode_untyped_retype(
                         // be a different TCB.
                         scrub_tcb_refs(s_ptr.as_mut().unwrap(), id);
                         Cap::Thread {
-                            tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64)
-                                .expect("nonzero tcb id"),
+                            tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64).expect("nonzero tcb id"),
                         }
                     }
-                    Cap::Endpoint { badge, rights, .. } => {
-                        match (*s_ptr).alloc_endpoint() {
-                            Some(i) => Cap::Endpoint {
-                                ptr: KernelState::endpoint_ptr(i),
-                                badge,
-                                rights,
-                            },
-                            None => {
-                                crate::arch::log("[retype: endpoint pool exhausted]\n");
-                                Cap::Null
-                            }
+                    Cap::Endpoint { badge, rights, .. } => match (*s_ptr).alloc_endpoint() {
+                        Some(i) => Cap::Endpoint {
+                            ptr: KernelState::endpoint_ptr(i),
+                            badge,
+                            rights,
+                        },
+                        None => {
+                            crate::arch::log("[retype: endpoint pool exhausted]\n");
+                            Cap::Null
                         }
-                    }
+                    },
                     Cap::Notification { badge, rights, .. } => {
                         match (*s_ptr).alloc_notification() {
                             Some(i) => Cap::Notification {
@@ -2964,13 +3183,19 @@ fn decode_untyped_retype(
                             }
                         }
                     }
-                    Cap::CNode { radix, guard_size, guard, .. } => {
+                    Cap::CNode {
+                        radix,
+                        guard_size,
+                        guard,
+                        ..
+                    } => {
                         // Pick small pool for radix ≤ SMALL_CNODE_RADIX
                         // (CSPACE0001's 64 radix-1 CNodes etc.). Fall
                         // back to big pool if small is full or radix
                         // exceeds the small pool's capacity.
                         let alloc = if radix <= crate::kernel::SMALL_CNODE_RADIX {
-                            (*s_ptr).alloc_small_cnode()
+                            (*s_ptr)
+                                .alloc_small_cnode()
                                 .or_else(|| (*s_ptr).alloc_cnode())
                         } else if radix > crate::kernel::CNODE_RADIX
                             && radix <= crate::kernel::XL_CNODE_RADIX
@@ -2981,8 +3206,7 @@ fn decode_untyped_retype(
                             // past slot 4095 and needs the real
                             // storage). Falls back to the clamped
                             // big-pool page if the XL entry is taken.
-                            (*s_ptr).alloc_xl_cnode()
-                                .or_else(|| (*s_ptr).alloc_cnode())
+                            (*s_ptr).alloc_xl_cnode().or_else(|| (*s_ptr).alloc_cnode())
                         } else {
                             // radix <= 12, or bigger than the XL pool
                             // can honestly back. The big-pool fallback
@@ -3004,30 +3228,26 @@ fn decode_untyped_retype(
                             }
                         }
                     }
-                    Cap::SchedContext { size_bits, .. } => {
-                        match (*s_ptr).alloc_sched_context() {
-                            Some(i) => Cap::SchedContext {
-                                ptr: KernelState::sched_context_ptr(i),
-                                size_bits,
-                            },
-                            None => {
-                                crate::arch::log("[retype: sc pool exhausted]\n");
-                                Cap::Null
-                            }
+                    Cap::SchedContext { size_bits, .. } => match (*s_ptr).alloc_sched_context() {
+                        Some(i) => Cap::SchedContext {
+                            ptr: KernelState::sched_context_ptr(i),
+                            size_bits,
+                        },
+                        None => {
+                            crate::arch::log("[retype: sc pool exhausted]\n");
+                            Cap::Null
                         }
-                    }
-                    Cap::Reply { can_grant, .. } => {
-                        match (*s_ptr).alloc_reply() {
-                            Some(i) => Cap::Reply {
-                                ptr: KernelState::reply_ptr(i),
-                                can_grant,
-                            },
-                            None => {
-                                crate::arch::log("[retype: reply pool exhausted]\n");
-                                Cap::Null
-                            }
+                    },
+                    Cap::Reply { can_grant, .. } => match (*s_ptr).alloc_reply() {
+                        Some(i) => Cap::Reply {
+                            ptr: KernelState::reply_ptr(i),
+                            can_grant,
+                        },
+                        None => {
+                            crate::arch::log("[retype: reply pool exhausted]\n");
+                            Cap::Null
                         }
-                    }
+                    },
                     // Phase 33d — when the rootserver retypes a fresh
                     // PML4, copy the live PML4's entries into it so
                     // the new vspace has the kernel half mapped. Any
@@ -3063,7 +3283,12 @@ fn decode_untyped_retype(
                         // tables; zeroing them would either trigger
                         // side effects or destroy data the user just
                         // wanted to read.
-                        Cap::Frame { ptr, size, is_device: false, .. } => {
+                        Cap::Frame {
+                            ptr,
+                            size,
+                            is_device: false,
+                            ..
+                        } => {
                             let n: u64 = match size {
                                 FrameSize::Small => 4096,
                                 FrameSize::Large => 2 * 1024 * 1024,
@@ -3077,8 +3302,7 @@ fn decode_untyped_retype(
                         // Reach the page through the kernel-half
                         // linear map (PML4[256+]) — keeps the
                         // rootserver's PML4[0] free for user mappings.
-                        let dst = crate::arch::x86_64::paging::phys_to_lin(paddr)
-                            as *mut u8;
+                        let dst = crate::arch::x86_64::paging::phys_to_lin(paddr) as *mut u8;
                         core::ptr::write_bytes(dst, 0, len as usize);
                     }
                 }
@@ -3086,8 +3310,7 @@ fn decode_untyped_retype(
                 cnode_slots[emit_idx].set_parent(Some(parent_id));
                 child_count_inc(parent_id, 1);
                 emit_idx += 1;
-            },
-        );
+            });
         result?;
 
         // Commit the updated UntypedState back into the SOURCE slot.
@@ -3100,7 +3323,11 @@ fn decode_untyped_retype(
         // and causing the next retype to re-allocate the same memory.
         let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
         let source_resolved = crate::cspace::resolve_address_bits(
-            s, &invoker_cspace, args.a0, crate::cspace::WORD_BITS);
+            s,
+            &invoker_cspace,
+            args.a0,
+            crate::cspace::WORD_BITS,
+        );
         if let Ok(res) = source_resolved {
             if res.bits_remaining == 0 {
                 let src_idx = KernelState::cnode_index(res.slot_ptr);
@@ -3124,15 +3351,17 @@ fn decode_cnode(
     invoker: TcbId,
 ) -> KResult<()> {
     match label {
-        InvocationLabel::CNodeCopy => cnode_copy_or_mint(target, args, invoker, /* mint */ false),
-        InvocationLabel::CNodeMint => cnode_copy_or_mint(target, args, invoker, /* mint */ true),
+        InvocationLabel::CNodeCopy => {
+            cnode_copy_or_mint(target, args, invoker, /* mint */ false)
+        }
+        InvocationLabel::CNodeMint => {
+            cnode_copy_or_mint(target, args, invoker, /* mint */ true)
+        }
         InvocationLabel::CNodeMove => cnode_move(target, args, invoker, /* mutate */ false),
         InvocationLabel::CNodeMutate => cnode_move(target, args, invoker, /* mutate */ true),
         InvocationLabel::CNodeDelete => cnode_delete(target, args, invoker),
         InvocationLabel::CNodeRevoke => cnode_revoke(target, args, invoker),
-        InvocationLabel::CNodeCancelBadgedSends => {
-            cnode_cancel_badged_sends(target, args, invoker)
-        }
+        InvocationLabel::CNodeCancelBadgedSends => cnode_cancel_badged_sends(target, args, invoker),
         InvocationLabel::CNodeRotate => cnode_rotate(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
@@ -3168,28 +3397,30 @@ fn cnode_rotate(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             (inv_tcb.pending_extra_caps[0], inv_tcb.pending_extra_caps[1])
         } else {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_TruncatedMessage)));
+                seL4_Error::seL4_TruncatedMessage,
+            )));
         };
         s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
 
         // Resolve all three slots.
-        let dest_res = crate::cspace::resolve_address_bits(
-            s, &dest_root, dest_index, dest_depth)?;
+        let dest_res = crate::cspace::resolve_address_bits(s, &dest_root, dest_index, dest_depth)?;
         if dest_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
-        let pivot_res = crate::cspace::resolve_address_bits(
-            s, &pivot_root, pivot_index, pivot_depth)?;
+        let pivot_res =
+            crate::cspace::resolve_address_bits(s, &pivot_root, pivot_index, pivot_depth)?;
         if pivot_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
-        let src_res = crate::cspace::resolve_address_bits(
-            s, &src_root, src_index, src_depth)?;
+        let src_res = crate::cspace::resolve_address_bits(s, &src_root, src_index, src_depth)?;
         if src_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let dest_cn = KernelState::cnode_index(dest_res.slot_ptr);
         let pivot_cn = KernelState::cnode_index(pivot_res.slot_ptr);
@@ -3201,29 +3432,39 @@ fn cnode_rotate(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         // src == pivot is illegal — would lose the cap.
         if src_cn == pivot_cn && src_si == pivot_si {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_IllegalOperation)));
+                seL4_Error::seL4_IllegalOperation,
+            )));
         }
         // src must be non-empty.
-        let src_cap = s.cnode_slot(src_cn, src_si)
-            .map(|c| c.cap()).unwrap_or(Cap::Null);
+        let src_cap = s
+            .cnode_slot(src_cn, src_si)
+            .map(|c| c.cap())
+            .unwrap_or(Cap::Null);
         if src_cap.is_null() {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         // dest must be empty unless dest == src (swap with self).
         if !(dest_cn == src_cn && dest_si == src_si) {
-            let dest_occupied = s.cnode_slot(dest_cn, dest_si)
-                .map(|c| !c.cap().is_null()).unwrap_or(false);
+            let dest_occupied = s
+                .cnode_slot(dest_cn, dest_si)
+                .map(|c| !c.cap().is_null())
+                .unwrap_or(false);
             if dest_occupied {
                 return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_DeleteFirst)));
+                    seL4_Error::seL4_DeleteFirst,
+                )));
             }
         }
-        let pivot_cap = s.cnode_slot(pivot_cn, pivot_si)
-            .map(|c| c.cap()).unwrap_or(Cap::Null);
+        let pivot_cap = s
+            .cnode_slot(pivot_cn, pivot_si)
+            .map(|c| c.cap())
+            .unwrap_or(Cap::Null);
         if pivot_cap.is_null() {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
 
         // Order of writes matters when dest == src: clear src first
@@ -3259,28 +3500,29 @@ fn cnode_rotate(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
 /// the cap's badge, removes them from the queue, and Restarts them.
 /// Mirrors upstream's `cancelBadgedSends` (we ignore non-badged
 /// caps, returning Ok with no work).
-fn cnode_cancel_badged_sends(
-    target: Cap,
-    args: &SyscallArgs,
-    _invoker: TcbId,
-) -> KResult<()> {
+fn cnode_cancel_badged_sends(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
     let src_index = args.a2 as usize;
     let cnode_ptr = match target {
         Cap::CNode { ptr, .. } => ptr,
-        _ => return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_InvalidCapability))),
+        _ => {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )))
+        }
     };
     unsafe {
         let s = KERNEL.get();
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        let slot_count = s.cnode_slots_at(cnode_idx)
-            .map(|sl| sl.len()).unwrap_or(0);
+        let slot_count = s.cnode_slots_at(cnode_idx).map(|sl| sl.len()).unwrap_or(0);
         if src_index >= slot_count {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_RangeError)));
+                seL4_Error::seL4_RangeError,
+            )));
         }
-        let cap = s.cnode_slot(cnode_idx, src_index)
-            .map(|c| c.cap()).unwrap_or(Cap::Null);
+        let cap = s
+            .cnode_slot(cnode_idx, src_index)
+            .map(|c| c.cap())
+            .unwrap_or(Cap::Null);
         let (ep_idx, badge) = match cap {
             Cap::Endpoint { ptr, badge, .. } => {
                 let i = KernelState::endpoint_index(ptr);
@@ -3290,11 +3532,16 @@ fn cnode_cancel_badged_sends(
             // (and non-Notification) targets here with IllegalOperation.
             // CNODEOP0006 calls cancelBadgedSends on an empty slot and
             // expects exactly that.
-            _ => return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_IllegalOperation))),
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_IllegalOperation,
+                )))
+            }
         };
         // Badge of 0 = unbadged, no-op (success).
-        if badge == 0 { return Ok(()); }
+        if badge == 0 {
+            return Ok(());
+        }
         let s_ptr: *mut crate::kernel::KernelState = s;
         let ep = &mut (*s_ptr).endpoints[ep_idx];
         if !matches!(ep.state, crate::endpoint::EpState::Send) {
@@ -3307,8 +3554,7 @@ fn cnode_cancel_badged_sends(
             let next = (*s_ptr).scheduler.slab.get(t).ep_next;
             let t_badge = (*s_ptr).scheduler.slab.get(t).ipc_badge;
             if t_badge == badge {
-                crate::endpoint::cancel_ipc_anywhere(
-                    &mut (*s_ptr).scheduler, t);
+                crate::endpoint::cancel_ipc_anywhere(&mut (*s_ptr).scheduler, t);
                 // Phase 43 — the cancelled sender resumes from its
                 // blocked seL4_Call as if the call returned a reply
                 // with `seL4_InvalidCapability` as the label, which
@@ -3340,8 +3586,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
     unsafe {
         let s = KERNEL.get();
         let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        let cn_slot_count = s.cnode_slots_at(cnode_idx)
-            .map(|sl| sl.len()).unwrap_or(0);
+        let cn_slot_count = s.cnode_slots_at(cnode_idx).map(|sl| sl.len()).unwrap_or(0);
         if src_index >= cn_slot_count {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_RangeError,
@@ -3357,48 +3602,54 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // grow ~3x once the small pool is included.
         const SLOTS_PER_NODE: usize = crate::kernel::CNODE_SLOTS;
         const SMALL_SLOTS: usize = crate::kernel::SMALL_CNODE_SLOTS;
-        static mut REVOKED_BIG:
-            [[bool; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES] =
+        static mut REVOKED_BIG: [[bool; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES] =
             [[false; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES];
-        static mut REVOKED_SMALL:
-            [[bool; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES] =
+        static mut REVOKED_SMALL: [[bool; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES] =
             [[false; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES];
         const XL_SLOTS: usize = crate::kernel::XL_CNODE_SLOTS;
-        static mut REVOKED_XL:
-            [[bool; XL_SLOTS]; crate::kernel::MAX_XL_CNODES] =
+        static mut REVOKED_XL: [[bool; XL_SLOTS]; crate::kernel::MAX_XL_CNODES] =
             [[false; XL_SLOTS]; crate::kernel::MAX_XL_CNODES];
         // Reset both pool bitmaps. We touch the statics through raw
         // pointers below to keep the borrow checker out of the way —
         // the closures used by the marking + clearing phases need
         // overlapping reads/writes that &mut won't permit.
         for row in (&mut *core::ptr::addr_of_mut!(REVOKED_BIG)).iter_mut() {
-            for v in row.iter_mut() { *v = false; }
+            for v in row.iter_mut() {
+                *v = false;
+            }
         }
         for row in (&mut *core::ptr::addr_of_mut!(REVOKED_SMALL)).iter_mut() {
-            for v in row.iter_mut() { *v = false; }
+            for v in row.iter_mut() {
+                *v = false;
+            }
         }
         for row in (&mut *core::ptr::addr_of_mut!(REVOKED_XL)).iter_mut() {
-            for v in row.iter_mut() { *v = false; }
+            for v in row.iter_mut() {
+                *v = false;
+            }
         }
         // Helpers: dispatch on virtual cnode index.
         let is_revoked = |ci: usize, si: usize| -> bool {
             if ci < crate::kernel::MAX_CNODES {
                 if si < SLOTS_PER_NODE {
                     (*core::ptr::addr_of!(REVOKED_BIG))[ci][si]
-                } else { false }
-            } else if ci < crate::kernel::MAX_CNODES
-                + crate::kernel::MAX_SMALL_CNODES
-            {
+                } else {
+                    false
+                }
+            } else if ci < crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES {
                 let small_i = ci - crate::kernel::MAX_CNODES;
                 if si < SMALL_SLOTS {
                     (*core::ptr::addr_of!(REVOKED_SMALL))[small_i][si]
-                } else { false }
+                } else {
+                    false
+                }
             } else if ci < crate::kernel::KernelState::cnode_pool_count() {
-                let xl_i = ci - crate::kernel::MAX_CNODES
-                    - crate::kernel::MAX_SMALL_CNODES;
+                let xl_i = ci - crate::kernel::MAX_CNODES - crate::kernel::MAX_SMALL_CNODES;
                 if si < XL_SLOTS {
                     (*core::ptr::addr_of!(REVOKED_XL))[xl_i][si]
-                } else { false }
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -3408,16 +3659,13 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 if si < SLOTS_PER_NODE {
                     (*core::ptr::addr_of_mut!(REVOKED_BIG))[ci][si] = true;
                 }
-            } else if ci < crate::kernel::MAX_CNODES
-                + crate::kernel::MAX_SMALL_CNODES
-            {
+            } else if ci < crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES {
                 let small_i = ci - crate::kernel::MAX_CNODES;
                 if si < SMALL_SLOTS {
                     (*core::ptr::addr_of_mut!(REVOKED_SMALL))[small_i][si] = true;
                 }
             } else if ci < crate::kernel::KernelState::cnode_pool_count() {
-                let xl_i = ci - crate::kernel::MAX_CNODES
-                    - crate::kernel::MAX_SMALL_CNODES;
+                let xl_i = ci - crate::kernel::MAX_CNODES - crate::kernel::MAX_SMALL_CNODES;
                 if si < XL_SLOTS {
                     (*core::ptr::addr_of_mut!(REVOKED_XL))[xl_i][si] = true;
                 }
@@ -3434,15 +3682,15 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
                 let slot_count = if ci < crate::kernel::MAX_CNODES {
                     s.cnodes[ci].0.len()
-                } else if ci < crate::kernel::MAX_CNODES
-                    + crate::kernel::MAX_SMALL_CNODES
-                {
+                } else if ci < crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES {
                     SMALL_SLOTS
                 } else {
                     XL_SLOTS
                 };
                 for si in 0..slot_count {
-                    if is_revoked(ci, si) { continue; }
+                    if is_revoked(ci, si) {
+                        continue;
+                    }
                     let parent = s.cnode_slot(ci, si).and_then(|c| c.parent());
                     if let Some(p) = parent {
                         let pi = p.cnode_idx() as usize;
@@ -3461,12 +3709,9 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // (no longer holds anything that has children) and decrement
         // the parent's count (we just removed one of its children).
         for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-            let slot_count = s.cnode_slots_at(ci)
-                .map(|sl| sl.len()).unwrap_or(0);
+            let slot_count = s.cnode_slots_at(ci).map(|sl| sl.len()).unwrap_or(0);
             for si in 0..slot_count {
-                if !is_revoked(ci, si)
-                    || (ci == cnode_idx && si == src_index)
-                {
+                if !is_revoked(ci, si) || (ci == cnode_idx && si == src_index) {
                     continue;
                 }
                 let id = crate::cte::MdbId::pack(ci as u8, si as u32);
@@ -3477,9 +3722,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 // an Untyped) does the free; copies via Mint
                 // would call free again for the same pool slot
                 // which is harmless (free is idempotent).
-                let cap_to_free = s.cnode_slot(ci, si)
-                    .map(|c| c.cap())
-                    .unwrap_or(Cap::Null);
+                let cap_to_free = s.cnode_slot(ci, si).map(|c| c.cap()).unwrap_or(Cap::Null);
                 // Phase 44 — clear the slot FIRST (the set_cap hook
                 // drops the refcount), then release the object if
                 // that was its last reference. Replaces the
@@ -3509,9 +3752,17 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // back to 0 so the next Retype starts from the bottom of the
         // block. Otherwise the second test's allocations exhaust the
         // untyped even though the memory is now free.
-        let source = s.cnode_slot(cnode_idx, src_index)
-            .map(|c| c.cap()).unwrap_or(Cap::Null);
-        if let Cap::Untyped { ptr, block_bits, is_device, .. } = source {
+        let source = s
+            .cnode_slot(cnode_idx, src_index)
+            .map(|c| c.cap())
+            .unwrap_or(Cap::Null);
+        if let Cap::Untyped {
+            ptr,
+            block_bits,
+            is_device,
+            ..
+        } = source
+        {
             if let Some(slot) = s.cnode_slot_mut(cnode_idx, src_index) {
                 slot.set_cap(&Cap::Untyped {
                     ptr,
@@ -3536,7 +3787,9 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
 fn is_derived_from(child: &Cap, parent: &Cap) -> bool {
     use Cap::*;
     match parent {
-        Untyped { ptr, block_bits, .. } => {
+        Untyped {
+            ptr, block_bits, ..
+        } => {
             let base = ptr.addr();
             let end = base.saturating_add(1u64 << block_bits);
             let inside = |addr: u64| addr >= base && addr < end;
@@ -3555,20 +3808,19 @@ fn is_derived_from(child: &Cap, parent: &Cap) -> bool {
                 _ => false,
             }
         }
-        Endpoint { ptr: pp, .. } => matches!(child, Endpoint { ptr: cp, .. } if cp.addr() == pp.addr()),
-        Notification { ptr: pp, .. } => matches!(child, Notification { ptr: cp, .. } if cp.addr() == pp.addr()),
+        Endpoint { ptr: pp, .. } => {
+            matches!(child, Endpoint { ptr: cp, .. } if cp.addr() == pp.addr())
+        }
+        Notification { ptr: pp, .. } => {
+            matches!(child, Notification { ptr: cp, .. } if cp.addr() == pp.addr())
+        }
         CNode { ptr: pp, .. } => matches!(child, CNode { ptr: cp, .. } if cp.addr() == pp.addr()),
         Thread { tcb: pp } => matches!(child, Thread { tcb: cp } if cp.addr() == pp.addr()),
         _ => false,
     }
 }
 
-fn cnode_copy_or_mint(
-    target: Cap,
-    args: &SyscallArgs,
-    invoker: TcbId,
-    mint: bool,
-) -> KResult<()> {
+fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: bool) -> KResult<()> {
     // Two ABI shapes coexist:
     //   * Phase 16 legacy (microtest, extra_caps == 0):
     //       a2 = dest_index, a3 = src_index (same CNode = `target`),
@@ -3581,21 +3833,26 @@ fn cnode_copy_or_mint(
     //       msg_regs[4] = rights, msg_regs[5] = badge (Mint).
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
-    let (dest_index, dest_depth, src_index, src_depth, badge, rights_word) =
-        if upstream {
-            let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
-            // Upstream wire layout (mirrors libsel4's CNode_Copy /
-            // CNode_Mint stubs): mr4 = rights, mr5 = badge (Mint).
-            let r = inv_tcb.msg_regs[4];
-            let b = inv_tcb.msg_regs[5];
-            (args.a2, args.a3 as u32, args.a4, args.a5 as u32, b, r)
-        } else {
-            // Legacy microtest path passes badge in a4 and gives no
-            // rights word. Default to "all rights" so existing
-            // microtest behaviour is preserved.
-            (args.a2, crate::cspace::WORD_BITS,
-             args.a3, crate::cspace::WORD_BITS, args.a4, !0u64)
-        };
+    let (dest_index, dest_depth, src_index, src_depth, badge, rights_word) = if upstream {
+        let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
+        // Upstream wire layout (mirrors libsel4's CNode_Copy /
+        // CNode_Mint stubs): mr4 = rights, mr5 = badge (Mint).
+        let r = inv_tcb.msg_regs[4];
+        let b = inv_tcb.msg_regs[5];
+        (args.a2, args.a3 as u32, args.a4, args.a5 as u32, b, r)
+    } else {
+        // Legacy microtest path passes badge in a4 and gives no
+        // rights word. Default to "all rights" so existing
+        // microtest behaviour is preserved.
+        (
+            args.a2,
+            crate::cspace::WORD_BITS,
+            args.a3,
+            crate::cspace::WORD_BITS,
+            args.a4,
+            !0u64,
+        )
+    };
     let dest_root = target;
     unsafe {
         let s = KERNEL.get();
@@ -3608,33 +3865,39 @@ fn cnode_copy_or_mint(
             inv_tcb.cspace_root
         };
 
-        let dest_res = crate::cspace::resolve_address_bits(
-            s, &dest_root, dest_index, dest_depth)?;
+        let dest_res = crate::cspace::resolve_address_bits(s, &dest_root, dest_index, dest_depth)?;
         if dest_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let dest_cnode_idx = KernelState::cnode_index(dest_res.slot_ptr);
 
-        let src_res = crate::cspace::resolve_address_bits(
-            s, &src_root, src_index, src_depth)?;
+        let src_res = crate::cspace::resolve_address_bits(s, &src_root, src_index, src_depth)?;
         if src_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
 
-        let mut copy = s.cnode_slot(src_cnode_idx, src_res.slot_index)
-            .map(|c| c.cap()).unwrap_or(Cap::Null);
-        let dest_occupied = s.cnode_slot(dest_cnode_idx, dest_res.slot_index)
-            .map(|c| !c.cap().is_null()).unwrap_or(false);
+        let mut copy = s
+            .cnode_slot(src_cnode_idx, src_res.slot_index)
+            .map(|c| c.cap())
+            .unwrap_or(Cap::Null);
+        let dest_occupied = s
+            .cnode_slot(dest_cnode_idx, dest_res.slot_index)
+            .map(|c| !c.cap().is_null())
+            .unwrap_or(false);
         if dest_occupied {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_DeleteFirst)));
+                seL4_Error::seL4_DeleteFirst,
+            )));
         }
         if copy.is_null() {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         // Mirror upstream `Arch_deriveCap` for x86 paging-structure
         // caps: the derived (copied/minted) cap starts with mapped
@@ -3672,19 +3935,19 @@ fn cnode_copy_or_mint(
         //   bit 3 = capAllowGrantReply  (= can_grant_reply)
         // sel4test's IPCRIGHTS0001 mints an EP cap with rights = 0
         // and verifies seL4_Send through it is silently dropped.
-        const ALLOW_WRITE: u64       = 1 << 0;
-        const ALLOW_READ: u64        = 1 << 1;
-        const ALLOW_GRANT: u64       = 1 << 2;
+        const ALLOW_WRITE: u64 = 1 << 0;
+        const ALLOW_READ: u64 = 1 << 1;
+        const ALLOW_GRANT: u64 = 1 << 2;
         const ALLOW_GRANT_REPLY: u64 = 1 << 3;
         match &mut copy {
             Cap::Endpoint { rights, .. } => {
-                rights.can_send        &= rights_word & ALLOW_WRITE != 0;
-                rights.can_receive     &= rights_word & ALLOW_READ != 0;
-                rights.can_grant       &= rights_word & ALLOW_GRANT != 0;
+                rights.can_send &= rights_word & ALLOW_WRITE != 0;
+                rights.can_receive &= rights_word & ALLOW_READ != 0;
+                rights.can_grant &= rights_word & ALLOW_GRANT != 0;
                 rights.can_grant_reply &= rights_word & ALLOW_GRANT_REPLY != 0;
             }
             Cap::Notification { rights, .. } => {
-                rights.can_send    &= rights_word & ALLOW_WRITE != 0;
+                rights.can_send &= rights_word & ALLOW_WRITE != 0;
                 rights.can_receive &= rights_word & ALLOW_READ != 0;
             }
             // TODO: mask Frame/Reply rights when sel4test exercises them.
@@ -3718,7 +3981,10 @@ fn cnode_copy_or_mint(
                 // and the domain must be non-zero, else the result is a
                 // null cap. `io_mint_invalid` defers the null assignment
                 // until after the `&mut copy` borrow ends.
-                Cap::IoSpace { domain_id, pci_device } => {
+                Cap::IoSpace {
+                    domain_id,
+                    pci_device,
+                } => {
                     let new_domain = ((badge >> 16) & 0xffff) as u16;
                     let new_pci = (badge & 0xffff) as u16;
                     if *pci_device == 0 && new_domain != 0 {
@@ -3728,7 +3994,12 @@ fn cnode_copy_or_mint(
                         io_mint_invalid = true;
                     }
                 }
-                Cap::CNode { ptr, radix, guard_size, guard } => {
+                Cap::CNode {
+                    ptr,
+                    radix,
+                    guard_size,
+                    guard,
+                } => {
                     if badge != 0 {
                         let new_guard_size = (badge & 0x3F) as u8;
                         let new_guard_raw = badge >> 6;
@@ -3754,8 +4025,7 @@ fn cnode_copy_or_mint(
             slot.set_cap(&copy);
             // Phase 30 — the new cap is derived from the source slot;
             // its MDB parent is the source CTE.
-            let src_id = crate::cte::MdbId::pack(
-                src_cnode_idx as u8, src_res.slot_index as u32);
+            let src_id = crate::cte::MdbId::pack(src_cnode_idx as u8, src_res.slot_index as u32);
             slot.set_parent(Some(src_id));
             child_count_inc(src_id, 1);
         }
@@ -3763,12 +4033,7 @@ fn cnode_copy_or_mint(
     Ok(())
 }
 
-fn cnode_move(
-    target: Cap,
-    args: &SyscallArgs,
-    invoker: TcbId,
-    _mutate: bool,
-) -> KResult<()> {
+fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) -> KResult<()> {
     // Two ABI shapes coexist (mirrors `cnode_copy_or_mint`):
     //   * legacy (microtest): a2 = dest, a3 = src, both in `target`'s
     //     CNode, depth = WORD_BITS.
@@ -3779,8 +4044,12 @@ fn cnode_move(
     let (dest_index, dest_depth, src_index, src_depth) = if upstream {
         (args.a2, args.a3 as u32, args.a4, args.a5 as u32)
     } else {
-        (args.a2, crate::cspace::WORD_BITS,
-         args.a3, crate::cspace::WORD_BITS)
+        (
+            args.a2,
+            crate::cspace::WORD_BITS,
+            args.a3,
+            crate::cspace::WORD_BITS,
+        )
     };
     let dest_root = target;
     unsafe {
@@ -3795,19 +4064,19 @@ fn cnode_move(
         };
 
         // Resolve dest slot via the dest_root cap.
-        let dest_res = crate::cspace::resolve_address_bits(
-            s, &dest_root, dest_index, dest_depth)?;
+        let dest_res = crate::cspace::resolve_address_bits(s, &dest_root, dest_index, dest_depth)?;
         if dest_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let dest_cnode_idx = KernelState::cnode_index(dest_res.slot_ptr);
 
-        let src_res = crate::cspace::resolve_address_bits(
-            s, &src_root, src_index, src_depth)?;
+        let src_res = crate::cspace::resolve_address_bits(s, &src_root, src_index, src_depth)?;
         if src_res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
 
@@ -3825,20 +4094,26 @@ fn cnode_move(
         // Snapshot src cap before mutating either slot — both might
         // be in the same CNode, in which case the borrow checker
         // would object to two simultaneous &mut on the same array.
-        let src_cap = s.cnode_slot(src_cnode_idx, src_res.slot_index)
-            .map(|c| c.cap()).unwrap_or(Cap::Null);
+        let src_cap = s
+            .cnode_slot(src_cnode_idx, src_res.slot_index)
+            .map(|c| c.cap())
+            .unwrap_or(Cap::Null);
         // Upstream order: dest-not-empty check first (DeleteFirst),
         // then src-empty check (FailedLookup). Matches sel4test's
         // `is_slot_empty` helper in helpers.c.
-        let dest_occupied = s.cnode_slot(dest_cnode_idx, dest_res.slot_index)
-            .map(|c| !c.cap().is_null()).unwrap_or(false);
+        let dest_occupied = s
+            .cnode_slot(dest_cnode_idx, dest_res.slot_index)
+            .map(|c| !c.cap().is_null())
+            .unwrap_or(false);
         if dest_occupied {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_DeleteFirst)));
+                seL4_Error::seL4_DeleteFirst,
+            )));
         }
         if src_cap.is_null() {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         if let Some(slot) = s.cnode_slot_mut(dest_cnode_idx, dest_res.slot_index) {
             slot.set_cap(&src_cap);
@@ -3857,17 +4132,25 @@ fn cnode_move(
 /// previous occupant of its slab slot.
 unsafe fn scrub_tcb_refs(s: &mut crate::kernel::KernelState, id: TcbId) {
     for n in s.notifications.iter_mut() {
-        if n.bound_tcb == Some(id) { n.bound_tcb = None; }
+        if n.bound_tcb == Some(id) {
+            n.bound_tcb = None;
+        }
     }
     for sc in s.sched_contexts.iter_mut() {
-        if sc.bound_tcb == Some(id) { sc.bound_tcb = None; }
+        if sc.bound_tcb == Some(id) {
+            sc.bound_tcb = None;
+        }
     }
     for r in s.replies.iter_mut() {
-        if r.bound_tcb == Some(id) { r.bound_tcb = None; }
+        if r.bound_tcb == Some(id) {
+            r.bound_tcb = None;
+        }
     }
     for opt in s.scheduler.slab.entries.iter_mut() {
         if let Some(t) = opt.as_mut() {
-            if t.reply_to == Some(id) { t.reply_to = None; }
+            if t.reply_to == Some(id) {
+                t.reply_to = None;
+            }
         }
     }
 }
@@ -3900,8 +4183,7 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     if let Some(sc_idx) = s.scheduler.slab.get(id).sc {
         if let Some(yielder) = s.sched_contexts[sc_idx as usize].yield_from {
             if yielder != id {
-                crate::sched_context::complete_yield_to(
-                    s, yielder, sc_idx as usize);
+                crate::sched_context::complete_yield_to(s, yielder, sc_idx as usize);
             }
         }
     }
@@ -3927,11 +4209,7 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
 /// sweep-based destroy performed. Self-references inside a CNode
 /// don't pin it: the page is freed when its EXTERNAL refcount hits
 /// zero.
-unsafe fn maybe_free_object(
-    s: &mut crate::kernel::KernelState,
-    cap: &Cap,
-    depth: u8,
-) {
+unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap, depth: u8) {
     use crate::kernel::cap_refcount;
     match cap {
         Cap::Thread { tcb } => {
@@ -3965,16 +4243,23 @@ unsafe fn maybe_free_object(
                 // BlockedOnReply so we don't disturb SC loans unrelated
                 // to an in-flight Call (INTERRUPT0005).
                 if let Some(caller) = s.replies[idx].bound_tcb {
-                    if matches!(s.scheduler.slab.get(caller).state,
-                        crate::tcb::ThreadStateType::BlockedOnReply)
-                    {
+                    if matches!(
+                        s.scheduler.slab.get(caller).state,
+                        crate::tcb::ThreadStateType::BlockedOnReply
+                    ) {
                         crate::sched_context::return_donated_sc(s, caller);
                     }
                 }
                 s.free_reply(idx);
             }
         }
-        Cap::IoPageTable { ptr, is_mapped, level, mapped_address, ioasid } => {
+        Cap::IoPageTable {
+            ptr,
+            is_mapped,
+            level,
+            mapped_address,
+            ioasid,
+        } => {
             // Phase 44 — deleting a mapped IO page table (e.g. at test
             // teardown when the child's Untyped is revoked) tears down
             // its VT-d entry (deleteIOPageTable). Without this, the
@@ -3983,8 +4268,7 @@ unsafe fn maybe_free_object(
             #[cfg(target_arch = "x86_64")]
             if *is_mapped {
                 unsafe {
-                    delete_io_page_table(
-                        ptr.addr(), *is_mapped, *level, *mapped_address, *ioasid);
+                    delete_io_page_table(ptr.addr(), *is_mapped, *level, *mapped_address, *ioasid);
                 }
             }
             let _ = (s, ptr, is_mapped, level, mapped_address, ioasid);
@@ -4023,11 +4307,10 @@ unsafe fn maybe_free_object(
                 return;
             }
             for si in 0..n {
-                let (inner_cap, inner_parent) =
-                    match s.cnode_slot(vi, si) {
-                        Some(c) => (c.cap(), c.parent()),
-                        None => continue,
-                    };
+                let (inner_cap, inner_parent) = match s.cnode_slot(vi, si) {
+                    Some(c) => (c.cap(), c.parent()),
+                    None => continue,
+                };
                 if inner_cap.is_null() {
                     continue;
                 }
@@ -4074,11 +4357,11 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
     }
     unsafe {
         let s = KERNEL.get();
-        let res = crate::cspace::resolve_address_bits(
-            s, &target, args.a2, depth)?;
+        let res = crate::cspace::resolve_address_bits(s, &target, args.a2, depth)?;
         if res.bits_remaining != 0 {
             return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup)));
+                seL4_Error::seL4_FailedLookup,
+            )));
         }
         let cnode_idx = KernelState::cnode_index(res.slot_ptr);
         if INV_TRACE {
@@ -4120,7 +4403,15 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // user accesses to that vaddr to fault. Without this, the page
         // stays mapped via stale PTE and the test thread silently
         // continues into corrupted state.
-        if let Cap::Frame { ptr, size, mapped: Some(vaddr), asid, map_type, .. } = deleted_cap {
+        if let Cap::Frame {
+            ptr,
+            size,
+            mapped: Some(vaddr),
+            asid,
+            map_type,
+            ..
+        } = deleted_cap
+        {
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 if map_type == crate::cap::FrameMapType::IoSpace {
@@ -4134,15 +4425,18 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                         match size {
                             crate::cap::FrameSize::Small => {
                                 crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
-                                    pml4_paddr, vaddr);
+                                    pml4_paddr, vaddr,
+                                );
                             }
                             crate::cap::FrameSize::Large => {
                                 crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
-                                    pml4_paddr, vaddr);
+                                    pml4_paddr, vaddr,
+                                );
                             }
                             crate::cap::FrameSize::Huge => {
                                 crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
-                                    pml4_paddr, vaddr);
+                                    pml4_paddr, vaddr,
+                                );
                             }
                         }
                         crate::smp::shootdown_tlb(vaddr);
@@ -4188,7 +4482,9 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
 /// fast-path and must fall through to the full walk.
 fn cap_extent(cap: &Cap) -> (u64, u64) {
     match cap {
-        Cap::Untyped { ptr, block_bits, .. } => (ptr.addr(), 1u64 << block_bits),
+        Cap::Untyped {
+            ptr, block_bits, ..
+        } => (ptr.addr(), 1u64 << block_bits),
         Cap::Frame { ptr, size, .. } => {
             let n: u64 = match size {
                 crate::cap::FrameSize::Small => 4096,
@@ -4234,12 +4530,10 @@ fn child_count_idx(pid: crate::cte::MdbId) -> Option<usize> {
     if ci < MAX_CNODES {
         (si < CNODE_SLOTS).then(|| ci * CNODE_SLOTS + si)
     } else if ci < MAX_CNODES + MAX_SMALL_CNODES {
-        (si < SMALL_CNODE_SLOTS)
-            .then(|| BIG_COUNTS + (ci - MAX_CNODES) * SMALL_CNODE_SLOTS + si)
+        (si < SMALL_CNODE_SLOTS).then(|| BIG_COUNTS + (ci - MAX_CNODES) * SMALL_CNODE_SLOTS + si)
     } else if ci < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
         (si < XL_CNODE_SLOTS).then(|| {
-            BIG_COUNTS + SMALL_COUNTS
-                + (ci - MAX_CNODES - MAX_SMALL_CNODES) * XL_CNODE_SLOTS + si
+            BIG_COUNTS + SMALL_COUNTS + (ci - MAX_CNODES - MAX_SMALL_CNODES) * XL_CNODE_SLOTS + si
         })
     } else {
         None
@@ -4279,8 +4573,7 @@ pub unsafe fn child_counts_reset_page(vi: usize) {
         )
     } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
         (
-            BIG_COUNTS + SMALL_COUNTS
-                + (vi - MAX_CNODES - MAX_SMALL_CNODES) * XL_CNODE_SLOTS,
+            BIG_COUNTS + SMALL_COUNTS + (vi - MAX_CNODES - MAX_SMALL_CNODES) * XL_CNODE_SLOTS,
             XL_CNODE_SLOTS,
         )
     } else {
@@ -4324,10 +4617,19 @@ unsafe fn reclaim_untyped_chain_at_tail(
             let psl = pid.slot() as usize;
             let parent_cap = s.cnode_slot(pcn, psl).map(|c| c.cap());
             let parent_of_parent = s.cnode_slot(pcn, psl).and_then(|c| c.parent());
-            if let Some(Cap::Untyped { ptr, block_bits, is_device, .. }) = parent_cap {
+            if let Some(Cap::Untyped {
+                ptr,
+                block_bits,
+                is_device,
+                ..
+            }) = parent_cap
+            {
                 if let Some(slot) = s.cnode_slot_mut(pcn, psl) {
                     slot.set_cap(&Cap::Untyped {
-                        ptr, block_bits, free_index: 0, is_device,
+                        ptr,
+                        block_bits,
+                        free_index: 0,
+                        is_device,
                     });
                 }
                 // Walk further up — this level just emptied,
@@ -4335,8 +4637,7 @@ unsafe fn reclaim_untyped_chain_at_tail(
                 // last child gone now. Recurse with this empty
                 // parent as the deleted-cap.
                 let _ = (deleted_base, deleted_size);
-                reclaim_untyped_chain_at_tail(
-                    parent_of_parent, ptr.addr(), 1u64 << block_bits);
+                reclaim_untyped_chain_at_tail(parent_of_parent, ptr.addr(), 1u64 << block_bits);
             }
         }
         return;
@@ -4349,8 +4650,9 @@ unsafe fn reclaim_untyped_chain_at_tail(
         if let Some(pid) = start {
             let pcn = pid.cnode_idx() as usize;
             let psl = pid.slot() as usize;
-            if let Some(Cap::Untyped { ptr, free_index, .. }) =
-                s.cnode_slot(pcn, psl).map(|c| c.cap())
+            if let Some(Cap::Untyped {
+                ptr, free_index, ..
+            }) = s.cnode_slot(pcn, psl).map(|c| c.cap())
             {
                 let parent_base = ptr.addr();
                 let parent_eff_end = parent_base + free_index;
@@ -4384,9 +4686,12 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
             None => return,
         };
         let (parent_base, parent_block_bits, parent_free_index) = match cap {
-            Cap::Untyped { ptr, block_bits, free_index, .. } => {
-                (ptr.addr(), block_bits as u32, free_index)
-            }
+            Cap::Untyped {
+                ptr,
+                block_bits,
+                free_index,
+                ..
+            } => (ptr.addr(), block_bits as u32, free_index),
             _ => return,
         };
         let parent_total = 1u64 << parent_block_bits;
@@ -4405,8 +4710,7 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
         // parent bytes and need to be tracked here too.
         let mut max_end: u64 = parent_base; // == "no children" sentinel
         for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-            let inner_count = s.cnode_slots_at(ci)
-                .map(|sl| sl.len()).unwrap_or(0);
+            let inner_count = s.cnode_slots_at(ci).map(|sl| sl.len()).unwrap_or(0);
             for si in 0..inner_count {
                 let cte = match s.cnode_slot(ci, si) {
                     Some(c) => c,
@@ -4416,9 +4720,9 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
                     continue;
                 }
                 let (cbase, csize) = match cte.cap() {
-                    Cap::Untyped { ptr, block_bits, .. } => {
-                        (ptr.addr(), 1u64 << block_bits)
-                    }
+                    Cap::Untyped {
+                        ptr, block_bits, ..
+                    } => (ptr.addr(), 1u64 << block_bits),
                     Cap::Frame { ptr, size, .. } => {
                         let n: u64 = match size {
                             crate::cap::FrameSize::Small => 4096,
@@ -4442,9 +4746,7 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
                     }
                     Cap::Reply { ptr, .. } => (ptr.addr(), 32),
                     Cap::Thread { tcb } => (tcb.addr(), 4096),
-                    Cap::SchedContext { ptr, size_bits, .. } => {
-                        (ptr.addr(), 1u64 << size_bits)
-                    }
+                    Cap::SchedContext { ptr, size_bits, .. } => (ptr.addr(), 1u64 << size_bits),
                     _ => continue,
                 };
                 let end = cbase + csize;
@@ -4455,12 +4757,19 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
         }
         let new_fi = max_end - parent_base;
         // Read the live cap, write back with updated free_index.
-        if let Some(Cap::Untyped { ptr, block_bits, free_index, is_device }) =
-            s.cnode_slot(pcn, psl).map(|c| c.cap())
+        if let Some(Cap::Untyped {
+            ptr,
+            block_bits,
+            free_index,
+            is_device,
+        }) = s.cnode_slot(pcn, psl).map(|c| c.cap())
         {
             if new_fi < free_index {
                 let updated = Cap::Untyped {
-                    ptr, block_bits, free_index: new_fi, is_device,
+                    ptr,
+                    block_bits,
+                    free_index: new_fi,
+                    is_device,
                 };
                 if let Some(slot) = s.cnode_slot_mut(pcn, psl) {
                     slot.set_cap(&updated);
@@ -4516,11 +4825,8 @@ fn decode_tcb(
                 // gets its consumed-report the moment the yielded-to
                 // thread stops running (SCHED0018 phase 1).
                 if let Some(sc_idx) = s.scheduler.slab.get(id).sc {
-                    if let Some(yielder) =
-                        s.sched_contexts[sc_idx as usize].yield_from
-                    {
-                        crate::sched_context::complete_yield_to(
-                            s, yielder, sc_idx as usize);
+                    if let Some(yielder) = s.sched_contexts[sc_idx as usize].yield_from {
+                        crate::sched_context::complete_yield_to(s, yielder, sc_idx as usize);
                     }
                 }
                 s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
@@ -4534,8 +4840,7 @@ fn decode_tcb(
                 if s.scheduler.slab.get(id).sc.is_some() {
                     s.scheduler.make_runnable(id);
                 } else {
-                    s.scheduler.slab.get_mut(id).state =
-                        crate::tcb::ThreadStateType::Running;
+                    s.scheduler.slab.get_mut(id).state = crate::tcb::ThreadStateType::Running;
                 }
                 Ok(())
             }
@@ -4579,31 +4884,33 @@ fn decode_tcb(
                 let upstream = info.extra_caps() > 0;
 
                 let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let (cnode_cap, vspace_cap, ipcbuf_cap, ipc_buffer_vaddr) =
-                    if upstream {
-                        let staged = s.scheduler.slab.get(invoker)
-                            .pending_extra_caps;
-                        let count = s.scheduler.slab.get(invoker)
-                            .pending_extra_caps_count as usize;
-                        let cnode = if count > 0 { Some(staged[0]) } else { None };
-                        let vspace = if count > 1 { Some(staged[1]) } else { None };
-                        let ipcbuf = if count > 2 { Some(staged[2]) } else { None };
-                        (cnode, vspace, ipcbuf, args.a5)
+                let (cnode_cap, vspace_cap, ipcbuf_cap, ipc_buffer_vaddr) = if upstream {
+                    let staged = s.scheduler.slab.get(invoker).pending_extra_caps;
+                    let count = s.scheduler.slab.get(invoker).pending_extra_caps_count as usize;
+                    let cnode = if count > 0 { Some(staged[0]) } else { None };
+                    let vspace = if count > 1 { Some(staged[1]) } else { None };
+                    let ipcbuf = if count > 2 { Some(staged[2]) } else { None };
+                    (cnode, vspace, ipcbuf, args.a5)
+                } else {
+                    let cnode = if args.a3 != 0 {
+                        Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
                     } else {
-                        let cnode = if args.a3 != 0 {
-                            Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
-                        } else { None };
-                        let vspace = if args.a4 != 0 {
-                            Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
-                        } else { None };
-                        (cnode, vspace, None, 0)
+                        None
                     };
+                    let vspace = if args.a4 != 0 {
+                        Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
+                    } else {
+                        None
+                    };
+                    (cnode, vspace, None, 0)
+                };
                 let t = s.scheduler.slab.get_mut(id);
                 t.fault_handler = args.a2;
                 if let Some(c) = cnode_cap {
                     if !matches!(c, Cap::CNode { .. } | Cap::Null) {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     if !matches!(c, Cap::Null) {
                         t.cspace_root = c;
@@ -4616,8 +4923,11 @@ fn decode_tcb(
                             t.vspace_root = c;
                         }
                         Cap::Null => {}
-                        _ => return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability))),
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
                     }
                 }
                 if upstream {
@@ -4647,19 +4957,27 @@ fn decode_tcb(
                 if info.extra_caps() > 0 {
                     let inv_tcb = s.scheduler.slab.get_mut(invoker);
                     let count = inv_tcb.pending_extra_caps_count as usize;
-                    let auth_cap = if count > 0 { Some(inv_tcb.pending_extra_caps[0]) } else { None };
+                    let auth_cap = if count > 0 {
+                        Some(inv_tcb.pending_extra_caps[0])
+                    } else {
+                        None
+                    };
                     inv_tcb.pending_extra_caps_count = 0;
                     let auth_mcp = match auth_cap {
                         Some(Cap::Thread { tcb }) => {
                             let auth_id = crate::tcb::TcbId(tcb.addr() as u16);
                             s.scheduler.slab.get(auth_id).mcp
                         }
-                        _ => return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability))),
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
                     };
                     if prio > auth_mcp {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_RangeError)));
+                            seL4_Error::seL4_RangeError,
+                        )));
                     }
                 }
                 // Phase 43 — properly migrate the thread between
@@ -4675,20 +4993,16 @@ fn decode_tcb(
                 let dom = s.scheduler.slab.get(id).domain as usize;
                 let was_runnable = s.scheduler.slab.get(id).is_runnable();
                 if was_runnable {
-                    s.scheduler.nodes[cpu].queues[dom]
-                        .dequeue(&mut s.scheduler.slab, id);
+                    s.scheduler.nodes[cpu].queues[dom].dequeue(&mut s.scheduler.slab, id);
                 }
                 s.scheduler.slab.get_mut(id).priority = prio;
                 if was_runnable {
-                    s.scheduler.nodes[cpu].queues[dom]
-                        .enqueue(&mut s.scheduler.slab, id);
+                    s.scheduler.nodes[cpu].queues[dom].enqueue(&mut s.scheduler.slab, id);
                     // If we just demoted the current thread on this
                     // CPU and a higher-priority thread is waiting,
                     // force a reschedule.
                     if s.scheduler.nodes[cpu].current == Some(id) {
-                        if let Some(top) = s.scheduler.nodes[cpu]
-                            .queues[dom].peek_highest()
-                        {
+                        if let Some(top) = s.scheduler.nodes[cpu].queues[dom].peek_highest() {
                             if top > prio {
                                 s.scheduler.nodes[cpu].current = None;
                             }
@@ -4713,7 +5027,10 @@ fn decode_tcb(
                     // new priority is honoured on the next pop.
                     use crate::tcb::ThreadStateType::*;
                     let state = s.scheduler.slab.get(id).state;
-                    if matches!(state, BlockedOnSend | BlockedOnReceive | BlockedOnNotification) {
+                    if matches!(
+                        state,
+                        BlockedOnSend | BlockedOnReceive | BlockedOnNotification
+                    ) {
                         crate::endpoint::reposition_in_wait_queue(&mut s.scheduler, id);
                     }
                 }
@@ -4763,22 +5080,27 @@ fn decode_tcb(
                         let inv = s.scheduler.slab.get(invoker);
                         let mut regs: [u64; 20] = [0; 20];
                         // First two registers ride in args.a4 / args.a5.
-                        if count > 0 { regs[0] = args.a4; }   // rip
-                        if count > 1 { regs[1] = args.a5; }   // rsp
-                        // Remaining registers come from msg word
-                        // index 4 onwards (where SetMR(i+2, ...) for
-                        // i=2 lands). Our msg_regs[4..] holds those
-                        // (for indices < SCRATCH_MSG_LEN); past that
-                        // we read from the IPC buffer at offset i+1
-                        // (the +1 skips the tag word).
+                        if count > 0 {
+                            regs[0] = args.a4;
+                        } // rip
+                        if count > 1 {
+                            regs[1] = args.a5;
+                        } // rsp
+                          // Remaining registers come from msg word
+                          // index 4 onwards (where SetMR(i+2, ...) for
+                          // i=2 lands). Our msg_regs[4..] holds those
+                          // (for indices < SCRATCH_MSG_LEN); past that
+                          // we read from the IPC buffer at offset i+1
+                          // (the +1 skips the tag word).
                         for i in 2..count.min(20) {
                             let msg_idx = i + 2;
                             if msg_idx < inv.msg_regs.len() {
                                 regs[i] = inv.msg_regs[msg_idx];
                             } else if inv.ipc_buffer_paddr != 0 {
-                                let buf = (crate::arch::x86_64::paging::phys_to_lin(
-                                    inv.ipc_buffer_paddr) as *const u64)
-                                    .wrapping_add(1);
+                                let buf =
+                                    (crate::arch::x86_64::paging::phys_to_lin(inv.ipc_buffer_paddr)
+                                        as *const u64)
+                                        .wrapping_add(1);
                                 regs[i] = core::ptr::read_volatile(buf.add(msg_idx));
                             }
                         }
@@ -4820,22 +5142,54 @@ fn decode_tcb(
                         } else {
                             0x202
                         };
-                        if n > 0  { t.user_context.rip = new_rip; }
-                        if n > 1  { t.user_context.rsp = regs[1]; }
-                        if n > 2  { t.user_context.rflags = new_rflags; }
-                        if n > 3  { t.user_context.rax = regs[3]; }
-                        if n > 4  { t.user_context.rbx = regs[4]; }
-                        if n > 6  { t.user_context.rdx = regs[6]; }
-                        if n > 7  { t.user_context.rsi = regs[7]; }
-                        if n > 8  { t.user_context.rdi = regs[8]; }
-                        if n > 9  { t.user_context.rbp = regs[9]; }
-                        if n > 10 { t.user_context.r8  = regs[10]; }
-                        if n > 11 { t.user_context.r9  = regs[11]; }
-                        if n > 12 { t.user_context.r10 = regs[12]; }
-                        if n > 14 { t.user_context.r12 = regs[14]; }
-                        if n > 15 { t.user_context.r13 = regs[15]; }
-                        if n > 16 { t.user_context.r14 = regs[16]; }
-                        if n > 17 { t.user_context.r15 = regs[17]; }
+                        if n > 0 {
+                            t.user_context.rip = new_rip;
+                        }
+                        if n > 1 {
+                            t.user_context.rsp = regs[1];
+                        }
+                        if n > 2 {
+                            t.user_context.rflags = new_rflags;
+                        }
+                        if n > 3 {
+                            t.user_context.rax = regs[3];
+                        }
+                        if n > 4 {
+                            t.user_context.rbx = regs[4];
+                        }
+                        if n > 6 {
+                            t.user_context.rdx = regs[6];
+                        }
+                        if n > 7 {
+                            t.user_context.rsi = regs[7];
+                        }
+                        if n > 8 {
+                            t.user_context.rdi = regs[8];
+                        }
+                        if n > 9 {
+                            t.user_context.rbp = regs[9];
+                        }
+                        if n > 10 {
+                            t.user_context.r8 = regs[10];
+                        }
+                        if n > 11 {
+                            t.user_context.r9 = regs[11];
+                        }
+                        if n > 12 {
+                            t.user_context.r10 = regs[12];
+                        }
+                        if n > 14 {
+                            t.user_context.r12 = regs[14];
+                        }
+                        if n > 15 {
+                            t.user_context.r13 = regs[15];
+                        }
+                        if n > 16 {
+                            t.user_context.r14 = regs[16];
+                        }
+                        if n > 17 {
+                            t.user_context.r15 = regs[17];
+                        }
                         // Decide on resume path BEFORE writing rcx
                         // and r11, since the choice affects what we
                         // store there.
@@ -4844,8 +5198,8 @@ fn decode_tcb(
                         // If user-set RCX / R11 are independently
                         // meaningful, we MUST use iretq — store the
                         // user values in rcx/r11 and set the flag.
-                        let need_iretq = (n > 5 && user_rcx != new_rip)
-                            || (n > 13 && user_r11 != new_rflags);
+                        let need_iretq =
+                            (n > 5 && user_rcx != new_rip) || (n > 13 && user_r11 != new_rflags);
                         if need_iretq {
                             t.user_context.rcx = user_rcx;
                             t.user_context.r11 = user_r11;
@@ -4916,26 +5270,26 @@ fn decode_tcb(
                         // report 0 like before).
                         let iq = t.use_iretq_resume;
                         let regs: [u64; 20] = [
-                            crate::fault::reported_ip(t),   // 0 rip
-                            t.user_context.rsp,             // 1 rsp
-                            crate::fault::resume_flags(t),  // 2 rflags
-                            t.user_context.rax,    // 3  rax
-                            t.user_context.rbx,    // 4  rbx
+                            crate::fault::reported_ip(t),            // 0 rip
+                            t.user_context.rsp,                      // 1 rsp
+                            crate::fault::resume_flags(t),           // 2 rflags
+                            t.user_context.rax,                      // 3  rax
+                            t.user_context.rbx,                      // 4  rbx
                             if iq { t.user_context.rcx } else { 0 }, // 5 rcx
-                            t.user_context.rdx,    // 6  rdx
-                            t.user_context.rsi,    // 7  rsi
-                            t.user_context.rdi,    // 8  rdi
-                            t.user_context.rbp,    // 9  rbp
-                            t.user_context.r8,     // 10 r8
-                            t.user_context.r9,     // 11 r9
-                            t.user_context.r10,    // 12 r10
+                            t.user_context.rdx,                      // 6  rdx
+                            t.user_context.rsi,                      // 7  rsi
+                            t.user_context.rdi,                      // 8  rdi
+                            t.user_context.rbp,                      // 9  rbp
+                            t.user_context.r8,                       // 10 r8
+                            t.user_context.r9,                       // 11 r9
+                            t.user_context.r10,                      // 12 r10
                             if iq { t.user_context.r11 } else { 0 }, // 13 r11
-                            t.user_context.r12,    // 14 r12
-                            t.user_context.r13,    // 15 r13
-                            t.user_context.r14,    // 16 r14
-                            t.user_context.r15,    // 17 r15
-                            0,                     // 18 fs_base (not modelled)
-                            0,                     // 19 gs_base (not modelled)
+                            t.user_context.r12,                      // 14 r12
+                            t.user_context.r13,                      // 15 r13
+                            t.user_context.r14,                      // 16 r14
+                            t.user_context.r15,                      // 17 r15
+                            0,                                       // 18 fs_base (not modelled)
+                            0,                                       // 19 gs_base (not modelled)
                         ];
                         // Phase 43 — count is mr1 (= args.a3) per
                         // libsel4's `seL4_TCB_ReadRegisters` stub
@@ -4955,8 +5309,9 @@ fn decode_tcb(
                         // invoker's IPC buffer so userspace's
                         // libsel4 stub can read the whole array.
                         if count > inv.msg_regs.len() && ipc_paddr != 0 {
-                            let buf = (crate::arch::x86_64::paging::phys_to_lin(
-                                ipc_paddr) as *mut u64).wrapping_add(1);
+                            let buf = (crate::arch::x86_64::paging::phys_to_lin(ipc_paddr)
+                                as *mut u64)
+                                .wrapping_add(1);
                             for i in inv.msg_regs.len()..count {
                                 core::ptr::write_volatile(buf.add(i), regs[i]);
                             }
@@ -4970,10 +5325,18 @@ fn decode_tcb(
                         // side syscall), but ReadRegisters is one
                         // of the few invocations that produce a
                         // return message.
-                        if count > 0 { inv.user_context.r10 = regs[0]; }
-                        if count > 1 { inv.user_context.r8  = regs[1]; }
-                        if count > 2 { inv.user_context.r9  = regs[2]; }
-                        if count > 3 { inv.user_context.r15 = regs[3]; }
+                        if count > 0 {
+                            inv.user_context.r10 = regs[0];
+                        }
+                        if count > 1 {
+                            inv.user_context.r8 = regs[1];
+                        }
+                        if count > 2 {
+                            inv.user_context.r9 = regs[2];
+                        }
+                        if count > 3 {
+                            inv.user_context.r15 = regs[3];
+                        }
                         // Also pack the returned msginfo (length=
                         // count, label=0) into rsi so userspace
                         // can decode it with seL4_MessageInfo_get_*.
@@ -5010,14 +5373,19 @@ fn decode_tcb(
                     let fault_cptr = if count > 0 && ipc_paddr != 0 {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            let buf = crate::arch::x86_64::paging::phys_to_lin(
-                                ipc_paddr) as *const u64;
+                            let buf =
+                                crate::arch::x86_64::paging::phys_to_lin(ipc_paddr) as *const u64;
                             core::ptr::read_volatile(
-                                buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET))
+                                buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET),
+                            )
                         }
                         #[cfg(not(target_arch = "x86_64"))]
-                        { 0 }
-                    } else { 0 };
+                        {
+                            0
+                        }
+                    } else {
+                        0
+                    };
                     let inv_tcb = s.scheduler.slab.get_mut(invoker);
                     // MCS semantics: the fault EP cap is resolved
                     // HERE, in the invoker's cspace (extraCaps[0]
@@ -5030,8 +5398,16 @@ fn decode_tcb(
                     } else {
                         Cap::Null
                     };
-                    let cnode = if count > 1 { Some(inv_tcb.pending_extra_caps[1]) } else { None };
-                    let vspace = if count > 2 { Some(inv_tcb.pending_extra_caps[2]) } else { None };
+                    let cnode = if count > 1 {
+                        Some(inv_tcb.pending_extra_caps[1])
+                    } else {
+                        None
+                    };
+                    let vspace = if count > 2 {
+                        Some(inv_tcb.pending_extra_caps[2])
+                    } else {
+                        None
+                    };
                     inv_tcb.pending_extra_caps_count = 0;
                     // Stash both the resolved cap (preferred) and
                     // the cptr (legacy fallback) on the target TCB.
@@ -5041,10 +5417,14 @@ fn decode_tcb(
                 } else {
                     let cnode = if args.a3 != 0 {
                         Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let vspace = if args.a4 != 0 {
                         Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     (cnode, vspace)
                 };
                 let t = s.scheduler.slab.get_mut(id);
@@ -5058,7 +5438,8 @@ fn decode_tcb(
                 if let Some(c) = cnode_cap {
                     if !matches!(c, Cap::CNode { .. }) {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     // Apply cspace_root_data (mr0 in upstream MCS layout
                     // = args.a2, mr1 in upstream non-MCS = args.a3,
@@ -5074,7 +5455,8 @@ fn decode_tcb(
                         if let Cap::CNode { ptr, radix, .. } = c {
                             if (new_guard_size as u32) + (radix as u32) > 64 {
                                 return Err(KException::SyscallError(SyscallError::new(
-                                    seL4_Error::seL4_RangeError)));
+                                    seL4_Error::seL4_RangeError,
+                                )));
                             }
                             Cap::CNode {
                                 ptr,
@@ -5101,8 +5483,11 @@ fn decode_tcb(
                             t.cpu_context.cr3 = ptr.addr();
                         }
                         Cap::Null => {}
-                        _ => return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability))),
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
                     }
                     t.vspace_root = c;
                 }
@@ -5138,7 +5523,8 @@ fn decode_tcb(
                     let inv_tcb = s.scheduler.slab.get_mut(invoker);
                     if inv_tcb.pending_extra_caps_count == 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     let c = inv_tcb.pending_extra_caps[0];
                     inv_tcb.pending_extra_caps_count = 0;
@@ -5149,8 +5535,11 @@ fn decode_tcb(
                 };
                 let paddr = match frame_cap {
                     Cap::Frame { ptr, .. } => ptr.addr(),
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
+                    }
                 };
                 let t = s.scheduler.slab.get_mut(id);
                 t.ipc_buffer = vaddr;
@@ -5169,7 +5558,8 @@ fn decode_tcb(
                 let ntfn_cap = if upstream {
                     if inv_tcb_mut.pending_extra_caps_count == 0 {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability)));
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
                     }
                     let c = inv_tcb_mut.pending_extra_caps[0];
                     inv_tcb_mut.pending_extra_caps_count = 0;
@@ -5179,22 +5569,25 @@ fn decode_tcb(
                     crate::cspace::lookup_cap(s, &cspace_root, args.a2)?
                 };
                 let ntfn_idx = match ntfn_cap {
-                    Cap::Notification { ptr, .. } => {
-                        KernelState::ntfn_index(ptr) as u16
+                    Cap::Notification { ptr, .. } => KernelState::ntfn_index(ptr) as u16,
+                    _ => {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )))
                     }
-                    _ => return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability))),
                 };
                 // Refuse double-bind (matches seL4's behaviour) on
                 // either side of the link.
                 let t = s.scheduler.slab.get_mut(id);
                 if t.bound_notification.is_some() {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst)));
+                        seL4_Error::seL4_DeleteFirst,
+                    )));
                 }
                 if s.notifications[ntfn_idx as usize].bound_tcb.is_some() {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst)));
+                        seL4_Error::seL4_DeleteFirst,
+                    )));
                 }
                 s.scheduler.slab.get_mut(id).bound_notification = Some(ntfn_idx);
                 s.notifications[ntfn_idx as usize].bound_tcb = Some(id);
@@ -5237,19 +5630,27 @@ fn decode_tcb(
                 if info.extra_caps() > 0 {
                     let inv_tcb = s.scheduler.slab.get_mut(invoker);
                     let count = inv_tcb.pending_extra_caps_count as usize;
-                    let auth_cap = if count > 0 { Some(inv_tcb.pending_extra_caps[0]) } else { None };
+                    let auth_cap = if count > 0 {
+                        Some(inv_tcb.pending_extra_caps[0])
+                    } else {
+                        None
+                    };
                     inv_tcb.pending_extra_caps_count = 0;
                     let auth_mcp = match auth_cap {
                         Some(Cap::Thread { tcb }) => {
                             let auth_id = crate::tcb::TcbId(tcb.addr() as u16);
                             s.scheduler.slab.get(auth_id).mcp
                         }
-                        _ => return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability))),
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
                     };
                     if mcp > auth_mcp {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_RangeError)));
+                            seL4_Error::seL4_RangeError,
+                        )));
                     }
                 } else {
                     s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
@@ -5267,19 +5668,27 @@ fn decode_tcb(
                 if info.extra_caps() > 0 {
                     let inv_tcb = s.scheduler.slab.get_mut(invoker);
                     let count = inv_tcb.pending_extra_caps_count as usize;
-                    let auth_cap = if count > 0 { Some(inv_tcb.pending_extra_caps[0]) } else { None };
+                    let auth_cap = if count > 0 {
+                        Some(inv_tcb.pending_extra_caps[0])
+                    } else {
+                        None
+                    };
                     inv_tcb.pending_extra_caps_count = 0;
                     let auth_mcp = match auth_cap {
                         Some(Cap::Thread { tcb }) => {
                             let auth_id = crate::tcb::TcbId(tcb.addr() as u16);
                             s.scheduler.slab.get(auth_id).mcp
                         }
-                        _ => return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability))),
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
                     };
                     if mcp > auth_mcp || prio > auth_mcp {
                         return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_RangeError)));
+                            seL4_Error::seL4_RangeError,
+                        )));
                     }
                 } else {
                     s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
@@ -5346,9 +5755,11 @@ fn decode_tcb(
                 // registers ride in CPU regs).
                 let rw = {
                     let paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
-                    if paddr == 0 { 0 } else {
-                        let buf = (crate::arch::x86_64::paging::phys_to_lin(paddr)
-                            as *const u64).wrapping_add(1);
+                    if paddr == 0 {
+                        0
+                    } else {
+                        let buf = (crate::arch::x86_64::paging::phys_to_lin(paddr) as *const u64)
+                            .wrapping_add(1);
                         core::ptr::read_volatile(buf.add(4))
                     }
                 };
@@ -5357,13 +5768,13 @@ fn decode_tcb(
                 if vaddr >= 0x0000_8000_0000_0000 {
                     return err(seL4_Error::seL4_InvalidArgument);
                 }
-                if ty != dbg::SEL4_INSTRUCTION_BREAKPOINT
-                    && ty != dbg::SEL4_DATA_BREAKPOINT
-                {
+                if ty != dbg::SEL4_INSTRUCTION_BREAKPOINT && ty != dbg::SEL4_DATA_BREAKPOINT {
                     return err(seL4_Error::seL4_InvalidArgument);
                 }
                 if ty == dbg::SEL4_INSTRUCTION_BREAKPOINT {
-                    if size != 0 { return err(seL4_Error::seL4_InvalidArgument); }
+                    if size != 0 {
+                        return err(seL4_Error::seL4_InvalidArgument);
+                    }
                     if rw != dbg::SEL4_BREAK_ON_READ {
                         return err(seL4_Error::seL4_InvalidArgument);
                     }
@@ -5384,7 +5795,12 @@ fn decode_tcb(
                 }
                 dbg::set_breakpoint(
                     &mut s.scheduler.slab.get_mut(id).debug,
-                    bp_num as usize, vaddr, ty, size, rw);
+                    bp_num as usize,
+                    vaddr,
+                    ty,
+                    size,
+                    rw,
+                );
                 Ok(())
             }
             InvocationLabel::TCBGetBreakpoint => {
@@ -5392,10 +5808,11 @@ fn decode_tcb(
                 let bp_num = args.a2;
                 if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_RangeError)));
+                        seL4_Error::seL4_RangeError,
+                    )));
                 }
-                let (vaddr, ty, size, rw, enabled) = dbg::get_breakpoint(
-                    &s.scheduler.slab.get(id).debug, bp_num as usize);
+                let (vaddr, ty, size, rw, enabled) =
+                    dbg::get_breakpoint(&s.scheduler.slab.get(id).debug, bp_num as usize);
                 let inv = s.scheduler.slab.get_mut(invoker);
                 inv.msg_regs[0] = vaddr;
                 inv.msg_regs[1] = ty;
@@ -5413,10 +5830,10 @@ fn decode_tcb(
                 let bp_num = args.a2;
                 if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_RangeError)));
+                        seL4_Error::seL4_RangeError,
+                    )));
                 }
-                dbg::unset_breakpoint(
-                    &mut s.scheduler.slab.get_mut(id).debug, bp_num as usize);
+                dbg::unset_breakpoint(&mut s.scheduler.slab.get_mut(id).debug, bp_num as usize);
                 Ok(())
             }
             InvocationLabel::TCBConfigureSingleStepping => {
@@ -5424,7 +5841,9 @@ fn decode_tcb(
                 let _bp_num = args.a2; // ignored on x86 (TF-based)
                 let n_instr = args.a3;
                 let consumed = dbg::configure_single_stepping(
-                    &mut s.scheduler.slab.get_mut(id).debug, n_instr);
+                    &mut s.scheduler.slab.get_mut(id).debug,
+                    n_instr,
+                );
                 let t = s.scheduler.slab.get_mut(id);
                 if n_instr == 0 {
                     // Disable: clear TF on the target's saved RFLAGS.
@@ -5517,7 +5936,9 @@ pub mod spec {
             mapped: true,
             asid: 0,
         };
-        unsafe { KERNEL.get().cnodes[0].0[6] = Cte::with_cap(&pml4_cap); }
+        unsafe {
+            KERNEL.get().cnodes[0].0[6] = Cte::with_cap(&pml4_cap);
+        }
 
         // AsidControl::MakePool — pool lands in slot 7.
         let args = SyscallArgs {
@@ -5527,8 +5948,7 @@ pub mod spec {
             a4: 7, // dest slot
             ..Default::default()
         };
-        decode_invocation(Cap::AsidControl, &args, invoker)
-            .expect("MakePool ok");
+        decode_invocation(Cap::AsidControl, &args, invoker).expect("MakePool ok");
         let pool = unsafe { KERNEL.get().cnodes[0].0[7].cap() };
         let (pool_ptr, pool_base) = match pool {
             Cap::AsidPool { ptr, asid_base } => (ptr, asid_base),
@@ -5546,10 +5966,11 @@ pub mod spec {
         unsafe {
             match KERNEL.get().cnodes[0].0[6].cap() {
                 Cap::PML4 { asid, .. } => {
-                    assert!(asid != 0,
-                        "Assign should set a non-zero ASID, got {asid}");
-                    assert!(asid >= pool_base && asid < pool_base + 512,
-                        "ASID {asid} should be within pool [{pool_base}, {pool_base}+512)");
+                    assert!(asid != 0, "Assign should set a non-zero ASID, got {asid}");
+                    assert!(
+                        asid >= pool_base && asid < pool_base + 512,
+                        "ASID {asid} should be within pool [{pool_base}, {pool_base}+512)"
+                    );
                 }
                 other => panic!("expected Cap::PML4, got {:?}", other),
             }
@@ -5560,10 +5981,15 @@ pub mod spec {
         // VSPACE0002 asserts exactly this for the already-mapped
         // page_directory).
         let r = decode_invocation(pool, &args, invoker);
-        assert!(matches!(r,
-            Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_InvalidCapability }))),
-            "second Assign on a non-zero-ASID PML4 should InvalidCapability");
+        assert!(
+            matches!(
+                r,
+                Err(KException::SyscallError(SyscallError {
+                    code: seL4_Error::seL4_InvalidCapability
+                }))
+            ),
+            "second Assign on a non-zero-ASID PML4 should InvalidCapability"
+        );
 
         teardown_invoker(invoker);
         arch::log("  ✓ AsidControl::MakePool + AsidPool::Assign\n");
@@ -5598,8 +6024,7 @@ pub mod spec {
             let expected = crate::cte::MdbId::pack(0, 0);
             for i in 4..7 {
                 let p = s.cnodes[0].0[i].parent();
-                assert_eq!(p, Some(expected),
-                    "slot {i}'s MDB parent should be (0, 0)");
+                assert_eq!(p, Some(expected), "slot {i}'s MDB parent should be (0, 0)");
             }
         }
         teardown_invoker(invoker);
@@ -5633,20 +6058,22 @@ pub mod spec {
         decode_invocation(ut_cap, &args, invoker).expect("retype");
 
         // Copy the endpoint at slot 4 → slot 5.
-        let cnode_cap = unsafe {
-            KERNEL.get().scheduler.slab.get(invoker).cspace_root
-        };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeCopy as u64) << 12,
-            a2: 5, a3: 4,
+            a2: 5,
+            a3: 4,
             ..Default::default()
         };
         decode_invocation(cnode_cap, &args, invoker).expect("copy");
         unsafe {
             let s = KERNEL.get();
             let original = crate::cte::MdbId::pack(0, 4);
-            assert_eq!(s.cnodes[0].0[5].parent(), Some(original),
-                "copy's MDB parent should be the original at slot 4");
+            assert_eq!(
+                s.cnodes[0].0[5].parent(),
+                Some(original),
+                "copy's MDB parent should be the original at slot 4"
+            );
         }
 
         // Revoke the Untyped at slot 0 — should walk transitively
@@ -5660,12 +6087,18 @@ pub mod spec {
         decode_invocation(cnode_cap, &args, invoker).expect("revoke");
         unsafe {
             let s = KERNEL.get();
-            assert!(matches!(s.cnodes[0].0[0].cap(), Cap::Untyped { .. }),
-                "source Untyped should remain after revoke");
-            assert!(s.cnodes[0].0[4].cap().is_null(),
-                "direct child should be revoked");
-            assert!(s.cnodes[0].0[5].cap().is_null(),
-                "grandchild via Copy should be revoked transitively");
+            assert!(
+                matches!(s.cnodes[0].0[0].cap(), Cap::Untyped { .. }),
+                "source Untyped should remain after revoke"
+            );
+            assert!(
+                s.cnodes[0].0[4].cap().is_null(),
+                "direct child should be revoked"
+            );
+            assert!(
+                s.cnodes[0].0[5].cap().is_null(),
+                "grandchild via Copy should be revoked transitively"
+            );
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Revoke walks derivation graph transitively (MDB)\n");
@@ -5677,7 +6110,7 @@ pub mod spec {
     /// stubs that out (no live PD to walk in this fixture).
     #[inline(never)]
     fn page_table_map_unmap() {
-        use crate::cap::{PageTableStorage};
+        use crate::cap::PageTableStorage;
         let invoker = setup_invoker(0);
         let pt_paddr = 0x0000_0000_00B0_0000u64;
         let pt_cap = Cap::PageTable {
@@ -5685,7 +6118,9 @@ pub mod spec {
             mapped: None,
             asid: 0,
         };
-        unsafe { KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&pt_cap); }
+        unsafe {
+            KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&pt_cap);
+        }
 
         // Map at a 2 MiB-aligned vaddr (PD-entry granularity).
         let vaddr = 0x0000_0100_0080_0000u64;
@@ -5698,7 +6133,9 @@ pub mod spec {
 
         unsafe {
             match KERNEL.get().cnodes[0].0[2].cap() {
-                Cap::PageTable { mapped: Some(v), .. } if v == vaddr => {}
+                Cap::PageTable {
+                    mapped: Some(v), ..
+                } if v == vaddr => {}
                 other => panic!("expected mapped PT, got {:?}", other),
             }
         }
@@ -5706,9 +6143,12 @@ pub mod spec {
         // Re-map → DeleteFirst.
         let stored = unsafe { KERNEL.get().cnodes[0].0[2].cap() };
         let r = decode_invocation(stored, &args, invoker);
-        assert!(matches!(r,
+        assert!(matches!(
+            r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_DeleteFirst }))));
+                code: seL4_Error::seL4_DeleteFirst
+            }))
+        ));
 
         // Unmap clears the mapping.
         let args = SyscallArgs {
@@ -5778,7 +6218,7 @@ pub mod spec {
         //   a3 = (size_bits << 32) | num_objects = (0 << 32) | 4 = 4
         //   a4 = dest_offset = 4
         let args = SyscallArgs {
-            a0: 0,                        // unused at this layer
+            a0: 0, // unused at this layer
             a1: (InvocationLabel::UntypedRetype as u64) << 12,
             a2: ObjectType::Endpoint.to_word(),
             a3: 4,
@@ -5799,8 +6239,11 @@ pub mod spec {
                 match s.cnodes[0].0[i].cap() {
                     Cap::Endpoint { ptr, .. } => {
                         let idx = (ptr.addr() - 1) as usize;
-                        assert!(idx < crate::kernel::MAX_ENDPOINTS,
-                            "ep index out of range: {}", idx);
+                        assert!(
+                            idx < crate::kernel::MAX_ENDPOINTS,
+                            "ep index out of range: {}",
+                            idx
+                        );
                         assert!(!seen_indices[idx], "duplicate ep index");
                         seen_indices[idx] = true;
                     }
@@ -5859,9 +6302,7 @@ pub mod spec {
         // node_offset, msg_regs[5] = num_objects, pending_extra_caps[0]
         // = root cap. Mirrors what `handle_send` would have populated
         // from the IPC buffer + caps_or_badges[].
-        let root_cap = unsafe {
-            KERNEL.get().scheduler.slab.get(invoker).cspace_root
-        };
+        let root_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         let target_slot = 0x57f;
         unsafe {
             let s = KERNEL.get();
@@ -5876,14 +6317,14 @@ pub mod spec {
         //   a2 = type, a3 = size_bits, a4 = node_index, a5 = node_depth
         let info_word = ((InvocationLabel::UntypedRetype as u64) << 12)
             | (1u64 << 7)    // extra_caps = 1
-            | 6u64;          // length = 6
+            | 6u64; // length = 6
         let args = SyscallArgs {
             a0: 0,
             a1: info_word,
             a2: ObjectType::Endpoint.to_word(),
-            a3: 0,           // size_bits (unused for Endpoint)
-            a4: 0,           // node_index = 0 (root cap IS dest CNode)
-            a5: 0,           // node_depth = 0 (root cap directly)
+            a3: 0, // size_bits (unused for Endpoint)
+            a4: 0, // node_index = 0 (root cap IS dest CNode)
+            a5: 0, // node_depth = 0 (root cap directly)
         };
         decode_invocation(ut_cap, &args, invoker).expect("retype far ok");
 
@@ -5895,13 +6336,16 @@ pub mod spec {
                 Cap::Endpoint { .. } => {}
                 other => panic!(
                     "expected Endpoint at far slot 0x{:x}, got {:?}",
-                    target_slot, other),
+                    target_slot, other
+                ),
             }
             // No collateral writes at slot 4 (the LEGACY-ABI default
             // dest_offset).
-            assert!(s.cnodes[0].0[4].cap().is_null(),
+            assert!(
+                s.cnodes[0].0[4].cap().is_null(),
                 "slot 4 should remain Null when upstream ABI requests slot 0x{:x}",
-                target_slot);
+                target_slot
+            );
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Untyped::Retype upstream ABI lands at requested far slot\n");
@@ -5948,21 +6392,21 @@ pub mod spec {
             s.cnodes[0].0[0] = Cte::with_cap(&parent_ut);
             s.cnodes[0].0[0x57f] = Cte::with_cap(&unrelated_ut);
             // Default parent for the unrelated cap is None (sentinel).
-            assert!(s.cnodes[0].0[0x57f].parent().is_none(),
-                "fresh Cte::with_cap should have parent=None");
+            assert!(
+                s.cnodes[0].0[0x57f].parent().is_none(),
+                "fresh Cte::with_cap should have parent=None"
+            );
         }
         // Retype parent into a sub-Untyped at slot 100, then sub into
         // an Endpoint at slot 200 (chained derivation). Both should
         // be revoked when we revoke slot 0; slot 0x57f must NOT be.
-        let cnode_cap = unsafe {
-            KERNEL.get().scheduler.slab.get(invoker).cspace_root
-        };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         // Legacy ABI: a3 = (size_bits << 32) | num_objects.
         let args = SyscallArgs {
             a1: (InvocationLabel::UntypedRetype as u64) << 12,
             a2: ObjectType::Untyped.to_word(),
-            a3: (8u64 << 32) | 1,   // size_bits=8 (256B), num=1
-            a4: 100,                // dest_offset
+            a3: (8u64 << 32) | 1, // size_bits=8 (256B), num=1
+            a4: 100,              // dest_offset
             ..Default::default()
         };
         decode_invocation(parent_ut, &args, invoker).expect("retype sub-ut");
@@ -5989,19 +6433,27 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             // Parent cap stays in slot 0 (revoke source is preserved).
-            assert!(matches!(s.cnodes[0].0[0].cap(), Cap::Untyped { .. }),
-                "revoke source slot 0 should keep its cap");
+            assert!(
+                matches!(s.cnodes[0].0[0].cap(), Cap::Untyped { .. }),
+                "revoke source slot 0 should keep its cap"
+            );
             // Both descendants gone.
-            assert!(s.cnodes[0].0[100].cap().is_null(),
-                "sub-Untyped at 100 should be nulled");
-            assert!(s.cnodes[0].0[200].cap().is_null(),
-                "Endpoint at 200 should be nulled");
+            assert!(
+                s.cnodes[0].0[100].cap().is_null(),
+                "sub-Untyped at 100 should be nulled"
+            );
+            assert!(
+                s.cnodes[0].0[200].cap().is_null(),
+                "Endpoint at 200 should be nulled"
+            );
             // The unrelated Untyped MUST survive.
             match s.cnodes[0].0[0x57f].cap() {
-                Cap::Untyped { ptr, .. } => assert_eq!(ptr.addr(), 0x00B0_0000,
-                    "unrelated Untyped at 0x57f must survive an unrelated revoke"),
-                other => panic!("unrelated cap at 0x57f got nulled by revoke: {:?}",
-                    other),
+                Cap::Untyped { ptr, .. } => assert_eq!(
+                    ptr.addr(),
+                    0x00B0_0000,
+                    "unrelated Untyped at 0x57f must survive an unrelated revoke"
+                ),
+                other => panic!("unrelated cap at 0x57f got nulled by revoke: {:?}", other),
             }
         }
         teardown_invoker(invoker);
@@ -6030,9 +6482,7 @@ pub mod spec {
             let s = KERNEL.get();
             s.cnodes[0].0[0] = Cte::with_cap(&ut_cap);
         }
-        let cnode_cap = unsafe {
-            KERNEL.get().scheduler.slab.get(invoker).cspace_root
-        };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         for cycle in 0..500u32 {
             // Retype 1 endpoint at slot 4.
             let args = SyscallArgs {
@@ -6044,14 +6494,19 @@ pub mod spec {
             };
             let r = decode_invocation(ut_cap, &args, invoker);
             if r.is_err() {
-                panic!("retype failed at cycle {} (free_index didn't reclaim?)",
-                    cycle);
+                panic!(
+                    "retype failed at cycle {} (free_index didn't reclaim?)",
+                    cycle
+                );
             }
             // Confirm cap landed.
             unsafe {
                 let s = KERNEL.get();
-                assert!(matches!(s.cnodes[0].0[4].cap(), Cap::Endpoint { .. }),
-                    "endpoint missing at cycle {}", cycle);
+                assert!(
+                    matches!(s.cnodes[0].0[4].cap(), Cap::Endpoint { .. }),
+                    "endpoint missing at cycle {}",
+                    cycle
+                );
             }
             // Mirror vka_free_object: revoke then delete. Some
             // vka implementations only call cnode_delete; others
@@ -6061,19 +6516,20 @@ pub mod spec {
                 a2: 4,
                 ..Default::default()
             };
-            decode_invocation(cnode_cap, &rev_args, invoker)
-                .expect("revoke ok");
+            decode_invocation(cnode_cap, &rev_args, invoker).expect("revoke ok");
             let del_args = SyscallArgs {
                 a1: (InvocationLabel::CNodeDelete as u64) << 12,
                 a2: 4,
                 ..Default::default()
             };
-            decode_invocation(cnode_cap, &del_args, invoker)
-                .expect("delete ok");
+            decode_invocation(cnode_cap, &del_args, invoker).expect("delete ok");
             unsafe {
                 let s = KERNEL.get();
-                assert!(s.cnodes[0].0[4].cap().is_null(),
-                    "slot 4 should be empty at cycle {}", cycle);
+                assert!(
+                    s.cnodes[0].0[4].cap().is_null(),
+                    "slot 4 should be empty at cycle {}",
+                    cycle
+                );
             }
         }
         teardown_invoker(invoker);
@@ -6090,15 +6546,15 @@ pub mod spec {
                 ptr: PPtr::<EndpointObj>::new(0x123).unwrap(),
                 badge: Badge(0xAA),
                 rights: EndpointRights {
-                    can_send: true, can_receive: false,
-                    can_grant: false, can_grant_reply: false,
+                    can_send: true,
+                    can_receive: false,
+                    can_grant: false,
+                    can_grant_reply: false,
                 },
             });
         }
 
-        let cnode_cap = unsafe {
-            KERNEL.get().scheduler.slab.get(invoker).cspace_root
-        };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeCopy as u64) << 12,
             a2: 2, // dest slot
@@ -6127,9 +6583,7 @@ pub mod spec {
                 rights: EndpointRights::default(),
             });
         }
-        let cnode_cap = unsafe {
-            KERNEL.get().scheduler.slab.get(invoker).cspace_root
-        };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeMove as u64) << 12,
             a2: 3, // dest
@@ -6158,7 +6612,9 @@ pub mod spec {
             free_index: 0,
             is_device: false,
         };
-        unsafe { KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap); }
+        unsafe {
+            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+        }
 
         // Retype 4 Endpoints into slots 4..7. Phase 30 — the MDB
         // tree records each child's parent CTE, so Revoke walks
@@ -6185,9 +6641,7 @@ pub mod spec {
 
         // Revoke the untyped at slot 0 — should zero all 4
         // descendants but leave the untyped intact.
-        let cnode_cap = unsafe {
-            KERNEL.get().scheduler.slab.get(invoker).cspace_root
-        };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeRevoke as u64) << 12,
             a2: 0, // src slot = the untyped
@@ -6201,8 +6655,10 @@ pub mod spec {
             assert!(matches!(s.cnodes[0].0[0].cap(), Cap::Untyped { .. }));
             // Children gone.
             for i in 4..8 {
-                assert!(s.cnodes[0].0[i].cap().is_null(),
-                    "slot {i} should have been revoked");
+                assert!(
+                    s.cnodes[0].0[i].cap().is_null(),
+                    "slot {i} should have been revoked"
+                );
             }
         }
         teardown_invoker(invoker);
@@ -6220,8 +6676,7 @@ pub mod spec {
             a3: 2,
             ..Default::default()
         };
-        decode_invocation(Cap::IrqControl, &args, invoker)
-            .expect("issue handler ok");
+        decode_invocation(Cap::IrqControl, &args, invoker).expect("issue handler ok");
         unsafe {
             let s = KERNEL.get();
             match s.cnodes[0].0[2].cap() {
@@ -6243,7 +6698,8 @@ pub mod spec {
                 ptr: KernelState::ntfn_ptr(3),
                 badge: crate::cap::Badge(0),
                 rights: crate::cap::NotificationRights {
-                    can_send: true, can_receive: true,
+                    can_send: true,
+                    can_receive: true,
                 },
             });
         }
@@ -6254,8 +6710,7 @@ pub mod spec {
             a2: 5, // CPtr to ntfn cap
             ..Default::default()
         };
-        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker)
-            .expect("set notification ok");
+        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker).expect("set notification ok");
         unsafe {
             let s = KERNEL.get();
             let entry = s.irqs.get(9).unwrap();
@@ -6280,8 +6735,7 @@ pub mod spec {
             a1: (InvocationLabel::IRQAckIRQ as u64) << 12,
             ..Default::default()
         };
-        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker)
-            .expect("ack ok");
+        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker).expect("ack ok");
         unsafe {
             let s = KERNEL.get();
             assert!(!s.irqs.get(9).unwrap().pending);
@@ -6292,12 +6746,13 @@ pub mod spec {
             a1: (InvocationLabel::IRQClearIRQHandler as u64) << 12,
             ..Default::default()
         };
-        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker)
-            .expect("clear ok");
+        decode_invocation(Cap::IrqHandler { irq: 9 }, &args, invoker).expect("clear ok");
         unsafe {
             let s = KERNEL.get();
-            assert_eq!(s.irqs.get(9).unwrap().state,
-                crate::interrupt::IrqState::Inactive);
+            assert_eq!(
+                s.irqs.get(9).unwrap().state,
+                crate::interrupt::IrqState::Inactive
+            );
         }
 
         teardown_invoker(invoker);
@@ -6358,8 +6813,11 @@ pub mod spec {
                 other => panic!("source sibling should stay unmapped, got {:?}", other),
             }
             match KERNEL.get().cnodes[0].0[2].cap() {
-                Cap::Frame { mapped: Some(v), rights: FrameRights::ReadWrite, .. }
-                    if v == vaddr => {}
+                Cap::Frame {
+                    mapped: Some(v),
+                    rights: FrameRights::ReadWrite,
+                    ..
+                } if v == vaddr => {}
                 other => panic!("expected mapped frame, got {:?}", other),
             }
         }
@@ -6392,10 +6850,12 @@ pub mod spec {
             ..Default::default()
         };
         let r = decode_invocation(now_cap, &args, invoker);
-        assert!(matches!(r,
+        assert!(matches!(
+            r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_DeleteFirst })))
-        );
+                code: seL4_Error::seL4_DeleteFirst
+            }))
+        ));
 
         // Unmap clears the mapping in the cap.
         let args = SyscallArgs {
@@ -6489,14 +6949,17 @@ pub mod spec {
             // Use cnode index 1 as the *target's* cspace_root.
             let new_cnode_cap = Cap::CNode {
                 ptr: KernelState::cnode_ptr(1),
-                radix: 5, guard_size: 59, guard: 0,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
             };
             s.cnodes[0].0[1] = Cte::with_cap(&new_cnode_cap);
             s.cnodes[0].0[2] = Cte::with_cap(&Cap::Notification {
                 ptr: KernelState::ntfn_ptr(5),
                 badge: crate::cap::Badge(0),
                 rights: crate::cap::NotificationRights {
-                    can_send: true, can_receive: true,
+                    can_send: true,
+                    can_receive: true,
                 },
             });
         }
@@ -6532,10 +6995,12 @@ pub mod spec {
 
         // Double-bind rejected.
         let r = decode_invocation(target_cap, &args, invoker);
-        assert!(matches!(r,
+        assert!(matches!(
+            r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_DeleteFirst })))
-        );
+                code: seL4_Error::seL4_DeleteFirst
+            }))
+        ));
 
         // Unbind clears the slot.
         let args = SyscallArgs {
@@ -6557,7 +7022,7 @@ pub mod spec {
     /// The syscall return path uses that as CR3 on resume.
     #[inline(never)]
     fn tcb_set_space_pml4_pins_cr3() {
-        use crate::cap::{Pml4Storage};
+        use crate::cap::Pml4Storage;
 
         let invoker = setup_invoker(0);
         let target = unsafe {
@@ -6576,12 +7041,16 @@ pub mod spec {
             mapped: true,
             asid: 0,
         };
-        unsafe { KERNEL.get().cnodes[0].0[3] = Cte::with_cap(&pml4_cap); }
+        unsafe {
+            KERNEL.get().cnodes[0].0[3] = Cte::with_cap(&pml4_cap);
+        }
 
         // SetSpace(fault_ep=0, cnode_cptr=0, vspace_cptr=3)
         let args = SyscallArgs {
             a1: (InvocationLabel::TCBSetSpace as u64) << 12,
-            a2: 0, a3: 0, a4: 3,
+            a2: 0,
+            a3: 0,
+            a4: 3,
             ..Default::default()
         };
         decode_invocation(target_cap, &args, invoker).expect("set vspace");
@@ -6595,18 +7064,25 @@ pub mod spec {
         unsafe {
             KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&Cap::CNode {
                 ptr: KernelState::cnode_ptr(1),
-                radix: 5, guard_size: 59, guard: 0,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
             });
         }
         let args = SyscallArgs {
             a1: (InvocationLabel::TCBSetSpace as u64) << 12,
-            a2: 0, a3: 0, a4: 4,
+            a2: 0,
+            a3: 0,
+            a4: 4,
             ..Default::default()
         };
         let r = decode_invocation(target_cap, &args, invoker);
-        assert!(matches!(r,
+        assert!(matches!(
+            r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_InvalidCapability }))));
+                code: seL4_Error::seL4_InvalidCapability
+            }))
+        ));
         // CR3 unchanged.
         unsafe {
             let t = KERNEL.get().scheduler.slab.get(target);
@@ -6633,12 +7109,15 @@ pub mod spec {
         // Plant a CNode at slot 4 and a PML4 at slot 5 in the invoker.
         let cnode_cap = Cap::CNode {
             ptr: KernelState::cnode_ptr(2),
-            radix: 5, guard_size: 59, guard: 0,
+            radix: 5,
+            guard_size: 59,
+            guard: 0,
         };
         let pml4_paddr = 0x0000_0000_00DD_0000u64;
         let pml4_cap = Cap::PML4 {
             ptr: PPtr::<Pml4Storage>::new(pml4_paddr).unwrap(),
-            mapped: true, asid: 0,
+            mapped: true,
+            asid: 0,
         };
         unsafe {
             KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&cnode_cap);
@@ -6741,9 +7220,12 @@ pub mod spec {
         // IllegalOperation (upstream decodeSchedContext_Bind;
         // SCHED_CONTEXT_0003).
         let r = decode_invocation(sc_cap, &args, invoker);
-        assert!(matches!(r,
+        assert!(matches!(
+            r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_IllegalOperation }))));
+                code: seL4_Error::seL4_IllegalOperation
+            }))
+        ));
 
         // Unbind clears both sides.
         let args = SyscallArgs {
@@ -6794,8 +7276,7 @@ pub mod spec {
 
         // Plant a SchedControl singleton cap at slot 9.
         unsafe {
-            KERNEL.get().cnodes[0].0[9] =
-                Cte::with_cap(&Cap::SchedControl { core: 0 });
+            KERNEL.get().cnodes[0].0[9] = Cte::with_cap(&Cap::SchedControl { core: 0 });
         }
         let sched_control = Cap::SchedControl { core: 0 };
 
@@ -6813,9 +7294,7 @@ pub mod spec {
 
         // Verify the SC got reprogrammed.
         let sc_idx = match unsafe { KERNEL.get().cnodes[0].0[7].cap() } {
-            Cap::SchedContext { ptr, .. } => {
-                KernelState::sched_context_index(ptr)
-            }
+            Cap::SchedContext { ptr, .. } => KernelState::sched_context_index(ptr),
             _ => panic!("expected SchedContext at slot 7"),
         };
         unsafe {
@@ -6836,9 +7315,12 @@ pub mod spec {
             ..Default::default()
         };
         let r = decode_invocation(sched_control, &args, invoker);
-        assert!(matches!(r,
+        assert!(matches!(
+            r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_RangeError }))));
+                code: seL4_Error::seL4_RangeError
+            }))
+        ));
 
         teardown_invoker(invoker);
         arch::log("  ✓ SchedControl::ConfigureFlags sets period/budget\n");
@@ -6847,9 +7329,7 @@ pub mod spec {
     #[inline(never)]
     fn unsupported_label_returns_illegal() {
         let invoker = setup_invoker(0);
-        let cnode_cap = unsafe {
-            KERNEL.get().scheduler.slab.get(invoker).cspace_root
-        };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         // Pick a cap-type-irrelevant label (UntypedRetype on a CNode).
         let args = SyscallArgs {
             a1: (InvocationLabel::UntypedRetype as u64) << 12,

@@ -38,8 +38,7 @@ fn main() {
     }
 
     let read = |name: &str| -> String {
-        fs::read_to_string(codegen_dir.join(name))
-            .unwrap_or_else(|e| panic!("read {name}: {e}"))
+        fs::read_to_string(codegen_dir.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"))
     };
 
     // .bf -> structures.rs
@@ -49,14 +48,13 @@ fn main() {
 
     // arch x86_64 .bf -> structures_arch.rs
     let bf_arch = read("structures_x86_64.bf");
-    let rust = bf::generate(&bf_arch)
-        .unwrap_or_else(|e| panic!("arch bf codegen: {e}"));
+    let rust = bf::generate(&bf_arch).unwrap_or_else(|e| panic!("arch bf codegen: {e}"));
     fs::write(out_dir.join("structures_arch.rs"), rust).expect("write structures_arch.rs");
 
     // syscall.xml -> syscalls.rs
     let syscall_xml = read("syscall.xml");
-    let rust = xml::generate_syscalls(&syscall_xml)
-        .unwrap_or_else(|e| panic!("syscall codegen: {e}"));
+    let rust =
+        xml::generate_syscalls(&syscall_xml).unwrap_or_else(|e| panic!("syscall codegen: {e}"));
     fs::write(out_dir.join("syscalls.rs"), rust).expect("write syscalls.rs");
 
     // object-api*.xml -> invocations.rs

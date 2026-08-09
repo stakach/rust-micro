@@ -39,9 +39,17 @@ pub enum FaultKind {
     /// error (e.g. an unmapped page). Carries the seL4 fault type
     /// tag the user thread will see in its fault message.
     CapFault,
-    UnknownSyscall { number: i64 },
-    UserException { number: u32, code: u32 },
-    VmFault { addr: u64, fsr: u64 },
+    UnknownSyscall {
+        number: i64,
+    },
+    UserException {
+        number: u32,
+        code: u32,
+    },
+    VmFault {
+        addr: u64,
+        fsr: u64,
+    },
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

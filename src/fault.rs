@@ -20,21 +20,41 @@ use crate::types::{seL4_Error, seL4_Word as Word};
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum FaultMessage {
     Null,
-    CapFault { addr: Word, in_recv: bool },
-    UnknownSyscall { number: Word },
-    UserException { number: u32, code: u32 },
-    VMFault { addr: Word, fsr: Word, instruction: bool },
+    CapFault {
+        addr: Word,
+        in_recv: bool,
+    },
+    UnknownSyscall {
+        number: Word,
+    },
+    UserException {
+        number: u32,
+        code: u32,
+    },
+    VMFault {
+        addr: Word,
+        fsr: Word,
+        instruction: bool,
+    },
     /// MCS timeout fault — raised when a thread with a timeout-fault
     /// endpoint exhausts its scheduling-context budget. `data` is the
     /// SC's badge (`seL4_Timeout_Data`); `consumed` is ticks consumed
     /// (`seL4_Timeout_Consumed`). Length 2.
-    Timeout { data: u64, consumed: u64 },
+    Timeout {
+        data: u64,
+        consumed: u64,
+    },
     /// Hardware debug exception (CONFIG_HARDWARE_DEBUG_API). `reason`:
     /// 0 = Data / 1 = Instruction (a HW breakpoint hit), 2 = SingleStep,
     /// 3 = SoftwareBreakRequest (INT3). HW-breakpoint faults also carry
     /// `trigger_addr` + `bp_num` (MR length 4); single-step / INT3 carry
     /// only `fault_ip` + `reason` (length 2).
-    DebugException { fault_ip: u64, reason: u64, trigger_addr: u64, bp_num: u64 },
+    DebugException {
+        fault_ip: u64,
+        reason: u64,
+        trigger_addr: u64,
+        bp_num: u64,
+    },
 }
 
 impl FaultMessage {
@@ -78,7 +98,11 @@ impl FaultMessage {
                 regs[2] = code as Word;
                 3
             }
-            FaultMessage::VMFault { addr, fsr, instruction } => {
+            FaultMessage::VMFault {
+                addr,
+                fsr,
+                instruction,
+            } => {
                 regs[1] = addr;
                 regs[2] = fsr;
                 regs[3] = instruction as Word;
@@ -89,7 +113,12 @@ impl FaultMessage {
                 regs[2] = consumed;
                 3
             }
-            FaultMessage::DebugException { fault_ip, reason, trigger_addr, bp_num } => {
+            FaultMessage::DebugException {
+                fault_ip,
+                reason,
+                trigger_addr,
+                bp_num,
+            } => {
                 regs[1] = fault_ip;
                 regs[2] = reason;
                 regs[3] = trigger_addr;
@@ -129,12 +158,16 @@ pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
             Cap::Endpoint { ptr, badge, rights } => {
                 if !rights.can_send {
                     return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability)));
+                        seL4_Error::seL4_InvalidCapability,
+                    )));
                 }
                 (ptr, badge.0)
             }
-            _ => return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability))),
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
         };
         // Stage the fault as a Call-shaped message: handler runs,
         // does SysReply to resume the faulter. Layout of msg_regs
@@ -160,18 +193,23 @@ pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
         let s_ptr: *mut KernelState = s;
         let ep = &mut (*s_ptr).endpoints[idx];
         let sched = &mut (*s_ptr).scheduler;
-        send_ipc(ep, sched, faulter, SendOptions {
-            blocking: true,
-            do_call: true,
-            badge,
-            // Fault delivery acts as a Call from the faulter to its
-            // fault handler — grant rights so the handler can install
-            // a reply cap and send caps back if it wants to.
-            can_grant: true,
-            // do_call path handles donation via finish_call; this is
-            // moot but matches the Call canDonate=true convention.
-            can_donate: true,
-        });
+        send_ipc(
+            ep,
+            sched,
+            faulter,
+            SendOptions {
+                blocking: true,
+                do_call: true,
+                badge,
+                // Fault delivery acts as a Call from the faulter to its
+                // fault handler — grant rights so the handler can install
+                // a reply cap and send caps back if it wants to.
+                can_grant: true,
+                // do_call path handles donation via finish_call; this is
+                // moot but matches the Call canDonate=true convention.
+                can_donate: true,
+            },
+        );
         Ok(())
     }
 }
@@ -192,9 +230,7 @@ pub fn deliver_timeout_fault(faulter: TcbId) -> bool {
         }
         let target = s.scheduler.slab.get(faulter).timeout_endpoint_cap;
         let (ep_ptr, badge) = match target {
-            Cap::Endpoint { ptr, badge, rights } if rights.can_send => {
-                (ptr, badge.0)
-            }
+            Cap::Endpoint { ptr, badge, rights } if rights.can_send => (ptr, badge.0),
             _ => return false,
         };
         // seL4_Timeout_Data = the SC's badge; Consumed = ticks used.
@@ -217,13 +253,18 @@ pub fn deliver_timeout_fault(faulter: TcbId) -> bool {
         let s_ptr: *mut KernelState = s;
         let ep = &mut (*s_ptr).endpoints[idx];
         let sched = &mut (*s_ptr).scheduler;
-        send_ipc(ep, sched, faulter, SendOptions {
-            blocking: true,
-            do_call: true,
-            badge,
-            can_grant: true,
-            can_donate: true,
-        });
+        send_ipc(
+            ep,
+            sched,
+            faulter,
+            SendOptions {
+                blocking: true,
+                do_call: true,
+                badge,
+                can_grant: true,
+                can_donate: true,
+            },
+        );
         true
     }
 }
@@ -235,7 +276,11 @@ pub fn deliver_timeout_fault(faulter: TcbId) -> bool {
 /// (rcx = RIP, r11 = RFLAGS).
 #[cfg(target_arch = "x86_64")]
 pub fn resume_ip(f: &crate::tcb::Tcb) -> Word {
-    if f.use_iretq_resume { f.user_context.rip } else { f.user_context.rcx }
+    if f.use_iretq_resume {
+        f.user_context.rip
+    } else {
+        f.user_context.rcx
+    }
 }
 
 /// IP to REPORT from TCB_ReadRegisters (the "fault IP"). For a thread
@@ -250,9 +295,10 @@ pub fn reported_ip(f: &crate::tcb::Tcb) -> Word {
     use crate::tcb::ThreadStateType::*;
     let ip = resume_ip(f);
     if !f.use_iretq_resume
-        && matches!(f.state,
-            BlockedOnReceive | BlockedOnSend | BlockedOnReply
-                | BlockedOnNotification)
+        && matches!(
+            f.state,
+            BlockedOnReceive | BlockedOnSend | BlockedOnReply | BlockedOnNotification
+        )
     {
         ip.wrapping_sub(2)
     } else {
@@ -262,7 +308,11 @@ pub fn reported_ip(f: &crate::tcb::Tcb) -> Word {
 
 #[cfg(target_arch = "x86_64")]
 pub fn resume_flags(f: &crate::tcb::Tcb) -> Word {
-    if f.use_iretq_resume { f.user_context.rflags } else { f.user_context.r11 }
+    if f.use_iretq_resume {
+        f.user_context.rflags
+    } else {
+        f.user_context.r11
+    }
 }
 
 /// Set the address this thread resumes at, honoring its capture
@@ -320,30 +370,68 @@ pub unsafe fn apply_fault_reply(
             // via SYSCALL, which destroyed them — sysret resume
             // rebuilds them from RIP/FLAGS.
             let n = length.min(regs.len());
-            if n > 0  { t.user_context.rax = regs[0]; }
-            if n > 1  { t.user_context.rbx = regs[1]; }
-            if n > 3  { t.user_context.rdx = regs[3]; }
-            if n > 4  { t.user_context.rsi = regs[4]; }
-            if n > 5  { t.user_context.rdi = regs[5]; }
-            if n > 6  { t.user_context.rbp = regs[6]; }
-            if n > 7  { t.user_context.r8  = regs[7]; }
-            if n > 8  { t.user_context.r9  = regs[8]; }
-            if n > 9  { t.user_context.r10 = regs[9]; }
-            if n > 11 { t.user_context.r12 = regs[11]; }
-            if n > 12 { t.user_context.r13 = regs[12]; }
-            if n > 13 { t.user_context.r14 = regs[13]; }
-            if n > 14 { t.user_context.r15 = regs[14]; }
-            if n > 15 { set_resume_ip(t, regs[15]); }
-            if n > 16 { t.user_context.rsp = regs[16]; }
-            if n > 17 { set_resume_flags(t, (regs[17] & 0xDD5) | 0x202); }
+            if n > 0 {
+                t.user_context.rax = regs[0];
+            }
+            if n > 1 {
+                t.user_context.rbx = regs[1];
+            }
+            if n > 3 {
+                t.user_context.rdx = regs[3];
+            }
+            if n > 4 {
+                t.user_context.rsi = regs[4];
+            }
+            if n > 5 {
+                t.user_context.rdi = regs[5];
+            }
+            if n > 6 {
+                t.user_context.rbp = regs[6];
+            }
+            if n > 7 {
+                t.user_context.r8 = regs[7];
+            }
+            if n > 8 {
+                t.user_context.r9 = regs[8];
+            }
+            if n > 9 {
+                t.user_context.r10 = regs[9];
+            }
+            if n > 11 {
+                t.user_context.r12 = regs[11];
+            }
+            if n > 12 {
+                t.user_context.r13 = regs[12];
+            }
+            if n > 13 {
+                t.user_context.r14 = regs[13];
+            }
+            if n > 14 {
+                t.user_context.r15 = regs[14];
+            }
+            if n > 15 {
+                set_resume_ip(t, regs[15]);
+            }
+            if n > 16 {
+                t.user_context.rsp = regs[16];
+            }
+            if n > 17 {
+                set_resume_flags(t, (regs[17] & 0xDD5) | 0x202);
+            }
             label == 0
         }
         3 => {
             // UserException — slots: 0 FaultIP, 1 SP, 2 FLAGS.
             let n = length.min(regs.len());
-            if n > 0 { set_resume_ip(t, regs[0]); }
-            if n > 1 { t.user_context.rsp = regs[1]; }
-            if n > 2 { set_resume_flags(t, (regs[2] & 0xDD5) | 0x202); }
+            if n > 0 {
+                set_resume_ip(t, regs[0]);
+            }
+            if n > 1 {
+                t.user_context.rsp = regs[1];
+            }
+            if n > 2 {
+                set_resume_flags(t, (regs[2] & 0xDD5) | 0x202);
+            }
             label == 0
         }
         5 => {
@@ -367,8 +455,8 @@ pub unsafe fn apply_fault_reply(
                 t.user_context.rsi = regs[7];
                 t.user_context.rdi = regs[8];
                 t.user_context.rbp = regs[9];
-                t.user_context.r8  = regs[10];
-                t.user_context.r9  = regs[11];
+                t.user_context.r8 = regs[10];
+                t.user_context.r9 = regs[11];
                 t.user_context.r10 = regs[12];
                 t.user_context.r12 = regs[14];
                 t.user_context.r13 = regs[15];
@@ -422,7 +510,9 @@ fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
             regs[0] = ip;
             regs[1] = addr;
             regs[2] = in_recv as u64;
-            for r in regs.iter_mut().take(8).skip(3) { *r = 0; }
+            for r in regs.iter_mut().take(8).skip(3) {
+                *r = 0;
+            }
             8
         }
         FaultMessage::UnknownSyscall { number } => {
@@ -451,22 +541,26 @@ fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
             // (0F 05). Mirrors upstream c_traps.c
             // `setRegister(FaultIP, getRegister(NextIP) - 2)`.
             regs[15] = ip.wrapping_sub(2);
-            regs[16] = ctx.rsp;   // SP
-            regs[17] = flags;     // FLAGS
-            regs[18] = number;    // Syscall
+            regs[16] = ctx.rsp; // SP
+            regs[17] = flags; // FLAGS
+            regs[18] = number; // Syscall
             19
         }
         FaultMessage::UserException { number, code } => {
             // x86_64 seL4_UserException_Msg: FaultIP, SP, FLAGS,
             // Number, Code → length 5.
             regs[0] = ip;
-            regs[1] = ctx.rsp;       // user SP
+            regs[1] = ctx.rsp; // user SP
             regs[2] = flags;
             regs[3] = number as u64;
             regs[4] = code as u64;
             5
         }
-        FaultMessage::VMFault { addr, fsr, instruction } => {
+        FaultMessage::VMFault {
+            addr,
+            fsr,
+            instruction,
+        } => {
             // x86_64 seL4_VMFault_Msg: IP, Addr, PrefetchFault,
             // FSR → length 4.
             regs[0] = ip;
@@ -481,7 +575,12 @@ fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
             regs[1] = consumed;
             2
         }
-        FaultMessage::DebugException { fault_ip, reason, trigger_addr, bp_num } => {
+        FaultMessage::DebugException {
+            fault_ip,
+            reason,
+            trigger_addr,
+            bp_num,
+        } => {
             // seL4_DebugException_Msg: FaultIP, ExceptionReason, then
             // (HW breakpoint only) TriggerAddress, BreakpointNumber.
             // Single-step (2) / software-break (3) deliver 2 MRs;
@@ -523,7 +622,11 @@ pub mod spec {
             let s = KERNEL.get();
             // Find the lowest occupied slot — that's the boot
             // thread (admitted by `bootstrap_boot_thread`).
-            let boot = s.scheduler.slab.entries.iter()
+            let boot = s
+                .scheduler
+                .slab
+                .entries
+                .iter()
                 .position(|e| e.is_some())
                 .map(|i| TcbId(i as u16))
                 .expect("boot thread must still be live");
@@ -575,14 +678,18 @@ pub mod spec {
 
         let cnode_cap = Cap::CNode {
             ptr: KernelState::cnode_ptr(0),
-            radix: 5, guard_size: 59, guard: 0,
+            radix: 5,
+            guard_size: 59,
+            guard: 0,
         };
         let ep_cap = Cap::Endpoint {
             ptr: KernelState::endpoint_ptr(7),
             badge: Badge(0xF1),
             rights: EndpointRights {
-                can_send: true, can_receive: true,
-                can_grant: false, can_grant_reply: true,
+                can_send: true,
+                can_receive: true,
+                can_grant: false,
+                can_grant_reply: true,
             },
         };
         unsafe {
@@ -599,18 +706,27 @@ pub mod spec {
         }
         let r = crate::syscall_handler::handle_syscall(
             crate::syscalls::Syscall::SysRecv,
-            &crate::syscall_handler::SyscallArgs { a0: 7, ..Default::default() },
+            &crate::syscall_handler::SyscallArgs {
+                a0: 7,
+                ..Default::default()
+            },
             &mut SinkVoid,
         );
         assert!(r.is_ok());
 
         // Now fault the faulter.
-        unsafe { KERNEL.get().scheduler.set_current(Some(faulter)); }
-        deliver_fault(faulter, FaultMessage::VMFault {
-            addr: 0xDEAD_BEEF,
-            fsr: 0x4,
-            instruction: false,
-        }).expect("fault delivery ok");
+        unsafe {
+            KERNEL.get().scheduler.set_current(Some(faulter));
+        }
+        deliver_fault(
+            faulter,
+            FaultMessage::VMFault {
+                addr: 0xDEAD_BEEF,
+                fsr: 0x4,
+                instruction: false,
+            },
+        )
+        .expect("fault delivery ok");
 
         unsafe {
             let s = KERNEL.get();
@@ -619,8 +735,10 @@ pub mod spec {
             // x86_64 seL4_VMFault_Msg: IP, Addr, PrefetchFault, FSR.
             // The fault label (6 = VMFault) lives in `ipc_label`,
             // not msg_regs.
-            assert_eq!(s.scheduler.slab.get(faulter).state,
-                ThreadStateType::BlockedOnReply);
+            assert_eq!(
+                s.scheduler.slab.get(faulter).state,
+                ThreadStateType::BlockedOnReply
+            );
             assert_eq!(s.scheduler.slab.get(handler).reply_to, Some(faulter));
             assert_eq!(s.scheduler.slab.get(handler).ipc_label, 6);
             assert_eq!(s.scheduler.slab.get(handler).msg_regs[1], 0xDEAD_BEEF);
@@ -630,15 +748,19 @@ pub mod spec {
         // Handler does SysReply to resume the faulter. Phase 36b —
         // SysReply isn't a syscall under MCS, so we call the
         // handler directly.
-        unsafe { KERNEL.get().scheduler.set_current(Some(handler)); }
-        let r = crate::syscall_handler::handle_reply(
-            &crate::syscall_handler::SyscallArgs::default());
+        unsafe {
+            KERNEL.get().scheduler.set_current(Some(handler));
+        }
+        let r =
+            crate::syscall_handler::handle_reply(&crate::syscall_handler::SyscallArgs::default());
         assert!(r.is_ok());
 
         unsafe {
             let s = KERNEL.get();
-            assert_eq!(s.scheduler.slab.get(faulter).state,
-                ThreadStateType::Running);
+            assert_eq!(
+                s.scheduler.slab.get(faulter).state,
+                ThreadStateType::Running
+            );
             // Cleanup.
             s.scheduler.slab.free(handler);
             s.scheduler.slab.free(faulter);

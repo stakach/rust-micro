@@ -239,9 +239,7 @@ extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
     // Phase 33a — IRQ-driven preemption: if the woken IRQ thread
     // outranks the interrupted one, switch contexts here rather
     // than `iretq`-ing back.
-    super::interrupts::swap_iretq_context_if_preempted(
-        ctx, from_user, interrupted,
-    );
+    super::interrupts::swap_iretq_context_if_preempted(ctx, from_user, interrupted);
 }
 
 struct BklGuard;
@@ -324,10 +322,7 @@ pub mod spec {
             core::hint::spin_loop();
         }
         let b = read_count(Channel::Ch2);
-        assert!(
-            b < a,
-            "PIT count should have decremented (a={a}, b={b})",
-        );
+        assert!(b < a, "PIT count should have decremented (a={a}, b={b})",);
         arch::log("  ✓ PIT one-shot count decrements over a busy wait\n");
     }
 

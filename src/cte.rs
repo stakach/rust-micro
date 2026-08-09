@@ -37,7 +37,10 @@ impl Cte {
     /// when DOMAINS0001's basic_set_up retypes a fresh page directory
     /// after the rootserver had revoked some innocuous slot 0 cap.
     pub const fn null() -> Self {
-        Self { cap_words: [0; 2], mdb_words: [MdbId::SENTINEL as u64, 0] }
+        Self {
+            cap_words: [0; 2],
+            mdb_words: [MdbId::SENTINEL as u64, 0],
+        }
     }
 
     /// Convenience constructor used by the specs.
@@ -69,7 +72,9 @@ impl Cte {
     }
 
     pub fn mdb(&self) -> MdbNode {
-        MdbNode { words: self.mdb_words }
+        MdbNode {
+            words: self.mdb_words,
+        }
     }
 
     pub fn set_mdb(&mut self, mdb: MdbNode) {
@@ -93,13 +98,16 @@ impl Cte {
 
     pub fn parent(&self) -> Option<MdbId> {
         let raw = (self.mdb_words[0] & MdbId::MASK as u64) as u32;
-        if raw == MdbId::SENTINEL { None } else { Some(MdbId(raw)) }
+        if raw == MdbId::SENTINEL {
+            None
+        } else {
+            Some(MdbId(raw))
+        }
     }
 
     pub fn set_parent(&mut self, parent: Option<MdbId>) {
         let raw = parent.map_or(MdbId::SENTINEL, |p| p.0);
-        self.mdb_words[0] =
-            (self.mdb_words[0] & !(MdbId::MASK as u64)) | (raw as u64);
+        self.mdb_words[0] = (self.mdb_words[0] & !(MdbId::MASK as u64)) | (raw as u64);
     }
 }
 
@@ -123,8 +131,12 @@ impl MdbId {
     pub const fn pack(cnode_idx: u8, slot: u32) -> Self {
         Self(((cnode_idx as u32) << 18) | (slot & 0x3FFFF))
     }
-    pub const fn cnode_idx(self) -> u8 { (self.0 >> 18) as u8 }
-    pub const fn slot(self) -> u32 { self.0 & 0x3FFFF }
+    pub const fn cnode_idx(self) -> u8 {
+        (self.0 >> 18) as u8
+    }
+    pub const fn slot(self) -> u32 {
+        self.0 & 0x3FFFF
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<Cte>() == Cte::SIZE_BYTES);

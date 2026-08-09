@@ -35,11 +35,17 @@ pub struct PrioBitmap {
 }
 
 impl PrioBitmap {
-    pub const fn new() -> Self { Self { words: [0; BITMAP_WORDS] } }
+    pub const fn new() -> Self {
+        Self {
+            words: [0; BITMAP_WORDS],
+        }
+    }
     pub const fn is_empty(&self) -> bool {
         let mut i = 0;
         while i < BITMAP_WORDS {
-            if self.words[i] != 0 { return false; }
+            if self.words[i] != 0 {
+                return false;
+            }
             i += 1;
         }
         true
@@ -91,7 +97,9 @@ impl ReadyQueues {
         while let Some(c) = cur {
             f(c);
             guard += 1;
-            if guard > 16 { break; }
+            if guard > 16 {
+                break;
+            }
             cur = slab.try_get(c).and_then(|t| t.sched_next);
         }
     }
@@ -126,7 +134,9 @@ impl ReadyQueues {
 }
 
 impl Default for ReadyQueues {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReadyQueues {
@@ -218,11 +228,7 @@ impl ReadyQueues {
     /// `TcbId` (without removing it from the queue) so the caller
     /// can dequeue + re-enqueue elsewhere. Used by cross-CPU
     /// migration in `Scheduler::choose_thread`.
-    pub fn peek_top_with_affinity(
-        &self,
-        slab: &TcbSlab,
-        want_affinity: u32,
-    ) -> Option<TcbId> {
+    pub fn peek_top_with_affinity(&self, slab: &TcbSlab, want_affinity: u32) -> Option<TcbId> {
         let mut prio_opt = self.bitmap.highest();
         while let Some(prio) = prio_opt {
             let mut cur = self.heads[prio as usize];
@@ -348,7 +354,9 @@ pub struct Scheduler {
 }
 
 impl Default for Scheduler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Scheduler {
@@ -362,9 +370,14 @@ impl Scheduler {
         // maximum duration, entry 1 is the end marker. With a single
         // never-expiring slice the kernel behaves as single-domain
         // until userspace reconfigures the schedule (DOMAINS0000).
-        let mut dom_sched = [DomScheduleEntry { domain: 0, duration: 0 };
-            NUM_DOM_SCHEDULES];
-        dom_sched[0] = DomScheduleEntry { domain: 0, duration: DSCHED_MAX_DURATION };
+        let mut dom_sched = [DomScheduleEntry {
+            domain: 0,
+            duration: 0,
+        }; NUM_DOM_SCHEDULES];
+        dom_sched[0] = DomScheduleEntry {
+            domain: 0,
+            duration: DSCHED_MAX_DURATION,
+        };
         Self {
             slab: TcbSlab::new(),
             nodes: [NODE; crate::smp::MAX_CPUS],
@@ -382,7 +395,9 @@ impl Scheduler {
     /// start index on an end marker. Loads the new current domain and
     /// its slice duration. Mirrors seL4 `nextDomain`.
     pub fn next_domain(&mut self) {
-        if NUM_DOMAINS <= 1 { return; }
+        if NUM_DOMAINS <= 1 {
+            return;
+        }
         let mut idx = self.dom_sched_idx + 1;
         if idx >= NUM_DOM_SCHEDULES || self.dom_sched[idx].duration == 0 {
             idx = self.dom_sched_start;
@@ -397,7 +412,9 @@ impl Scheduler {
     /// reschedule into the next domain (seL4 `ksDomainTime--` +
     /// rescheduleRequired in the timer tick).
     pub fn domain_tick(&mut self, delta_ms: u64) -> bool {
-        if NUM_DOMAINS <= 1 { return false; }
+        if NUM_DOMAINS <= 1 {
+            return false;
+        }
         // Domain-schedule durations are expressed in
         // CONFIG_TIMER_FREQUENCY ticks (1 GHz on PC99, i.e.
         // nanoseconds), but our scheduler tick `delta_ms` is in
@@ -422,14 +439,11 @@ impl Scheduler {
         }
         self.slab.get_mut(id).domain = domain;
         if was_enqueued && self.slab.get(id).is_schedulable() {
-            self.nodes[cpu].queues[domain as usize]
-                .enqueue(&mut self.slab, id);
+            self.nodes[cpu].queues[domain as usize].enqueue(&mut self.slab, id);
         }
         // If we just moved the running thread out of the current
         // domain, surrender the CPU so a same-domain thread is picked.
-        if self.nodes[cpu].current == Some(id)
-            && domain != self.cur_domain
-        {
+        if self.nodes[cpu].current == Some(id) && domain != self.cur_domain {
             self.nodes[cpu].current = None;
         }
     }
@@ -720,9 +734,11 @@ impl Scheduler {
         // whose affinity already matches their queue's CPU. Only the
         // current domain is eligible.
         for i in 0..self.nodes.len() {
-            if i == cpu { continue; }
-            if let Some(id) = self.nodes[i].queues[dom].peek_top_with_affinity(
-                &self.slab, cpu as u32)
+            if i == cpu {
+                continue;
+            }
+            if let Some(id) =
+                self.nodes[i].queues[dom].peek_top_with_affinity(&self.slab, cpu as u32)
             {
                 self.nodes[i].queues[dom].dequeue(&mut self.slab, id);
                 self.nodes[cpu].queues[dom].enqueue(&mut self.slab, id);
@@ -737,10 +753,17 @@ impl Scheduler {
     pub fn should_preempt(&self) -> Option<u8> {
         let cpu = crate::arch::get_cpu_id() as usize;
         let node = &self.nodes[cpu];
-        match (node.current, node.queues[self.cur_domain as usize].peek_highest()) {
+        match (
+            node.current,
+            node.queues[self.cur_domain as usize].peek_highest(),
+        ) {
             (Some(cur), Some(top)) => {
                 let cur_prio = self.slab.get(cur).priority;
-                if top > cur_prio { Some(top) } else { None }
+                if top > cur_prio {
+                    Some(top)
+                } else {
+                    None
+                }
             }
             (None, Some(top)) => Some(top),
             _ => None,

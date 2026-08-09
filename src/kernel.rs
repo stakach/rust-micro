@@ -15,7 +15,7 @@
 
 use core::cell::UnsafeCell;
 
-use crate::cap::{Cap, CNodeStorage, EndpointObj, NotificationObj, PPtr};
+use crate::cap::{CNodeStorage, Cap, EndpointObj, NotificationObj, PPtr};
 use crate::cspace::CSpace;
 use crate::cte::Cte;
 use crate::endpoint::Endpoint;
@@ -67,7 +67,9 @@ pub const MAX_CNODES: usize = 24;
 pub struct CNodePage(pub [Cte; CNODE_SLOTS]);
 
 impl Default for CNodePage {
-    fn default() -> Self { Self([Cte::null(); CNODE_SLOTS]) }
+    fn default() -> Self {
+        Self([Cte::null(); CNODE_SLOTS])
+    }
 }
 
 /// Small CNode pool — radix ≤ 6 (64 slots). Lets CSPACE0001
@@ -88,7 +90,9 @@ const _: () = assert!(MAX_CNODES + MAX_SMALL_CNODES <= 254);
 pub struct SmallCNodePage(pub [Cte; SMALL_CNODE_SLOTS]);
 
 impl Default for SmallCNodePage {
-    fn default() -> Self { Self([Cte::null(); SMALL_CNODE_SLOTS]) }
+    fn default() -> Self {
+        Self([Cte::null(); SMALL_CNODE_SLOTS])
+    }
 }
 
 /// XL CNode pool — test-process CSpace roots and, in the extern profile, the
@@ -110,8 +114,7 @@ pub const MAX_XL_CNODES: usize = 1;
 ///   [0, MAX_CNODES)                      big (radix 12)
 ///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix ≤ 6)
 ///   [.., +MAX_XL_CNODES)                 XL (radix 17 or 18)
-const _: () =
-    assert!(MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES <= 254);
+const _: () = assert!(MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES <= 254);
 
 #[repr(C, align(32))]
 pub struct XlCNodePage(pub [Cte; XL_CNODE_SLOTS]);
@@ -127,8 +130,7 @@ pub struct KernelState {
     pub notifications: [Notification; MAX_NTFNS],
     /// Phase 32c — in-kernel SchedContext pool. `Cap::SchedContext`
     /// PPtrs encode `pool_index + 1`, same convention as endpoints.
-    pub sched_contexts: [crate::sched_context::SchedContext;
-                         MAX_SCHED_CONTEXTS],
+    pub sched_contexts: [crate::sched_context::SchedContext; MAX_SCHED_CONTEXTS],
     /// Phase 34e — in-kernel Reply object pool. Same +1 PPtr
     /// convention. `Untyped::Retype(Reply)` allocates a slot and
     /// emits a `Cap::Reply { ptr, can_grant: true }` referencing
@@ -189,10 +191,8 @@ impl KernelState {
         const EMPTY_EP: Endpoint = Endpoint::new();
         const EMPTY_NT: Notification = Notification::new();
         const EMPTY_CN: CNodePage = CNodePage([Cte::null(); CNODE_SLOTS]);
-        const EMPTY_SCN: SmallCNodePage =
-            SmallCNodePage([Cte::null(); SMALL_CNODE_SLOTS]);
-        const EMPTY_XL: XlCNodePage =
-            XlCNodePage([Cte::null(); XL_CNODE_SLOTS]);
+        const EMPTY_SCN: SmallCNodePage = SmallCNodePage([Cte::null(); SMALL_CNODE_SLOTS]);
+        const EMPTY_XL: XlCNodePage = XlCNodePage([Cte::null(); XL_CNODE_SLOTS]);
         const EMPTY_SC: crate::sched_context::SchedContext =
             crate::sched_context::SchedContext::new(0, 0);
         const EMPTY_REPLY: crate::reply::Reply = crate::reply::Reply::new();
@@ -231,7 +231,8 @@ impl KernelState {
         // Recycle: an endpoint with no waiters is free for reuse.
         for i in 0..MAX_ENDPOINTS {
             let ep = &self.endpoints[i];
-            if ep.head.is_none() && ep.tail.is_none()
+            if ep.head.is_none()
+                && ep.tail.is_none()
                 && matches!(ep.state, crate::endpoint::EpState::Idle)
             {
                 // Need a sentinel to distinguish "freshly idle" from
@@ -392,9 +393,7 @@ impl KernelState {
     /// Free a small CNode slot. `virt_idx` is the VIRTUAL index
     /// (must be in `MAX_CNODES..MAX_CNODES+MAX_SMALL_CNODES`).
     pub fn free_small_cnode(&mut self, virt_idx: usize) {
-        if virt_idx >= MAX_CNODES
-            && virt_idx < MAX_CNODES + MAX_SMALL_CNODES
-        {
+        if virt_idx >= MAX_CNODES && virt_idx < MAX_CNODES + MAX_SMALL_CNODES {
             let i = virt_idx - MAX_CNODES;
             for slot in self.small_cnodes[i].0.iter_mut() {
                 slot.set_cap(&Cap::Null);
@@ -448,7 +447,11 @@ impl KernelState {
     fn set_xl_cnode_in_use(&self, i: usize, v: bool) {
         unsafe {
             let w = &mut POOL_BITMAPS.xl_cnodes[i / 64];
-            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+            if v {
+                *w |= 1 << (i % 64);
+            } else {
+                *w &= !(1 << (i % 64));
+            }
         }
     }
 
@@ -495,9 +498,7 @@ impl KernelState {
     pub fn cnode_slot(&self, vi: usize, si: usize) -> Option<&Cte> {
         self.cnode_slots_at(vi).and_then(|s| s.get(si))
     }
-    pub fn cnode_slot_mut(&mut self, vi: usize, si: usize)
-        -> Option<&mut Cte>
-    {
+    pub fn cnode_slot_mut(&mut self, vi: usize, si: usize) -> Option<&mut Cte> {
         self.cnode_slots_at_mut(vi).and_then(|s| s.get_mut(si))
     }
 
@@ -508,7 +509,11 @@ impl KernelState {
     fn set_ep_in_use(&self, i: usize, v: bool) {
         unsafe {
             let w = &mut POOL_BITMAPS.endpoints[i / 64];
-            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+            if v {
+                *w |= 1 << (i % 64);
+            } else {
+                *w &= !(1 << (i % 64));
+            }
         }
     }
     fn ntfn_in_use(&self, i: usize) -> bool {
@@ -517,7 +522,11 @@ impl KernelState {
     fn set_ntfn_in_use(&self, i: usize, v: bool) {
         unsafe {
             let w = &mut POOL_BITMAPS.notifications[i / 64];
-            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+            if v {
+                *w |= 1 << (i % 64);
+            } else {
+                *w &= !(1 << (i % 64));
+            }
         }
     }
     fn cnode_in_use(&self, i: usize) -> bool {
@@ -526,7 +535,11 @@ impl KernelState {
     fn set_cnode_in_use(&self, i: usize, v: bool) {
         unsafe {
             let w = &mut POOL_BITMAPS.cnodes[i / 64];
-            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+            if v {
+                *w |= 1 << (i % 64);
+            } else {
+                *w &= !(1 << (i % 64));
+            }
         }
     }
     fn small_cnode_in_use(&self, i: usize) -> bool {
@@ -535,7 +548,11 @@ impl KernelState {
     fn set_small_cnode_in_use(&self, i: usize, v: bool) {
         unsafe {
             let w = &mut POOL_BITMAPS.small_cnodes[i / 64];
-            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+            if v {
+                *w |= 1 << (i % 64);
+            } else {
+                *w &= !(1 << (i % 64));
+            }
         }
     }
     fn reply_in_use(&self, i: usize) -> bool {
@@ -544,7 +561,11 @@ impl KernelState {
     fn set_reply_in_use(&self, i: usize, v: bool) {
         unsafe {
             let w = &mut POOL_BITMAPS.replies[i / 64];
-            if v { *w |= 1 << (i % 64); } else { *w &= !(1 << (i % 64)); }
+            if v {
+                *w |= 1 << (i % 64);
+            } else {
+                *w &= !(1 << (i % 64));
+            }
         }
     }
 
@@ -568,9 +589,7 @@ impl KernelState {
             return Some(i);
         }
         for i in 0..MAX_SCHED_CONTEXTS {
-            if self.sched_contexts[i].bound_tcb.is_none()
-                && self.sched_contexts[i].count == 0
-            {
+            if self.sched_contexts[i].bound_tcb.is_none() && self.sched_contexts[i].count == 0 {
                 self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
                 return Some(i);
             }
@@ -637,15 +656,10 @@ impl KernelState {
 
     /// `PPtr<SchedContextStorage>` for SC pool slot `i` — encodes
     /// `i + 1` into the address so it stays NonZero.
-    pub fn sched_context_ptr(
-        i: usize,
-    ) -> PPtr<crate::cap::SchedContextStorage> {
-        PPtr::<crate::cap::SchedContextStorage>::new(i as u64 + 1)
-            .expect("non-zero")
+    pub fn sched_context_ptr(i: usize) -> PPtr<crate::cap::SchedContextStorage> {
+        PPtr::<crate::cap::SchedContextStorage>::new(i as u64 + 1).expect("non-zero")
     }
-    pub fn sched_context_index(
-        p: PPtr<crate::cap::SchedContextStorage>,
-    ) -> usize {
+    pub fn sched_context_index(p: PPtr<crate::cap::SchedContextStorage>) -> usize {
         (p.addr() - 1) as usize
     }
 
@@ -771,32 +785,44 @@ fn refcount_cell(cap: &Cap) -> Option<*mut u16> {
         Some(match cap {
             Cap::Endpoint { ptr, .. } => {
                 let i = KernelState::endpoint_index(*ptr);
-                if i >= MAX_ENDPOINTS { return None; }
+                if i >= MAX_ENDPOINTS {
+                    return None;
+                }
                 &mut (*rc).endpoints[i] as *mut u16
             }
             Cap::Notification { ptr, .. } => {
                 let i = KernelState::ntfn_index(*ptr);
-                if i >= MAX_NTFNS { return None; }
+                if i >= MAX_NTFNS {
+                    return None;
+                }
                 &mut (*rc).ntfns[i] as *mut u16
             }
             Cap::SchedContext { ptr, .. } => {
                 let i = KernelState::sched_context_index(*ptr);
-                if i >= MAX_SCHED_CONTEXTS { return None; }
+                if i >= MAX_SCHED_CONTEXTS {
+                    return None;
+                }
                 &mut (*rc).scs[i] as *mut u16
             }
             Cap::Reply { ptr, .. } => {
                 let i = KernelState::reply_index(*ptr);
-                if i >= MAX_REPLIES { return None; }
+                if i >= MAX_REPLIES {
+                    return None;
+                }
                 &mut (*rc).replies[i] as *mut u16
             }
             Cap::CNode { ptr, .. } => {
                 let i = KernelState::cnode_index(*ptr);
-                if i >= KernelState::cnode_pool_count() { return None; }
+                if i >= KernelState::cnode_pool_count() {
+                    return None;
+                }
                 &mut (*rc).cnodes[i] as *mut u16
             }
             Cap::Thread { tcb } => {
                 let i = tcb.addr() as usize;
-                if i >= crate::tcb::MAX_TCBS { return None; }
+                if i >= crate::tcb::MAX_TCBS {
+                    return None;
+                }
                 &mut (*rc).tcbs[i] as *mut u16
             }
             _ => return None,
@@ -807,7 +833,9 @@ fn refcount_cell(cap: &Cap) -> Option<*mut u16> {
 /// Live references to the pool object behind `cap` (0 for
 /// non-pooled caps).
 pub fn cap_refcount(cap: &Cap) -> u32 {
-    refcount_cell(cap).map(|p| unsafe { *p } as u32).unwrap_or(0)
+    refcount_cell(cap)
+        .map(|p| unsafe { *p } as u32)
+        .unwrap_or(0)
 }
 
 /// Called by `Cte::set_cap` for slots inside the kernel CNode pools.
@@ -859,8 +887,7 @@ pub fn recount_refcounts() {
         for vi in 0..KernelState::cnode_pool_count() {
             let n = s.cnode_slots_at(vi).map(|sl| sl.len()).unwrap_or(0);
             for si in 0..n {
-                let cap = s.cnode_slot(vi, si)
-                    .map(|c| c.cap()).unwrap_or(Cap::Null);
+                let cap = s.cnode_slot(vi, si).map(|c| c.cap()).unwrap_or(Cap::Null);
                 if let Some(p) = refcount_cell(&cap) {
                     *p = (*p).saturating_add(1);
                 }
@@ -921,11 +948,11 @@ pub fn bootstrap_boot_thread() -> TcbId {
         let s = KERNEL.get();
         let mut t = Tcb::default();
         t.priority = 254; // top priority — kernel boot
-        // Upstream gives the root task tcbMCP = seL4_MaxPrio (255).
-        // sel4test-driver configures test processes with mcp=255;
-        // anything lower here makes that SetSchedParams hit the
-        // authority RangeError and the whole MCP chain (driver →
-        // test → helpers) silently collapses to 0.
+                          // Upstream gives the root task tcbMCP = seL4_MaxPrio (255).
+                          // sel4test-driver configures test processes with mcp=255;
+                          // anything lower here makes that SetSchedParams hit the
+                          // authority RangeError and the whole MCP chain (driver →
+                          // test → helpers) silently collapses to 0.
         t.mcp = 255;
         t.state = ThreadStateType::Running;
         // Placeholder SC so the boot thread is schedulable under the
@@ -974,16 +1001,23 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             let vi = s.alloc_small_cnode().expect("alloc_small_cnode");
-            assert!(vi >= MAX_CNODES,
+            assert!(
+                vi >= MAX_CNODES,
                 "small alloc returned virtual index {} (must be >= MAX_CNODES={})",
-                vi, MAX_CNODES);
+                vi,
+                MAX_CNODES
+            );
             assert!(vi < MAX_CNODES + MAX_SMALL_CNODES);
             // `cnode_slots_at` must dispatch to the small backing array
             // and surface SMALL_CNODE_SLOTS slots (not CNODE_SLOTS).
             let slots = s.cnode_slots_at(vi).expect("slots present");
-            assert_eq!(slots.len(), SMALL_CNODE_SLOTS,
+            assert_eq!(
+                slots.len(),
+                SMALL_CNODE_SLOTS,
                 "small pool slot dispatch wrong: got {} slots, expected {}",
-                slots.len(), SMALL_CNODE_SLOTS);
+                slots.len(),
+                SMALL_CNODE_SLOTS
+            );
             // PPtr round-trip: encoding a small virtual index and
             // decoding it must come back to the same virtual index.
             let ptr = KernelState::cnode_ptr(vi);
@@ -991,8 +1025,7 @@ pub mod spec {
             assert!(KernelState::is_small_cnode_idx(vi));
             s.free_small_cnode(vi);
             assert!(!s.small_cnode_in_use(vi - MAX_CNODES));
-            arch::log(
-                "  \u{2713} small CNode pool alloc/free dispatch via virtual index\n");
+            arch::log("  \u{2713} small CNode pool alloc/free dispatch via virtual index\n");
         }
     }
 
@@ -1015,22 +1048,30 @@ pub mod spec {
             let was_in_use = s.cnode_in_use(target);
             let was_next = s.next_cnode;
             s.claim_cnode(target);
-            assert!(s.cnode_in_use(target),
-                "claim_cnode should mark slot in-use");
-            assert!(s.next_cnode > target,
-                "next_cnode should advance past a claimed slot");
+            assert!(
+                s.cnode_in_use(target),
+                "claim_cnode should mark slot in-use"
+            );
+            assert!(
+                s.next_cnode > target,
+                "next_cnode should advance past a claimed slot"
+            );
             // alloc_cnode must NOT now hand back our claimed slot.
             let alloced = s.alloc_cnode().expect("alloc_cnode");
-            assert!(alloced != target,
+            assert!(
+                alloced != target,
                 "alloc_cnode handed back our claimed slot {} (got {})",
-                target, alloced);
+                target,
+                alloced
+            );
             // Cleanup: free both back so other specs see the original
             // bookkeeping.
             s.free_cnode(alloced);
-            if !was_in_use { s.free_cnode(target); }
+            if !was_in_use {
+                s.free_cnode(target);
+            }
             s.next_cnode = was_next;
-            arch::log(
-                "  \u{2713} claim_cnode pins a directly-initialised CNode\n");
+            arch::log("  \u{2713} claim_cnode pins a directly-initialised CNode\n");
         }
     }
 
@@ -1058,8 +1099,10 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             let id2 = s.scheduler.admit(t);
-            assert!(id2 != current_thread().unwrap(),
-                "second TCB should have a different id");
+            assert!(
+                id2 != current_thread().unwrap(),
+                "second TCB should have a different id"
+            );
             // Both threads at different priorities — choose_thread
             // picks the higher one (boot thread).
             let chosen = s.scheduler.choose_thread();

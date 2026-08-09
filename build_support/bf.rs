@@ -149,14 +149,38 @@ pub fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         match c {
-            '{' => { out.push(Tok::LBrace); i += 1; }
-            '}' => { out.push(Tok::RBrace); i += 1; }
-            '(' => { out.push(Tok::LParen); i += 1; }
-            ')' => { out.push(Tok::RParen); i += 1; }
-            ',' => { out.push(Tok::Comma); i += 1; }
-            '+' => { out.push(Tok::Plus); i += 1; }
-            '-' => { out.push(Tok::Minus); i += 1; }
-            '*' => { out.push(Tok::Star); i += 1; }
+            '{' => {
+                out.push(Tok::LBrace);
+                i += 1;
+            }
+            '}' => {
+                out.push(Tok::RBrace);
+                i += 1;
+            }
+            '(' => {
+                out.push(Tok::LParen);
+                i += 1;
+            }
+            ')' => {
+                out.push(Tok::RParen);
+                i += 1;
+            }
+            ',' => {
+                out.push(Tok::Comma);
+                i += 1;
+            }
+            '+' => {
+                out.push(Tok::Plus);
+                i += 1;
+            }
+            '-' => {
+                out.push(Tok::Minus);
+                i += 1;
+            }
+            '*' => {
+                out.push(Tok::Star);
+                i += 1;
+            }
             c if c.is_ascii_digit() => {
                 let start = i;
                 while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
@@ -259,12 +283,20 @@ struct Parser {
 
 impl Parser {
     fn new(toks: Vec<Tok>) -> Self {
-        Self { toks, pos: 0, canonical_size: CANONICAL_SIZE }
+        Self {
+            toks,
+            pos: 0,
+            canonical_size: CANONICAL_SIZE,
+        }
     }
-    fn peek(&self) -> Option<&Tok> { self.toks.get(self.pos) }
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
     fn bump(&mut self) -> Option<Tok> {
         let t = self.toks.get(self.pos).cloned();
-        if t.is_some() { self.pos += 1; }
+        if t.is_some() {
+            self.pos += 1;
+        }
         t
     }
     fn expect(&mut self, want: &Tok) -> Result<(), String> {
@@ -281,7 +313,10 @@ impl Parser {
     }
     fn eat_keyword(&mut self, kw: &str) -> bool {
         if let Some(Tok::Ident(s)) = self.peek() {
-            if s == kw { self.pos += 1; return true; }
+            if s == kw {
+                self.pos += 1;
+                return true;
+            }
         }
         false
     }
@@ -356,10 +391,18 @@ impl Parser {
         // supports 64-bit base.
         let word_bits = match self.parse_expr()? {
             Expr::Lit(n) => n,
-            other => return Err(format!("base directive expects literal word size, got {:?}", other)),
+            other => {
+                return Err(format!(
+                    "base directive expects literal word size, got {:?}",
+                    other
+                ))
+            }
         };
         if word_bits != WORD_SIZE {
-            return Err(format!("base directive: word size {} not supported", word_bits));
+            return Err(format!(
+                "base directive: word size {} not supported",
+                word_bits
+            ));
         }
         if !matches!(self.peek(), Some(Tok::LParen)) {
             // Plain `base 64` with no parens — keep the default.
@@ -368,7 +411,12 @@ impl Parser {
         self.bump(); // (
         let canonical = match self.parse_expr()? {
             Expr::Lit(n) => n,
-            other => return Err(format!("base directive: canonical size must be literal, got {:?}", other)),
+            other => {
+                return Err(format!(
+                    "base directive: canonical size must be literal, got {:?}",
+                    other
+                ))
+            }
         };
         // Eat optional `,M` sign-extend flag.
         if matches!(self.peek(), Some(Tok::Comma)) {
@@ -407,7 +455,11 @@ impl Parser {
             fields.extend(self.parse_field_decls()?);
         }
         self.expect(&Tok::RBrace)?;
-        Ok(BlockDecl { name, explicit_params, fields })
+        Ok(BlockDecl {
+            name,
+            explicit_params,
+            fields,
+        })
     }
 
     /// Returns one or two field declarations (`field_ptr` expands into
@@ -515,7 +567,11 @@ impl Parser {
             tags.push(TaggedTag { block, value });
         }
         self.expect(&Tok::RBrace)?;
-        Ok(TaggedUnionDecl { name, tagname, tags })
+        Ok(TaggedUnionDecl {
+            name,
+            tagname,
+            tags,
+        })
     }
 }
 
@@ -537,7 +593,8 @@ pub fn eval_expr(e: &Expr, syms: &HashMap<&'static str, u64>) -> Result<i64, Str
             Expr::Lit(n) => *n as i64,
             Expr::Symbol(s) => *syms
                 .get(s.as_str())
-                .ok_or_else(|| format!("unknown symbol `{}`", s))? as i64,
+                .ok_or_else(|| format!("unknown symbol `{}`", s))?
+                as i64,
             Expr::Add(a, b) => go(a, syms)? + go(b, syms)?,
             Expr::Sub(a, b) => go(a, syms)? - go(b, syms)?,
             Expr::Mul(a, b) => go(a, syms)? * go(b, syms)?,
@@ -565,12 +622,10 @@ pub struct LoweredBlock {
 }
 
 pub fn lower(module: &Module) -> Result<Vec<LoweredBlock>, String> {
-    let syms: HashMap<&'static str, u64> = [
-        ("word_size", WORD_SIZE),
-        ("canonical_size", CANONICAL_SIZE),
-    ]
-    .into_iter()
-    .collect();
+    let syms: HashMap<&'static str, u64> =
+        [("word_size", WORD_SIZE), ("canonical_size", CANONICAL_SIZE)]
+            .into_iter()
+            .collect();
 
     let mut out = Vec::new();
     for b in &module.blocks {
@@ -586,7 +641,10 @@ pub fn lower(module: &Module) -> Result<Vec<LoweredBlock>, String> {
                     return Err(format!("block {}: field {} has size {}", b.name, n, size));
                 }
             } else if size < 0 {
-                return Err(format!("block {}: padding has negative size {}", b.name, size));
+                return Err(format!(
+                    "block {}: padding has negative size {}",
+                    b.name, size
+                ));
             }
             let sign_extend = matches!(f.kind, FieldKind::High);
             sized.push((f.name.clone(), size, sign_extend, shift));
@@ -689,8 +747,7 @@ fn render_block(s: &mut String, b: &LoweredBlock) {
     }
 
     // Constructor.
-    let visible: Vec<&LoweredField> =
-        b.fields.iter().filter(|f| f.name.is_some()).collect();
+    let visible: Vec<&LoweredField> = b.fields.iter().filter(|f| f.name.is_some()).collect();
     let arg_names: Vec<String> = if let Some(ep) = &b.explicit_params {
         ep.clone()
     } else {
@@ -808,7 +865,11 @@ fn emit_setter(s: &mut String, f: &LoweredField, name: &str) {
 /// emitted code compiles. The list is tiny — extend as we run into
 /// more.
 fn field_ident(name: &str) -> String {
-    let raw_keywords = ["type", "fn", "in", "ref", "match", "loop", "move", "use", "where", "yield", "self", "super", "crate", "pub", "as", "let", "mut", "static", "const", "if", "else", "while", "for", "return", "true", "false"];
+    let raw_keywords = [
+        "type", "fn", "in", "ref", "match", "loop", "move", "use", "where", "yield", "self",
+        "super", "crate", "pub", "as", "let", "mut", "static", "const", "if", "else", "while",
+        "for", "return", "true", "false",
+    ];
     if raw_keywords.contains(&name) {
         format!("r#{}", name)
     } else {

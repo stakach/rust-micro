@@ -222,8 +222,7 @@ pub fn read_cr3() -> u64 {
 /// loaded: a user PML4 root reclaimed by process teardown on another
 /// core would otherwise leave the idling core reading an unmapped IDT
 /// on its next interrupt → triple fault (MULTICORE0003 cross-AS teardown).
-pub static KERNEL_ROOT_CR3: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static KERNEL_ROOT_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Physical CR3 value of the kernel root, or 0 if not yet captured.
 #[inline]
@@ -334,8 +333,7 @@ pub fn install_kernel_page_tables() {
         // because that needs `kernel_virt_to_phys` to compute the
         // PDPT page's paddr.
         let kpt_va = (&raw const KPT_POOL) as u64;
-        let kpt_pa = live_virt_to_phys(kpt_va)
-            .expect("KPT_POOL must be live-mapped");
+        let kpt_pa = live_virt_to_phys(kpt_va).expect("KPT_POOL must be live-mapped");
         KERNEL_VIRT_TO_PHYS_OFFSET = kpt_va - kpt_pa;
 
         // Patch the existing PML4 directly. We never CR3-swap —
@@ -348,7 +346,8 @@ pub fn install_kernel_page_tables() {
         if KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed) == 0 {
             KERNEL_ROOT_CR3.store(
                 root_cr3 & 0x000F_FFFF_FFFF_F000,
-                core::sync::atomic::Ordering::Relaxed);
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
         let pml4 = (root_cr3 & 0x000F_FFFF_FFFF_F000) as *mut u64;
 
@@ -492,8 +491,11 @@ pub mod spec {
         // — the upper-half. Our kernel runs at 0xFFFFFFFF_FFE02000+,
         // so PML4[511] must be present.
         let entry = read_pml4_entry(511);
-        assert_eq!(entry & PTE_PRESENT, PTE_PRESENT,
-            "PML4[511] must be present (kernel image lives there)");
+        assert_eq!(
+            entry & PTE_PRESENT,
+            PTE_PRESENT,
+            "PML4[511] must be present (kernel image lives there)"
+        );
         arch::log("  ✓ existing PML4[511] is present (kernel half mapped)\n");
     }
 

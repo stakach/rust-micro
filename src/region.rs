@@ -35,7 +35,11 @@ impl PRegion {
         self.start >= self.end
     }
     pub const fn size(self) -> u64 {
-        if self.is_empty() { 0 } else { self.end - self.start }
+        if self.is_empty() {
+            0
+        } else {
+            self.end - self.start
+        }
     }
     pub const fn contains(self, addr: u64) -> bool {
         addr >= self.start && addr < self.end
@@ -57,7 +61,11 @@ impl VRegion {
         self.start >= self.end
     }
     pub const fn size(self) -> u64 {
-        if self.is_empty() { 0 } else { self.end - self.start }
+        if self.is_empty() {
+            0
+        } else {
+            self.end - self.start
+        }
     }
 }
 

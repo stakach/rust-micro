@@ -239,7 +239,11 @@ unsafe fn lookup_iopt_slot_resolve(
     levels_remaining: u64,
 ) -> IoptLookup {
     if iopt_paddr == 0 {
-        return IoptLookup { slot: core::ptr::null_mut(), level: levels_remaining, ok: false };
+        return IoptLookup {
+            slot: core::ptr::null_mut(),
+            level: levels_remaining,
+            ok: false,
+        };
     }
     let n = NUM_IOPT_LEVELS;
     let shift = VTD_PT_INDEX_BITS * (n - 1 - (levels_to_resolve - levels_remaining));
@@ -247,7 +251,11 @@ unsafe fn lookup_iopt_slot_resolve(
     let slot = (phys_to_lin(iopt_paddr) as *mut u64).add(iopt_index as usize);
     let entry = core::ptr::read_volatile(slot);
     if !pte_write(entry) || levels_remaining == 0 {
-        return IoptLookup { slot, level: levels_remaining, ok: true };
+        return IoptLookup {
+            slot,
+            level: levels_remaining,
+            ok: true,
+        };
     }
     let next = pte_addr(entry);
     lookup_iopt_slot_resolve(next, translation, levels_to_resolve, levels_remaining - 1)
@@ -257,7 +265,11 @@ unsafe fn lookup_iopt_slot_resolve(
 /// top IO page table); `io_address` is byte-addressed.
 pub unsafe fn lookup_iopt_slot(top_iopt_paddr: u64, io_address: u64) -> IoptLookup {
     if top_iopt_paddr == 0 {
-        return IoptLookup { slot: core::ptr::null_mut(), level: 0, ok: false };
+        return IoptLookup {
+            slot: core::ptr::null_mut(),
+            level: 0,
+            ok: false,
+        };
     }
     let n = NUM_IOPT_LEVELS;
     lookup_iopt_slot_resolve(top_iopt_paddr, io_address >> PAGE_BITS, n - 1, n - 1)
@@ -270,7 +282,12 @@ pub unsafe fn lookup_iopt_slot_levels(
     levels_to_resolve: u64,
     levels_remaining: u64,
 ) -> IoptLookup {
-    lookup_iopt_slot_resolve(top_iopt_paddr, translation, levels_to_resolve, levels_remaining)
+    lookup_iopt_slot_resolve(
+        top_iopt_paddr,
+        translation,
+        levels_to_resolve,
+        levels_remaining,
+    )
 }
 
 /// Read a PTE slot's address field (kernel-linear pointer in).
@@ -294,7 +311,11 @@ fn log_hex(v: u64) {
     let mut buf = [b'0'; 16];
     for i in 0..16 {
         let nyb = ((v >> ((15 - i) * 4)) & 0xF) as u8;
-        buf[i] = if nyb < 10 { b'0' + nyb } else { b'a' + (nyb - 10) };
+        buf[i] = if nyb < 10 {
+            b'0' + nyb
+        } else {
+            b'a' + (nyb - 10)
+        };
     }
     if let Ok(s) = core::str::from_utf8(&buf) {
         crate::arch::log(s);
@@ -306,7 +327,8 @@ fn log_hex(v: u64) {
 /// IOMMU page pool is installed (`install_iommu_pool`). Idempotent-ish:
 /// safe to call once.
 pub fn vtd_init() {
-    let bootboot = unsafe { &*(crate::bootboot::BOOTBOOT_INFO as *const crate::bootboot::BOOTBOOT) };
+    let bootboot =
+        unsafe { &*(crate::bootboot::BOOTBOOT_INFO as *const crate::bootboot::BOOTBOOT) };
     let sdt_addr = unsafe { bootboot.arch.x86_64 }.acpi_ptr;
 
     let dmar = match acpi::find_dmar(sdt_addr) {

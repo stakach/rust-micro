@@ -47,12 +47,17 @@ pub struct RegionList {
 }
 
 impl Default for RegionList {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RegionList {
     pub const fn new() -> Self {
-        Self { entries: [PRegion { start: 0, end: 0 }; MAX_FREEMEM_REGIONS], len: 0 }
+        Self {
+            entries: [PRegion { start: 0, end: 0 }; MAX_FREEMEM_REGIONS],
+            len: 0,
+        }
     }
 
     pub fn push(&mut self, r: PRegion) -> Result<(), BootError> {
@@ -260,21 +265,39 @@ pub fn place_rootserver(
 
 fn max_align_bits(layout: &RootserverLayout) -> u32 {
     let mut m = layout.cnode_size_bits;
-    if layout.tcb_size_bits > m { m = layout.tcb_size_bits; }
-    if layout.page_bits > m { m = layout.page_bits; }
-    if layout.paging_bits > m { m = layout.paging_bits; }
+    if layout.tcb_size_bits > m {
+        m = layout.tcb_size_bits;
+    }
+    if layout.page_bits > m {
+        m = layout.page_bits;
+    }
+    if layout.paging_bits > m {
+        m = layout.paging_bits;
+    }
     m
 }
 
 fn layout_at(base: u64, layout: &RootserverLayout) -> RootserverMem {
     let mut p = base;
-    let cnode = p; p += 1u64 << layout.cnode_size_bits;
-    let tcb = p; p += 1u64 << layout.tcb_size_bits;
-    let ipc_buf = p; p += 1u64 << layout.page_bits;
-    let boot_info = p; p += 1u64 << layout.page_bits;
-    let paging_start = p; p += 1u64 << layout.paging_bits;
+    let cnode = p;
+    p += 1u64 << layout.cnode_size_bits;
+    let tcb = p;
+    p += 1u64 << layout.tcb_size_bits;
+    let ipc_buf = p;
+    p += 1u64 << layout.page_bits;
+    let boot_info = p;
+    p += 1u64 << layout.page_bits;
+    let paging_start = p;
+    p += 1u64 << layout.paging_bits;
     let paging_end = p;
-    RootserverMem { cnode, tcb, ipc_buf, boot_info, paging_start, paging_end }
+    RootserverMem {
+        cnode,
+        tcb,
+        ipc_buf,
+        boot_info,
+        paging_start,
+        paging_end,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,8 +346,10 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
     use crate::arch;
 
     arch::log("boot: reading BOOTBOOT memory map\n");
-    let mut entries = [MemEntry { region: PRegion::new(0, 0), kind: MemKind::Used };
-        MAX_FREEMEM_REGIONS];
+    let mut entries = [MemEntry {
+        region: PRegion::new(0, 0),
+        kind: MemKind::Used,
+    }; MAX_FREEMEM_REGIONS];
     let n = read_bootboot_mmap(&mut entries);
     arch::log("boot:   ");
     log_count(n);
@@ -343,10 +368,18 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
     let mem = place_rootserver(&mut free, &layout)?;
 
     arch::log("boot: rootserver placed:\n");
-    arch::log("  cnode @0x"); log_hex64(mem.cnode); arch::log("\n");
-    arch::log("  tcb   @0x"); log_hex64(mem.tcb); arch::log("\n");
-    arch::log("  ipc   @0x"); log_hex64(mem.ipc_buf); arch::log("\n");
-    arch::log("  bi    @0x"); log_hex64(mem.boot_info); arch::log("\n");
+    arch::log("  cnode @0x");
+    log_hex64(mem.cnode);
+    arch::log("\n");
+    arch::log("  tcb   @0x");
+    log_hex64(mem.tcb);
+    arch::log("\n");
+    arch::log("  ipc   @0x");
+    log_hex64(mem.ipc_buf);
+    arch::log("\n");
+    arch::log("  bi    @0x");
+    log_hex64(mem.boot_info);
+    arch::log("\n");
 
     Ok(mem)
 }
@@ -366,8 +399,10 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
 pub fn reserve_user_page_region() -> Result<(), BootError> {
     use crate::arch;
 
-    let mut entries = [MemEntry { region: PRegion::new(0, 0), kind: MemKind::Used };
-        MAX_FREEMEM_REGIONS];
+    let mut entries = [MemEntry {
+        region: PRegion::new(0, 0),
+        kind: MemKind::Used,
+    }; MAX_FREEMEM_REGIONS];
     let n = read_bootboot_mmap(&mut entries);
     let mut free = extract_free(&entries[..n])?;
 
@@ -388,12 +423,12 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 
     arch::log("boot: reserved user-pages @0x");
     log_hex64(user_pages_base);
-    arch::log(".."); log_hex64(user_pages_base + USER_PAGES_SIZE);
+    arch::log("..");
+    log_hex64(user_pages_base + USER_PAGES_SIZE);
     arch::log("\n");
 
     unsafe {
-        crate::rootserver::install_user_page_region(
-            user_pages_base, USER_PAGES_SIZE);
+        crate::rootserver::install_user_page_region(user_pages_base, USER_PAGES_SIZE);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -401,11 +436,11 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
         let iommu_base = user_pages_base + USER_PAGES_SIZE;
         arch::log("boot: reserved iommu-pool @0x");
         log_hex64(iommu_base);
-        arch::log(".."); log_hex64(iommu_base + IOMMU_POOL_SIZE);
+        arch::log("..");
+        log_hex64(iommu_base + IOMMU_POOL_SIZE);
         arch::log("\n");
         unsafe {
-            crate::arch::x86_64::iommu::install_iommu_pool(
-                iommu_base, IOMMU_POOL_SIZE);
+            crate::arch::x86_64::iommu::install_iommu_pool(iommu_base, IOMMU_POOL_SIZE);
         }
     }
 
@@ -424,13 +459,14 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 
     arch::log("boot: reserved rootserver-ut @0x");
     log_hex64(ut_base);
-    arch::log(".."); log_hex64(ut_base + ROOTSERVER_UT_SIZE);
-    arch::log(" (size_bits="); log_count(ROOTSERVER_UT_SIZE_BITS as usize);
+    arch::log("..");
+    log_hex64(ut_base + ROOTSERVER_UT_SIZE);
+    arch::log(" (size_bits=");
+    log_count(ROOTSERVER_UT_SIZE_BITS as usize);
     arch::log(")\n");
 
     unsafe {
-        crate::rootserver::install_rootserver_untyped(
-            ut_base, ROOTSERVER_UT_SIZE_BITS as u8);
+        crate::rootserver::install_rootserver_untyped(ut_base, ROOTSERVER_UT_SIZE_BITS as u8);
     }
 
     Ok(())
@@ -440,11 +476,7 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 /// out of the free-region list. Returns the chunk's base paddr and
 /// shrinks the free region accordingly. Used by `kernel_init` for
 /// out-of-band reservations like the rootserver user-page region.
-fn carve_chunk(
-    free: &mut RegionList,
-    size: u64,
-    align_bits: u32,
-) -> Result<u64, BootError> {
+fn carve_chunk(free: &mut RegionList, size: u64, align_bits: u32) -> Result<u64, BootError> {
     for i in 0..free.len {
         let f = free.entries[i];
         let base = align_up(f.start, align_bits);
@@ -502,7 +534,11 @@ fn log_hex64(v: u64) {
     let mut buf = [b'0'; 16];
     for i in 0..16 {
         let nyb = ((v >> ((15 - i) * 4)) & 0xF) as u8;
-        buf[i] = if nyb < 10 { b'0' + nyb } else { b'a' + (nyb - 10) };
+        buf[i] = if nyb < 10 {
+            b'0' + nyb
+        } else {
+            b'a' + (nyb - 10)
+        };
     }
     if let Ok(s) = core::str::from_utf8(&buf) {
         crate::arch::log(s);
@@ -531,7 +567,10 @@ pub mod spec {
     }
 
     fn entry(start: u64, end: u64, kind: MemKind) -> MemEntry {
-        MemEntry { region: PRegion::new(start, end), kind }
+        MemEntry {
+            region: PRegion::new(start, end),
+            kind,
+        }
     }
 
     #[inline(never)]
@@ -619,8 +658,10 @@ pub mod spec {
         let layout = RootserverLayout::default_x86_64();
         match place_rootserver(&mut free, &layout) {
             Err(BootError::NoSuitableRegion) => {}
-            other => panic!("expected NoSuitableRegion, got {:?}",
-                other.map(|_| ()).err()),
+            other => panic!(
+                "expected NoSuitableRegion, got {:?}",
+                other.map(|_| ()).err()
+            ),
         }
         arch::log("  ✓ place_rootserver fails on insufficient memory\n");
     }
@@ -628,7 +669,10 @@ pub mod spec {
     #[inline(never)]
     #[cfg(target_arch = "x86_64")]
     fn bootboot_mmap_yields_at_least_one_free_region() {
-        let mut entries = [MemEntry { region: PRegion::new(0, 0), kind: MemKind::Used }; 16];
+        let mut entries = [MemEntry {
+            region: PRegion::new(0, 0),
+            kind: MemKind::Used,
+        }; 16];
         let n = read_bootboot_mmap(&mut entries);
         assert!(n > 0, "BOOTBOOT must report at least one mmap entry");
         let any_free = entries[..n].iter().any(|e| e.kind == MemKind::Free);

@@ -109,11 +109,14 @@ fn test_runtime_offsets() {
     //   ioSpaceCaps @ 104, extraBIPages @ 120,
     //   initThreadCNodeSizeBits @ 136, initThreadDomain @ 144,
     //   schedcontrol @ 152, untyped @ 168, untypedList @ 184.
-    assert_eq!(off(&bi.initThreadCNodeSizeBits as *const _ as *const u8), 136);
-    assert_eq!(off(&bi.initThreadDomain        as *const _ as *const u8), 144);
-    assert_eq!(off(&bi.schedcontrol            as *const _ as *const u8), 152);
-    assert_eq!(off(&bi.untyped                 as *const _ as *const u8), 168);
-    assert_eq!(off(&bi.untypedList             as *const _ as *const u8), 184);
+    assert_eq!(
+        off(&bi.initThreadCNodeSizeBits as *const _ as *const u8),
+        136
+    );
+    assert_eq!(off(&bi.initThreadDomain as *const _ as *const u8), 144);
+    assert_eq!(off(&bi.schedcontrol as *const _ as *const u8), 152);
+    assert_eq!(off(&bi.untyped as *const _ as *const u8), 168);
+    assert_eq!(off(&bi.untypedList as *const _ as *const u8), 184);
     #[cfg(feature = "extern-rootserver")]
     assert_eq!(
         off(&bi.userImageElfFrameCount as *const _ as *const u8),
@@ -126,9 +129,7 @@ fn test_message_info_roundtrip() {
     // Pick distinct values per packed sub-field; check round-trip and
     // bit positions.
     let mi = seL4_MessageInfo_t::new(
-        /* label */ 0xCAFE,
-        /* caps_unwrapped */ 0b011,
-        /* extra_caps */ 0b10,
+        /* label */ 0xCAFE, /* caps_unwrapped */ 0b011, /* extra_caps */ 0b10,
         /* length */ 5,
     );
     assert_eq!(mi.length(), 5);
@@ -175,8 +176,8 @@ fn test_syscall_decoding() {
     //   -3 NBSendRecv, -4 NBSendWait, -5 Send, -6 NBSend,
     //   -7 Recv, -8 NBRecv, -9 Wait, -10 NBWait, -11 Yield,
     //   -12 DebugPutChar.
-    assert_eq!(Syscall::from_i32(-5),  Some(Syscall::SysSend));
-    assert_eq!(Syscall::from_i32(-9),  Some(Syscall::SysWait));
+    assert_eq!(Syscall::from_i32(-5), Some(Syscall::SysSend));
+    assert_eq!(Syscall::from_i32(-9), Some(Syscall::SysWait));
     assert_eq!(Syscall::from_i32(-12), Some(Syscall::SysDebugPutChar));
     assert_eq!(Syscall::from_i32(0), None);
     assert_eq!(Syscall::from_i32(-1000), None);
@@ -184,8 +185,14 @@ fn test_syscall_decoding() {
 }
 
 fn test_invocation_decoding() {
-    assert_eq!(InvocationLabel::from_u64(0), Some(InvocationLabel::InvalidInvocation));
-    assert_eq!(InvocationLabel::from_u64(1), Some(InvocationLabel::UntypedRetype));
+    assert_eq!(
+        InvocationLabel::from_u64(0),
+        Some(InvocationLabel::InvalidInvocation)
+    );
+    assert_eq!(
+        InvocationLabel::from_u64(1),
+        Some(InvocationLabel::UntypedRetype)
+    );
     // Last common label, then first arch-specific tag (X86PDPTMap).
     // We don't hard-code numbers other than the anchor points, since
     // adding methods upstream would shift them — but we do confirm

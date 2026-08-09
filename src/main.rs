@@ -145,13 +145,13 @@ fn _start() -> ! {
     use bootboot::*;
 
     // use the BOOTBOOT_INFO as a pointer, dereference it and immediately borrow it.
-    let _bootboot_r = unsafe { & (*(BOOTBOOT_INFO as *const BOOTBOOT)) };
+    let _bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
 
     // Only initialize on the bootstrap processor
     // Check if current APIC ID matches the BOOTBOOT BSP ID
     let current_apic_id = arch::get_cpu_id();
     let bootboot_bsp_id = bootboot::get_bootstrap_processor_id() as arch::CpuId;
-    
+
     if current_apic_id == bootboot_bsp_id {
         bsp_main();
     } else {
@@ -174,8 +174,7 @@ static mut BSP_BIG_STACK: BspStack = BspStack([0; 1024 * 1024]);
 fn bsp_main() -> ! {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let top = (&raw const BSP_BIG_STACK as u64)
-            + core::mem::size_of::<BspStack>() as u64;
+        let top = (&raw const BSP_BIG_STACK as u64) + core::mem::size_of::<BspStack>() as u64;
         core::arch::asm!(
             "mov rsp, {top}",
             "jmp {cont}",
@@ -283,7 +282,9 @@ fn bsp_main_big_stack() -> ! {
     // bootstrap. The dispatcher exits QEMU when the rootserver
     // prints '\n' (closing its banner).
     #[cfg(target_arch = "x86_64")]
-    unsafe { crate::rootserver::launch_rootserver(); }
+    unsafe {
+        crate::rootserver::launch_rootserver();
+    }
 
     #[cfg(any(not(target_arch = "x86_64"), not(feature = "spec")))]
     loop {}
@@ -388,9 +389,14 @@ fn ap_scheduler_loop() -> ! {
                 // that want to merely place a TCB on the AP's
                 // queue without dispatching should leave cr3=0.
                 let dispatchable = unsafe {
-                    crate::kernel::KERNEL.get()
-                        .scheduler.slab.get(tcb_id)
-                        .cpu_context.cr3 != 0
+                    crate::kernel::KERNEL
+                        .get()
+                        .scheduler
+                        .slab
+                        .get(tcb_id)
+                        .cpu_context
+                        .cr3
+                        != 0
                 };
                 if dispatchable {
                     let ctx_ptr = unsafe {
@@ -449,11 +455,9 @@ fn ap_scheduler_loop() -> ! {
                         // owner, fxrstor this thread). Critical for
                         // FPU0002 round-robin migration.
                         #[cfg(feature = "smp")]
-                        crate::arch::x86_64::fpu_ctx::fpu_switch_to(
-                            &mut s.scheduler.slab, tcb_id);
+                        crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, tcb_id);
 
-                        let pcc = crate::arch::x86_64::syscall_entry
-                            ::current_cpu_user_ctx_mut();
+                        let pcc = crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
                         *pcc = next_user_ctx;
                         pcc as *const crate::arch::x86_64::syscall_entry::UserContext
                     };
@@ -464,14 +468,17 @@ fn ap_scheduler_loop() -> ! {
                     let use_iretq = unsafe {
                         // Don't clear — use_iretq_resume tracks the save
                         // flavor and persists until the next save.
-                        crate::kernel::KERNEL.get()
-                            .scheduler.slab.get(tcb_id).use_iretq_resume
+                        crate::kernel::KERNEL
+                            .get()
+                            .scheduler
+                            .slab
+                            .get(tcb_id)
+                            .use_iretq_resume
                     };
                     smp::bkl_release();
                     unsafe {
                         if use_iretq {
-                            crate::arch::x86_64::syscall_entry
-                                ::enter_user_via_iretq(ctx_ptr);
+                            crate::arch::x86_64::syscall_entry::enter_user_via_iretq(ctx_ptr);
                         }
                         crate::arch::x86_64::syscall_entry::enter_user_via_sysret(ctx_ptr);
                     }
@@ -487,7 +494,8 @@ fn ap_scheduler_loop() -> ! {
         #[cfg(all(target_arch = "x86_64", feature = "smp"))]
         unsafe {
             crate::arch::x86_64::fpu_ctx::flush_local_fpu(
-                &mut crate::kernel::KERNEL.get().scheduler.slab);
+                &mut crate::kernel::KERNEL.get().scheduler.slab,
+            );
         }
         // Park on the kernel root page table before idling: a user
         // vspace left in CR3 can be freed by another core's process
@@ -506,12 +514,7 @@ fn ap_scheduler_loop() -> ! {
         // (the BKL re-entrancy / silent-hang class fixed in the BSP idle
         // loops — syscall_entry.rs / exceptions.rs).
         unsafe {
-            core::arch::asm!(
-                "sti",
-                "hlt",
-                "cli",
-                options(nostack, preserves_flags),
-            );
+            core::arch::asm!("sti", "hlt", "cli", options(nostack, preserves_flags),);
         }
     }
 }

@@ -1,7 +1,7 @@
-#[cfg(all(target_arch = "x86_64"))]
-pub mod x86_64;
 #[cfg(all(target_arch = "aarch64"))]
 pub mod aarch64;
+#[cfg(all(target_arch = "x86_64"))]
+pub mod x86_64;
 
 pub type CpuId = u32;
 
@@ -26,16 +26,13 @@ pub use aarch64::qemu::qemu_exit;
 
 #[cfg(all(target_arch = "x86_64"))]
 pub use x86_64::{
-    serial::init_serial, serial::log,
-    get_cpu_id, halt_cpu, init_gdt, init_interrupts, init_exceptions,
-    init_syscall_msrs,
-    init_gdt_for_cpu, load_idt,
+    get_cpu_id, halt_cpu, init_exceptions, init_gdt, init_gdt_for_cpu, init_interrupts,
+    init_syscall_msrs, load_idt, serial::init_serial, serial::log,
 };
 
 #[cfg(all(target_arch = "aarch64"))]
 pub use aarch64::{
-    serial::init_serial, serial::log,
-    get_cpu_id, halt_cpu, init_interrupts, init_exceptions,
+    get_cpu_id, halt_cpu, init_exceptions, init_interrupts, serial::init_serial, serial::log,
 };
 
 /// Debug helper: log a tag followed by a decimal number + space.

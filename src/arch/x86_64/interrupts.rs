@@ -45,20 +45,11 @@ impl IdtEntry {
 pub fn init_interrupts() {
     unsafe {
         for i in 0..256 {
-            IDT[i] = IdtEntry::new(
-                default_interrupt_handler as u64,
-                0x08,
-                0,
-                0x8E,
-            );
+            IDT[i] = IdtEntry::new(default_interrupt_handler as u64, 0x08, 0, 0x8E);
         }
         // Phase 28d — install the cross-CPU IPI handler.
-        IDT[crate::smp::IPI_VECTOR as usize] = IdtEntry::new(
-            super::lapic::ipi_irq_entry as u64,
-            0x08,
-            0,
-            0x8E,
-        );
+        IDT[crate::smp::IPI_VECTOR as usize] =
+            IdtEntry::new(super::lapic::ipi_irq_entry as u64, 0x08, 0, 0x8E);
     }
     // Phase 33b — install generic IRQ entries for IRQ 1..15 so
     // hardware vectors funnel through `irq_dispatch` →
@@ -103,7 +94,7 @@ macro_rules! interrupt_with_error {
         #[no_mangle]
         pub unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
-                "push {vector}",     // Push vector number  
+                "push {vector}",     // Push vector number
                 "call {handler}",    // Call actual handler function
                 "add rsp, 16",       // Clean up stack (error code + vector)
                 "iretq",             // Return from interrupt
@@ -538,15 +529,15 @@ pub fn install_irq_entries() {
         let base = PIC1_VECTOR_BASE as usize;
         // 0xEE = present, DPL=3, 64-bit interrupt gate. Software
         // INT 0x21 from user mode is allowed.
-        IDT[base + 1]  = IdtEntry::new(irq1_entry  as u64, 0x08, 0, 0xEE);
-        IDT[base + 2]  = IdtEntry::new(irq2_entry  as u64, 0x08, 0, 0x8E);
-        IDT[base + 3]  = IdtEntry::new(irq3_entry  as u64, 0x08, 0, 0x8E);
-        IDT[base + 4]  = IdtEntry::new(irq4_entry  as u64, 0x08, 0, 0x8E);
-        IDT[base + 5]  = IdtEntry::new(irq5_entry  as u64, 0x08, 0, 0x8E);
-        IDT[base + 6]  = IdtEntry::new(irq6_entry  as u64, 0x08, 0, 0x8E);
-        IDT[base + 7]  = IdtEntry::new(irq7_entry  as u64, 0x08, 0, 0x8E);
-        IDT[base + 8]  = IdtEntry::new(irq8_entry  as u64, 0x08, 0, 0x8E);
-        IDT[base + 9]  = IdtEntry::new(irq9_entry  as u64, 0x08, 0, 0x8E);
+        IDT[base + 1] = IdtEntry::new(irq1_entry as u64, 0x08, 0, 0xEE);
+        IDT[base + 2] = IdtEntry::new(irq2_entry as u64, 0x08, 0, 0x8E);
+        IDT[base + 3] = IdtEntry::new(irq3_entry as u64, 0x08, 0, 0x8E);
+        IDT[base + 4] = IdtEntry::new(irq4_entry as u64, 0x08, 0, 0x8E);
+        IDT[base + 5] = IdtEntry::new(irq5_entry as u64, 0x08, 0, 0x8E);
+        IDT[base + 6] = IdtEntry::new(irq6_entry as u64, 0x08, 0, 0x8E);
+        IDT[base + 7] = IdtEntry::new(irq7_entry as u64, 0x08, 0, 0x8E);
+        IDT[base + 8] = IdtEntry::new(irq8_entry as u64, 0x08, 0, 0x8E);
+        IDT[base + 9] = IdtEntry::new(irq9_entry as u64, 0x08, 0, 0x8E);
         IDT[base + 10] = IdtEntry::new(irq10_entry as u64, 0x08, 0, 0x8E);
         IDT[base + 11] = IdtEntry::new(irq11_entry as u64, 0x08, 0, 0x8E);
         IDT[base + 12] = IdtEntry::new(irq12_entry as u64, 0x08, 0, 0x8E);

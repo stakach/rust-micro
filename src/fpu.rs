@@ -73,7 +73,10 @@ pub fn on_fpu_trap<S: FpuStorage>(
     // Restore current's state.
     storage.state(current).generation = storage.state(current).generation.wrapping_add(1);
     owner.current = Some(current);
-    FpuSwitch::Switched { prev, restored: current }
+    FpuSwitch::Switched {
+        prev,
+        restored: current,
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -82,7 +85,10 @@ pub enum FpuSwitch {
     /// clear TS and resume.
     NoOp,
     /// Saved `prev` (if Some) and loaded `restored`.
-    Switched { prev: Option<TcbId>, restored: TcbId },
+    Switched {
+        prev: Option<TcbId>,
+        restored: TcbId,
+    },
 }
 
 /// Forcibly release the FPU on thread teardown. Mirrors seL4's
@@ -124,7 +130,13 @@ pub mod spec {
         let mut owner = FpuOwner::default();
         let mut store = Storage([FpuState::default(); 4]);
         let r = on_fpu_trap(&mut owner, &mut store, TcbId(1));
-        assert_eq!(r, FpuSwitch::Switched { prev: None, restored: TcbId(1) });
+        assert_eq!(
+            r,
+            FpuSwitch::Switched {
+                prev: None,
+                restored: TcbId(1)
+            }
+        );
         assert_eq!(owner.current, Some(TcbId(1)));
         assert_eq!(owner.trap_count, 1);
         assert_eq!(owner.save_count, 0); // nothing to save first time
@@ -150,7 +162,13 @@ pub mod spec {
         let mut store = Storage([FpuState::default(); 4]);
         on_fpu_trap(&mut owner, &mut store, TcbId(1));
         let r = on_fpu_trap(&mut owner, &mut store, TcbId(2));
-        assert_eq!(r, FpuSwitch::Switched { prev: Some(TcbId(1)), restored: TcbId(2) });
+        assert_eq!(
+            r,
+            FpuSwitch::Switched {
+                prev: Some(TcbId(1)),
+                restored: TcbId(2)
+            }
+        );
         assert_eq!(owner.save_count, 1);
         // Both saved-state generations bumped: TcbId(1) once, TcbId(2) twice.
         assert_eq!(store.0[1].generation, 2);

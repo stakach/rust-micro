@@ -77,7 +77,9 @@ pub struct SchedContext {
 }
 
 impl Default for SchedContext {
-    fn default() -> Self { Self::new(0, 0) }
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
 }
 
 impl SchedContext {
@@ -85,7 +87,10 @@ impl SchedContext {
         Self {
             period,
             budget,
-            refills: [Refill { release_time: 0, amount: 0 }; MAX_REFILLS],
+            refills: [Refill {
+                release_time: 0,
+                amount: 0,
+            }; MAX_REFILLS],
             head: 0,
             count: 0,
             bound_tcb: None,
@@ -96,10 +101,16 @@ impl SchedContext {
         }
     }
 
-    pub const fn is_empty(&self) -> bool { self.count == 0 }
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 
     pub fn head_refill(&self) -> Option<Refill> {
-        if self.count == 0 { None } else { Some(self.refills[self.head as usize]) }
+        if self.count == 0 {
+            None
+        } else {
+            Some(self.refills[self.head as usize])
+        }
     }
 
     /// Remaining ticks of CPU time at the head refill — the value
@@ -286,7 +297,10 @@ pub fn mcs_tick(delta_ticks: Ticks) {
                 // round-robin SCs — the budget is instantly whole
                 // again. Replenish AT now, not now + period, so the
                 // rotated thread is immediately runnable.
-                let _ = sc.push(Refill { release_time: now, amount: sc.budget });
+                let _ = sc.push(Refill {
+                    release_time: now,
+                    amount: sc.budget,
+                });
             } else {
                 // Sporadic: next refill matures a period from now.
                 let _ = refill_replenish(sc, now);
@@ -306,10 +320,8 @@ pub fn mcs_tick(delta_ticks: Ticks) {
             if round_robin {
                 let cpu = s.scheduler.slab.get(cur).affinity as usize;
                 let dom = s.scheduler.slab.get(cur).domain as usize;
-                s.scheduler.nodes[cpu].queues[dom]
-                    .dequeue(&mut s.scheduler.slab, cur);
-                s.scheduler.nodes[cpu].queues[dom]
-                    .enqueue(&mut s.scheduler.slab, cur);
+                s.scheduler.nodes[cpu].queues[dom].dequeue(&mut s.scheduler.slab, cur);
+                s.scheduler.nodes[cpu].queues[dom].enqueue(&mut s.scheduler.slab, cur);
                 // rescheduleRequired — let the dispatcher pick the
                 // (possibly different) head of the queue.
                 if s.scheduler.nodes[cpu].current == Some(cur) {
@@ -326,8 +338,8 @@ pub fn mcs_tick(delta_ticks: Ticks) {
                 #[cfg(not(target_arch = "x86_64"))]
                 let delivered = false;
                 if !delivered {
-                    s.scheduler.block(
-                        cur, crate::tcb::ThreadStateType::BlockedOnBudget);
+                    s.scheduler
+                        .block(cur, crate::tcb::ThreadStateType::BlockedOnBudget);
                 }
             }
         }
@@ -364,13 +376,14 @@ pub fn dispatch_budget_check(tcb_id: TcbId) -> bool {
         // it) — without this, a thread that inherits an unready donated
         // SC (e.g. the client re-receiving its over-spent SC) would run
         // and immediately re-trigger the fault cascade.
-        if matches!(s.scheduler.slab.get(tcb_id).timeout_endpoint_cap,
-                    crate::cap::Cap::Endpoint { .. })
-        {
+        if matches!(
+            s.scheduler.slab.get(tcb_id).timeout_endpoint_cap,
+            crate::cap::Cap::Endpoint { .. }
+        ) {
             let _ = crate::fault::deliver_timeout_fault(tcb_id);
         } else {
-            s.scheduler.block(
-                tcb_id, crate::tcb::ThreadStateType::BlockedOnBudget);
+            s.scheduler
+                .block(tcb_id, crate::tcb::ThreadStateType::BlockedOnBudget);
         }
         false
     }
@@ -414,7 +427,10 @@ pub fn yield_current() -> bool {
             let head = sc.head_amount();
             let _ = refill_charge(sc, head);
             if rr {
-                let _ = sc.push(Refill { release_time: now, amount: sc.budget });
+                let _ = sc.push(Refill {
+                    release_time: now,
+                    amount: sc.budget,
+                });
             } else {
                 let _ = refill_replenish(sc, now);
             }
@@ -429,8 +445,8 @@ pub fn yield_current() -> bool {
                 s.scheduler.nodes[cpu].current = None;
             }
         } else {
-            s.scheduler.block(
-                cur, crate::tcb::ThreadStateType::BlockedOnBudget);
+            s.scheduler
+                .block(cur, crate::tcb::ThreadStateType::BlockedOnBudget);
         }
         true
     }
@@ -445,11 +461,7 @@ pub fn yield_current() -> bool {
 /// is dispatched (`complete_yield_if_pending`, the activateThread
 /// equivalent) or eagerly when the yielded-to side is suspended /
 /// unbound / destroyed.
-pub fn complete_yield_to(
-    s: &mut crate::kernel::KernelState,
-    yielder: TcbId,
-    sc_idx: usize,
-) {
+pub fn complete_yield_to(s: &mut crate::kernel::KernelState, yielder: TcbId, sc_idx: usize) {
     // Consumed is reported in microseconds (upstream ticksToUs);
     // our ticks are milliseconds.
     let consumed_us = s.sched_contexts[sc_idx].consumed.saturating_mul(1000);
@@ -546,16 +558,17 @@ pub fn current_time() -> Ticks {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        return crate::arch::x86_64::pit::TICK_COUNT
-            .load(core::sync::atomic::Ordering::Relaxed) as Ticks;
+        return crate::arch::x86_64::pit::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+            as Ticks;
     }
     #[cfg(not(target_arch = "x86_64"))]
-    { 0 }
+    {
+        0
+    }
 }
 
 #[cfg(feature = "spec")]
-static TEST_TIME: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(u64::MAX);
+static TEST_TIME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Spec-only: pin `current_time()` to a known value.
 #[cfg(feature = "spec")]
@@ -608,8 +621,12 @@ pub mod spec {
             let sc_caller = s.alloc_sched_context().expect("sc pool");
             s.sched_contexts[sc_caller] =
                 SchedContext::new(/* period */ 100, /* budget */ 5);
-            s.sched_contexts[sc_caller].push(
-                Refill { release_time: 0, amount: 5 }).unwrap();
+            s.sched_contexts[sc_caller]
+                .push(Refill {
+                    release_time: 0,
+                    amount: 5,
+                })
+                .unwrap();
             s.sched_contexts[sc_caller].bound_tcb = Some(caller_id);
             s.scheduler.slab.get_mut(caller_id).sc = Some(sc_caller as u16);
 
@@ -625,8 +642,8 @@ pub mod spec {
             // production path runs through `endpoint::send_ipc`
             // with `do_call`; here we set the same fields directly
             // so the spec doesn't have to construct an endpoint.
-            s.scheduler.block(caller_id,
-                crate::tcb::ThreadStateType::BlockedOnReply);
+            s.scheduler
+                .block(caller_id, crate::tcb::ThreadStateType::BlockedOnReply);
             s.scheduler.slab.get_mut(server_id).reply_to = Some(caller_id);
             s.scheduler.slab.get_mut(server_id).active_sc = Some(sc_caller as u16);
             s.scheduler.set_current(Some(server_id));
@@ -634,8 +651,10 @@ pub mod spec {
             // Tick — the server's `active_sc` (= caller's SC) is
             // charged, even though `server.sc` is None.
             crate::sched_context::mcs_tick(1);
-            assert_eq!(s.sched_contexts[sc_caller].refills[0].amount, 4,
-                "caller's SC should have been debited via the server");
+            assert_eq!(
+                s.sched_contexts[sc_caller].refills[0].amount, 4,
+                "caller's SC should have been debited via the server"
+            );
 
             // Reply: clear donation. Production path is
             // `handle_reply`; spec mirrors the active_sc clear.
@@ -646,8 +665,10 @@ pub mod spec {
             // donation; mcs_tick should early-out without charging.
             s.scheduler.set_current(Some(server_id));
             crate::sched_context::mcs_tick(1);
-            assert_eq!(s.sched_contexts[sc_caller].refills[0].amount, 4,
-                "caller's SC must NOT be charged once donation is cleared");
+            assert_eq!(
+                s.sched_contexts[sc_caller].refills[0].amount, 4,
+                "caller's SC must NOT be charged once donation is cleared"
+            );
 
             // Cleanup.
             super::set_test_time(None);
@@ -657,8 +678,7 @@ pub mod spec {
             s.sched_contexts[sc_caller].bound_tcb = None;
             s.scheduler.reset_queues();
         }
-        arch::log(
-            "  ✓ Call donates caller's SC; mcs_tick charges callee on it; reply releases\n");
+        arch::log("  ✓ Call donates caller's SC; mcs_tick charges callee on it; reply releases\n");
     }
 
     /// Phase 32f — exhausting the budget should both:
@@ -682,7 +702,12 @@ pub mod spec {
 
             let sc_idx = s.alloc_sched_context().expect("sc pool");
             s.sched_contexts[sc_idx] = SchedContext::new(/* period */ 10, /* budget */ 1);
-            s.sched_contexts[sc_idx].push(Refill { release_time: 0, amount: 1 }).unwrap();
+            s.sched_contexts[sc_idx]
+                .push(Refill {
+                    release_time: 0,
+                    amount: 1,
+                })
+                .unwrap();
             s.sched_contexts[sc_idx].bound_tcb = Some(id);
             s.scheduler.slab.get_mut(id).sc = Some(sc_idx as u16);
 
@@ -691,12 +716,16 @@ pub mod spec {
             // Tick → budget exhausts → thread parks. The exhaustion
             // path replenishes a new refill at now+period=10.
             super::mcs_tick(1);
-            assert_eq!(s.scheduler.slab.get(id).state,
+            assert_eq!(
+                s.scheduler.slab.get(id).state,
                 crate::tcb::ThreadStateType::BlockedOnBudget,
-                "thread should be parked when SC exhausts");
+                "thread should be parked when SC exhausts"
+            );
             // The new refill should sit in the ring with release_time=10.
-            assert!(s.sched_contexts[sc_idx].count >= 1,
-                "replenish should have queued a fresh refill");
+            assert!(
+                s.sched_contexts[sc_idx].count >= 1,
+                "replenish should have queued a fresh refill"
+            );
             let head = s.sched_contexts[sc_idx].head as usize;
             assert_eq!(s.sched_contexts[sc_idx].refills[head].release_time, 10);
 
@@ -708,9 +737,11 @@ pub mod spec {
             // wake-up scan: clear current first.
             s.scheduler.set_current(None);
             super::mcs_tick(0);
-            assert_eq!(s.scheduler.slab.get(id).state,
+            assert_eq!(
+                s.scheduler.slab.get(id).state,
                 crate::tcb::ThreadStateType::Running,
-                "thread should be re-runnable after refill matures");
+                "thread should be re-runnable after refill matures"
+            );
 
             // Cleanup.
             super::set_test_time(None);
@@ -743,8 +774,14 @@ pub mod spec {
             // Allocate a SC slot, give it a 2-tick budget with one
             // ready refill.
             let sc_idx = s.alloc_sched_context().expect("sc pool");
-            s.sched_contexts[sc_idx] = SchedContext::new(/* period */ 100, /* budget */ 2);
-            s.sched_contexts[sc_idx].push(Refill { release_time: 0, amount: 2 }).unwrap();
+            s.sched_contexts[sc_idx] =
+                SchedContext::new(/* period */ 100, /* budget */ 2);
+            s.sched_contexts[sc_idx]
+                .push(Refill {
+                    release_time: 0,
+                    amount: 2,
+                })
+                .unwrap();
             s.sched_contexts[sc_idx].bound_tcb = Some(id);
             s.scheduler.slab.get_mut(id).sc = Some(sc_idx as u16);
 
@@ -754,15 +791,19 @@ pub mod spec {
 
             // Tick once — budget 2 → 1, still running.
             crate::sched_context::mcs_tick(1);
-            assert_eq!(s.scheduler.slab.get(id).state,
-                crate::tcb::ThreadStateType::Running);
+            assert_eq!(
+                s.scheduler.slab.get(id).state,
+                crate::tcb::ThreadStateType::Running
+            );
             assert_eq!(s.sched_contexts[sc_idx].refills[0].amount, 1);
 
             // Tick again — budget 1 → 0, exhausted, thread parks.
             crate::sched_context::mcs_tick(1);
-            assert_eq!(s.scheduler.slab.get(id).state,
+            assert_eq!(
+                s.scheduler.slab.get(id).state,
                 crate::tcb::ThreadStateType::BlockedOnBudget,
-                "thread should be parked when SC exhausts");
+                "thread should be parked when SC exhausts"
+            );
 
             // Cleanup: free the slot so subsequent specs aren't
             // poisoned. The SC pool entry stays consumed (no
@@ -790,10 +831,13 @@ pub mod spec {
             t.state = crate::tcb::ThreadStateType::Running;
             let id = s.scheduler.admit(t);
             let sc_idx = s.alloc_sched_context().expect("sc pool");
-            s.sched_contexts[sc_idx] =
-                SchedContext::new(/* period */ 2, /* budget */ 2);
+            s.sched_contexts[sc_idx] = SchedContext::new(/* period */ 2, /* budget */ 2);
             s.sched_contexts[sc_idx]
-                .push(Refill { release_time: 0, amount: 2 }).unwrap();
+                .push(Refill {
+                    release_time: 0,
+                    amount: 2,
+                })
+                .unwrap();
             s.sched_contexts[sc_idx].bound_tcb = Some(id);
             s.scheduler.slab.get_mut(id).sc = Some(sc_idx as u16);
             s.scheduler.set_current(Some(id));
@@ -801,9 +845,11 @@ pub mod spec {
             // Exhaust the 2-tick budget in one charge.
             crate::sched_context::mcs_tick(2);
             // Still Running — rotated, not parked.
-            assert_eq!(s.scheduler.slab.get(id).state,
+            assert_eq!(
+                s.scheduler.slab.get(id).state,
                 crate::tcb::ThreadStateType::Running,
-                "round-robin thread must stay runnable on exhaustion");
+                "round-robin thread must stay runnable on exhaustion"
+            );
             // Reschedule was requested (current cleared)...
             assert_eq!(s.scheduler.current(), None);
             // ...and the budget is instantly whole again at the new
@@ -811,12 +857,13 @@ pub mod spec {
             assert_eq!(s.sched_contexts[sc_idx].head_amount(), 2);
             assert!(crate::sched_context::refill_ready(
                 &s.sched_contexts[sc_idx],
-                crate::sched_context::current_time()));
+                crate::sched_context::current_time()
+            ));
 
             s.scheduler.set_current(None);
             let dom = s.scheduler.slab.get(id).domain as usize;
-            s.scheduler.nodes[crate::arch::get_cpu_id() as usize]
-                .queues[dom].dequeue(&mut s.scheduler.slab, id);
+            s.scheduler.nodes[crate::arch::get_cpu_id() as usize].queues[dom]
+                .dequeue(&mut s.scheduler.slab, id);
             s.scheduler.slab.free(id);
             s.sched_contexts[sc_idx].bound_tcb = None;
         }
@@ -826,8 +873,16 @@ pub mod spec {
     #[inline(never)]
     fn push_pop_round_trip() {
         let mut sc = SchedContext::new(/* period */ 100, /* budget */ 30);
-        sc.push(Refill { release_time: 0, amount: 30 }).unwrap();
-        sc.push(Refill { release_time: 100, amount: 30 }).unwrap();
+        sc.push(Refill {
+            release_time: 0,
+            amount: 30,
+        })
+        .unwrap();
+        sc.push(Refill {
+            release_time: 100,
+            amount: 30,
+        })
+        .unwrap();
         assert_eq!(sc.count, 2);
         assert_eq!(sc.head_amount(), 30);
         assert_eq!(sc.head_ready_time(), Some(0));
@@ -843,7 +898,11 @@ pub mod spec {
     #[inline(never)]
     fn charge_consumes_head_amount() {
         let mut sc = SchedContext::new(100, 30);
-        sc.push(Refill { release_time: 0, amount: 30 }).unwrap();
+        sc.push(Refill {
+            release_time: 0,
+            amount: 30,
+        })
+        .unwrap();
         let exhausted = refill_charge(&mut sc, 10);
         assert!(!exhausted);
         assert_eq!(sc.head_amount(), 20);
@@ -853,8 +912,16 @@ pub mod spec {
     #[inline(never)]
     fn charge_drops_exhausted_head() {
         let mut sc = SchedContext::new(100, 30);
-        sc.push(Refill { release_time: 0, amount: 30 }).unwrap();
-        sc.push(Refill { release_time: 100, amount: 30 }).unwrap();
+        sc.push(Refill {
+            release_time: 0,
+            amount: 30,
+        })
+        .unwrap();
+        sc.push(Refill {
+            release_time: 100,
+            amount: 30,
+        })
+        .unwrap();
         let exhausted = refill_charge(&mut sc, 30);
         assert!(exhausted);
         assert_eq!(sc.count, 1);
@@ -878,7 +945,11 @@ pub mod spec {
     #[inline(never)]
     fn refill_ready_threshold() {
         let mut sc = SchedContext::new(100, 30);
-        sc.push(Refill { release_time: 200, amount: 30 }).unwrap();
+        sc.push(Refill {
+            release_time: 200,
+            amount: 30,
+        })
+        .unwrap();
         assert!(!refill_ready(&sc, 100));
         assert!(!refill_ready(&sc, 199));
         assert!(refill_ready(&sc, 200));
@@ -890,10 +961,17 @@ pub mod spec {
     fn ring_full_returns_error() {
         let mut sc = SchedContext::new(10, 1);
         for i in 0..MAX_REFILLS {
-            sc.push(Refill { release_time: i as Ticks, amount: 1 }).unwrap();
+            sc.push(Refill {
+                release_time: i as Ticks,
+                amount: 1,
+            })
+            .unwrap();
         }
         assert_eq!(
-            sc.push(Refill { release_time: 99, amount: 1 }),
+            sc.push(Refill {
+                release_time: 99,
+                amount: 1
+            }),
             Err(RefillError::Full),
         );
         arch::log("  ✓ ring overflow surfaces as RefillError::Full\n");

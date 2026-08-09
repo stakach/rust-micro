@@ -34,13 +34,10 @@ pub unsafe extern "C" fn switch_context(prev: *mut CpuContext, next: *const CpuC
         "push r13",
         "push r14",
         "push r15",
-
         // Save the current rsp into prev->ksp (offset 0).
         "mov [rdi + 0], rsp",
-
         // Load the next thread's ksp.
         "mov rsp, [rsi + 0]",
-
         // Conditionally swap CR3. cr3 = 0 means "keep current".
         "mov rax, [rsi + 8]",
         "test rax, rax",
@@ -50,7 +47,6 @@ pub unsafe extern "C" fn switch_context(prev: *mut CpuContext, next: *const CpuC
         "je 2f",
         "mov cr3, rax",
         "2:",
-
         // Restore callee-saved registers from the new thread's stack.
         "pop r15",
         "pop r14",
@@ -88,7 +84,7 @@ pub unsafe fn prime_stack(
     arg: u64,
 ) {
     let mut sp = stack_top & !0xFu64; // 16-byte align
-    // Push the trampoline arguments first (further from top of stack).
+                                      // Push the trampoline arguments first (further from top of stack).
     sp -= 16;
     let args_ptr = sp as *mut u64;
     args_ptr.write(entry as u64);
@@ -118,8 +114,8 @@ pub unsafe fn prime_stack(
 pub unsafe extern "C" fn thread_trampoline() {
     core::arch::naked_asm!(
         // rbx contains the args pointer set up by prime_stack.
-        "mov rdi, [rbx + 8]",     // arg
-        "mov rax, [rbx]",         // entry function
+        "mov rdi, [rbx + 8]", // arg
+        "mov rax, [rbx]",     // entry function
         "jmp rax",
     );
 }
@@ -149,17 +145,24 @@ pub mod spec {
     #[repr(C, align(16))]
     struct StackPage([u8; 16384]);
     static mut SECONDARY_STACK: StackPage = StackPage([0; 16384]);
-    static mut SECONDARY_CTX: CpuContext = CpuContext { ksp: 0, cr3: 0, fs_base: 0, gs_base: 0 };
-    static mut PRIMARY_CTX: CpuContext = CpuContext { ksp: 0, cr3: 0, fs_base: 0, gs_base: 0 };
+    static mut SECONDARY_CTX: CpuContext = CpuContext {
+        ksp: 0,
+        cr3: 0,
+        fs_base: 0,
+        gs_base: 0,
+    };
+    static mut PRIMARY_CTX: CpuContext = CpuContext {
+        ksp: 0,
+        cr3: 0,
+        fs_base: 0,
+        gs_base: 0,
+    };
 
     extern "C" fn secondary_entry(arg: u64) -> ! {
         SECONDARY_RAN.fetch_add(arg, Ordering::Relaxed);
         // Yield back to the primary.
         unsafe {
-            switch_context(
-                &raw mut SECONDARY_CTX,
-                &raw const PRIMARY_CTX,
-            );
+            switch_context(&raw mut SECONDARY_CTX, &raw const PRIMARY_CTX);
         }
         // Should never resume.
         panic!("secondary thread resumed after switch_context back");
@@ -168,17 +171,14 @@ pub mod spec {
     #[inline(never)]
     fn switch_to_primed_thread_runs_entry() {
         unsafe {
-            let stack_top = (&raw const SECONDARY_STACK) as u64
-                + core::mem::size_of::<StackPage>() as u64;
+            let stack_top =
+                (&raw const SECONDARY_STACK) as u64 + core::mem::size_of::<StackPage>() as u64;
             prime_stack(&mut SECONDARY_CTX, stack_top, secondary_entry, 7);
 
             // First switch — primary saves its state into PRIMARY_CTX,
             // then jumps into the secondary's primed stack and runs
             // secondary_entry(7).
-            switch_context(
-                &raw mut PRIMARY_CTX,
-                &raw const SECONDARY_CTX,
-            );
+            switch_context(&raw mut PRIMARY_CTX, &raw const SECONDARY_CTX);
         }
         // After the secondary yields back, control returns here.
         let n = SECONDARY_RAN.load(Ordering::Relaxed);
@@ -194,13 +194,10 @@ pub mod spec {
         // re-uses the same context — re-prime the secondary stack
         // and verify the round-trip again with a different arg.
         unsafe {
-            let stack_top = (&raw const SECONDARY_STACK) as u64
-                + core::mem::size_of::<StackPage>() as u64;
+            let stack_top =
+                (&raw const SECONDARY_STACK) as u64 + core::mem::size_of::<StackPage>() as u64;
             prime_stack(&mut SECONDARY_CTX, stack_top, secondary_entry, 100);
-            switch_context(
-                &raw mut PRIMARY_CTX,
-                &raw const SECONDARY_CTX,
-            );
+            switch_context(&raw mut PRIMARY_CTX, &raw const SECONDARY_CTX);
         }
         let n = SECONDARY_RAN.load(Ordering::Relaxed);
         assert_eq!(n, 107, "second round-trip should accumulate (+100)");

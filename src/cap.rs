@@ -17,12 +17,11 @@
 //! objects, not accessing their fields. Dereferencing happens in
 //! later phases inside small, well-encapsulated `unsafe` helpers.
 
-use crate::structures::*;
 use crate::structures::arch::{
-    AsidControlCap, AsidPoolCap, FrameCap, IoPageTableCap, IoPortCap,
-    IoPortControlCap, IoSpaceCap, PageDirectoryCap, PageTableCap, PdptCap,
-    Pml4Cap,
+    AsidControlCap, AsidPoolCap, FrameCap, IoPageTableCap, IoPortCap, IoPortControlCap, IoSpaceCap,
+    PageDirectoryCap, PageTableCap, PdptCap, Pml4Cap,
 };
+use crate::structures::*;
 use crate::structures::{SchedContextCap, SchedControlCap};
 use crate::types::seL4_Word as Word;
 use core::marker::PhantomData;
@@ -97,7 +96,10 @@ impl<T> PPtr<T> {
     /// (e.g. cap decoders) can pair this with `expect`.
     pub const fn new(addr: u64) -> Option<Self> {
         match NonZeroU64::new(addr) {
-            Some(nz) => Some(Self { addr: nz, _phantom: PhantomData }),
+            Some(nz) => Some(Self {
+                addr: nz,
+                _phantom: PhantomData,
+            }),
             None => None,
         }
     }
@@ -113,10 +115,14 @@ impl<T> PPtr<T> {
 // required impls so callers don't need T: Trait.
 impl<T> Copy for PPtr<T> {}
 impl<T> Clone for PPtr<T> {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 impl<T> PartialEq for PPtr<T> {
-    fn eq(&self, other: &Self) -> bool { self.addr == other.addr }
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr
+    }
 }
 impl<T> Eq for PPtr<T> {}
 impl<T> core::fmt::Debug for PPtr<T> {
@@ -227,7 +233,11 @@ pub enum FrameSize {
 
 impl FrameSize {
     pub const fn bits(self) -> u32 {
-        match self { Self::Small => 12, Self::Large => 21, Self::Huge => 30 }
+        match self {
+            Self::Small => 12,
+            Self::Large => 21,
+            Self::Huge => 30,
+        }
     }
     pub const fn from_word(w: u64) -> Option<Self> {
         match w {
@@ -238,7 +248,11 @@ impl FrameSize {
         }
     }
     pub const fn to_word(self) -> u64 {
-        match self { Self::Small => 0, Self::Large => 1, Self::Huge => 2 }
+        match self {
+            Self::Small => 0,
+            Self::Large => 1,
+            Self::Huge => 2,
+        }
     }
 }
 
@@ -265,7 +279,7 @@ impl FrameRights {
     }
     pub const fn from_word(w: u64) -> Self {
         let can_write = (w & 0b001) != 0;
-        let can_read  = (w & 0b010) != 0;
+        let can_read = (w & 0b010) != 0;
         if can_write {
             // Write implies read in our model — there's no WriteOnly
             // FrameRights variant.
@@ -549,7 +563,9 @@ pub fn from_words(words: [Word; 2]) -> Cap {
         tag::IRQ_CONTROL => Cap::IrqControl,
         tag::IRQ_HANDLER => {
             let c = IrqHandlerCap { words };
-            Cap::IrqHandler { irq: c.capIRQ() as u16 }
+            Cap::IrqHandler {
+                irq: c.capIRQ() as u16,
+            }
         }
         tag::ZOMBIE => {
             let c = ZombieCap { words };
@@ -560,9 +576,14 @@ pub fn from_words(words: [Word; 2]) -> Cap {
             let kind = if zt & (1 << 6) != 0 {
                 ZombieKind::Tcb
             } else {
-                ZombieKind::CNode { bits: (zt & 0x3f) as u8 }
+                ZombieKind::CNode {
+                    bits: (zt & 0x3f) as u8,
+                }
             };
-            Cap::Zombie { id: c.capZombieID(), kind }
+            Cap::Zombie {
+                id: c.capZombieID(),
+                kind,
+            }
         }
         tag::DOMAIN => Cap::Domain,
         tag::FRAME => {
@@ -576,7 +597,11 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 rights: FrameRights::from_word(c.capFVMRights()),
                 mapped: {
                     let v = c.capFMappedAddress();
-                    if v == 0 { None } else { Some(v) }
+                    if v == 0 {
+                        None
+                    } else {
+                        Some(v)
+                    }
                 },
                 asid: c.capFMappedASID() as u16,
                 is_device: c.capFIsDevice() != 0,
@@ -662,7 +687,9 @@ pub fn from_words(words: [Word; 2]) -> Cap {
         }
         tag::SCHED_CONTROL => {
             let c = SchedControlCap { words };
-            Cap::SchedControl { core: c.core() as u32 }
+            Cap::SchedControl {
+                core: c.core() as u32,
+            }
         }
         tag::IO_PORT => {
             let c = IoPortCap { words };
@@ -701,46 +728,61 @@ pub fn from_words(words: [Word; 2]) -> Cap {
 pub fn to_words(cap: &Cap) -> [Word; 2] {
     match cap {
         Cap::Null => NullCap::new(tag::NULL).words,
-        Cap::Untyped { ptr, block_bits, free_index, is_device } => UntypedCap::new(
-            *free_index,
-            *is_device as u64,
-            *block_bits as u64,
-            tag::UNTYPED,
-            ptr.addr(),
-        )
-        .words,
-        Cap::Endpoint { ptr, badge, rights } => EndpointCap::new(
-            badge.0,
-            rights.can_grant_reply as u64,
-            rights.can_grant as u64,
-            rights.can_send as u64,
-            rights.can_receive as u64,
-            ptr.addr(),
-            tag::ENDPOINT,
-        )
-        .words,
-        Cap::Notification { ptr, badge, rights } => NotificationCap::new(
-            badge.0,                        // capNtfnBadge
-            tag::NOTIFICATION,              // capType
-            rights.can_receive as u64,      // capNtfnCanReceive
-            rights.can_send as u64,         // capNtfnCanSend
-            ptr.addr(),                     // capNtfnPtr
-        )
-        .words,
-        Cap::Reply { ptr, can_grant } => ReplyCap::new(
-            ptr.addr(),
-            tag::REPLY,
-            *can_grant as u64,
-        )
-        .words,
-        Cap::CNode { ptr, radix, guard_size, guard } => CnodeCap::new(
-            *radix as u64,
-            *guard_size as u64,
-            *guard,
-            ptr.addr(),
-            tag::CNODE,
-        )
-        .words,
+        Cap::Untyped {
+            ptr,
+            block_bits,
+            free_index,
+            is_device,
+        } => {
+            UntypedCap::new(
+                *free_index,
+                *is_device as u64,
+                *block_bits as u64,
+                tag::UNTYPED,
+                ptr.addr(),
+            )
+            .words
+        }
+        Cap::Endpoint { ptr, badge, rights } => {
+            EndpointCap::new(
+                badge.0,
+                rights.can_grant_reply as u64,
+                rights.can_grant as u64,
+                rights.can_send as u64,
+                rights.can_receive as u64,
+                ptr.addr(),
+                tag::ENDPOINT,
+            )
+            .words
+        }
+        Cap::Notification { ptr, badge, rights } => {
+            NotificationCap::new(
+                badge.0,                   // capNtfnBadge
+                tag::NOTIFICATION,         // capType
+                rights.can_receive as u64, // capNtfnCanReceive
+                rights.can_send as u64,    // capNtfnCanSend
+                ptr.addr(),                // capNtfnPtr
+            )
+            .words
+        }
+        Cap::Reply { ptr, can_grant } => {
+            ReplyCap::new(ptr.addr(), tag::REPLY, *can_grant as u64).words
+        }
+        Cap::CNode {
+            ptr,
+            radix,
+            guard_size,
+            guard,
+        } => {
+            CnodeCap::new(
+                *radix as u64,
+                *guard_size as u64,
+                *guard,
+                ptr.addr(),
+                tag::CNODE,
+            )
+            .words
+        }
         Cap::Thread { tcb } => {
             let mut c = ThreadCap::zeroed();
             c = c.with_capType(tag::THREAD);
@@ -807,13 +849,7 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             // pml4_cap has explicit_params (capPML4MappedASID,
             // capPML4BasePtr, capType, capPML4IsMapped) — pass them
             // in that order.
-            Pml4Cap::new(
-                *asid as u64,
-                ptr.addr(),
-                tag::PML4,
-                *mapped as u64,
-            )
-            .words
+            Pml4Cap::new(*asid as u64, ptr.addr(), tag::PML4, *mapped as u64).words
         }
         Cap::AsidControl => {
             let mut c = AsidControlCap::zeroed();
@@ -823,27 +859,18 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
         Cap::AsidPool { ptr, asid_base } => {
             // asid_pool_cap visible-field order (no explicit_params):
             //   capType, capASIDBase, capASIDPool.
-            AsidPoolCap::new(
-                tag::ASID_POOL,
-                *asid_base as u64,
-                ptr.addr(),
-            )
-            .words
+            AsidPoolCap::new(tag::ASID_POOL, *asid_base as u64, ptr.addr()).words
         }
         Cap::SchedContext { ptr, size_bits } => {
             // sched_context_cap (no explicit_params):
             //   capSCPtr, capSCSizeBits, capType.
-            SchedContextCap::new(
-                ptr.addr(),
-                *size_bits as u64,
-                tag::SCHED_CONTEXT,
-            )
-            .words
+            SchedContextCap::new(ptr.addr(), *size_bits as u64, tag::SCHED_CONTEXT).words
         }
-        Cap::SchedControl { core } => {
-            SchedControlCap::new(*core as u64, tag::SCHED_CONTROL).words
-        }
-        Cap::IOPort { first_port, last_port } => {
+        Cap::SchedControl { core } => SchedControlCap::new(*core as u64, tag::SCHED_CONTROL).words,
+        Cap::IOPort {
+            first_port,
+            last_port,
+        } => {
             let mut c = IoPortCap::zeroed();
             c = c.with_capType(tag::IO_PORT);
             c = c.with_capIOPortFirstPort(*first_port as u64);
@@ -855,7 +882,15 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             c = c.with_capType(tag::IO_PORT_CONTROL);
             c.words
         }
-        Cap::Frame { ptr, size, rights, mapped, asid, is_device, map_type } => {
+        Cap::Frame {
+            ptr,
+            size,
+            rights,
+            mapped,
+            asid,
+            is_device,
+            map_type,
+        } => {
             // Visible field order (no explicit_params on frame_cap):
             //   capFMappedASID, capFBasePtr, capType, capFSize,
             //   capFMapType, capFMappedAddress, capFVMRights,
@@ -865,14 +900,17 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
                 ptr.addr(),
                 tag::FRAME,
                 size.to_word(),
-                map_type.to_word(),             // capFMapType: None/VSpace/IOSpace
+                map_type.to_word(), // capFMapType: None/VSpace/IOSpace
                 mapped.unwrap_or(0),
                 rights.to_word(),
                 *is_device as u64,
             )
             .words
         }
-        Cap::IoSpace { domain_id, pci_device } => {
+        Cap::IoSpace {
+            domain_id,
+            pci_device,
+        } => {
             // io_space_cap (no explicit_params): visible field order is
             //   capType, capDomainID, capPCIDevice.
             let mut c = IoSpaceCap::zeroed();
@@ -881,7 +919,13 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             c = c.with_capPCIDevice(*pci_device as u64);
             c.words
         }
-        Cap::IoPageTable { ptr, is_mapped, level, mapped_address, ioasid } => {
+        Cap::IoPageTable {
+            ptr,
+            is_mapped,
+            level,
+            mapped_address,
+            ioasid,
+        } => {
             // io_page_table_cap explicit_params order:
             //   capType, capIOPTIsMapped, capIOPTLevel,
             //   capIOPTMappedAddress, capIOPTIOASID, capIOPTBasePtr.
@@ -1152,7 +1196,10 @@ pub mod spec {
         words[0] = 25u64 << 59;
         let back = from_words(words);
         match back {
-            Cap::Arch { cap_type: 25, words: w } => assert_eq!(w, words),
+            Cap::Arch {
+                cap_type: 25,
+                words: w,
+            } => assert_eq!(w, words),
             other => panic!("expected Cap::Arch{{25,..}}, got {:?}", other),
         }
         arch::log("  ✓ arch cap passes through opaquely (un-typed tags)\n");
@@ -1160,7 +1207,10 @@ pub mod spec {
 
     fn roundtrip_iommu_caps() {
         // io_space_cap (tag 15): domain_id + pci_device round-trip.
-        let ios = Cap::IoSpace { domain_id: 0xf, pci_device: 0x216 };
+        let ios = Cap::IoSpace {
+            domain_id: 0xf,
+            pci_device: 0x216,
+        };
         let words = to_words(&ios);
         assert_eq!(cap_type_of(words), tag::IO_SPACE);
         assert_eq!(from_words(words), ios);

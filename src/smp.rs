@@ -101,12 +101,7 @@ pub fn bkl_acquire() {
         return;
     }
     loop {
-        match BKL.compare_exchange_weak(
-            0,
-            me,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
+        match BKL.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return,
             Err(_) => {
                 while BKL.load(Ordering::Relaxed) != 0 {
@@ -157,8 +152,9 @@ const NODE_INIT: NodeState = NodeState {
     ipi_cause: [None; MAX_CPUS],
 };
 
-static IPI_NODES: IpiNodes =
-    IpiNodes(core::cell::UnsafeCell::new(PerCpu { entries: [NODE_INIT; MAX_CPUS] }));
+static IPI_NODES: IpiNodes = IpiNodes(core::cell::UnsafeCell::new(PerCpu {
+    entries: [NODE_INIT; MAX_CPUS],
+}));
 
 /// Borrow the per-CPU node array mutably. Caller must hold the BKL.
 pub fn nodes_mut() -> &'static mut PerCpu<NodeState> {
@@ -211,8 +207,10 @@ pub static IPI_HANDLED_COUNT: AtomicU32 = AtomicU32::new(0);
 /// + syscalling there. Hand-listed because `AtomicU32` isn't `Copy`
 /// (so `[AtomicU32::new(0); MAX_CPUS]` won't compile).
 pub static SYSCALL_COUNT_PER_CPU: [AtomicU32; MAX_CPUS] = [
-    AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
 ];
 const _: () = assert!(
     MAX_CPUS == 4,
@@ -245,12 +243,16 @@ pub fn kick_cpu(target_cpu: u32) {
 // ---------------------------------------------------------------------------
 
 pub static STALL_REQUESTED: [AtomicBool; MAX_CPUS] = [
-    AtomicBool::new(false), AtomicBool::new(false),
-    AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
 ];
 pub static STALL_ACK: [AtomicBool; MAX_CPUS] = [
-    AtomicBool::new(false), AtomicBool::new(false),
-    AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
 ];
 
 /// Per-core "went idle since last dispatch" flag. Set just before a
@@ -265,8 +267,10 @@ pub static STALL_ACK: [AtomicBool; MAX_CPUS] = [
 /// the idle→running transition that needs it (MULTICORE0002). Hand-
 /// listed because `AtomicBool` isn't `Copy`.
 pub static WENT_IDLE: [AtomicBool; MAX_CPUS] = [
-    AtomicBool::new(true), AtomicBool::new(true),
-    AtomicBool::new(true), AtomicBool::new(true),
+    AtomicBool::new(true),
+    AtomicBool::new(true),
+    AtomicBool::new(true),
+    AtomicBool::new(true),
 ];
 
 /// Mark the calling core as having gone idle (call right before HLT in
@@ -350,7 +354,9 @@ pub fn shootdown_tlb(vaddr: u64) {
     let me = crate::arch::get_cpu_id();
     let n_cores = crate::bootboot::get_num_cores() as u32;
     for cpu in 0..n_cores.min(MAX_CPUS as u32) {
-        if cpu == me { continue; }
+        if cpu == me {
+            continue;
+        }
         // Only a CPU actively running a user thread can hold the stale
         // mapping in its TLB. An idle CPU (current == None) reloads CR3
         // — which flushes the TLB — when it's next handed a thread, so
@@ -360,9 +366,15 @@ pub fn shootdown_tlb(vaddr: u64) {
         // teardown) would otherwise wake the 3 idle APs on every unmap,
         // and they burn emulator cycles spinning on the BKL.
         let running = unsafe {
-            crate::kernel::KERNEL.get().scheduler.current_for_cpu(cpu).is_some()
+            crate::kernel::KERNEL
+                .get()
+                .scheduler
+                .current_for_cpu(cpu)
+                .is_some()
         };
-        if !running { continue; }
+        if !running {
+            continue;
+        }
         send_ipi(cpu, IpiKind::InvalidateTlb { vaddr });
     }
 }
@@ -381,12 +393,16 @@ pub struct PerCpu<T, const N: usize = MAX_CPUS> {
 
 impl<T: Copy + Default, const N: usize> Default for PerCpu<T, N> {
     fn default() -> Self {
-        Self { entries: [T::default(); N] }
+        Self {
+            entries: [T::default(); N],
+        }
     }
 }
 
 impl<T, const N: usize> PerCpu<T, N> {
-    pub const fn new(initial: [T; N]) -> Self { Self { entries: initial } }
+    pub const fn new(initial: [T; N]) -> Self {
+        Self { entries: initial }
+    }
 
     pub fn get(&self, cpu: u32) -> Option<&T> {
         self.entries.get(cpu as usize)
@@ -434,12 +450,7 @@ pub enum IpiKind {
 /// Mark that `from_cpu` wants `to_cpu` to handle `kind`. The actual
 /// hardware send (writing the LAPIC ICR register) is the arch
 /// driver's job; this routine handles the in-kernel bookkeeping.
-pub fn signal_ipi(
-    nodes: &mut PerCpu<NodeState>,
-    from_cpu: u32,
-    to_cpu: u32,
-    kind: IpiKind,
-) {
+pub fn signal_ipi(nodes: &mut PerCpu<NodeState>, from_cpu: u32, to_cpu: u32, kind: IpiKind) {
     if from_cpu == to_cpu {
         // self-IPI is meaningless; let the caller catch this.
         return;
@@ -538,8 +549,10 @@ pub mod spec {
                 // throttles the rest of the kernel via the BKL.
                 unsafe {
                     bkl_acquire();
-                    crate::kernel::KERNEL.get().scheduler.block(
-                        id, crate::tcb::ThreadStateType::Inactive);
+                    crate::kernel::KERNEL
+                        .get()
+                        .scheduler
+                        .block(id, crate::tcb::ThreadStateType::Inactive);
                     bkl_release();
                 }
                 return;
@@ -548,7 +561,8 @@ pub mod spec {
             if spins > 1_000_000_000 {
                 panic!(
                     "AP1 syscall counter never advanced (got {}, want {})",
-                    now - before, 64,
+                    now - before,
+                    64,
                 );
             }
             core::hint::spin_loop();
@@ -579,7 +593,8 @@ pub mod spec {
         {
             let s = unsafe { crate::kernel::KERNEL.get() };
             for ap in 1..n_cores.min(MAX_CPUS as u32) {
-                s.scheduler.set_current_for_cpu(ap, Some(crate::tcb::TcbId(0)));
+                s.scheduler
+                    .set_current_for_cpu(ap, Some(crate::tcb::TcbId(0)));
             }
         }
         // Pick a vaddr that BOOTBOOT does NOT map (kernel half,
@@ -606,7 +621,8 @@ pub mod spec {
             if spins > 100_000_000 {
                 panic!(
                     "shootdown didn't reach all APs (got {} of {})",
-                    now - before, n_aps,
+                    now - before,
+                    n_aps,
                 );
             }
             core::hint::spin_loop();
@@ -652,10 +668,7 @@ pub mod spec {
         // its pick at the tail, so the value remains visible.
         let mut spins = 0u64;
         loop {
-            let cur = unsafe {
-                crate::kernel::KERNEL.get()
-                    .scheduler.current_for_cpu(1)
-            };
+            let cur = unsafe { crate::kernel::KERNEL.get().scheduler.current_for_cpu(1) };
             if cur == Some(admitted_id) {
                 break;
             }
@@ -719,10 +732,15 @@ pub mod spec {
         // After the ISR drains, AP1's pending bitmap is empty and
         // its cause slot for BSP (CPU 0) is cleared.
         let n = node(1);
-        assert_eq!(n.pending_ipis & 1, 0,
-            "AP1's pending bit for BSP should be cleared");
-        assert!(n.ipi_cause[0].is_none(),
-            "AP1's cause slot for BSP should be cleared");
+        assert_eq!(
+            n.pending_ipis & 1,
+            0,
+            "AP1's pending bit for BSP should be cleared"
+        );
+        assert!(
+            n.ipi_cause[0].is_none(),
+            "AP1's cause slot for BSP should be cleared"
+        );
         arch::log("  ✓ BSP→AP1 Reschedule IPI delivered + handled\n");
     }
 
@@ -759,8 +777,11 @@ pub mod spec {
     fn all_aps_came_up() {
         let total = crate::bootboot::get_num_cores() as u32;
         let expected_aps = total.saturating_sub(1);
-        assert_eq!(aps_alive(), expected_aps,
-            "APS_ALIVE should equal numcores-1 once BSP is past barrier");
+        assert_eq!(
+            aps_alive(),
+            expected_aps,
+            "APS_ALIVE should equal numcores-1 once BSP is past barrier"
+        );
         arch::log("  ✓ all APs reached the barrier\n");
     }
 
@@ -809,7 +830,9 @@ pub mod spec {
         assert_eq!(n.pending_ipis, 0b0111);
 
         let mut count = 0;
-        handle_ipis(&mut nodes, 3, |_from, _kind| { count += 1; });
+        handle_ipis(&mut nodes, 3, |_from, _kind| {
+            count += 1;
+        });
         assert_eq!(count, 3);
         arch::log("  ✓ pending mask coalesces multiple senders\n");
     }

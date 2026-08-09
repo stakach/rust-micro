@@ -175,7 +175,10 @@ pub mod spec {
     fn write_guest_requires_loaded() {
         let mut v = Vcpu::default();
         // Inactive → BadState.
-        assert_eq!(write_guest(&mut v, GuestState::default()), Err(VcpuError::BadState));
+        assert_eq!(
+            write_guest(&mut v, GuestState::default()),
+            Err(VcpuError::BadState)
+        );
         bind(&mut v, TcbId(1)).unwrap();
         // Loaded → ok.
         let mut g = GuestState::default();
@@ -192,7 +195,10 @@ pub mod spec {
         let mut v = Vcpu::default();
         bind(&mut v, TcbId(1)).unwrap();
         // Can't exit without entering.
-        assert_eq!(inject_exit(&mut v, ExitReason::Hlt), Err(VcpuError::BadState));
+        assert_eq!(
+            inject_exit(&mut v, ExitReason::Hlt),
+            Err(VcpuError::BadState)
+        );
         // Enter, then exit on Hlt.
         vmenter(&mut v).unwrap();
         assert_eq!(v.state, VcpuState::Running);

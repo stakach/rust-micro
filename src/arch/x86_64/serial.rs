@@ -14,7 +14,9 @@ pub fn init_serial() {
 
 pub fn log(msg: &str) {
     for byte in msg.bytes() {
-        unsafe { write_byte(byte); }
+        unsafe {
+            write_byte(byte);
+        }
     }
 }
 

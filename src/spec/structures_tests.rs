@@ -64,7 +64,7 @@ fn test_endpoint_cap_roundtrip() {
     //
     // Pick distinct values per field so a transposition would fail.
     let badge: u64 = 0x1122_3344_5566_7788;
-    let cap_type: u64 = 4;        // EndpointCap tag
+    let cap_type: u64 = 4; // EndpointCap tag
     let can_grant_reply: u64 = 1;
     let can_grant: u64 = 0;
     let can_receive: u64 = 1;
@@ -72,8 +72,15 @@ fn test_endpoint_cap_roundtrip() {
     // A small kernel-half-style address (sign bit clear → no extension).
     let ep_ptr: u64 = 0x0000_0000_DEAD_B000;
 
-    let cap = EndpointCap::new(badge, can_grant_reply, can_grant, can_send,
-                               can_receive, ep_ptr, cap_type);
+    let cap = EndpointCap::new(
+        badge,
+        can_grant_reply,
+        can_grant,
+        can_send,
+        can_receive,
+        ep_ptr,
+        cap_type,
+    );
     assert_eq!(cap.capEPBadge(), badge);
     assert_eq!(cap.capType(), cap_type);
     assert_eq!(cap.capCanGrantReply(), can_grant_reply);
@@ -103,8 +110,13 @@ fn test_cnode_cap_aligned_pointer() {
     // odd-aligned-by-2 pointer matches and a misaligned pointer is
     // rounded down on store.
     let aligned_ptr: u64 = 0x0000_0000_0010_2030; // bit 0 = 0
-    let cap = CnodeCap::new(/* radix */ 12, /* guard_size */ 0, /* guard */ 0,
-                            aligned_ptr, /* capType */ 10);
+    let cap = CnodeCap::new(
+        /* radix */ 12,
+        /* guard_size */ 0,
+        /* guard */ 0,
+        aligned_ptr,
+        /* capType */ 10,
+    );
     assert_eq!(cap.capCNodePtr(), aligned_ptr);
 
     // The stored bits in word 0 are the pointer >> 1, occupying

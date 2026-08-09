@@ -13,7 +13,7 @@
 //! the trait with a static table — no `unsafe` needed in this
 //! module's logic, only in callers that bridge from raw pointers.
 
-use crate::cap::{Cap, CNodeStorage, PPtr};
+use crate::cap::{CNodeStorage, Cap, PPtr};
 use crate::cte::Cte;
 use crate::types::seL4_Word as Word;
 
@@ -34,7 +34,11 @@ pub enum LookupFault {
     /// The CPtr's guard portion didn't match the CNode's recorded
     /// guard. The lookup fault carries the *expected* guard from
     /// the cap, not what the CPtr supplied.
-    GuardMismatch { bits_left: u32, guard_found: Word, guard_size: u32 },
+    GuardMismatch {
+        bits_left: u32,
+        guard_found: Word,
+        guard_size: u32,
+    },
 }
 
 /// Result of a successful (or partially-successful) address-bits
@@ -70,9 +74,12 @@ pub fn resolve_address_bits<C: CSpace>(
     n_bits: u32,
 ) -> Result<ResolveResult, LookupFault> {
     let (mut node_ptr, mut radix, mut guard_size, mut guard) = match *node_cap {
-        Cap::CNode { ptr, radix, guard_size, guard } => {
-            (ptr, radix as u32, guard_size as u32, guard)
-        }
+        Cap::CNode {
+            ptr,
+            radix,
+            guard_size,
+            guard,
+        } => (ptr, radix as u32, guard_size as u32, guard),
         _ => return Err(LookupFault::InvalidRoot),
     };
     let mut n_bits = n_bits;
@@ -123,9 +130,18 @@ pub fn resolve_address_bits<C: CSpace>(
         fn log_dec_cs(mut v: u64) {
             let mut b = [b'0'; 8];
             let mut i = 8;
-            if v == 0 { crate::arch::log("0"); return; }
-            while v > 0 && i > 0 { i -= 1; b[i] = b'0' + (v % 10) as u8; v /= 10; }
-            if let Ok(st) = core::str::from_utf8(&b[i..]) { crate::arch::log(st); }
+            if v == 0 {
+                crate::arch::log("0");
+                return;
+            }
+            while v > 0 && i > 0 {
+                i -= 1;
+                b[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+            if let Ok(st) = core::str::from_utf8(&b[i..]) {
+                crate::arch::log(st);
+            }
         }
         let slot_count = 1usize << radix;
         let slots = cspace
@@ -164,7 +180,12 @@ pub fn resolve_address_bits<C: CSpace>(
         // leftover bits are an error.
         n_bits -= level_bits;
         match slot.cap() {
-            Cap::CNode { ptr, radix: r, guard_size: gs, guard: g } => {
+            Cap::CNode {
+                ptr,
+                radix: r,
+                guard_size: gs,
+                guard: g,
+            } => {
                 node_ptr = ptr;
                 radix = r as u32;
                 guard_size = gs as u32;
@@ -193,11 +214,7 @@ pub fn resolve_address_bits<C: CSpace>(
 /// `cnode[0] → slot 0 (CNode) → cnode[1] → slot 0 (Null)` and expects
 /// `seL4_InvalidCapability` back from the dispatch on `Null`, not a
 /// fault.
-pub fn lookup_cap<C: CSpace>(
-    cspace: &C,
-    root: &Cap,
-    cptr: Word,
-) -> Result<Cap, LookupFault> {
+pub fn lookup_cap<C: CSpace>(cspace: &C, root: &Cap, cptr: Word) -> Result<Cap, LookupFault> {
     let res = resolve_address_bits(cspace, root, cptr, WORD_BITS)?;
     let slots = cspace
         .cnode_at(res.slot_ptr, res.slot_count)
@@ -225,7 +242,7 @@ pub mod spec {
 
     use super::*;
     use crate::arch;
-    use crate::cap::{Cap, CNodeStorage, EndpointObj, EndpointRights, PPtr, Badge};
+    use crate::cap::{Badge, CNodeStorage, Cap, EndpointObj, EndpointRights, PPtr};
     use crate::cte::Cte;
 
     /// Test backing-store: a fixed pair of CNodes, addressed by the
@@ -282,7 +299,9 @@ pub mod spec {
         let target = ep_cap(0xFFFF_8000_DEAD_B000, 0x1234);
         slots[5] = Cte::with_cap(&target);
 
-        let cspace = TestCSpace { nodes: &[(cnode_ptr, &slots)] };
+        let cspace = TestCSpace {
+            nodes: &[(cnode_ptr, &slots)],
+        };
         let root = Cap::CNode {
             ptr: cnode_ptr,
             radix: RADIX,
@@ -302,7 +321,9 @@ pub mod spec {
         // different guard — must fault.
         let cnode_ptr = PPtr::<CNodeStorage>::new(0xC0DE_0000).unwrap();
         let slots = [Cte::null(); 16];
-        let cspace = TestCSpace { nodes: &[(cnode_ptr, &slots)] };
+        let cspace = TestCSpace {
+            nodes: &[(cnode_ptr, &slots)],
+        };
         let root = Cap::CNode {
             ptr: cnode_ptr,
             radix: 4,
@@ -313,7 +334,11 @@ pub mod spec {
         // Top 4 bits = 0x5 → mismatch.
         let cptr: Word = 0x5 << 60;
         match resolve_address_bits(&cspace, &root, cptr, 8) {
-            Err(LookupFault::GuardMismatch { guard_size: 4, guard_found: 0xA, .. }) => {}
+            Err(LookupFault::GuardMismatch {
+                guard_size: 4,
+                guard_found: 0xA,
+                ..
+            }) => {}
             other => panic!("expected GuardMismatch, got {:?}", other),
         }
         arch::log("  ✓ guard mismatch surfaces as LookupFault::GuardMismatch\n");
@@ -323,7 +348,9 @@ pub mod spec {
         // levelBits = radix(4) + guard_size(4) = 8, but n_bits = 4.
         let cnode_ptr = PPtr::<CNodeStorage>::new(0xDEAD_0000).unwrap();
         let slots = [Cte::null(); 16];
-        let cspace = TestCSpace { nodes: &[(cnode_ptr, &slots)] };
+        let cspace = TestCSpace {
+            nodes: &[(cnode_ptr, &slots)],
+        };
         let root = Cap::CNode {
             ptr: cnode_ptr,
             radix: 4,
@@ -331,7 +358,10 @@ pub mod spec {
             guard: 0,
         };
         match resolve_address_bits(&cspace, &root, 0, 4) {
-            Err(LookupFault::DepthMismatch { bits_left: 4, bits_found: 8 }) => {}
+            Err(LookupFault::DepthMismatch {
+                bits_left: 4,
+                bits_found: 8,
+            }) => {}
             other => panic!("expected DepthMismatch, got {:?}", other),
         }
         arch::log("  ✓ depth mismatch surfaces as LookupFault::DepthMismatch\n");
@@ -398,7 +428,9 @@ pub mod spec {
         let mut root_slots = [Cte::null(); 16];
         root_slots[2] = Cte::with_cap(&target);
 
-        let cspace = TestCSpace { nodes: &[(root_ptr, &root_slots)] };
+        let cspace = TestCSpace {
+            nodes: &[(root_ptr, &root_slots)],
+        };
         let root = Cap::CNode {
             ptr: root_ptr,
             radix: 4,

@@ -27,13 +27,19 @@ pub const SEL4_NUM_HW_BREAKPOINTS: usize = 4;
 // ---- DR7 field encodings (debug.h / breakpoint.c) -----------------------
 // Local-enable bits are the ODD bits 1,3,5,7 (L0..L3).
 #[inline]
-fn enable_bit(bp: usize) -> u64 { 1u64 << (2 * bp + 1) }
+fn enable_bit(bp: usize) -> u64 {
+    1u64 << (2 * bp + 1)
+}
 const ALL_ENABLE_BITS: u64 = 0xAA; // BIT(1)|BIT(3)|BIT(5)|BIT(7)
-// Per-bp 2-bit R/W field at 16,20,24,28 and 2-bit LEN field at 18,22,26,30.
+                                   // Per-bp 2-bit R/W field at 16,20,24,28 and 2-bit LEN field at 18,22,26,30.
 #[inline]
-fn type_shift(bp: usize) -> u64 { 16 + 4 * bp as u64 }
+fn type_shift(bp: usize) -> u64 {
+    16 + 4 * bp as u64
+}
 #[inline]
-fn len_shift(bp: usize) -> u64 { 18 + 4 * bp as u64 }
+fn len_shift(bp: usize) -> u64 {
+    18 + 4 * bp as u64
+}
 
 // DR7 R/W (type) values.
 const X86_BP_TYPE_INSTR: u64 = 0;
@@ -68,7 +74,9 @@ pub struct DebugState {
 }
 
 impl Default for DebugState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DebugState {
@@ -82,10 +90,16 @@ impl DebugState {
     }
 
     #[inline]
-    pub fn any_breakpoint_used(&self) -> bool { self.used_breakpoints_bf != 0 }
+    pub fn any_breakpoint_used(&self) -> bool {
+        self.used_breakpoints_bf != 0
+    }
 
-    fn set_used(&mut self, bp: usize) { self.used_breakpoints_bf |= 1 << bp; }
-    fn clear_used(&mut self, bp: usize) { self.used_breakpoints_bf &= !(1u32 << bp); }
+    fn set_used(&mut self, bp: usize) {
+        self.used_breakpoints_bf |= 1 << bp;
+    }
+    fn clear_used(&mut self, bp: usize) {
+        self.used_breakpoints_bf &= !(1u32 << bp);
+    }
 }
 
 // seL4_BreakpointType/Access -> DR7 R/W field.

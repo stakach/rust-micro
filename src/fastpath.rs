@@ -272,7 +272,9 @@ pub mod spec {
         sched.slab.get_mut(sender).msg_regs[0] = 0x99;
         sched.slab.get_mut(sender).ipc_badge = 0xFE;
         crate::endpoint::send_ipc(
-            &mut ep, &mut sched, sender,
+            &mut ep,
+            &mut sched,
+            sender,
             crate::endpoint::SendOptions::blocking(0xFE),
         );
         assert_eq!(ep.state, EpState::Send);

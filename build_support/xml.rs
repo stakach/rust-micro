@@ -109,7 +109,10 @@ pub fn iter_methods(xml: &str) -> impl Iterator<Item = (String, String)> + '_ {
             }
             end += 1;
         };
-        let attrs = xml[after_open..close].trim().trim_end_matches('/').to_string();
+        let attrs = xml[after_open..close]
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
         let self_closing = bytes[close - 1] == b'/';
         idx = close + 1;
         let body = if self_closing {
@@ -149,7 +152,7 @@ fn extract_condition(body: &str) -> Option<&str> {
 
 #[derive(Debug)]
 enum CondTok<'a> {
-    Open(&'a str, &'a str),  // tag name, attrs (without `<`/`>`)
+    Open(&'a str, &'a str), // tag name, attrs (without `<`/`>`)
     Close(&'a str),
     SelfClose(&'a str, &'a str),
 }
@@ -353,8 +356,8 @@ fn parse_syscall_configs(xml: &str) -> Result<Vec<(String, Option<String>)>, Str
         let block = &xml[s..e];
         let condition = extract_condition_inline(block);
         for cap in find_self_closing(block, "syscall") {
-            let name = attr(cap, "name")
-                .ok_or_else(|| format!("syscall: missing name in {cap}"))?;
+            let name =
+                attr(cap, "name").ok_or_else(|| format!("syscall: missing name in {cap}"))?;
             out.push((name.to_string(), condition.clone()));
         }
         i = e + "</config>".len();
@@ -401,7 +404,10 @@ pub struct InvocLabel {
     pub included: bool,
 }
 
-pub fn parse_methods(xml: &str, cfg: &HashMap<&'static str, bool>) -> Result<Vec<InvocLabel>, String> {
+pub fn parse_methods(
+    xml: &str,
+    cfg: &HashMap<&'static str, bool>,
+) -> Result<Vec<InvocLabel>, String> {
     let mut out = Vec::new();
     for (attrs, body) in iter_methods(xml) {
         let id = attr(&attrs, "id")
@@ -526,11 +532,7 @@ mod tests {
             &cfg
         )
         .unwrap());
-        assert!(eval_cond(
-            "<or><config var=\"B\"/><config var=\"A\"/></or>",
-            &cfg
-        )
-        .unwrap());
+        assert!(eval_cond("<or><config var=\"B\"/><config var=\"A\"/></or>", &cfg).unwrap());
     }
 
     #[test]

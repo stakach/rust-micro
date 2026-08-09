@@ -35,7 +35,14 @@ pub struct SyscallArgs {
 
 impl SyscallArgs {
     pub const fn new(a0: Word) -> Self {
-        Self { a0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0 }
+        Self {
+            a0,
+            a1: 0,
+            a2: 0,
+            a3: 0,
+            a4: 0,
+            a5: 0,
+        }
     }
 }
 
@@ -52,29 +59,29 @@ pub trait DebugSink {
 /// `crate::cap::tag` — keep in sync.
 #[cfg(target_arch = "x86_64")]
 fn debug_cap_type_tag(cap: &crate::cap::Cap) -> u64 {
-    use crate::cap::{Cap, tag};
+    use crate::cap::{tag, Cap};
     match cap {
-        Cap::Null              => tag::NULL,
-        Cap::Untyped { .. }    => tag::UNTYPED,
-        Cap::Endpoint { .. }   => tag::ENDPOINT,
+        Cap::Null => tag::NULL,
+        Cap::Untyped { .. } => tag::UNTYPED,
+        Cap::Endpoint { .. } => tag::ENDPOINT,
         Cap::Notification { .. } => tag::NOTIFICATION,
-        Cap::Reply { .. }      => tag::REPLY,
-        Cap::CNode { .. }      => tag::CNODE,
-        Cap::Thread { .. }     => tag::THREAD,
-        Cap::IrqControl        => tag::IRQ_CONTROL,
+        Cap::Reply { .. } => tag::REPLY,
+        Cap::CNode { .. } => tag::CNODE,
+        Cap::Thread { .. } => tag::THREAD,
+        Cap::IrqControl => tag::IRQ_CONTROL,
         Cap::IrqHandler { .. } => tag::IRQ_HANDLER,
-        Cap::Domain            => tag::DOMAIN,
+        Cap::Domain => tag::DOMAIN,
         Cap::SchedContext { .. } => tag::SCHED_CONTEXT,
         Cap::SchedControl { .. } => tag::SCHED_CONTROL,
-        Cap::Frame { .. }      => tag::FRAME,
-        Cap::PageTable { .. }  => tag::PAGE_TABLE,
+        Cap::Frame { .. } => tag::FRAME,
+        Cap::PageTable { .. } => tag::PAGE_TABLE,
         Cap::PageDirectory { .. } => tag::PAGE_DIRECTORY,
-        Cap::Pdpt { .. }       => tag::PDPT,
-        Cap::PML4 { .. }       => tag::PML4,
-        Cap::AsidControl       => tag::ASID_CONTROL,
-        Cap::AsidPool { .. }   => tag::ASID_POOL,
-        Cap::IOPort { .. }     => tag::IO_PORT,
-        Cap::IOPortControl     => tag::IO_PORT_CONTROL,
+        Cap::Pdpt { .. } => tag::PDPT,
+        Cap::PML4 { .. } => tag::PML4,
+        Cap::AsidControl => tag::ASID_CONTROL,
+        Cap::AsidPool { .. } => tag::ASID_POOL,
+        Cap::IOPort { .. } => tag::IO_PORT,
+        Cap::IOPortControl => tag::IO_PORT_CONTROL,
         // Catch-all for variants we don't model individually
         // (Zombie, generic Arch). Returning a non-zero non-NULL
         // value preserves the legacy "any cap = non-null" contract.
@@ -92,9 +99,15 @@ pub fn handle_syscall(
     sink: &mut dyn DebugSink,
 ) -> KResult<()> {
     match syscall {
-        Syscall::SysSend => handle_send(args, /* blocking */ true, /* call */ false, /* donate */ false),
-        Syscall::SysNBSend => handle_send(args, /* blocking */ false, /* call */ false, /* donate */ false),
-        Syscall::SysCall => handle_send(args, /* blocking */ true, /* call */ true, /* donate */ true),
+        Syscall::SysSend => handle_send(
+            args, /* blocking */ true, /* call */ false, /* donate */ false,
+        ),
+        Syscall::SysNBSend => handle_send(
+            args, /* blocking */ false, /* call */ false, /* donate */ false,
+        ),
+        Syscall::SysCall => handle_send(
+            args, /* blocking */ true, /* call */ true, /* donate */ true,
+        ),
         Syscall::SysRecv => handle_recv(args, /* blocking */ true),
         Syscall::SysNBRecv => handle_recv(args, /* blocking */ false),
         // Phase 36b — under MCS there's no standalone Reply syscall;
@@ -112,9 +125,7 @@ pub fn handle_syscall(
             // handle_recv sees the right TCB. The actual reschedule
             // happens at the dispatcher tail once handle_recv is done.
             #[cfg(target_arch = "x86_64")]
-            let saved_current = unsafe {
-                crate::kernel::KERNEL.get().scheduler.current()
-            };
+            let saved_current = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
             handle_reply(args)?;
             #[cfg(target_arch = "x86_64")]
             unsafe {
@@ -147,17 +158,13 @@ pub fn handle_syscall(
         // non-blocking-send-then-blocking-recv — if the send has no
         // queued receiver it just drops, and the Recv proceeds.
         Syscall::SysNBSendRecv => {
-            let invoker = unsafe {
-                crate::kernel::KERNEL.get().scheduler.current()
-            };
+            let invoker = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
             let dest_cptr = {
                 let s = unsafe { crate::kernel::KERNEL.get() };
                 let cur = invoker.ok_or_else(|| {
-                    crate::error::KException::SyscallError(
-                        crate::error::SyscallError::new(
-                            crate::types::seL4_Error::seL4_InvalidCapability,
-                        ),
-                    )
+                    crate::error::KException::SyscallError(crate::error::SyscallError::new(
+                        crate::types::seL4_Error::seL4_InvalidCapability,
+                    ))
                 })?;
                 s.scheduler.slab.get(cur).user_context.r13
             };
@@ -172,8 +179,10 @@ pub fn handle_syscall(
             // NB-send: blocking=false, call=false. Errors are
             // intentionally swallowed — send drops if no receiver,
             // exactly what NBSend should do.
-            let _ = handle_send(&send_args, /* blocking */ false,
-                /* call */ false, /* donate */ true);
+            let _ = handle_send(
+                &send_args, /* blocking */ false, /* call */ false,
+                /* donate */ true,
+            );
             // The NB-send may have woken a higher-priority receiver,
             // which `possibleSwitchTo` signals by clearing `current`.
             // The Recv half still needs `current` to identify the
@@ -194,17 +203,13 @@ pub fn handle_syscall(
         // treat it the same since handle_recv falls back to
         // notification handling when the target is a Notification cap.
         Syscall::SysNBSendWait => {
-            let invoker = unsafe {
-                crate::kernel::KERNEL.get().scheduler.current()
-            };
+            let invoker = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
             let dest_cptr = {
                 let s = unsafe { crate::kernel::KERNEL.get() };
                 let cur = invoker.ok_or_else(|| {
-                    crate::error::KException::SyscallError(
-                        crate::error::SyscallError::new(
-                            crate::types::seL4_Error::seL4_InvalidCapability,
-                        ),
-                    )
+                    crate::error::KException::SyscallError(crate::error::SyscallError::new(
+                        crate::types::seL4_Error::seL4_InvalidCapability,
+                    ))
                 })?;
                 // NBSendWait's libsel4 stub puts the send destination in
                 // the REPLY register (r12), NOT the NBSendRecv dest
@@ -250,8 +255,7 @@ pub fn handle_syscall(
             // the new head. Re-enqueueing without dequeuing first
             // double-adds `cur` and corrupts the intrusive list.
             #[cfg(target_arch = "x86_64")]
-            if crate::rootserver::ROOTSERVER_DEMO_ACTIVE
-                .load(core::sync::atomic::Ordering::Relaxed)
+            if crate::rootserver::ROOTSERVER_DEMO_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
             {
                 // MCS yield: charge the full remaining budget
                 // (upstream handleYield). Falls back to a plain
@@ -299,11 +303,8 @@ pub fn handle_syscall(
             unsafe {
                 use crate::kernel::KERNEL;
                 if let Some(cur) = KERNEL.get().scheduler.current() {
-                    let cspace_root = KERNEL.get().scheduler.slab
-                        .get(cur).cspace_root;
-                    let tag = match crate::cspace::lookup_cap(
-                        KERNEL.get(), &cspace_root, args.a0)
-                    {
+                    let cspace_root = KERNEL.get().scheduler.slab.get(cur).cspace_root;
+                    let tag = match crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a0) {
                         Ok(cap) => debug_cap_type_tag(&cap),
                         Err(_) => 0,
                     };
@@ -313,9 +314,7 @@ pub fn handle_syscall(
             }
             Ok(())
         }
-        Syscall::SysDebugSnapshot
-        | Syscall::SysDebugNameThread
-        | Syscall::SysDebugSendIPI => {
+        Syscall::SysDebugSnapshot | Syscall::SysDebugNameThread | Syscall::SysDebugSendIPI => {
             // Best-effort no-ops. Names would print to serial; we
             // skip for now.
             Ok(())
@@ -389,9 +388,7 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
         let current = s.scheduler.current().ok_or_else(|| {
-            KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability,
-            ))
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
         })?;
         let caller = match s.scheduler.slab.get(current).reply_to {
             Some(c) => c,
@@ -423,8 +420,9 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             if length > 4 && me.ipc_buffer_paddr != 0 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    let buf = (crate::arch::x86_64::paging::phys_to_lin(
-                        me.ipc_buffer_paddr) as *const u64).wrapping_add(1);
+                    let buf = (crate::arch::x86_64::paging::phys_to_lin(me.ipc_buffer_paddr)
+                        as *const u64)
+                        .wrapping_add(1);
                     let max = (length as usize).min(me.msg_regs.len());
                     for i in 4..max {
                         me.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -440,8 +438,7 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
                 let me = s.scheduler.slab.get(current);
                 (me.ipc_label, me.msg_regs)
             };
-            let restart = crate::fault::apply_fault_reply(
-                s, caller, label, length as usize, &regs);
+            let restart = crate::fault::apply_fault_reply(s, caller, label, length as usize, &regs);
             s.scheduler.slab.get_mut(current).active_sc = None;
             // IPC0021 — a page fault donates the FAULTER's SC to a
             // passive fault handler (deliver_fault is a Call). On the
@@ -451,8 +448,8 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             if restart {
                 s.scheduler.make_runnable(caller);
             } else {
-                s.scheduler.block(
-                    caller, crate::tcb::ThreadStateType::Inactive);
+                s.scheduler
+                    .block(caller, crate::tcb::ThreadStateType::Inactive);
             }
             return Ok(());
         }
@@ -489,9 +486,7 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
 ///
 /// Looks up the cap in the current thread's CSpace, requires it to
 /// be a `Cap::Endpoint`, then drives `endpoint::send_ipc`.
-fn handle_send(
-    args: &SyscallArgs, blocking: bool, call: bool, can_donate: bool,
-) -> KResult<()> {
+fn handle_send(args: &SyscallArgs, blocking: bool, call: bool, can_donate: bool) -> KResult<()> {
     use crate::cap::Cap;
     use crate::cspace::lookup_cap;
     use crate::endpoint::{send_ipc, SendOptions};
@@ -500,9 +495,7 @@ fn handle_send(
     unsafe {
         let s = KERNEL.get();
         let current = s.scheduler.current().ok_or_else(|| {
-            KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability,
-            ))
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
         })?;
         let cspace_root = s.scheduler.slab.get(current).cspace_root;
 
@@ -567,8 +560,8 @@ fn handle_send(
             // msg[] starts at offset 1).
             if length > 4 && snd.ipc_buffer_paddr != 0 {
                 let buf_paddr = snd.ipc_buffer_paddr;
-                let buf = (crate::arch::x86_64::paging::phys_to_lin(buf_paddr)
-                    as *const u64).wrapping_add(1);
+                let buf = (crate::arch::x86_64::paging::phys_to_lin(buf_paddr) as *const u64)
+                    .wrapping_add(1);
                 let max = (length as usize).min(snd.msg_regs.len());
                 for i in 4..max {
                     snd.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -584,15 +577,14 @@ fn handle_send(
                 (snd.ipc_buffer_paddr, snd.cspace_root)
             };
             if buf_paddr != 0 {
-                let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr)
-                    as *const u64;
-                let mut staged: [crate::cap::Cap; 3] =
-                    [crate::cap::Cap::Null; 3];
+                let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr) as *const u64;
+                let mut staged: [crate::cap::Cap; 3] = [crate::cap::Cap::Null; 3];
                 let mut count = 0u8;
                 let n = n_caps.min(staged.len());
                 for i in 0..n {
                     let cptr = core::ptr::read_volatile(
-                        buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET + i));
+                        buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET + i),
+                    );
                     if let Ok(c) = crate::cspace::lookup_cap(s, &snd_cspace, cptr) {
                         staged[i] = c;
                         count += 1;
@@ -666,23 +658,22 @@ fn handle_send(
                     let mi = (label << 12) | length;
                     inv_tcb.user_context.rsi = mi;
                     inv_tcb.user_context.rdi = 0; // no badge on reply
-                    // Fan msg_regs into the IPC return registers so
-                    // invocation results (e.g. RDMSR) reach userspace.
+                                                  // Fan msg_regs into the IPC return registers so
+                                                  // invocation results (e.g. RDMSR) reach userspace.
                     inv_tcb.user_context.r10 = inv_tcb.msg_regs[0];
-                    inv_tcb.user_context.r8  = inv_tcb.msg_regs[1];
-                    inv_tcb.user_context.r9  = inv_tcb.msg_regs[2];
+                    inv_tcb.user_context.r8 = inv_tcb.msg_regs[1];
+                    inv_tcb.user_context.r9 = inv_tcb.msg_regs[2];
                     inv_tcb.user_context.r15 = inv_tcb.msg_regs[3];
                     // libsel4's seL4_GetMR(i) reads from the IPC
                     // buffer (not registers), so also stage there.
                     // Buffer layout: word 0 = tag, words 1..N = msg.
                     let ipc_paddr = inv_tcb.ipc_buffer_paddr;
                     if ipc_paddr != 0 {
-                        let buf = (crate::arch::x86_64::paging::phys_to_lin(
-                            ipc_paddr) as *mut u64).wrapping_add(1);
+                        let buf = (crate::arch::x86_64::paging::phys_to_lin(ipc_paddr) as *mut u64)
+                            .wrapping_add(1);
                         let n = (length as usize).min(inv_tcb.msg_regs.len());
                         for i in 0..n {
-                            core::ptr::write_volatile(
-                                buf.add(i), inv_tcb.msg_regs[i]);
+                            core::ptr::write_volatile(buf.add(i), inv_tcb.msg_regs[i]);
                         }
                     }
                 }
@@ -724,9 +715,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
         let current = s.scheduler.current().ok_or_else(|| {
-            KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidCapability,
-            ))
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
         })?;
         // Fresh Recv: clear the count of caps transferred into our
         // receive slots so it reflects only THIS receive (a sender's
@@ -744,13 +733,9 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         {
             let reply_cptr = s.scheduler.slab.get(current).user_context.r12;
             if reply_cptr != 0 {
-                if let Ok(Cap::Reply { ptr, .. }) =
-                    lookup_cap(s, &cspace_root, reply_cptr)
-                {
-                    let reply_idx =
-                        crate::kernel::KernelState::reply_index(ptr) as u16;
-                    s.scheduler.slab.get_mut(current).pending_reply =
-                        Some(reply_idx);
+                if let Ok(Cap::Reply { ptr, .. }) = lookup_cap(s, &cspace_root, reply_cptr) {
+                    let reply_idx = crate::kernel::KernelState::reply_index(ptr) as u16;
+                    s.scheduler.slab.get_mut(current).pending_reply = Some(reply_idx);
                 }
             }
         }
@@ -792,10 +777,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 let s_ptr: *mut crate::kernel::KernelState = s;
                 let ntfn = &mut (*s_ptr).notifications[idx];
                 let sched = &mut (*s_ptr).scheduler;
-                if !blocking
-                    && !matches!(ntfn.state,
-                        crate::notification::NtfnState::Active)
-                {
+                if !blocking && !matches!(ntfn.state, crate::notification::NtfnState::Active) {
                     // NBWait on Idle notification — return 0 badge.
                     let tcb = sched.slab.get_mut(current);
                     tcb.ipc_badge = 0;
@@ -909,7 +891,12 @@ pub mod spec {
         len: usize,
     }
     impl BufferSink {
-        fn new() -> Self { Self { buf: [0; 64], len: 0 } }
+        fn new() -> Self {
+            Self {
+                buf: [0; 64],
+                len: 0,
+            }
+        }
         fn as_str(&self) -> &str {
             core::str::from_utf8(&self.buf[..self.len]).unwrap_or("<non-utf8>")
         }
@@ -1041,9 +1028,9 @@ pub mod spec {
         // Issue SysSend on cap_ptr=1.
         let mut sink = BufferSink::new();
         let args = SyscallArgs {
-            a0: 1,            // CPtr to slot 1
-            a1: 0,            // empty MessageInfo
-            a2: 0xAA,         // first message reg
+            a0: 1,    // CPtr to slot 1
+            a1: 0,    // empty MessageInfo
+            a2: 0xAA, // first message reg
             ..Default::default()
         };
         let r = handle_syscall(Syscall::SysSend, &args, &mut sink);
@@ -1052,17 +1039,14 @@ pub mod spec {
         assert!(r.is_ok(), "SysSend should not fault");
         unsafe {
             let s = KERNEL.get();
-            assert_eq!(s.scheduler.slab.get(boot_tcb).state,
-                ThreadStateType::BlockedOnSend);
+            assert_eq!(
+                s.scheduler.slab.get(boot_tcb).state,
+                ThreadStateType::BlockedOnSend
+            );
             assert_eq!(s.endpoints[0].state, crate::endpoint::EpState::Send);
             // Restore the boot thread for downstream specs.
-            crate::endpoint::cancel_ipc(
-                &mut s.endpoints[0],
-                &mut s.scheduler,
-                boot_tcb,
-            );
-            s.scheduler.slab.get_mut(boot_tcb).state =
-                ThreadStateType::Running;
+            crate::endpoint::cancel_ipc(&mut s.endpoints[0], &mut s.scheduler, boot_tcb);
+            s.scheduler.slab.get_mut(boot_tcb).state = ThreadStateType::Running;
             s.scheduler.set_current(Some(boot_tcb));
             s.scheduler.slab.get_mut(boot_tcb).cspace_root = Cap::Null;
         }
@@ -1095,8 +1079,10 @@ pub mod spec {
                 ptr: ep_ptr,
                 badge: Badge(0xC0DE),
                 rights: EndpointRights {
-                    can_send: true, can_receive: true,
-                    can_grant: false, can_grant_reply: true,
+                    can_send: true,
+                    can_receive: true,
+                    can_grant: false,
+                    can_grant_reply: true,
                 },
             };
             s.cnodes[cn].0[1] = Cte::with_cap(&ep_cap);
@@ -1122,30 +1108,51 @@ pub mod spec {
         let mut sink = BufferSink::new();
 
         // Server arrives first → blocks on Recv.
-        unsafe { KERNEL.get().scheduler.set_current(Some(server)); }
-        let r = handle_syscall(Syscall::SysRecv,
-            &SyscallArgs { a0: 1, ..Default::default() }, &mut sink);
+        unsafe {
+            KERNEL.get().scheduler.set_current(Some(server));
+        }
+        let r = handle_syscall(
+            Syscall::SysRecv,
+            &SyscallArgs {
+                a0: 1,
+                ..Default::default()
+            },
+            &mut sink,
+        );
         assert!(r.is_ok());
         unsafe {
             let s = KERNEL.get();
-            assert_eq!(s.scheduler.slab.get(server).state,
-                ThreadStateType::BlockedOnReceive);
+            assert_eq!(
+                s.scheduler.slab.get(server).state,
+                ThreadStateType::BlockedOnReceive
+            );
             assert_eq!(s.endpoints[ep_idx].state, EpState::Recv);
         }
 
         // Caller does SysCall (a Send + auto-block-on-Reply).
         // Sender stages 'X' as msg_regs[0], length=1.
-        unsafe { KERNEL.get().scheduler.set_current(Some(caller)); }
-        let r = handle_syscall(Syscall::SysCall,
-            &SyscallArgs { a0: 1, a1: 1, a2: b'X' as Word, ..Default::default() },
-            &mut sink);
+        unsafe {
+            KERNEL.get().scheduler.set_current(Some(caller));
+        }
+        let r = handle_syscall(
+            Syscall::SysCall,
+            &SyscallArgs {
+                a0: 1,
+                a1: 1,
+                a2: b'X' as Word,
+                ..Default::default()
+            },
+            &mut sink,
+        );
         assert!(r.is_ok());
         unsafe {
             let s = KERNEL.get();
             // Caller is parked on Reply; server is runnable with
             // the message + caller in its reply_to slot.
-            assert_eq!(s.scheduler.slab.get(caller).state,
-                ThreadStateType::BlockedOnReply);
+            assert_eq!(
+                s.scheduler.slab.get(caller).state,
+                ThreadStateType::BlockedOnReply
+            );
             assert_eq!(s.scheduler.slab.get(server).reply_to, Some(caller));
             assert_eq!(s.scheduler.slab.get(server).msg_regs[0], b'X' as Word);
         }
@@ -1154,17 +1161,21 @@ pub mod spec {
         // longer a userspace syscall under MCS; the kernel-side
         // `handle_reply` is still the function that performs the
         // transfer, callable directly.
-        unsafe { KERNEL.get().scheduler.set_current(Some(server)); }
-        let r = handle_reply(
-            &SyscallArgs { a1: 1, a2: b'Y' as Word, ..Default::default() });
+        unsafe {
+            KERNEL.get().scheduler.set_current(Some(server));
+        }
+        let r = handle_reply(&SyscallArgs {
+            a1: 1,
+            a2: b'Y' as Word,
+            ..Default::default()
+        });
         let _ = &mut sink; // keep `sink` borrow check happy across the move
         assert!(r.is_ok());
         unsafe {
             let s = KERNEL.get();
             // Caller is back to Running with reply payload in its
             // msg_regs.
-            assert_eq!(s.scheduler.slab.get(caller).state,
-                ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], b'Y' as Word);
             // Server's reply_to slot consumed.
             assert_eq!(s.scheduler.slab.get(server).reply_to, None);

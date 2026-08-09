@@ -48,7 +48,10 @@ pub unsafe fn ensure_ioapic_paddr_discovered(madt_addr: u64) {
     }
     if let Ok(madt) = super::acpi::find_madt(madt_addr) {
         super::acpi::iter_madt_entries(madt, |e| {
-            if let super::acpi::MadtEntry::IoApic { address, gsi_base, .. } = e {
+            if let super::acpi::MadtEntry::IoApic {
+                address, gsi_base, ..
+            } = e
+            {
                 if IOAPIC_PADDR == 0 {
                     IOAPIC_PADDR = address as u64;
                     IOAPIC_GSI_BASE = gsi_base;
