@@ -159,7 +159,16 @@ pub fn untyped_retype(
 ) -> u64 {
     let msg_info = LBL_UNTYPED_RETYPE << 12;
     let size_num = ((user_size_bits as u64) << 32) | (num_objects as u64);
-    unsafe { syscall5(SYS_SEND, untyped_cap_ptr, msg_info, obj_type, size_num, dest_offset) }
+    unsafe {
+        syscall5(
+            SYS_SEND,
+            untyped_cap_ptr,
+            msg_info,
+            obj_type,
+            size_num,
+            dest_offset,
+        )
+    }
 }
 
 /// `TCB::SetSpace(target, fault_ep, cnode_cptr, vspace_cptr)`.
@@ -211,9 +220,23 @@ pub fn tcb_set_gs_base(target: u64, base: u64) -> u64 {
 
 /// `SchedControl::ConfigureFlags(target_sc, budget, period)`.
 #[inline(always)]
-pub fn sched_control_configure(sched_control: u64, target_sc_cptr: u64, budget: u64, period: u64) -> u64 {
+pub fn sched_control_configure(
+    sched_control: u64,
+    target_sc_cptr: u64,
+    budget: u64,
+    period: u64,
+) -> u64 {
     let msg_info = LBL_SCHED_CONTROL_CONFIGURE << 12;
-    unsafe { syscall5(SYS_SEND, sched_control, msg_info, target_sc_cptr, budget, period) }
+    unsafe {
+        syscall5(
+            SYS_SEND,
+            sched_control,
+            msg_info,
+            target_sc_cptr,
+            budget,
+            period,
+        )
+    }
 }
 
 /// `SchedContext::Bind(target_sc, tcb_cap)`.
@@ -393,7 +416,11 @@ pub fn print_hex(n: u64) {
     while x > 0 {
         i -= 1;
         let nyb = (x & 0xF) as u8;
-        buf[i] = if nyb < 10 { b'0' + nyb } else { b'a' + nyb - 10 };
+        buf[i] = if nyb < 10 {
+            b'0' + nyb
+        } else {
+            b'a' + nyb - 10
+        };
         x >>= 4;
     }
     print_str(&buf[i..]);
