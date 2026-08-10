@@ -40,8 +40,13 @@ pub const MAX_SCHED_CONTEXTS: usize = 384;
 #[cfg(feature = "extern-rootserver")]
 pub const MAX_SCHED_CONTEXTS: usize = 1024;
 
-/// Maximum Reply objects in the in-kernel pool (Phase 34e).
+/// Maximum Reply objects in the in-kernel pool (Phase 34e). The extern NT rootserver parks many
+/// simultaneous user threads on MCS replies while also reserving dedicated replies for component
+/// channels, so it needs the same larger profile treatment as sched contexts.
+#[cfg(not(feature = "extern-rootserver"))]
 pub const MAX_REPLIES: usize = 384;
+#[cfg(feature = "extern-rootserver")]
+pub const MAX_REPLIES: usize = 1024;
 
 /// CTEs per pre-allocated CNode in the in-kernel pool.
 ///
