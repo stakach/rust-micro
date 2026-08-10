@@ -4789,6 +4789,54 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
 // TCB invocations.
 // ---------------------------------------------------------------------------
 
+const TCB_DEBUG_STATE_WORDS: usize = 16;
+const TCB_DEBUG_NONE: Word = Word::MAX;
+
+#[inline]
+fn debug_opt_tcb(v: Option<TcbId>) -> Word {
+    v.map(|id| id.0 as Word).unwrap_or(TCB_DEBUG_NONE)
+}
+
+#[inline]
+fn debug_opt_u16(v: Option<u16>) -> Word {
+    v.map(|id| id as Word).unwrap_or(TCB_DEBUG_NONE)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_invocation_words(invoker_tcb: &mut crate::tcb::Tcb, ipc_paddr: Word, words: &[Word]) {
+    let in_regs = words.len().min(invoker_tcb.msg_regs.len());
+    for (i, word) in words.iter().copied().enumerate().take(in_regs) {
+        invoker_tcb.msg_regs[i] = word;
+    }
+    invoker_tcb.ipc_length = words.len() as u32;
+    if words.len() > invoker_tcb.msg_regs.len() && ipc_paddr != 0 {
+        let buf = (crate::arch::x86_64::paging::phys_to_lin(ipc_paddr) as *mut u64).wrapping_add(1);
+        for (i, word) in words
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(invoker_tcb.msg_regs.len())
+        {
+            unsafe {
+                core::ptr::write_volatile(buf.add(i), word);
+            }
+        }
+    }
+    if !words.is_empty() {
+        invoker_tcb.user_context.r10 = words[0];
+    }
+    if words.len() > 1 {
+        invoker_tcb.user_context.r8 = words[1];
+    }
+    if words.len() > 2 {
+        invoker_tcb.user_context.r9 = words[2];
+    }
+    if words.len() > 3 {
+        invoker_tcb.user_context.r15 = words[3];
+    }
+    invoker_tcb.user_context.rsi = (words.len() as u64) & 0x7F;
+}
+
 fn decode_tcb(
     target: Cap,
     label: InvocationLabel,
@@ -4853,6 +4901,54 @@ fn decode_tcb(
             // plumbing. The flag is write-once (never cleared).
             InvocationLabel::TCBSetHostedSyscalls => {
                 s.scheduler.slab.get_mut(id).hosted_syscalls = true;
+                Ok(())
+            }
+            InvocationLabel::TCBReadDebugState => {
+                let reply_bound = if args.a2 != 0 {
+                    let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    match lookup_cap(s, &inv_cspace, args.a2)? {
+                        Cap::Reply { ptr, .. } => {
+                            let reply_idx = KernelState::reply_index(ptr);
+                            s.replies
+                                .get(reply_idx)
+                                .and_then(|reply| reply.bound_tcb)
+                                .map(|t| t.0 as Word)
+                                .unwrap_or(TCB_DEBUG_NONE)
+                        }
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
+                    }
+                } else {
+                    TCB_DEBUG_NONE
+                };
+                let t = s.scheduler.slab.get(id);
+                let words: [Word; TCB_DEBUG_STATE_WORDS] = [
+                    t.state as Word,
+                    t.is_schedulable() as Word,
+                    t.enqueued as Word,
+                    t.priority as Word,
+                    debug_opt_u16(t.sc),
+                    debug_opt_u16(t.active_sc),
+                    debug_opt_u16(t.pending_reply),
+                    debug_opt_tcb(t.reply_to),
+                    debug_opt_u16(t.bound_notification),
+                    t.blocked_is_call as Word,
+                    t.blocked_can_grant as Word,
+                    debug_opt_u16(t.donated_sc),
+                    t.pending_fault as Word,
+                    t.hosted_syscalls as Word,
+                    reply_bound,
+                    debug_opt_tcb(s.scheduler.current()),
+                ];
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                    let inv = s.scheduler.slab.get_mut(invoker);
+                    write_invocation_words(inv, ipc_paddr, &words);
+                }
                 Ok(())
             }
             // `seL4_TCB_Configure` — one-shot TCB setup. Two ABI
@@ -5893,6 +5989,7 @@ pub mod spec {
         frame_map_unmap_get_address();
         page_table_map_unmap();
         tcb_write_read_registers();
+        tcb_read_debug_state_reports_scheduler_and_reply_binding();
         tcb_set_space_and_bind_notification();
         tcb_set_space_pml4_pins_cr3();
         tcb_configure_one_shot_setup();
@@ -6928,6 +7025,78 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ TCB::Write/ReadRegisters round-trip\n");
+    }
+
+    #[inline(never)]
+    fn tcb_read_debug_state_reports_scheduler_and_reply_binding() {
+        let invoker = setup_invoker(0);
+        let reply_idx = 9usize;
+        let target = unsafe {
+            let s = KERNEL.get();
+            let mut t = crate::tcb::Tcb::default();
+            t.priority = 88;
+            t.state = crate::tcb::ThreadStateType::BlockedOnReply;
+            t.sc = Some(7);
+            t.active_sc = Some(8);
+            t.pending_reply = Some(11);
+            t.reply_to = Some(invoker);
+            t.bound_notification = Some(12);
+            t.blocked_is_call = true;
+            t.blocked_can_grant = true;
+            t.donated_sc = Some(13);
+            t.pending_fault = 6;
+            t.hosted_syscalls = true;
+            let target = s.scheduler.admit(t);
+            s.cnodes[0].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.replies[reply_idx] = crate::reply::Reply {
+                bound_tcb: Some(target),
+            };
+            s.scheduler.set_current(Some(invoker));
+            target
+        };
+        let target_cap = Cap::Thread {
+            tcb: crate::cap::PPtr::<crate::cap::Tcb>::new(target.0 as u64).unwrap(),
+        };
+
+        let args = SyscallArgs {
+            a1: (InvocationLabel::TCBReadDebugState as u64) << 12,
+            a2: 2,
+            ..Default::default()
+        };
+        decode_invocation(target_cap, &args, invoker).expect("debug state");
+        unsafe {
+            let s = KERNEL.get();
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(inv.ipc_length, TCB_DEBUG_STATE_WORDS as u32);
+            assert_eq!(
+                inv.msg_regs[0],
+                crate::tcb::ThreadStateType::BlockedOnReply as u64
+            );
+            assert_eq!(inv.msg_regs[1], 0);
+            assert_eq!(inv.msg_regs[2], 0);
+            assert_eq!(inv.msg_regs[3], 88);
+            assert_eq!(inv.msg_regs[4], 7);
+            assert_eq!(inv.msg_regs[5], 8);
+            assert_eq!(inv.msg_regs[6], 11);
+            assert_eq!(inv.msg_regs[7], invoker.0 as u64);
+            assert_eq!(inv.msg_regs[8], 12);
+            assert_eq!(inv.msg_regs[9], 1);
+            assert_eq!(inv.msg_regs[10], 1);
+            assert_eq!(inv.msg_regs[11], 13);
+            assert_eq!(inv.msg_regs[12], 6);
+            assert_eq!(inv.msg_regs[13], 1);
+            assert_eq!(inv.msg_regs[14], target.0 as u64);
+            assert_eq!(inv.msg_regs[15], invoker.0 as u64);
+            s.cnodes[0].0[2] = Cte::null();
+            s.replies[reply_idx] = crate::reply::Reply::new();
+            s.scheduler.slab.free(target);
+            s.scheduler.set_current(None);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ TCB::ReadDebugState reports scheduler and reply binding\n");
     }
 
     #[inline(never)]

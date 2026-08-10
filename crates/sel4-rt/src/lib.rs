@@ -48,6 +48,8 @@ pub const LBL_X86_PAGE_DIRECTORY_MAP: u64 = 45;
 pub const LBL_X86_PAGE_TABLE_MAP: u64 = 47;
 pub const LBL_X86_PAGE_MAP: u64 = 51;
 pub const LBL_X86_PAGE_UNMAP: u64 = 52;
+pub const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
+pub const LBL_TCB_READ_DEBUG_STATE: u64 = 67;
 
 // --- Object types -----------------------------------------------------------
 pub const OBJ_UNTYPED: u64 = 0;

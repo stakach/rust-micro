@@ -1284,5 +1284,22 @@
                 be cleared.
             </description>
         </method>
+        <method id="TCBReadDebugState" name="ReadDebugState" manual_name="Read Debug State" manual_label="tcb_readdebugstate">
+            <brief>
+                Read compact scheduler/IPC state for a target TCB.
+            </brief>
+            <description>
+                rust-micro diagnostic extension. Returns a bounded vector of
+                kernel scheduler and IPC fields for the target TCB, plus the
+                bound TCB of an optional Reply cap named by the caller in MR0.
+                This is for invariant proofs and deadman diagnostics; it does
+                not affect scheduling or IPC policy.
+            </description>
+            <param dir="in" name="reply" type="seL4_CPtr" description="Optional Reply cap to inspect; 0 skips reply-object state."/>
+            <param dir="out" name="state" type="seL4_Word" description="ThreadStateType discriminant."/>
+            <param dir="out" name="schedulable" type="seL4_Word" description="1 when runnable with a bound scheduling context."/>
+            <param dir="out" name="enqueued" type="seL4_Word" description="1 when linked into a ready queue."/>
+            <param dir="out" name="priority" type="seL4_Word" description="Thread priority."/>
+        </method>
     </interface>
 </api>

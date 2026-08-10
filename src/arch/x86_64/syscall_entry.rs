@@ -900,6 +900,8 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 Syscall::SysRecv
                     | Syscall::SysNBRecv
                     | Syscall::SysReplyRecv
+                    | Syscall::SysNBSendRecv
+                    | Syscall::SysNBSendWait
                     | Syscall::SysWait
                     | Syscall::SysNBWait,
             ) && Some(next) == s.scheduler.current();

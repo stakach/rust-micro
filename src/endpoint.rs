@@ -374,12 +374,20 @@ pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
         if !ep_queue_contains(ep, sched, thread) {
             continue;
         }
+        let was_receive = matches!(
+            sched.slab.get(thread).state,
+            ThreadStateType::BlockedOnReceive
+        );
         queue_remove(ep, sched, thread);
         if queue_is_empty(ep) {
             ep.state = EpState::Idle;
         }
         if sched.slab.try_get(thread).is_some() {
-            sched.slab.get_mut(thread).state = ThreadStateType::Inactive;
+            let tcb = sched.slab.get_mut(thread);
+            tcb.state = ThreadStateType::Inactive;
+            if was_receive {
+                tcb.pending_reply = None;
+            }
         }
         return;
     }
@@ -434,8 +442,15 @@ pub fn cancel_ipc(ep: &mut Endpoint, sched: &mut Scheduler, thread: TcbId) {
     ) {
         return;
     }
+    let was_receive = matches!(state, ThreadStateType::BlockedOnReceive);
     queue_remove(ep, sched, thread);
-    sched.slab.get_mut(thread).state = ThreadStateType::Restart;
+    {
+        let tcb = sched.slab.get_mut(thread);
+        tcb.state = ThreadStateType::Restart;
+        if was_receive {
+            tcb.pending_reply = None;
+        }
+    }
     if queue_is_empty(ep) {
         ep.state = EpState::Idle;
     }
