@@ -49,6 +49,7 @@ fi
 # real FS. It stays a superfloppy (no partition table — the storage host reads FAT32
 # from LBA 0); BOOTBOOT (UEFI) + our LBA48 AHCI reader both handle the larger volume.
 IMAGE_MIB="${IMAGE_MIB:-256}"
+rm -f "$IMAGE"
 dd if=/dev/zero of="$IMAGE" bs=1M count="$IMAGE_MIB" status=none
 mkfs.vfat -F 32 "$IMAGE" >/dev/null
 

@@ -139,9 +139,8 @@ pub fn handle_syscall(
             handle_recv(args, /* blocking */ true)
         }
         // Phase 36b — MCS notification-only Recv variants. Forward
-        // to handle_recv for now; the difference (Wait doesn't
-        // capture a reply cap because the receiver isn't a server
-        // expecting a Call) will matter once cap-based reply lands.
+        // to handle_recv; Notification targets ignore r12 because a
+        // wait is not a server receive that can accept Call IPC.
         Syscall::SysWait => handle_recv(args, /* blocking */ true),
         Syscall::SysNBWait => handle_recv(args, /* blocking */ false),
         // MCS atomic non-blocking-send + blocking-recv composite.
@@ -150,7 +149,7 @@ pub fn handle_syscall(
         //   rsi (a1)  = send msginfo
         //   r10/r8/r9/r15 (a2..a5) = send mr0..mr3
         //   r13       = dest cptr          (send target)
-        //   r12       = reply cap          (consumed by handle_recv)
+        //   r12       = reply cap          (offered to the Recv half)
         //
         // sel4test's IPC0002 / IPC0003 replywait_func opens with
         // an empty NBSendRecv used purely as a Recv (no actual send
@@ -199,9 +198,8 @@ pub fn handle_syscall(
             handle_recv(args, /* blocking */ true)
         }
         // SysNBSendWait — same as NBSendRecv but the Recv side is a
-        // notification-only Wait (no reply cap captured). For now
-        // treat it the same since handle_recv falls back to
-        // notification handling when the target is a Notification cap.
+        // notification-only Wait, so handle_recv ignores r12 after
+        // resolving the target as a Notification cap.
         Syscall::SysNBSendWait => {
             let invoker = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
             let dest_cptr = {
@@ -723,19 +721,29 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         s.scheduler.slab.get_mut(current).received_extra_caps = 0;
         let cspace_root = s.scheduler.slab.get(current).cspace_root;
         let target = lookup_cap(s, &cspace_root, args.a0)?;
+        // A running thread must not carry a stale receive-side reply
+        // offer from an earlier syscall. A valid endpoint receive
+        // below installs a fresh offer after bound-notification
+        // delivery has been ruled out.
+        s.scheduler.slab.get_mut(current).pending_reply = None;
         // Phase 36d / 43 — MCS reply cap is in `replyRegister = R12`
         // per upstream's `registerset.h`. libsel4's `MCS_REPLY_DECL`
         // pins it via `register seL4_Word reply_reg asm("r12") = reply;`.
         // Read it from the saved `user_context.r12` (NOT args.a2 / r10
         // which is mr0). cptr 0 means "no reply" — we fall back to the
         // legacy Tcb.reply_to path that handle_reply consults.
+        //
+        // The offer is only committed for Endpoint receives. A bound
+        // notification that satisfies Recv must not leave the reply
+        // object pending, or a later unrelated Call on this TCB could
+        // bind that stale reply object to the wrong caller.
+        let mut endpoint_reply_idx: Option<u16> = None;
         #[cfg(target_arch = "x86_64")]
         {
             let reply_cptr = s.scheduler.slab.get(current).user_context.r12;
             if reply_cptr != 0 {
                 if let Ok(Cap::Reply { ptr, .. }) = lookup_cap(s, &cspace_root, reply_cptr) {
-                    let reply_idx = crate::kernel::KernelState::reply_index(ptr) as u16;
-                    s.scheduler.slab.get_mut(current).pending_reply = Some(reply_idx);
+                    endpoint_reply_idx = Some(crate::kernel::KernelState::reply_index(ptr) as u16);
                 }
             }
         }
@@ -820,7 +828,16 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         let s_ptr: *mut crate::kernel::KernelState = s;
         let ep = &mut (*s_ptr).endpoints[idx];
         let sched = &mut (*s_ptr).scheduler;
+        if let Some(reply_idx) = endpoint_reply_idx {
+            sched.slab.get_mut(current).pending_reply = Some(reply_idx);
+        }
         let outcome = receive_ipc(ep, sched, current, opts);
+        if !matches!(outcome, crate::endpoint::IpcOutcome::Blocked) {
+            // A Call consumes the pending reply in finish_call. Plain
+            // sends and skipped non-blocking receives do not, so clear
+            // the unconsumed offer before returning to user mode.
+            sched.slab.get_mut(current).pending_reply = None;
+        }
         // For NBRecv that found nothing, mirror upstream's
         // contract: badge = 0 in rdi, msginfo = 0 in rsi. Without
         // this, userspace reads stale registers and NBWAIT0001 sees
@@ -919,6 +936,9 @@ pub mod spec {
         debug_dump_scheduler_writes_placeholder();
         sys_send_through_cspace_to_endpoint();
         sys_call_then_reply_round_trip();
+        recv_bound_notification_does_not_stage_reply_cap();
+        nbrecv_with_reply_cap_does_not_leave_pending_offer();
+        plain_send_recv_with_reply_cap_does_not_leave_pending_offer();
         arch::log("Syscall dispatcher tests completed\n");
     }
 
@@ -1180,13 +1200,289 @@ pub mod spec {
             // Server's reply_to slot consumed.
             assert_eq!(s.scheduler.slab.get(server).reply_to, None);
             // Clean up — free the temp TCBs and reset current.
-            s.scheduler.slab.free(caller);
-            s.scheduler.slab.free(server);
+            free_temp_tcb(caller);
+            free_temp_tcb(server);
             // Restore boot thread (id 0 — first admitted) as
             // current.
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ SysCall → Recv → Reply round-trip\n");
+    }
+
+    #[inline(never)]
+    fn recv_bound_notification_does_not_stage_reply_cap() {
+        use crate::cap::{Badge, Cap, EndpointRights};
+        use crate::cte::Cte;
+        use crate::endpoint::EpState;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::notification::{Notification, NtfnState};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (server, ep_idx, ntfn_idx, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            let cn = 4;
+            let ep_idx = 2;
+            let ntfn_idx = 2;
+            let reply_idx = 2;
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            let ep_cap = Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(ep_idx),
+                badge: Badge(0xE0),
+                rights: EndpointRights {
+                    can_send: true,
+                    can_receive: true,
+                    can_grant: true,
+                    can_grant_reply: true,
+                },
+            };
+            let reply_cap = Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            };
+            s.cnodes[cn].0[1] = Cte::with_cap(&ep_cap);
+            s.cnodes[cn].0[2] = Cte::with_cap(&reply_cap);
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            s.notifications[ntfn_idx] = Notification {
+                state: NtfnState::Active,
+                pending_badge: 0xBAD0,
+                ..Notification::new()
+            };
+            s.replies[reply_idx] = Reply::new();
+
+            let mut t = Tcb::default();
+            t.priority = 50;
+            t.state = ThreadStateType::Running;
+            t.cspace_root = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            t.bound_notification = Some(ntfn_idx as u16);
+            #[cfg(target_arch = "x86_64")]
+            {
+                t.user_context.r12 = 2;
+            }
+            let server = s.scheduler.admit(t);
+            s.scheduler.set_current(Some(server));
+            (server, ep_idx, ntfn_idx, reply_idx)
+        };
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysRecv,
+            &SyscallArgs {
+                a0: 1,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            let t = s.scheduler.slab.get(server);
+            assert_eq!(t.pending_reply, None);
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(t.user_context.rdi, 0xBAD0);
+            s.notifications[ntfn_idx] = Notification::new();
+            s.cnodes[4].0[1] = Cte::null();
+            s.cnodes[4].0[2] = Cte::null();
+            free_temp_tcb(server);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ bound notifications do not consume Recv reply caps\n");
+    }
+
+    #[inline(never)]
+    fn nbrecv_with_reply_cap_does_not_leave_pending_offer() {
+        use crate::cap::{Badge, Cap, EndpointRights};
+        use crate::cte::Cte;
+        use crate::endpoint::EpState;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (server, ep_idx, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            let cn = 5;
+            let ep_idx = 3;
+            let reply_idx = 3;
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(ep_idx),
+                badge: Badge(0xE1),
+                rights: EndpointRights {
+                    can_send: true,
+                    can_receive: true,
+                    can_grant: true,
+                    can_grant_reply: true,
+                },
+            });
+            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            s.replies[reply_idx] = Reply::new();
+
+            let mut t = Tcb::default();
+            t.priority = 50;
+            t.state = ThreadStateType::Running;
+            t.cspace_root = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            #[cfg(target_arch = "x86_64")]
+            {
+                t.user_context.r12 = 2;
+            }
+            let server = s.scheduler.admit(t);
+            s.scheduler.set_current(Some(server));
+            (server, ep_idx, reply_idx)
+        };
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysNBRecv,
+            &SyscallArgs {
+                a0: 1,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            let t = s.scheduler.slab.get(server);
+            assert_eq!(t.pending_reply, None);
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert_eq!(t.user_context.rdi, 0);
+                assert_eq!(t.user_context.rsi, 0);
+            }
+            s.cnodes[5].0[1] = Cte::null();
+            s.cnodes[5].0[2] = Cte::null();
+            free_temp_tcb(server);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ NBRecv does not leave an unpaired reply-cap offer\n");
+    }
+
+    #[inline(never)]
+    fn plain_send_recv_with_reply_cap_does_not_leave_pending_offer() {
+        use crate::cap::{Badge, Cap, EndpointRights};
+        use crate::cte::Cte;
+        use crate::endpoint::EpState;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+        use crate::types::seL4_Word as Word;
+
+        let (sender, server, ep_idx, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            let cn = 6;
+            let ep_idx = 4;
+            let reply_idx = 4;
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(ep_idx),
+                badge: Badge(0xE2),
+                rights: EndpointRights {
+                    can_send: true,
+                    can_receive: true,
+                    can_grant: true,
+                    can_grant_reply: true,
+                },
+            });
+            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            s.replies[reply_idx] = Reply::new();
+
+            let mk_tcb = || {
+                let mut t = Tcb::default();
+                t.priority = 50;
+                t.state = ThreadStateType::Running;
+                t.cspace_root = Cap::CNode {
+                    ptr: cnode_ptr,
+                    radix: 5,
+                    guard_size: 59,
+                    guard: 0,
+                };
+                t
+            };
+            let sender = s.scheduler.admit(mk_tcb());
+            let mut server_tcb = mk_tcb();
+            #[cfg(target_arch = "x86_64")]
+            {
+                server_tcb.user_context.r12 = 2;
+            }
+            let server = s.scheduler.admit(server_tcb);
+            (sender, server, ep_idx, reply_idx)
+        };
+
+        let mut sink = BufferSink::new();
+        unsafe {
+            KERNEL.get().scheduler.set_current(Some(sender));
+        }
+        let r = handle_syscall(
+            Syscall::SysSend,
+            &SyscallArgs {
+                a0: 1,
+                a1: 1,
+                a2: b'P' as Word,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            KERNEL.get().scheduler.set_current(Some(server));
+        }
+        let r = handle_syscall(
+            Syscall::SysRecv,
+            &SyscallArgs {
+                a0: 1,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(server).pending_reply, None);
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            assert_eq!(s.scheduler.slab.get(sender).state, ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(server).msg_regs[0], b'P' as Word);
+            assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
+            s.cnodes[6].0[1] = Cte::null();
+            s.cnodes[6].0[2] = Cte::null();
+            free_temp_tcb(sender);
+            free_temp_tcb(server);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ plain Send receive does not retain the offered reply cap\n");
+    }
+
+    unsafe fn free_temp_tcb(id: crate::tcb::TcbId) {
+        let s = crate::kernel::KERNEL.get();
+        if s.scheduler.slab.try_get(id).is_none() {
+            return;
+        }
+        crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
+        s.scheduler
+            .block(id, crate::tcb::ThreadStateType::Inactive);
+        s.scheduler.slab.free(id);
+        s.scheduler.reset_queues();
     }
 
     #[inline(never)]
