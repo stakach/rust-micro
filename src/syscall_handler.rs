@@ -198,7 +198,7 @@ pub fn handle_syscall(
                 }
             }
             let r = handle_recv(args, /* blocking */ true);
-            maybe_yield_to_reply_wake(invoker, reply_wake);
+            handoff_to_reply_wake(invoker, reply_wake);
             r
         }
         // SysNBSendWait — same as NBSendRecv but the Recv side is a
@@ -243,7 +243,7 @@ pub fn handle_syscall(
                 }
             }
             let r = handle_recv(args, true);
-            maybe_yield_to_reply_wake(invoker, reply_wake);
+            handoff_to_reply_wake(invoker, reply_wake);
             r
         }
         Syscall::SysYield => {
@@ -387,7 +387,7 @@ fn reply_bound_tcb_for_current_cptr(
     }
 }
 
-fn maybe_yield_to_reply_wake(
+fn handoff_to_reply_wake(
     invoker: Option<crate::tcb::TcbId>,
     reply_wake: Option<crate::tcb::TcbId>,
 ) {
@@ -406,22 +406,19 @@ fn maybe_yield_to_reply_wake(
             return;
         };
         let invoker_affinity = invoker_tcb.affinity;
-        let invoker_priority = invoker_tcb.priority;
         let woken_affinity = woken_tcb.affinity;
         let woken_domain = woken_tcb.domain;
-        let woken_priority = woken_tcb.priority;
         let woken_ready =
             woken_tcb.is_runnable() && woken_tcb.is_schedulable() && woken_tcb.enqueued;
         if !woken_ready
             || woken_affinity != invoker_affinity
             || woken_domain != s.scheduler.cur_domain
-            || woken_priority < invoker_priority
         {
             return;
         }
         let cpu = invoker_affinity as usize;
         if s.scheduler.nodes[cpu].current == Some(invoker) {
-            s.scheduler.nodes[cpu].current = None;
+            s.scheduler.nodes[cpu].current = Some(woken);
         }
     }
 }
@@ -1748,7 +1745,7 @@ pub mod spec {
                 guard: 0,
             };
             let mut server_t = Tcb::default();
-            server_t.priority = 70;
+            server_t.priority = 120;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
             server_t.cspace_root = cspace;
@@ -1792,17 +1789,16 @@ pub mod spec {
             assert_eq!(s.notifications[ntfn_idx].state, NtfnState::Idle);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
-            assert_eq!(s.scheduler.current(), None);
-            assert_eq!(s.scheduler.choose_thread(), Some(caller));
+            assert_eq!(s.scheduler.current(), Some(caller));
             s.notifications[ntfn_idx] = Notification::new();
             s.replies[reply_idx] = Reply::new();
             s.cnodes[9].0[1] = Cte::null();
             s.cnodes[9].0[2] = Cte::null();
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
             free_temp_tcb(caller);
             free_temp_tcb(server);
-            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
-        arch::log("  ✓ NBSendRecv reply wake yields after bound-notification receive\n");
+        arch::log("  ✓ NBSendRecv reply wake hands off after bound-notification receive\n");
     }
 
     #[inline(never)]
