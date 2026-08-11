@@ -1765,6 +1765,10 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         };
         let active_sc_returned = reply_handoff_requested(s, invoker)
             && reply_returns_active_sc_to_caller(s, invoker, caller);
+        #[cfg(target_arch = "x86_64")]
+        if reply_handoff_requested(s, invoker) {
+            s.scheduler.slab.get_mut(invoker).user_context.r13 = 0;
+        }
         // Stage the reply message on the invoker so the existing
         // transfer machinery (used by handle_reply too) sees the
         // right msg_regs. Then route through `do_reply_transfer`.
