@@ -18,7 +18,7 @@
 //! syscall path in Phase 5. `choose_thread` returns a `TcbId` and
 //! the caller is expected to switch to it.
 
-use crate::tcb::{Tcb, TcbId, TcbSlab, ThreadStateType, MAX_PRIORITY, NUM_PRIORITIES};
+use crate::tcb::{Tcb, TcbId, TcbSlab, ThreadStateType, MAX_PRIORITY, MAX_TCBS, NUM_PRIORITIES};
 
 // ---------------------------------------------------------------------------
 // Priority bitmap. 256 priorities packed into four u64s, indexed
@@ -221,6 +221,55 @@ impl ReadyQueues {
     /// thread can keep running.
     pub fn peek_highest(&self) -> Option<u8> {
         self.bitmap.highest()
+    }
+
+    /// Return true when this ready queue contains a schedulable peer
+    /// distinct from `current` at `min_prio` or above.
+    pub fn has_schedulable_peer_at_or_above(
+        &self,
+        slab: &TcbSlab,
+        current: TcbId,
+        min_prio: u8,
+    ) -> bool {
+        let Some(mut prio) = self.bitmap.highest() else {
+            return false;
+        };
+        loop {
+            if prio < min_prio {
+                return false;
+            }
+
+            let mut cur = self.heads[prio as usize];
+            let mut guard = 0;
+            while let Some(id) = cur {
+                guard += 1;
+                if guard > MAX_TCBS {
+                    break;
+                }
+                let Some(tcb) = slab.try_get(id) else {
+                    break;
+                };
+                if id != current && tcb.is_schedulable() {
+                    return true;
+                }
+                cur = tcb.sched_next;
+            }
+
+            if prio == 0 {
+                return false;
+            }
+            let mut next = prio - 1;
+            loop {
+                if self.bitmap.bit_set(next) {
+                    prio = next;
+                    break;
+                }
+                if next == 0 {
+                    return false;
+                }
+                next -= 1;
+            }
+        }
     }
 
     /// Walk this queue from highest priority down looking for the
@@ -729,6 +778,40 @@ impl Scheduler {
             }
             _ => {}
         }
+    }
+
+    /// Rotate `current` behind an already-ready peer of equal or
+    /// higher priority. Used when a receive completes from a bound
+    /// notification: the receiver's return registers already contain
+    /// the badge, but endpoint/component work that was ready before
+    /// the notification should get a chance to run before the receiver
+    /// immediately re-enters its pump.
+    pub fn rotate_current_after_bound_notification(&mut self, current: TcbId) -> bool {
+        let Some(current_tcb) = self.slab.try_get(current) else {
+            return false;
+        };
+        if !current_tcb.is_schedulable() {
+            return false;
+        }
+        let cpu = current_tcb.affinity as usize;
+        let dom = current_tcb.domain as usize;
+        if dom != self.cur_domain as usize {
+            return false;
+        }
+        let prio = current_tcb.priority;
+        if !self.nodes[cpu].queues[dom].has_schedulable_peer_at_or_above(&self.slab, current, prio)
+        {
+            return false;
+        }
+
+        if self.slab.get(current).enqueued {
+            self.nodes[cpu].queues[dom].dequeue(&mut self.slab, current);
+        }
+        self.nodes[cpu].queues[dom].enqueue(&mut self.slab, current);
+        if self.nodes[cpu].current == Some(current) {
+            self.nodes[cpu].current = None;
+        }
+        true
     }
 
     /// Call before a thread LOSES its scheduling context (SchedContext

@@ -167,7 +167,6 @@ pub fn handle_syscall(
                 })?;
                 s.scheduler.slab.get(cur).user_context.r13
             };
-            let reply_wake = reply_bound_tcb_for_current_cptr(invoker, dest_cptr);
             let send_args = SyscallArgs {
                 a0: dest_cptr,
                 a1: args.a1,
@@ -183,7 +182,6 @@ pub fn handle_syscall(
                     &send_args, /* blocking */ false, /* call */ false,
                     /* donate */ true,
                 )?;
-                stage_composite_reply_handoff(invoker, reply_wake);
             }
             // The NB-send may have woken a higher-priority receiver,
             // which `possibleSwitchTo` signals by clearing `current`.
@@ -224,7 +222,6 @@ pub fn handle_syscall(
                 // nbsend_wait failed to wake the stack spawner.
                 s.scheduler.slab.get(cur).user_context.r12
             };
-            let reply_wake = reply_bound_tcb_for_current_cptr(invoker, dest_cptr);
             let send_args = SyscallArgs {
                 a0: dest_cptr,
                 a1: args.a1,
@@ -235,7 +232,6 @@ pub fn handle_syscall(
             };
             if dest_cptr != 0 {
                 handle_send(&send_args, false, false, /* donate */ true)?;
-                stage_composite_reply_handoff(invoker, reply_wake);
             }
             #[cfg(target_arch = "x86_64")]
             unsafe {
@@ -370,42 +366,6 @@ fn yield_current_thread() {
     }
 }
 
-fn reply_bound_tcb_for_current_cptr(
-    invoker: Option<crate::tcb::TcbId>,
-    cptr: u64,
-) -> Option<crate::tcb::TcbId> {
-    use crate::cap::Cap;
-    use crate::cspace::lookup_cap;
-    use crate::kernel::{KernelState, KERNEL};
-
-    let current = invoker?;
-    unsafe {
-        let s = KERNEL.get();
-        let cspace_root = s.scheduler.slab.get(current).cspace_root;
-        let Cap::Reply { ptr, .. } = lookup_cap(s, &cspace_root, cptr).ok()? else {
-            return None;
-        };
-        s.replies
-            .get(KernelState::reply_index(ptr))
-            .and_then(|reply| reply.bound_tcb)
-    }
-}
-
-fn stage_composite_reply_handoff(
-    invoker: Option<crate::tcb::TcbId>,
-    reply_wake: Option<crate::tcb::TcbId>,
-) {
-    let (Some(invoker), Some(woken)) = (invoker, reply_wake) else {
-        return;
-    };
-    unsafe {
-        let s = crate::kernel::KERNEL.get();
-        if s.scheduler.slab.try_get(invoker).is_some() {
-            s.scheduler.slab.get_mut(invoker).composite_reply_handoff = Some(woken);
-        }
-    }
-}
-
 fn finish_composite_reply_handoff(invoker: Option<crate::tcb::TcbId>, receive_ok: bool) {
     let Some(invoker) = invoker else {
         return;
@@ -444,7 +404,6 @@ fn finish_composite_reply_handoff(invoker: Option<crate::tcb::TcbId>, receive_ok
 pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
     use crate::kernel::KERNEL;
     use crate::tcb::ThreadStateType;
-    use crate::types::seL4_Word as Word;
 
     unsafe {
         let s = KERNEL.get();
@@ -882,13 +841,16 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 let badge = ntfn.pending_badge;
                 ntfn.pending_badge = 0;
                 ntfn.state = crate::notification::NtfnState::Idle;
-                let tcb = s.scheduler.slab.get_mut(current);
-                tcb.ipc_badge = badge;
-                #[cfg(target_arch = "x86_64")]
                 {
-                    tcb.user_context.rdi = badge;
-                    tcb.user_context.rsi = 0;
+                    let tcb = s.scheduler.slab.get_mut(current);
+                    tcb.ipc_badge = badge;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        tcb.user_context.rdi = badge;
+                        tcb.user_context.rsi = 0;
+                    }
                 }
+                s.scheduler.rotate_current_after_bound_notification(current);
                 return Ok(());
             }
         }
@@ -1007,6 +969,7 @@ pub mod spec {
         sys_call_then_reply_round_trip();
         marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller();
         recv_bound_notification_does_not_stage_reply_cap();
+        recv_bound_notification_rotates_behind_ready_peer();
         blocked_recv_bound_notification_clears_reply_offer();
         recv_prefers_queued_endpoint_over_bound_notification();
         nbsendrecv_reply_wake_yields_after_bound_notification();
@@ -1155,7 +1118,6 @@ pub mod spec {
         use crate::cte::Cte;
         use crate::kernel::{KernelState, KERNEL};
         use crate::tcb::ThreadStateType;
-        use crate::types::seL4_Word as Word;
 
         unsafe {
             let s = KERNEL.get();
@@ -1523,6 +1485,105 @@ pub mod spec {
     }
 
     #[inline(never)]
+    fn recv_bound_notification_rotates_behind_ready_peer() {
+        use crate::cap::{Badge, Cap, EndpointRights};
+        use crate::cte::Cte;
+        use crate::endpoint::EpState;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::notification::{Notification, NtfnState};
+        use crate::sched_context::SchedContext;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (server, peer, ep_idx, ntfn_idx) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            let cn = 11;
+            let ep_idx = 8;
+            let ntfn_idx = 8;
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(ep_idx),
+                badge: Badge(0xE8),
+                rights: EndpointRights {
+                    can_send: true,
+                    can_receive: true,
+                    can_grant: true,
+                    can_grant_reply: true,
+                },
+            });
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            s.notifications[ntfn_idx] = Notification {
+                state: NtfnState::Active,
+                pending_badge: 0xD1,
+                ..Notification::new()
+            };
+            s.sched_contexts[0] = SchedContext::new(10, 10);
+            s.sched_contexts[1] = SchedContext::new(10, 10);
+
+            let mut server_t = Tcb::default();
+            server_t.priority = 100;
+            server_t.state = ThreadStateType::Running;
+            server_t.sc = Some(0);
+            server_t.cspace_root = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            server_t.bound_notification = Some(ntfn_idx as u16);
+            let server = s.scheduler.admit(server_t);
+            s.notifications[ntfn_idx].bound_tcb = Some(server);
+            s.sched_contexts[0].bound_tcb = Some(server);
+
+            let mut peer_t = Tcb::default();
+            peer_t.priority = 100;
+            peer_t.state = ThreadStateType::Running;
+            peer_t.sc = Some(1);
+            let peer = s.scheduler.admit(peer_t);
+            s.sched_contexts[1].bound_tcb = Some(peer);
+
+            s.scheduler.set_current(Some(server));
+            (server, peer, ep_idx, ntfn_idx)
+        };
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysRecv,
+            &SyscallArgs {
+                a0: 1,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(server).ipc_badge, 0xD1);
+            #[cfg(target_arch = "x86_64")]
+            let server_rdi = s.scheduler.slab.get(server).user_context.rdi;
+            #[cfg(target_arch = "x86_64")]
+            let server_rsi = s.scheduler.slab.get(server).user_context.rsi;
+            assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
+            assert_eq!(s.notifications[ntfn_idx].state, NtfnState::Idle);
+            assert_eq!(s.scheduler.current(), None);
+            assert_eq!(s.scheduler.choose_thread(), Some(peer));
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert_eq!(server_rdi, 0xD1);
+                assert_eq!(server_rsi, 0);
+            }
+            s.notifications[ntfn_idx] = Notification::new();
+            s.cnodes[11].0[1] = Cte::null();
+            s.sched_contexts[0] = SchedContext::new(0, 0);
+            s.sched_contexts[1] = SchedContext::new(0, 0);
+            free_temp_tcb(peer);
+            free_temp_tcb(server);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ bound notification receive rotates behind a ready peer\n");
+    }
+
+    #[inline(never)]
     fn blocked_recv_bound_notification_clears_reply_offer() {
         use crate::cap::{Badge, Cap, EndpointRights};
         use crate::cte::Cte;
@@ -1803,6 +1864,7 @@ pub mod spec {
             server_t.bound_notification = Some(ntfn_idx as u16);
             #[cfg(target_arch = "x86_64")]
             {
+                server_t.user_context.rdx = Syscall::SysNBSendRecv as i32 as u64;
                 server_t.user_context.r12 = 2;
                 server_t.user_context.r13 = 2;
             }
@@ -1904,6 +1966,7 @@ pub mod spec {
             server_t.bound_notification = Some(ntfn_idx as u16);
             #[cfg(target_arch = "x86_64")]
             {
+                server_t.user_context.rdx = Syscall::SysNBSendRecv as i32 as u64;
                 server_t.user_context.r12 = 2;
                 server_t.user_context.r13 = 2;
             }
