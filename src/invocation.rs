@@ -4789,7 +4789,7 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
 // TCB invocations.
 // ---------------------------------------------------------------------------
 
-const TCB_DEBUG_STATE_WORDS: usize = 16;
+const TCB_DEBUG_STATE_WORDS: usize = 24;
 const TCB_DEBUG_NONE: Word = Word::MAX;
 
 #[inline]
@@ -4800,6 +4800,65 @@ fn debug_opt_tcb(v: Option<TcbId>) -> Word {
 #[inline]
 fn debug_opt_u16(v: Option<u16>) -> Word {
     v.map(|id| id as Word).unwrap_or(TCB_DEBUG_NONE)
+}
+
+#[inline]
+fn debug_cap_kind(c: &Cap) -> Word {
+    match c {
+        Cap::Null => 0,
+        Cap::Endpoint { .. } => 1,
+        Cap::Notification { .. } => 2,
+        Cap::Reply { .. } => 3,
+        Cap::CNode { .. } => 4,
+        Cap::Thread { .. } => 5,
+        _ => 255,
+    }
+}
+
+#[inline]
+fn debug_endpoint_state(ep: &crate::endpoint::Endpoint) -> Word {
+    match ep.state {
+        crate::endpoint::EpState::Idle => 0,
+        crate::endpoint::EpState::Send => 1,
+        crate::endpoint::EpState::Recv => 2,
+    }
+}
+
+fn debug_tcb_fault_slot(s: &KernelState, cspace_idx: Word) -> [Word; 6] {
+    if cspace_idx == TCB_DEBUG_NONE {
+        return [
+            TCB_DEBUG_NONE,
+            0,
+            TCB_DEBUG_NONE,
+            TCB_DEBUG_NONE,
+            TCB_DEBUG_NONE,
+            TCB_DEBUG_NONE,
+        ];
+    }
+    let cap = s
+        .cnode_slot(cspace_idx as usize, 6)
+        .map(|slot| slot.cap())
+        .unwrap_or(Cap::Null);
+    let kind = debug_cap_kind(&cap);
+    let mut detail = TCB_DEBUG_NONE;
+    let mut ep_state = TCB_DEBUG_NONE;
+    let mut ep_head = TCB_DEBUG_NONE;
+    let mut ep_tail = TCB_DEBUG_NONE;
+    if let Cap::Endpoint { ptr, badge, rights } = cap {
+        let ep_idx = KernelState::endpoint_index(ptr);
+        detail = (ep_idx as Word) << 32
+            | ((badge.0 & 0xFFFF) << 8)
+            | (rights.can_send as Word)
+            | ((rights.can_receive as Word) << 1)
+            | ((rights.can_grant as Word) << 2)
+            | ((rights.can_grant_reply as Word) << 3);
+        if let Some(ep) = s.endpoints.get(ep_idx) {
+            ep_state = debug_endpoint_state(ep);
+            ep_head = debug_opt_tcb(ep.head);
+            ep_tail = debug_opt_tcb(ep.tail);
+        }
+    }
+    [cspace_idx, kind, detail, ep_state, ep_head, ep_tail]
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -4925,6 +4984,11 @@ fn decode_tcb(
                     TCB_DEBUG_NONE
                 };
                 let t = s.scheduler.slab.get(id);
+                let cspace_idx = match t.cspace_root {
+                    Cap::CNode { ptr, .. } => KernelState::cnode_index(ptr) as Word,
+                    _ => TCB_DEBUG_NONE,
+                };
+                let fault_slot = debug_tcb_fault_slot(s, cspace_idx);
                 let words: [Word; TCB_DEBUG_STATE_WORDS] = [
                     t.state as Word,
                     t.is_schedulable() as Word,
@@ -4942,6 +5006,14 @@ fn decode_tcb(
                     t.hosted_syscalls as Word,
                     reply_bound,
                     debug_opt_tcb(s.scheduler.current()),
+                    id.0 as Word,
+                    fault_slot[0],
+                    fault_slot[1],
+                    fault_slot[2],
+                    fault_slot[3],
+                    fault_slot[4],
+                    fault_slot[5],
+                    0,
                 ];
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -7090,6 +7162,9 @@ pub mod spec {
             assert_eq!(inv.msg_regs[13], 1);
             assert_eq!(inv.msg_regs[14], target.0 as u64);
             assert_eq!(inv.msg_regs[15], invoker.0 as u64);
+            assert_eq!(inv.msg_regs[16], target.0 as u64);
+            assert_eq!(inv.msg_regs[17], TCB_DEBUG_NONE);
+            assert_eq!(inv.msg_regs[18], 0);
             s.cnodes[0].0[2] = Cte::null();
             s.replies[reply_idx] = crate::reply::Reply::new();
             s.scheduler.slab.free(target);
