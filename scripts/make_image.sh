@@ -75,7 +75,20 @@ strip_boot_elf_copy() {
   local path="$1"
   local strip_tool="$2"
   [ -n "$strip_tool" ] || return 0
-  "$strip_tool" --strip-debug "$path"
+  # The BOOTBOOT initrd has a hard 16 MiB load window. The rootserver loader
+  # only needs program headers, but BOOTBOOT itself reads the kernel's linker
+  # symbols below to configure its handoff addresses and stack size.
+  if [ "$path" = "$INITRD_STAGE/sys/core" ]; then
+    "$strip_tool" --strip-all \
+      --keep-symbol=bootboot \
+      --keep-symbol=environment \
+      --keep-symbol=fb \
+      --keep-symbol=mmio \
+      --keep-symbol=initstack \
+      "$path"
+  else
+    "$strip_tool" --strip-all "$path"
+  fi
 }
 
 # Create a 256 MiB blank image and format as FAT32. macOS `dd` accepts the same
