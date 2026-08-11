@@ -692,21 +692,6 @@ extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u
         let t = s.scheduler.slab.get_mut(faulter);
         t.user_context = snapshot;
         t.use_iretq_resume = true;
-        crate::arch::log("[user #GP: tcb=");
-        log_dec_u64(faulter.0 as u64);
-        crate::arch::log(" err=0x");
-        log_hex64(error_code);
-        crate::arch::log(" rip=0x");
-        log_hex64(snapshot.rip);
-        crate::arch::log(" rsp=0x");
-        log_hex64(snapshot.rsp);
-        crate::arch::log(" rax=0x");
-        log_hex64(snapshot.rax);
-        crate::arch::log(" rcx=0x");
-        log_hex64(snapshot.rcx);
-        crate::arch::log(" r11=0x");
-        log_hex64(snapshot.r11);
-        crate::arch::log("]\n");
         // UserException(number = 13 = #GP vector, code = error_code) —
         // mirrors upstream handleUserLevelFault for a user GP fault.
         // IOPORTS1000's handler only checks the label is UserException,
@@ -720,6 +705,21 @@ extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u
         )
         .is_err()
         {
+            crate::arch::log("[user #GP: tcb=");
+            log_dec_u64(faulter.0 as u64);
+            crate::arch::log(" err=0x");
+            log_hex64(error_code);
+            crate::arch::log(" rip=0x");
+            log_hex64(snapshot.rip);
+            crate::arch::log(" rsp=0x");
+            log_hex64(snapshot.rsp);
+            crate::arch::log(" rax=0x");
+            log_hex64(snapshot.rax);
+            crate::arch::log(" rcx=0x");
+            log_hex64(snapshot.rcx);
+            crate::arch::log(" r11=0x");
+            log_hex64(snapshot.r11);
+            crate::arch::log("]\n");
             crate::fault::log_fault_handler_state(faulter);
             crate::arch::log("[#GP: no fault handler — suspending thread]\n");
             s.scheduler
