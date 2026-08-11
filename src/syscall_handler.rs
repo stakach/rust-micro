@@ -998,6 +998,7 @@ pub mod spec {
         debug_dump_scheduler_writes_placeholder();
         sys_send_through_cspace_to_endpoint();
         sys_call_then_reply_round_trip();
+        marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller();
         recv_bound_notification_does_not_stage_reply_cap();
         blocked_recv_bound_notification_clears_reply_offer();
         recv_prefers_queued_endpoint_over_bound_notification();
@@ -1305,6 +1306,86 @@ pub mod spec {
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ SysCall → Recv → Reply round-trip\n");
+    }
+
+    #[inline(never)]
+    fn marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller() {
+        use crate::cap::Cap;
+        use crate::cte::Cte;
+        use crate::invocation::REPLY_HANDOFF_MAGIC;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+        use crate::types::seL4_Word as Word;
+
+        let (server, caller, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            let cn = 10;
+            let reply_idx = 8;
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.replies[reply_idx] = Reply::new();
+
+            let mut caller_t = Tcb::default();
+            caller_t.priority = 40;
+            caller_t.state = ThreadStateType::BlockedOnReply;
+            caller_t.sc = Some(1);
+            let caller = s.scheduler.admit(caller_t);
+
+            let mut server_t = Tcb::default();
+            server_t.priority = 120;
+            server_t.state = ThreadStateType::Running;
+            server_t.sc = Some(0);
+            server_t.active_sc = Some(1);
+            #[cfg(target_arch = "x86_64")]
+            {
+                server_t.user_context.r13 = REPLY_HANDOFF_MAGIC;
+            }
+            server_t.cspace_root = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            let server = s.scheduler.admit(server_t);
+
+            s.replies[reply_idx] = Reply {
+                bound_tcb: Some(caller),
+            };
+            s.scheduler.set_current(Some(server));
+            (server, caller, reply_idx)
+        };
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysCall,
+            &SyscallArgs {
+                a0: 2,
+                a1: 1,
+                a2: 0x5150 as Word,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0x5150);
+            assert_eq!(s.scheduler.slab.get(server).active_sc, None);
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            assert_eq!(s.scheduler.current(), Some(caller));
+            s.cnodes[10].0[2] = Cte::null();
+            s.replies[reply_idx] = Reply::new();
+            free_temp_tcb(caller);
+            free_temp_tcb(server);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ marked Reply-cap active-SC return hands off to the caller\n");
     }
 
     #[inline(never)]
