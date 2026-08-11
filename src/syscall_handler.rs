@@ -355,12 +355,14 @@ fn yield_current_thread() {
         let Some(cur) = s.scheduler.current() else {
             return;
         };
-        if !s.scheduler.slab.get(cur).enqueued {
-            return;
-        }
         let cpu = s.scheduler.slab.get(cur).affinity as usize;
         let dom = s.scheduler.slab.get(cur).domain as usize;
-        s.scheduler.nodes[cpu].queues[dom].dequeue(&mut s.scheduler.slab, cur);
+        if !s.scheduler.slab.get(cur).is_runnable() {
+            return;
+        }
+        if s.scheduler.slab.get(cur).enqueued {
+            s.scheduler.nodes[cpu].queues[dom].dequeue(&mut s.scheduler.slab, cur);
+        }
         s.scheduler.nodes[cpu].queues[dom].enqueue(&mut s.scheduler.slab, cur);
         if s.scheduler.nodes[cpu].current == Some(cur) {
             s.scheduler.nodes[cpu].current = None;
@@ -999,6 +1001,7 @@ pub mod spec {
         ipc_syscalls_return_invalid_cap_in_phase5();
         sys_yield_succeeds();
         sys_yield_rotates_equal_priority_threads();
+        sys_yield_requeues_nonqueued_current_before_choosing_peer();
         debug_dump_scheduler_writes_placeholder();
         sys_send_through_cspace_to_endpoint();
         sys_call_then_reply_round_trip();
@@ -1100,6 +1103,45 @@ pub mod spec {
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ SysYield rotates a queued peer in the normal path\n");
+    }
+
+    fn sys_yield_requeues_nonqueued_current_before_choosing_peer() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (current, peer) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            let mut current_tcb = Tcb::default();
+            current_tcb.priority = 80;
+            current_tcb.state = ThreadStateType::Running;
+            let current = s
+                .scheduler
+                .slab
+                .alloc(current_tcb)
+                .expect("temporary current TCB");
+
+            let mut peer_tcb = Tcb::default();
+            peer_tcb.priority = 80;
+            peer_tcb.state = ThreadStateType::Running;
+            let peer = s.scheduler.admit(peer_tcb);
+            s.scheduler.set_current(Some(current));
+            (current, peer)
+        };
+
+        let mut sink = BufferSink::new();
+        handle_syscall(Syscall::SysYield, &SyscallArgs::default(), &mut sink).unwrap();
+        assert_eq!(sink.len, 0);
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), None);
+            assert!(s.scheduler.slab.get(current).enqueued);
+            assert_eq!(s.scheduler.choose_thread(), Some(peer));
+            free_temp_tcb(current);
+            free_temp_tcb(peer);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ SysYield requeues a nonqueued current before choosing a peer\n");
     }
 
     /// Phase 14c integration spec: stage an endpoint cap in slot 1
@@ -1768,7 +1810,7 @@ pub mod spec {
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
             let mut caller_t = Tcb::default();
-            caller_t.priority = 70;
+            caller_t.priority = 100;
             caller_t.state = ThreadStateType::BlockedOnReply;
             caller_t.sc = Some(1);
             let caller = s.scheduler.admit(caller_t);

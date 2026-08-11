@@ -695,16 +695,31 @@ impl Scheduler {
         let Some(target_tcb) = self.slab.try_get(target) else {
             return;
         };
-        if !target_tcb.is_runnable()
-            || !target_tcb.is_schedulable()
-            || !target_tcb.enqueued
-            || target_tcb.affinity != receiver_tcb.affinity
-            || target_tcb.domain != self.cur_domain
+        let receiver_affinity = receiver_tcb.affinity;
+        let receiver_enqueued = receiver_tcb.enqueued;
+        let target_affinity = target_tcb.affinity;
+        let target_domain = target_tcb.domain;
+        let target_runnable = target_tcb.is_runnable();
+        let target_schedulable = target_tcb.is_schedulable();
+        let target_enqueued = target_tcb.enqueued;
+        if !target_runnable
+            || !target_schedulable
+            || !target_enqueued
+            || target_affinity != receiver_affinity
+            || target_domain != self.cur_domain
         {
             return;
         }
 
-        let cpu = receiver_tcb.affinity as usize;
+        let cpu = receiver_affinity as usize;
+        let dom = target_domain as usize;
+        if receiver != target && receiver_enqueued {
+            self.nodes[cpu].queues[dom].dequeue(&mut self.slab, receiver);
+            self.nodes[cpu].queues[dom].enqueue(&mut self.slab, receiver);
+        }
+        self.nodes[cpu].queues[dom].dequeue(&mut self.slab, target);
+        self.nodes[cpu].queues[dom].enqueue_front(&mut self.slab, target);
+
         match self.nodes[cpu].current {
             Some(cur) if cur == receiver || cur == target => {
                 self.nodes[cpu].current = Some(target);
