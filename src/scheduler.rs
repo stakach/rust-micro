@@ -670,6 +670,52 @@ impl Scheduler {
         }
     }
 
+    /// Consume a composite reply/receive handoff marker for `receiver`.
+    ///
+    /// A `SysNBSendRecv` reply half can wake a thread and then have its
+    /// receive half interrupted by a bound notification. In that case the
+    /// receiver is runnable again, but the replied thread has not had a
+    /// chance to consume the reply. When the current CPU would otherwise
+    /// continue running `receiver`, hand the CPU to that replied thread
+    /// first. Endpoint IPC completion clears the marker before this point,
+    /// so a real receive-side message is never deferred behind it.
+    pub fn handoff_composite_reply_wake(&mut self, receiver: TcbId) {
+        let Some(target) = self
+            .slab
+            .try_get(receiver)
+            .and_then(|t| t.composite_reply_handoff)
+        else {
+            return;
+        };
+        self.slab.get_mut(receiver).composite_reply_handoff = None;
+
+        let Some(receiver_tcb) = self.slab.try_get(receiver) else {
+            return;
+        };
+        let Some(target_tcb) = self.slab.try_get(target) else {
+            return;
+        };
+        if !target_tcb.is_runnable()
+            || !target_tcb.is_schedulable()
+            || !target_tcb.enqueued
+            || target_tcb.affinity != receiver_tcb.affinity
+            || target_tcb.domain != self.cur_domain
+        {
+            return;
+        }
+
+        let cpu = receiver_tcb.affinity as usize;
+        match self.nodes[cpu].current {
+            Some(cur) if cur == receiver || cur == target => {
+                self.nodes[cpu].current = Some(target);
+            }
+            None => {
+                self.nodes[cpu].current = Some(target);
+            }
+            _ => {}
+        }
+    }
+
     /// Call before a thread LOSES its scheduling context (SchedContext
     /// unbind / SC free / donation away) so it is removed from its
     /// ready queue (dequeue self-guards) and surrenders the CPU.

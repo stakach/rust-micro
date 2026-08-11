@@ -291,6 +291,11 @@ pub struct Tcb {
     /// receiver — no Reply available; fall back to the legacy
     /// `reply_to` stash". Cleared once a Call binds the Reply.
     pub pending_reply: Option<u16>,
+    /// TCB woken by the send half of a composite reply+receive syscall.
+    /// If the receive half is later satisfied by a bound notification
+    /// instead of endpoint IPC, the scheduler should let this replied
+    /// thread consume the reply before the receiver continues.
+    pub composite_reply_handoff: Option<TcbId>,
     /// Phase 43 — set on the sender side when the queued IPC is a
     /// Call (vs plain Send). When a receiver later pops this sender
     /// off the endpoint queue, it must transition the sender into
@@ -421,6 +426,7 @@ impl Default for Tcb {
             pending_extra_caps_count: 0,
             received_extra_caps: 0,
             pending_reply: None,
+            composite_reply_handoff: None,
             blocked_is_call: false,
             blocked_can_grant: false,
             use_iretq_resume: false,

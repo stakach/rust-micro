@@ -5066,7 +5066,7 @@ fn decode_tcb(
                     fault_slot[3],
                     fault_slot[4],
                     fault_slot[5],
-                    0,
+                    debug_opt_tcb(t.composite_reply_handoff),
                 ];
                 #[cfg(target_arch = "x86_64")]
                 {

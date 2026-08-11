@@ -485,6 +485,7 @@ pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: Tc
     r.ipc_label = label;
     r.ipc_length = length;
     r.ipc_badge = badge;
+    r.composite_reply_handoff = None;
     let n = (length as usize).min(r.msg_regs.len());
     r.msg_regs[..n].copy_from_slice(&regs[..n]);
 

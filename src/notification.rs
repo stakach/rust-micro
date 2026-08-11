@@ -201,6 +201,7 @@ pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Op
                             }
                         }
                         sched.make_runnable(bt);
+                        sched.handoff_composite_reply_wake(bt);
                         return Some(bt);
                     }
                 } // end of else branch (bt slab slot was Some)
@@ -254,6 +255,7 @@ pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Op
                 }
             }
             sched.make_runnable(t);
+            sched.handoff_composite_reply_wake(t);
             if ntfn.head.is_none() {
                 ntfn.state = NtfnState::Idle;
             }
