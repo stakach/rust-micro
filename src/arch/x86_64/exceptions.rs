@@ -692,6 +692,21 @@ extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u
         let t = s.scheduler.slab.get_mut(faulter);
         t.user_context = snapshot;
         t.use_iretq_resume = true;
+        crate::arch::log("[user #GP: tcb=");
+        log_dec_u64(faulter.0 as u64);
+        crate::arch::log(" err=0x");
+        log_hex64(error_code);
+        crate::arch::log(" rip=0x");
+        log_hex64(snapshot.rip);
+        crate::arch::log(" rsp=0x");
+        log_hex64(snapshot.rsp);
+        crate::arch::log(" rax=0x");
+        log_hex64(snapshot.rax);
+        crate::arch::log(" rcx=0x");
+        log_hex64(snapshot.rcx);
+        crate::arch::log(" r11=0x");
+        log_hex64(snapshot.r11);
+        crate::arch::log("]\n");
         // UserException(number = 13 = #GP vector, code = error_code) —
         // mirrors upstream handleUserLevelFault for a user GP fault.
         // IOPORTS1000's handler only checks the label is UserException,
@@ -705,6 +720,7 @@ extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u
         )
         .is_err()
         {
+            crate::fault::log_fault_handler_state(faulter);
             crate::arch::log("[#GP: no fault handler — suspending thread]\n");
             s.scheduler
                 .block(faulter, crate::tcb::ThreadStateType::Inactive);
@@ -1171,6 +1187,23 @@ extern "C" fn handle_int3_typed(saved_cs: u64, saved_rip: u64) {
             },
         );
         dispatch_next_or_idle("[INT3]\n")
+    }
+}
+
+fn log_dec_u64(mut v: u64) {
+    let mut buf = [b'0'; 20];
+    let mut i = buf.len();
+    if v == 0 {
+        crate::arch::log("0");
+        return;
+    }
+    while v > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        crate::arch::log(s);
     }
 }
 

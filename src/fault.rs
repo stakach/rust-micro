@@ -15,6 +15,116 @@ use crate::kernel::{KernelState, KERNEL};
 use crate::tcb::TcbId;
 use crate::types::{seL4_Error, seL4_Word as Word};
 
+fn log_dec_u64(mut v: u64) {
+    let mut buf = [b'0'; 20];
+    let mut i = buf.len();
+    if v == 0 {
+        crate::arch::log("0");
+        return;
+    }
+    while v > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        crate::arch::log(s);
+    }
+}
+
+fn log_hex64(v: u64) {
+    let mut buf = [b'0'; 16];
+    for i in 0..16 {
+        let shift = (15 - i) * 4;
+        let n = ((v >> shift) & 0xF) as u8;
+        buf[i] = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
+    }
+    if let Ok(s) = core::str::from_utf8(&buf) {
+        crate::arch::log(s);
+    }
+}
+
+fn cap_name(cap: &Cap) -> &'static str {
+    match cap {
+        Cap::Null => "null",
+        Cap::Untyped { .. } => "untyped",
+        Cap::Endpoint { .. } => "endpoint",
+        Cap::Notification { .. } => "notification",
+        Cap::Reply { .. } => "reply",
+        Cap::CNode { .. } => "cnode",
+        Cap::Thread { .. } => "thread",
+        Cap::IrqControl => "irq-control",
+        Cap::IrqHandler { .. } => "irq-handler",
+        Cap::Zombie { .. } => "zombie",
+        Cap::Domain => "domain",
+        Cap::Frame { .. } => "frame",
+        Cap::PageTable { .. } => "page-table",
+        Cap::PageDirectory { .. } => "page-directory",
+        Cap::Pdpt { .. } => "pdpt",
+        Cap::PML4 { .. } => "pml4",
+        Cap::AsidControl => "asid-control",
+        Cap::AsidPool { .. } => "asid-pool",
+        Cap::IOPort { .. } => "io-port",
+        Cap::IOPortControl => "io-port-control",
+        Cap::IoSpace { .. } => "io-space",
+        Cap::IoPageTable { .. } => "io-page-table",
+        Cap::SchedContext { .. } => "sched-context",
+        Cap::SchedControl { .. } => "sched-control",
+        Cap::Arch { .. } => "arch",
+    }
+}
+
+/// Print the fault-handler state for diagnostics when a user fault cannot be delivered.
+pub fn log_fault_handler_state(faulter: TcbId) {
+    unsafe {
+        let s = KERNEL.get();
+        let t = s.scheduler.slab.get(faulter);
+        crate::arch::log("[fault-delivery] tcb=");
+        log_dec_u64(faulter.0 as u64);
+        crate::arch::log(" fault_cptr=0x");
+        log_hex64(t.fault_handler);
+        crate::arch::log(" stored=");
+        crate::arch::log(cap_name(&t.fault_handler_cap));
+        if let Cap::Endpoint { ptr, badge, rights } = t.fault_handler_cap {
+            crate::arch::log(" ep=");
+            log_dec_u64(KernelState::endpoint_index(ptr) as u64);
+            crate::arch::log(" badge=0x");
+            log_hex64(badge.0);
+            crate::arch::log(" rights=");
+            crate::arch::log(if rights.can_send { "S" } else { "-" });
+            crate::arch::log(if rights.can_receive { "R" } else { "-" });
+            crate::arch::log(if rights.can_grant { "G" } else { "-" });
+            crate::arch::log(if rights.can_grant_reply { "P" } else { "-" });
+        }
+        let root = t.cspace_root;
+        crate::arch::log(" cspace=");
+        crate::arch::log(cap_name(&root));
+        if t.fault_handler != 0 {
+            match lookup_cap(s, &root, t.fault_handler) {
+                Ok(cap) => {
+                    crate::arch::log(" lookup=");
+                    crate::arch::log(cap_name(&cap));
+                    if let Cap::Endpoint { ptr, badge, rights } = cap {
+                        crate::arch::log(" ep=");
+                        log_dec_u64(KernelState::endpoint_index(ptr) as u64);
+                        crate::arch::log(" badge=0x");
+                        log_hex64(badge.0);
+                        crate::arch::log(" rights=");
+                        crate::arch::log(if rights.can_send { "S" } else { "-" });
+                        crate::arch::log(if rights.can_receive { "R" } else { "-" });
+                        crate::arch::log(if rights.can_grant { "G" } else { "-" });
+                        crate::arch::log(if rights.can_grant_reply { "P" } else { "-" });
+                    }
+                }
+                Err(_) => crate::arch::log(" lookup=err"),
+            }
+        }
+        crate::arch::log(" pending_fault=");
+        log_dec_u64(t.pending_fault as u64);
+        crate::arch::log("\n");
+    }
+}
+
 /// The four user-visible fault types. Discriminants match
 /// `seL4_FaultType` in libsel4.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
