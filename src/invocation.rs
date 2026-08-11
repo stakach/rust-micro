@@ -1721,21 +1721,6 @@ fn reply_handoff_requested(s: &KernelState, invoker: TcbId) -> bool {
     }
 }
 
-fn composite_reply_receive_syscall(s: &KernelState, invoker: TcbId) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use crate::syscalls::Syscall;
-
-        let nr = s.scheduler.slab.get(invoker).user_context.rdx as i32;
-        nr == Syscall::SysNBSendRecv as i32 || nr == Syscall::SysNBSendWait as i32
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (s, invoker);
-        false
-    }
-}
-
 fn handoff_replied_active_sc(
     s: &mut KernelState,
     invoker: TcbId,
@@ -1780,13 +1765,9 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         };
         let active_sc_returned = reply_handoff_requested(s, invoker)
             && reply_returns_active_sc_to_caller(s, invoker, caller);
-        let composite_reply_receive = composite_reply_receive_syscall(s, invoker);
         #[cfg(target_arch = "x86_64")]
         if reply_handoff_requested(s, invoker) {
             s.scheduler.slab.get_mut(invoker).user_context.r13 = 0;
-        }
-        if composite_reply_receive {
-            s.scheduler.slab.get_mut(invoker).composite_reply_handoff = Some(caller);
         }
         // Stage the reply message on the invoker so the existing
         // transfer machinery (used by handle_reply too) sees the
@@ -4861,7 +4842,7 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
 // TCB invocations.
 // ---------------------------------------------------------------------------
 
-const TCB_DEBUG_STATE_WORDS: usize = 28;
+const TCB_DEBUG_STATE_WORDS: usize = 29;
 const TCB_DEBUG_NONE: Word = Word::MAX;
 
 #[inline]
@@ -5066,6 +5047,8 @@ fn decode_tcb(
                     .peek_highest()
                     .map(|prio| prio as Word)
                     .unwrap_or(TCB_DEBUG_NONE);
+                let direct_handoff =
+                    debug_opt_tcb(s.scheduler.nodes[t.affinity as usize].direct_handoff);
                 let words: [Word; TCB_DEBUG_STATE_WORDS] = [
                     t.state as Word,
                     t.is_schedulable() as Word,
@@ -5095,6 +5078,7 @@ fn decode_tcb(
                     t.domain as Word,
                     s.scheduler.cur_domain as Word,
                     queue_top_priority,
+                    direct_handoff,
                 ];
                 #[cfg(target_arch = "x86_64")]
                 {

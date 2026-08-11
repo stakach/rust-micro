@@ -839,9 +839,12 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         let s = KERNEL.get();
         let mut next;
         loop {
-            next = match s.scheduler.current() {
+            next = match s.scheduler.take_direct_handoff() {
                 Some(t) => Some(t),
-                None => s.scheduler.choose_thread(),
+                None => match s.scheduler.current() {
+                    Some(t) => Some(t),
+                    None => s.scheduler.choose_thread(),
+                },
             };
             match next {
                 Some(t) if !crate::sched_context::dispatch_budget_check(t) => continue,

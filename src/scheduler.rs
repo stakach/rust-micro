@@ -287,7 +287,6 @@ impl ReadyQueues {
                 // dequeue before the next test resets the slab);
                 // skip them so the walk doesn't panic.
                 let Some(tcb) = slab.try_get(id) else {
-                    cur = None;
                     break;
                 };
                 if tcb.affinity == want_affinity {
@@ -366,6 +365,7 @@ pub struct SchedulerNode {
     /// run while its domain is current (`Scheduler::cur_domain`).
     pub queues: [ReadyQueues; NUM_DOMAINS],
     pub current: Option<TcbId>,
+    pub direct_handoff: Option<TcbId>,
     pub idle: Option<TcbId>,
 }
 
@@ -374,6 +374,7 @@ impl Default for SchedulerNode {
         Self {
             queues: [ReadyQueues::new(); NUM_DOMAINS],
             current: None,
+            direct_handoff: None,
             idle: None,
         }
     }
@@ -413,6 +414,7 @@ impl Scheduler {
         const NODE: SchedulerNode = SchedulerNode {
             queues: [ReadyQueues::new(); NUM_DOMAINS],
             current: None,
+            direct_handoff: None,
             idle: None,
         };
         // Boot default domain schedule: entry 0 runs domain 0 for the
@@ -552,6 +554,32 @@ impl Scheduler {
         self.nodes[cpu].current = val;
     }
 
+    /// Consume a one-shot direct handoff target for this CPU.
+    ///
+    /// Composite reply/receive syscalls can legally return a bound
+    /// notification to the receiver while also waking the thread that
+    /// consumed the reply. The reply target must get one dispatch
+    /// opportunity before the receiver continues pumping notifications,
+    /// even when the receiver has a higher priority. The target still
+    /// has to be runnable, schedulable, same-affinity, and in the
+    /// current scheduling domain.
+    pub fn take_direct_handoff(&mut self) -> Option<TcbId> {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        let target = self.nodes[cpu].direct_handoff.take()?;
+        let Some(tcb) = self.slab.try_get(target) else {
+            return None;
+        };
+        if !tcb.is_runnable()
+            || !tcb.is_schedulable()
+            || !tcb.enqueued
+            || tcb.affinity as usize != cpu
+            || tcb.domain != self.cur_domain
+        {
+            return None;
+        }
+        Some(target)
+    }
+
     /// Read another CPU's `current` thread (used by IPI handlers
     /// once Phase 28d lands).
     #[inline]
@@ -584,6 +612,7 @@ impl Scheduler {
     pub fn reset_queues(&mut self) {
         for node in self.nodes.iter_mut() {
             node.queues = [ReadyQueues::new(); NUM_DOMAINS];
+            node.direct_handoff = None;
         }
         // Clear the per-TCB `enqueued` flags too, otherwise a thread
         // that was enqueued before the wipe would later refuse re-
@@ -768,6 +797,7 @@ impl Scheduler {
         }
         self.nodes[cpu].queues[dom].dequeue(&mut self.slab, target);
         self.nodes[cpu].queues[dom].enqueue_front(&mut self.slab, target);
+        self.nodes[cpu].direct_handoff = Some(target);
 
         match self.nodes[cpu].current {
             Some(cur) if cur == receiver || cur == target => {
@@ -825,6 +855,9 @@ impl Scheduler {
             if node.current == Some(id) {
                 node.current = None;
             }
+            if node.direct_handoff == Some(id) {
+                node.direct_handoff = None;
+            }
         }
     }
 
@@ -846,6 +879,9 @@ impl Scheduler {
         for node in self.nodes.iter_mut() {
             if node.current == Some(id) {
                 node.current = None;
+            }
+            if node.direct_handoff == Some(id) {
+                node.direct_handoff = None;
             }
         }
     }
@@ -950,6 +986,7 @@ pub mod spec {
         tick_decrements_timeslice();
         tick_with_no_current_is_noop();
         per_cpu_queues_are_isolated();
+        direct_handoff_beats_higher_priority_current();
         arch::log("Scheduler tests completed\n");
     }
 
@@ -979,6 +1016,20 @@ pub mod spec {
         assert_eq!(s.current_for_cpu(0), Some(crate::tcb::TcbId(0)));
         assert_eq!(s.current_for_cpu(1), Some(crate::tcb::TcbId(1)));
         arch::log("  ✓ per-CPU queues + current are independent\n");
+    }
+
+    #[inline(never)]
+    fn direct_handoff_beats_higher_priority_current() {
+        let mut s = Scheduler::new();
+        let executive = s.admit(runnable(255));
+        let component = s.admit(runnable(100));
+        s.set_current(Some(executive));
+        s.nodes[0].direct_handoff = Some(component);
+
+        assert_eq!(s.take_direct_handoff(), Some(component));
+        assert_eq!(s.current(), Some(executive));
+        assert_eq!(s.take_direct_handoff(), None);
+        arch::log("  ✓ direct handoff beats a higher-priority current thread once\n");
     }
 
     fn runnable(prio: u8) -> Tcb {
