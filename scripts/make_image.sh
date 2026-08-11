@@ -33,6 +33,7 @@ mkdir -p .tmp
 IMAGE=.tmp/disk.img
 KERNEL=target/mykernel-x86/release/mykernel-rust
 ROOTSERVER=.tmp/rootserver.elf
+BOOTBOOT_INITRD_MAX_BYTES=$((16 * 1024 * 1024))
 
 if [ ! -f "$KERNEL" ]; then
   echo "error: kernel not built at $KERNEL — run scripts/build_kernel.sh first" >&2
@@ -42,6 +43,40 @@ if [ ! -f "$ROOTSERVER" ]; then
   echo "error: rootserver not staged at $ROOTSERVER — run scripts/build_kernel.sh first" >&2
   exit 1
 fi
+
+find_elf_strip() {
+  if [ -n "${ELF_STRIP:-}" ]; then
+    command -v "$ELF_STRIP" >/dev/null 2>&1 && {
+      printf '%s\n' "$ELF_STRIP"
+      return 0
+    }
+    echo "error: ELF_STRIP is set but not executable: $ELF_STRIP" >&2
+    exit 1
+  fi
+  for tool in \
+    x86_64-elf-strip \
+    /opt/homebrew/opt/llvm/bin/llvm-strip \
+    /usr/local/opt/llvm/bin/llvm-strip \
+    llvm-strip \
+    x86_64-linux-gnu-strip; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      printf '%s\n' "$tool"
+      return 0
+    fi
+  done
+  if [ "$(uname)" != "Darwin" ] && command -v strip >/dev/null 2>&1; then
+    printf '%s\n' strip
+    return 0
+  fi
+  return 1
+}
+
+strip_boot_elf_copy() {
+  local path="$1"
+  local strip_tool="$2"
+  [ -n "$strip_tool" ] || return 0
+  "$strip_tool" --strip-debug "$path"
+}
 
 # Create a 256 MiB blank image and format as FAT32. macOS `dd` accepts the same
 # `bs=1M count=256` syntax as GNU dd. P7-A: grown 64->256 MiB to hold the COMPLETE
@@ -71,14 +106,23 @@ mcopy -i "$IMAGE" .tmp/bootboot.efi ::efi/boot/bootx64.efi
 
 # Phase 39 — pack kernel + rootserver into a USTAR tar archive at
 # ::bootboot/INITRD. BOOTBOOT loads it into RAM, extracts sys/core
-# as the kernel, and exposes the whole archive's physical address
-# to the kernel via `bootboot.initrd_ptr` so userspace ELFs can be
-# located at runtime (see src/initrd.rs).
+# by path as the kernel, and exposes the live archive's physical
+# address to the kernel via `bootboot.initrd_ptr` so userspace ELFs
+# can be located at runtime (see src/initrd.rs). Keep boot/rootserver
+# before the large sys/core payload so the runtime loader can find it
+# even when a loader-visible initrd window is tight.
 INITRD_STAGE=.tmp/initrd
 rm -rf "$INITRD_STAGE"
 mkdir -p "$INITRD_STAGE/sys" "$INITRD_STAGE/boot"
 cp "$KERNEL"     "$INITRD_STAGE/sys/core"
 cp "$ROOTSERVER" "$INITRD_STAGE/boot/rootserver"
+
+if STRIP_TOOL="$(find_elf_strip)"; then
+  strip_boot_elf_copy "$INITRD_STAGE/sys/core" "$STRIP_TOOL"
+  strip_boot_elf_copy "$INITRD_STAGE/boot/rootserver" "$STRIP_TOOL"
+else
+  echo "warning: no ELF strip tool found; BOOTBOOT initrd may exceed the 16 MiB load window" >&2
+fi
 
 # Use a deterministic mtime so reproducible builds produce
 # byte-identical archives. macOS bsdtar and GNU tar both support
@@ -86,7 +130,14 @@ cp "$ROOTSERVER" "$INITRD_STAGE/boot/rootserver"
 tar --format=ustar \
     -C "$INITRD_STAGE" \
     -cf .tmp/initrd.tar \
-    sys/core boot/rootserver
+    boot/rootserver sys/core
+
+INITRD_BYTES="$(wc -c < .tmp/initrd.tar | tr -d ' ')"
+if [ "$INITRD_BYTES" -gt "$BOOTBOOT_INITRD_MAX_BYTES" ]; then
+  echo "error: BOOTBOOT initrd is ${INITRD_BYTES} bytes, limit is ${BOOTBOOT_INITRD_MAX_BYTES}" >&2
+  echo "       reduce the staged boot ELF payloads or provide a larger-capacity BOOTBOOT loader" >&2
+  exit 1
+fi
 
 mcopy -i "$IMAGE" .tmp/initrd.tar ::bootboot/INITRD
 
