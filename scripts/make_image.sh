@@ -91,12 +91,19 @@ strip_boot_elf_copy() {
   fi
 }
 
-# Create a 256 MiB blank image and format as FAT32. macOS `dd` accepts the same
+# Create a 256 MiB blank FAT volume. macOS `dd` accepts the same
 # `bs=1M count=256` syntax as GNU dd. P7-A: grown 64->256 MiB to hold the COMPLETE
 # \reactos install tree (~171 MiB) so the executive loads ANY binary BY PATH from the
 # real FS. It stays a superfloppy (no partition table — the storage host reads FAT32
 # from LBA 0); BOOTBOOT (UEFI) + our LBA48 AHCI reader both handle the larger volume.
+#
+# D3 persistence reserve: after the FAT volume is populated, the script appends a raw tail that is
+# outside the BPB TotalSectors count. FAT/BOOTBOOT/mtools ignore it, while the kernel can address it
+# by LBA for its two-slot writable-overlay snapshot store. This avoids mutating FAT metadata before
+# we have a full FAT writer, and it gives the executive a real block range rather than an in-memory
+# "reboot" proof.
 IMAGE_MIB="${IMAGE_MIB:-256}"
+PERSIST_IMAGE_MIB="${PERSIST_IMAGE_MIB:-16}"
 rm -f "$IMAGE"
 dd if=/dev/zero of="$IMAGE" bs=1M count="$IMAGE_MIB" status=none
 mkfs.vfat -F 32 "$IMAGE" >/dev/null
@@ -259,4 +266,9 @@ else
   exit 1
 fi
 
-echo "disk image ready: $IMAGE ($IMAGE_MIB MiB)"
+if [ "$PERSIST_IMAGE_MIB" -gt 0 ]; then
+  dd if=/dev/zero bs=1M count="$PERSIST_IMAGE_MIB" status=none >> "$IMAGE"
+  echo "persistent snapshot reserve appended: ${PERSIST_IMAGE_MIB} MiB after FAT volume"
+fi
+
+echo "disk image ready: $IMAGE ($((IMAGE_MIB + PERSIST_IMAGE_MIB)) MiB; FAT ${IMAGE_MIB} MiB)"
