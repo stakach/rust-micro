@@ -188,6 +188,8 @@ fn bsp_main() -> ! {
 }
 
 fn bsp_main_big_stack() -> ! {
+    crate::kernel::init_global_state();
+
     arch::init_serial();
     arch::log("Serial initialized!\n");
 

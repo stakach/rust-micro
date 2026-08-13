@@ -13,7 +13,7 @@
 //! later replaces this with `[KernelState; NUM_CPUS]` keyed by
 //! GS_BASE.
 
-use core::cell::UnsafeCell;
+use core::{cell::UnsafeCell, mem::MaybeUninit, ptr};
 
 use crate::cap::{CNodeStorage, Cap, EndpointObj, NotificationObj, PPtr};
 use crate::cspace::CSpace;
@@ -222,6 +222,107 @@ impl KernelState {
             next_xl_cnode: 0,
             next_sched_context: 0,
             next_reply: 0,
+        }
+    }
+
+    /// Initialise a `KernelState` at `dst` without constructing a second
+    /// whole-state image in `.rodata`. Large object pools are written
+    /// element-by-element so the storage can stay BSS-backed while still
+    /// preserving non-zero empty encodings such as `Cte::null()`'s MDB
+    /// parent sentinel.
+    ///
+    /// SAFETY: `dst` must point at writable, properly aligned storage for one
+    /// uninitialised `KernelState`, and callers must not read it until this
+    /// function returns.
+    pub unsafe fn init_at(dst: *mut Self) {
+        ptr::addr_of_mut!((*dst).scheduler).write(Scheduler::new());
+
+        let endpoints = ptr::addr_of_mut!((*dst).endpoints).cast::<Endpoint>();
+        let mut i = 0;
+        while i < MAX_ENDPOINTS {
+            endpoints.add(i).write(Endpoint::new());
+            i += 1;
+        }
+
+        let notifications = ptr::addr_of_mut!((*dst).notifications).cast::<Notification>();
+        i = 0;
+        while i < MAX_NTFNS {
+            notifications.add(i).write(Notification::new());
+            i += 1;
+        }
+
+        let sched_contexts =
+            ptr::addr_of_mut!((*dst).sched_contexts).cast::<crate::sched_context::SchedContext>();
+        i = 0;
+        while i < MAX_SCHED_CONTEXTS {
+            sched_contexts
+                .add(i)
+                .write(crate::sched_context::SchedContext::new(0, 0));
+            i += 1;
+        }
+
+        let replies = ptr::addr_of_mut!((*dst).replies).cast::<crate::reply::Reply>();
+        i = 0;
+        while i < MAX_REPLIES {
+            replies.add(i).write(crate::reply::Reply::new());
+            i += 1;
+        }
+
+        let cnodes = ptr::addr_of_mut!((*dst).cnodes).cast::<CNodePage>();
+        i = 0;
+        while i < MAX_CNODES {
+            Self::init_cnode_page(cnodes.add(i));
+            i += 1;
+        }
+
+        let small_cnodes = ptr::addr_of_mut!((*dst).small_cnodes).cast::<SmallCNodePage>();
+        i = 0;
+        while i < MAX_SMALL_CNODES {
+            Self::init_small_cnode_page(small_cnodes.add(i));
+            i += 1;
+        }
+
+        let xl_cnodes = ptr::addr_of_mut!((*dst).xl_cnodes).cast::<XlCNodePage>();
+        i = 0;
+        while i < MAX_XL_CNODES {
+            Self::init_xl_cnode_page(xl_cnodes.add(i));
+            i += 1;
+        }
+
+        ptr::addr_of_mut!((*dst).irqs).write(IrqTable::new());
+        ptr::addr_of_mut!((*dst).next_endpoint).write(4);
+        ptr::addr_of_mut!((*dst).next_notification).write(0);
+        ptr::addr_of_mut!((*dst).next_cnode).write(4);
+        ptr::addr_of_mut!((*dst).next_small_cnode).write(0);
+        ptr::addr_of_mut!((*dst).next_xl_cnode).write(0);
+        ptr::addr_of_mut!((*dst).next_sched_context).write(0);
+        ptr::addr_of_mut!((*dst).next_reply).write(0);
+    }
+
+    unsafe fn init_cnode_page(page: *mut CNodePage) {
+        let slots = ptr::addr_of_mut!((*page).0).cast::<Cte>();
+        let mut i = 0;
+        while i < CNODE_SLOTS {
+            slots.add(i).write(Cte::null());
+            i += 1;
+        }
+    }
+
+    unsafe fn init_small_cnode_page(page: *mut SmallCNodePage) {
+        let slots = ptr::addr_of_mut!((*page).0).cast::<Cte>();
+        let mut i = 0;
+        while i < SMALL_CNODE_SLOTS {
+            slots.add(i).write(Cte::null());
+            i += 1;
+        }
+    }
+
+    unsafe fn init_xl_cnode_page(page: *mut XlCNodePage) {
+        let slots = ptr::addr_of_mut!((*page).0).cast::<Cte>();
+        let mut i = 0;
+        while i < XL_CNODE_SLOTS {
+            slots.add(i).write(Cte::null());
+            i += 1;
         }
     }
 
@@ -912,18 +1013,39 @@ impl CSpace for KernelState {
     }
 }
 
-/// `Sync` newtype around an `UnsafeCell<KernelState>` so it can be
-/// `static`. The contract: only the kernel itself (not user mode,
-/// not interrupt context) holds a reference, and the kernel never
-/// recurses into itself, so there is exactly one `&mut` in flight
-/// at any time.
-pub struct KernelStateCell(UnsafeCell<KernelState>);
+/// `Sync` newtype around an `UnsafeCell<MaybeUninit<KernelState>>` so it can be
+/// `static` without forcing the large runtime object pools into file-backed
+/// `.data`. BSP boot writes the real initial state before APs are released or
+/// any syscall/interrupt path can reach `KERNEL.get()`.
+///
+/// The access contract: only the kernel itself (not user mode, not interrupt
+/// context) holds a reference, and the kernel never recurses into itself, so
+/// there is exactly one `&mut` in flight at any time.
+pub struct KernelStateCell {
+    initialized: UnsafeCell<bool>,
+    state: UnsafeCell<MaybeUninit<KernelState>>,
+}
 
 unsafe impl Sync for KernelStateCell {}
 
 impl KernelStateCell {
-    pub const fn new() -> Self {
-        Self(UnsafeCell::new(KernelState::new()))
+    pub const fn uninit() -> Self {
+        Self {
+            initialized: UnsafeCell::new(false),
+            state: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    /// Initialise the global kernel state exactly once from the BSP.
+    ///
+    /// SAFETY: caller must run before any other CPU or kernel-entry path can
+    /// call `get()`. `_start` routes only the BSP here before AP release.
+    pub unsafe fn init_once(&self) {
+        if *self.initialized.get() {
+            panic!("KERNEL initialized twice");
+        }
+        KernelState::init_at((*self.state.get()).as_mut_ptr());
+        *self.initialized.get() = true;
     }
 
     /// SAFETY: caller is the kernel running in CPL=0 with
@@ -932,12 +1054,21 @@ impl KernelStateCell {
     /// drop its `&mut` before another kernel entry runs.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get(&self) -> &mut KernelState {
-        &mut *self.0.get()
+        if !*self.initialized.get() {
+            panic!("KERNEL used before initialization");
+        }
+        &mut *(*self.state.get()).as_mut_ptr()
     }
 }
 
 #[no_mangle]
-pub static KERNEL: KernelStateCell = KernelStateCell::new();
+pub static KERNEL: KernelStateCell = KernelStateCell::uninit();
+
+/// Initialise the global kernel state at the first point where the BSP is on
+/// the large kernel stack and before any subsystem can observe `KERNEL`.
+pub fn init_global_state() {
+    unsafe { KERNEL.init_once() };
+}
 
 // ---------------------------------------------------------------------------
 // Bootstrap: register the running kernel context as TCB 0.
