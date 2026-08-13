@@ -62,10 +62,14 @@ pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 /// historical 48 x 4096 x 32 B = 6 MiB pool. The extern NT rootserver needs the
 /// static budget for its XL root CNode instead; its hosted components use
 /// radix-5 CNodes backed by the small pool, so a smaller big pool is sufficient.
+/// Keep this profile under BOOTBOOT's 16 MiB initrd/load window without changing
+/// the runtime allocation model: one big CNode costs 128 KiB, and desktop
+/// bring-up has tens of thousands of spare CSlots after the XL root CNode is in
+/// place.
 #[cfg(not(feature = "extern-rootserver"))]
 pub const MAX_CNODES: usize = 48;
 #[cfg(feature = "extern-rootserver")]
-pub const MAX_CNODES: usize = 24;
+pub const MAX_CNODES: usize = 23;
 
 /// One pre-allocated CNode: 32 slots × 32 bytes = 1 KiB.
 #[repr(C, align(32))]
