@@ -10,7 +10,6 @@
 //! BOOTBOOT memory-map adapter so the bring-up has a foundation.
 
 use crate::region::{align_up, PRegion};
-use crate::types::seL4_Word as Word;
 
 // ---------------------------------------------------------------------------
 // Memory-map representation. Independent of BOOTBOOT so the algorithm
@@ -444,32 +443,60 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
         }
     }
 
-    // Phase 42 — sel4test's allocman needs to carve TCBs, CNodes,
-    // frames, page tables for hundreds of tests. 64 MiB of Untyped
-    // is enough; the chunk is power-of-2 sized + power-of-2 aligned
-    // so it satisfies seL4's Untyped invariants.
-    // 256 MiB: (A) EAGER IMAGE-MAP front-loads every hosted process's whole DLL tree into frames
-    // UPFRONT at load time (instead of per-page demand), so the boot now advances all 5 processes to
-    // their frontiers within the TCG budget — which means it reaches the STEADY-STATE frame footprint
-    // (~5 processes × dozens of DLLs) that the timed-out boot never did. 128 MiB exhausted mid-lsass
-    // (fill_image_page wrote to unmapped scratch when alloc_frame silently failed). Raised 27→28.
-    const ROOTSERVER_UT_SIZE_BITS: u32 = 28; // 256 MiB
-    const ROOTSERVER_UT_SIZE: u64 = 1u64 << ROOTSERVER_UT_SIZE_BITS;
-    let ut_base = carve_chunk(&mut free, ROOTSERVER_UT_SIZE, ROOTSERVER_UT_SIZE_BITS)?;
+    // Phase 42 — backing memory for the rootserver's Untyped cap.
+    //
+    // This remains a single power-of-two, power-of-two-aligned seL4 Untyped. Size it from the live
+    // BOOTBOOT free map instead of hard-coding the old 256 MiB value: the ReactOS desktop workload
+    // now reaches a broader steady-state service/process wave, and the normal QEMU launch gives us
+    // enough RAM to hand the rootserver 512 MiB while preserving smaller spec maps.
+    let ut_size_bits = choose_rootserver_untyped_size_bits(&free)?;
+    let ut_size = 1u64 << ut_size_bits;
+    let ut_base = carve_chunk(&mut free, ut_size, ut_size_bits)?;
 
     arch::log("boot: reserved rootserver-ut @0x");
     log_hex64(ut_base);
     arch::log("..");
-    log_hex64(ut_base + ROOTSERVER_UT_SIZE);
+    log_hex64(ut_base + ut_size);
     arch::log(" (size_bits=");
-    log_count(ROOTSERVER_UT_SIZE_BITS as usize);
+    log_count(ut_size_bits as usize);
     arch::log(")\n");
 
     unsafe {
-        crate::rootserver::install_rootserver_untyped(ut_base, ROOTSERVER_UT_SIZE_BITS as u8);
+        crate::rootserver::install_rootserver_untyped(ut_base, ut_size_bits as u8);
     }
 
     Ok(())
+}
+
+const ROOTSERVER_UT_MIN_SIZE_BITS: u32 = 28; // 256 MiB
+const ROOTSERVER_UT_TARGET_SIZE_BITS: u32 = 29; // 512 MiB
+
+fn choose_rootserver_untyped_size_bits(free: &RegionList) -> Result<u32, BootError> {
+    let mut size_bits = ROOTSERVER_UT_TARGET_SIZE_BITS;
+    loop {
+        if rootserver_untyped_fits(free, size_bits) {
+            return Ok(size_bits);
+        }
+        if size_bits == ROOTSERVER_UT_MIN_SIZE_BITS {
+            break;
+        }
+        size_bits -= 1;
+    }
+    Err(BootError::NoSuitableRegion)
+}
+
+fn rootserver_untyped_fits(free: &RegionList, size_bits: u32) -> bool {
+    let Some(size) = 1u64.checked_shl(size_bits) else {
+        return false;
+    };
+    for i in 0..free.len {
+        let f = free.entries[i];
+        let base = align_up(f.start, size_bits);
+        if base.checked_add(size).map(|e| e <= f.end).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Carve a contiguous chunk of `size` bytes (aligned to `1 << align_bits`)
@@ -562,6 +589,9 @@ pub mod spec {
         place_rootserver_carves_region();
         place_rootserver_picks_aligned_address();
         place_rootserver_fails_when_too_small();
+        rootserver_untyped_prefers_target_when_available();
+        rootserver_untyped_falls_back_to_minimum();
+        rootserver_untyped_fails_below_minimum();
         bootboot_mmap_yields_at_least_one_free_region();
         arch::log("Boot tests completed\n");
     }
@@ -664,6 +694,39 @@ pub mod spec {
             ),
         }
         arch::log("  ✓ place_rootserver fails on insufficient memory\n");
+    }
+
+    #[inline(never)]
+    fn rootserver_untyped_prefers_target_when_available() {
+        let map = [entry(0x10_0000, 0x4010_0000, MemKind::Free)];
+        let free = extract_free(&map).unwrap();
+        assert_eq!(
+            choose_rootserver_untyped_size_bits(&free).unwrap(),
+            ROOTSERVER_UT_TARGET_SIZE_BITS
+        );
+        arch::log("  ✓ rootserver Untyped prefers target size when available\n");
+    }
+
+    #[inline(never)]
+    fn rootserver_untyped_falls_back_to_minimum() {
+        let map = [entry(0x1000_0000, 0x2000_0000, MemKind::Free)];
+        let free = extract_free(&map).unwrap();
+        assert_eq!(
+            choose_rootserver_untyped_size_bits(&free).unwrap(),
+            ROOTSERVER_UT_MIN_SIZE_BITS
+        );
+        arch::log("  ✓ rootserver Untyped falls back to minimum size\n");
+    }
+
+    #[inline(never)]
+    fn rootserver_untyped_fails_below_minimum() {
+        let map = [entry(0x1000_0000, 0x1800_0000, MemKind::Free)];
+        let free = extract_free(&map).unwrap();
+        assert!(matches!(
+            choose_rootserver_untyped_size_bits(&free),
+            Err(BootError::NoSuitableRegion)
+        ));
+        arch::log("  ✓ rootserver Untyped fails below minimum size\n");
     }
 
     #[inline(never)]

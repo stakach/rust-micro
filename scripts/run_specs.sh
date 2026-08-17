@@ -40,6 +40,7 @@ if [ ! -f "$IMAGE" ]; then
   echo "error: $IMAGE missing — run scripts/build_kernel.sh first" >&2
   exit 1
 fi
+QEMU_MEMORY="${QEMU_MEMORY:-2048M}"
 
 DEBUG_FLAGS=()
 # GRAPHICS=1 (or the `--display`/`--graphics` flag) boots with a real QEMU
@@ -111,7 +112,7 @@ exec qemu-system-x86_64 \
   -netdev user,id=ntnet0 \
   -device e1000,netdev=ntnet0 \
   -device intel-iommu,intremap=off \
-  -m 1024M \
+  -m "$QEMU_MEMORY" \
   -smp 4 \
   -serial stdio \
   -no-reboot \

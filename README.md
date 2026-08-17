@@ -173,8 +173,10 @@ Notes:
 - **`-machine q35`** + **`-device intel-iommu,intremap=off`** — the VT-d IOMMU
   the IOPT/CONFIG_IOMMU tests need (DMA remapping only, no IRQ remap). Under q35
   the boot disk is attached over AHCI/SATA with an explicit `bootindex=0`.
-- **`-smp 4`**, **`-m 1024M`**, **`-serial stdio`**, **`-nographic`**,
-  **`-no-reboot`**.
+- **`-smp 4`**, **`-m ${QEMU_MEMORY:-2048M}`**, **`-serial stdio`**,
+  **`-nographic`**, **`-no-reboot`**. The 2 GiB default gives the rootserver
+  Untyped allocator enough aligned RAM for the ReactOS desktop service wave; set
+  `QEMU_MEMORY=1024M` when reproducing older tight-memory runs.
 - Firmware is loaded as `pflash` (the Homebrew EDK2 image isn't padded to the
   4 MiB the legacy `-bios` path needs).
 

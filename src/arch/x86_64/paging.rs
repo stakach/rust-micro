@@ -188,8 +188,8 @@ pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
 pub static mut LINEAR_MAP_BASE: u64 = 0;
 #[no_mangle]
 pub static mut LINEAR_MAP_PML4_IDX: usize = 0;
-/// Coverage in 1 GiB increments. 4 GiB is comfortably above the
-/// rootserver UT (256 MiB) + qemu RAM (1 GiB) we configure today;
+/// Coverage in 1 GiB increments. 4 GiB is comfortably above the current
+/// rootserver Untyped target plus the 2 GiB QEMU RAM we configure today;
 /// bumping this just adds a few PDPT entries.
 pub const LINEAR_MAP_GIB: u64 = 4;
 
