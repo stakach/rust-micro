@@ -28,18 +28,13 @@ pub struct Cte {
 impl Cte {
     pub const SIZE_BYTES: usize = 32;
 
-    /// A null CTE: null cap, parent = None (sentinel `MdbId::SENTINEL`).
-    /// Without the parent sentinel, a freshly-zeroed CTE decodes its
-    /// parent as `Some(MdbId(0))` = (cnode 0, slot 0). cnode_revoke on
-    /// that slot would then mark every default-parent CTE as a
-    /// descendant and clear it — wiping unrelated Untyped/CNode/Frame
-    /// caps across the kernel. Manifested as a Cap::Null at cptr 0x57f
-    /// when DOMAINS0001's basic_set_up retypes a fresh page directory
-    /// after the rootserver had revoked some innocuous slot 0 cap.
+    /// A null CTE: null cap, parent = None. The all-zero byte pattern is canonical so large CNode
+    /// pools can live in `.bss`; parent ids stored in MDB words are biased by one to keep
+    /// `(cnode 0, slot 0)` representable without making zero mean a real parent.
     pub const fn null() -> Self {
         Self {
             cap_words: [0; 2],
-            mdb_words: [MdbId::SENTINEL as u64, 0],
+            mdb_words: [MdbId::STORED_NONE as u64, 0],
         }
     }
 
@@ -90,52 +85,54 @@ impl Cte {
     // descendants and exactly that walk is what `Revoke` needs. Phase
     // 30+ can grow the encoding to use the rest of `mdb_words`.
     //
-    // Encoding: low 26 bits of `mdb_words[0]` = packed `MdbId`
-    // (8-bit cnode_idx + 18-bit slot, see `MdbId::pack`; the slot
-    // width covers the XL pool's radix-18 pages). Sentinel
-    // `MdbId::SENTINEL` = "no parent" (a root cap, or one that
-    // pre-dates the MDB).
+    // Encoding: low `MdbId::MASK` bits of `mdb_words[0]` = packed `MdbId + 1`.
+    // Stored zero means "no parent" (a root cap, an empty CTE, or one that predates the MDB), while
+    // `MdbId::pack(0, 0)` stores as one and remains a valid parent.
 
     pub fn parent(&self) -> Option<MdbId> {
         let raw = (self.mdb_words[0] & MdbId::MASK as u64) as u32;
-        if raw == MdbId::SENTINEL {
+        if raw == MdbId::STORED_NONE {
             None
         } else {
-            Some(MdbId(raw))
+            Some(MdbId(raw - 1))
         }
     }
 
     pub fn set_parent(&mut self, parent: Option<MdbId>) {
-        let raw = parent.map_or(MdbId::SENTINEL, |p| p.0);
+        let raw = parent.map_or(MdbId::STORED_NONE, |p| p.0 + 1);
         self.mdb_words[0] = (self.mdb_words[0] & !(MdbId::MASK as u64)) | (raw as u64);
     }
 }
 
 /// Packed (cnode_idx, slot) handle on a CTE somewhere in
 /// `KernelState`'s big / small / XL CNode pools. 8 bits cnode_idx
-/// (virtual index across all three pools) + 18 bits slot (covers
-/// the XL pool's radix-18 pages).
+/// (virtual index across all three pools) + 20 bits slot. Extern-rootserver
+/// currently uses a radix-18 XL page; the wider field leaves room for future
+/// dynamically backed CNodes without changing the on-CTE parent encoding.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct MdbId(pub u32);
 
 impl MdbId {
-    pub const MASK: u32 = 0x3FF_FFFF;
+    pub const SLOT_BITS: u32 = 20;
+    pub const SLOT_MASK: u32 = (1u32 << Self::SLOT_BITS) - 1;
+    pub const CNODE_IDX_BITS: u32 = 8;
+    pub const MASK: u32 = (1u32 << (Self::CNODE_IDX_BITS + Self::SLOT_BITS)) - 1;
+    pub const STORED_NONE: u32 = 0;
 
-    /// 26 all-ones means "no parent". Picked over (cnode=0xFF,
-    /// slot=0x3FFFF) so a real cap at the highest virtual cnode +
-    /// last slot is still distinguishable.
-    pub const SENTINEL: u32 = Self::MASK;
+    /// Kept as a storage-level alias for older comments/tests that referred to "sentinel"; raw
+    /// zero is no-parent, while `MdbId(0)` is a valid encoded parent and stores as one.
+    pub const SENTINEL: u32 = Self::STORED_NONE;
 
     /// `cnode_idx`: 0..256 (virtual, across all pools), `slot`:
-    /// 0..262,144 (radix-18 XL root CNode).
+    /// 0..1,048,576 (20-bit slot field).
     pub const fn pack(cnode_idx: u8, slot: u32) -> Self {
-        Self(((cnode_idx as u32) << 18) | (slot & 0x3FFFF))
+        Self(((cnode_idx as u32) << Self::SLOT_BITS) | (slot & Self::SLOT_MASK))
     }
     pub const fn cnode_idx(self) -> u8 {
-        (self.0 >> 18) as u8
+        (self.0 >> Self::SLOT_BITS) as u8
     }
     pub const fn slot(self) -> u32 {
-        self.0 & 0x3FFFF
+        self.0 & Self::SLOT_MASK
     }
 }
 

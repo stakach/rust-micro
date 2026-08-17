@@ -59,13 +59,12 @@ pub const CNODE_RADIX: u8 = 12;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 
 /// Maximum pre-allocated big CNodes. The built-in sel4test profile keeps the
-/// historical 48 x 4096 x 32 B = 6 MiB pool. The extern NT rootserver needs the
-/// static budget for its XL root CNode instead; its hosted components use
-/// radix-5 CNodes backed by the small pool, so a smaller big pool is sufficient.
-/// Keep this profile under BOOTBOOT's 16 MiB initrd/load window without changing
-/// the runtime allocation model: one big CNode costs 128 KiB, and desktop
-/// bring-up has tens of thousands of spare CSlots after the XL root CNode is in
-/// place.
+/// historical 48 x 4096 x 32 B = 6 MiB pool. The extern NT rootserver spends
+/// the large-capacity CSpace requirement on an out-of-line XL root CNode; big
+/// CNodes remain a scarce kernel-object pool for modest child CapTables such as
+/// image map-cap banks. Large USER/GDI retained mapping-cap sets should use the
+/// XL root CSpace or future dynamic CNode backing, not inflate the boot kernel's
+/// loaded image.
 #[cfg(not(feature = "extern-rootserver"))]
 pub const MAX_CNODES: usize = 48;
 #[cfg(feature = "extern-rootserver")]
@@ -90,9 +89,8 @@ impl Default for CNodePage {
 pub const SMALL_CNODE_RADIX: u8 = 6;
 pub const SMALL_CNODE_SLOTS: usize = 1 << SMALL_CNODE_RADIX;
 pub const MAX_SMALL_CNODES: usize = 96;
-/// `MAX_CNODES + MAX_SMALL_CNODES` must fit in MdbId's 8-bit
-/// cnode_idx (0..=254 — 0xFF is part of the SENTINEL). 48 + 96
-/// = 144 ✓.
+/// `MAX_CNODES + MAX_SMALL_CNODES` must leave room for the XL pool
+/// inside MdbId's 8-bit virtual cnode index field.
 const _: () = assert!(MAX_CNODES + MAX_SMALL_CNODES <= 254);
 
 #[repr(C, align(32))]
@@ -111,14 +109,17 @@ impl Default for SmallCNodePage {
 /// many live page-map caps for the booting OS frontier, so extern-rootserver
 /// trades big-CNode pool entries for a radix-18 XL page.
 ///
-/// This is intentionally one entry: BOOTBOOT caps the whole kernel at 16 MiB,
-/// and test processes are spawned strictly sequentially.
+/// This is intentionally one entry. The XL backing store lives in its own
+/// zero-initialized static so it does not turn the whole root CNode into
+/// boot-ELF `.data`. Higher root CSpace capacity must come from dynamic CNode
+/// backing, not a larger kernel-image BSS.
 #[cfg(not(feature = "extern-rootserver"))]
 pub const XL_CNODE_RADIX: u8 = 17;
 #[cfg(feature = "extern-rootserver")]
 pub const XL_CNODE_RADIX: u8 = 18;
 pub const XL_CNODE_SLOTS: usize = 1 << XL_CNODE_RADIX;
 pub const MAX_XL_CNODES: usize = 1;
+const _: () = assert!((XL_CNODE_RADIX as u32) <= crate::cte::MdbId::SLOT_BITS);
 /// Virtual cnode index space:
 ///   [0, MAX_CNODES)                      big (radix 12)
 ///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix ≤ 6)
@@ -127,6 +128,29 @@ const _: () = assert!(MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES <= 254);
 
 #[repr(C, align(32))]
 pub struct XlCNodePage(pub [Cte; XL_CNODE_SLOTS]);
+
+// Keep the large zeroed XL root storage out of `KernelState`; otherwise raising
+// extern-rootserver CSpace capacity inflates the boot ELF `.data` section.
+static mut XL_CNODES: [XlCNodePage; MAX_XL_CNODES] =
+    [const { XlCNodePage([Cte::null(); XL_CNODE_SLOTS]) }; MAX_XL_CNODES];
+
+#[inline]
+unsafe fn xl_cnode_slots_at(i: usize) -> Option<&'static [Cte]> {
+    if i >= MAX_XL_CNODES {
+        return None;
+    }
+    let base = core::ptr::addr_of!(XL_CNODES) as *const XlCNodePage;
+    Some(&(&(*base.add(i)).0)[..])
+}
+
+#[inline]
+unsafe fn xl_cnode_slots_at_mut(i: usize) -> Option<&'static mut [Cte]> {
+    if i >= MAX_XL_CNODES {
+        return None;
+    }
+    let base = core::ptr::addr_of_mut!(XL_CNODES) as *mut XlCNodePage;
+    Some(&mut (&mut (*base.add(i)).0)[..])
+}
 
 pub struct KernelState {
     pub scheduler: Scheduler,
@@ -153,8 +177,6 @@ pub struct KernelState {
     /// exhaust the big pool. Virtual cnode_idx range:
     /// MAX_CNODES..MAX_CNODES+MAX_SMALL_CNODES.
     pub small_cnodes: [SmallCNodePage; MAX_SMALL_CNODES],
-    /// XL CNode pool (radix 17 for sel4test, radix 18 for extern-rootserver).
-    pub xl_cnodes: [XlCNodePage; MAX_XL_CNODES],
     /// Per-IRQ binding table.
     pub irqs: IrqTable,
 
@@ -201,7 +223,6 @@ impl KernelState {
         const EMPTY_NT: Notification = Notification::new();
         const EMPTY_CN: CNodePage = CNodePage([Cte::null(); CNODE_SLOTS]);
         const EMPTY_SCN: SmallCNodePage = SmallCNodePage([Cte::null(); SMALL_CNODE_SLOTS]);
-        const EMPTY_XL: XlCNodePage = XlCNodePage([Cte::null(); XL_CNODE_SLOTS]);
         const EMPTY_SC: crate::sched_context::SchedContext =
             crate::sched_context::SchedContext::new(0, 0);
         const EMPTY_REPLY: crate::reply::Reply = crate::reply::Reply::new();
@@ -211,7 +232,6 @@ impl KernelState {
             notifications: [EMPTY_NT; MAX_NTFNS],
             cnodes: [EMPTY_CN; MAX_CNODES],
             small_cnodes: [EMPTY_SCN; MAX_SMALL_CNODES],
-            xl_cnodes: [EMPTY_XL; MAX_XL_CNODES],
             sched_contexts: [EMPTY_SC; MAX_SCHED_CONTEXTS],
             replies: [EMPTY_REPLY; MAX_REPLIES],
             irqs: IrqTable::new(),
@@ -417,7 +437,10 @@ impl KernelState {
         const BASE: usize = MAX_CNODES + MAX_SMALL_CNODES;
         for i in 0..self.next_xl_cnode.min(MAX_XL_CNODES) {
             if !self.xl_cnode_in_use(i) {
-                for slot in self.xl_cnodes[i].0.iter_mut() {
+                let Some(slots) = (unsafe { xl_cnode_slots_at_mut(i) }) else {
+                    return None;
+                };
+                for slot in slots.iter_mut() {
                     slot.set_cap(&Cap::Null);
                     slot.set_parent(None);
                 }
@@ -428,7 +451,10 @@ impl KernelState {
         if self.next_xl_cnode < MAX_XL_CNODES {
             let i = self.next_xl_cnode;
             self.next_xl_cnode += 1;
-            for slot in self.xl_cnodes[i].0.iter_mut() {
+            let Some(slots) = (unsafe { xl_cnode_slots_at_mut(i) }) else {
+                return None;
+            };
+            for slot in slots.iter_mut() {
                 slot.set_cap(&Cap::Null);
                 slot.set_parent(None);
             }
@@ -442,9 +468,11 @@ impl KernelState {
         const BASE: usize = MAX_CNODES + MAX_SMALL_CNODES;
         if virt_idx >= BASE && virt_idx < BASE + MAX_XL_CNODES {
             let i = virt_idx - BASE;
-            for slot in self.xl_cnodes[i].0.iter_mut() {
-                slot.set_cap(&Cap::Null);
-                slot.set_parent(None);
+            if let Some(slots) = unsafe { xl_cnode_slots_at_mut(i) } {
+                for slot in slots.iter_mut() {
+                    slot.set_cap(&Cap::Null);
+                    slot.set_parent(None);
+                }
             }
             self.set_xl_cnode_in_use(i, false);
         }
@@ -471,17 +499,15 @@ impl KernelState {
     }
 
     /// Backing slot slice for virtual cnode index `vi`.
-    /// Dispatches to either `cnodes[vi]` (big) or
-    /// `small_cnodes[vi - MAX_CNODES]` (small).
+    /// Dispatches to `cnodes[vi]` (big), `small_cnodes[vi - MAX_CNODES]` (small), or the
+    /// out-of-line `XL_CNODES` pool.
     pub fn cnode_slots_at(&self, vi: usize) -> Option<&[Cte]> {
         if vi < MAX_CNODES {
             self.cnodes.get(vi).map(|p| &p.0[..])
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
             self.small_cnodes.get(vi - MAX_CNODES).map(|p| &p.0[..])
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
-            self.xl_cnodes
-                .get(vi - MAX_CNODES - MAX_SMALL_CNODES)
-                .map(|p| &p.0[..])
+            unsafe { xl_cnode_slots_at(vi - MAX_CNODES - MAX_SMALL_CNODES) }
         } else {
             None
         }
@@ -495,9 +521,7 @@ impl KernelState {
                 .get_mut(vi - MAX_CNODES)
                 .map(|p| &mut p.0[..])
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
-            self.xl_cnodes
-                .get_mut(vi - MAX_CNODES - MAX_SMALL_CNODES)
-                .map(|p| &mut p.0[..])
+            unsafe { xl_cnode_slots_at_mut(vi - MAX_CNODES - MAX_SMALL_CNODES) }
         } else {
             None
         }
@@ -717,9 +741,7 @@ impl KernelState {
         // 2-byte stride: i=0→addr=2, i=1→addr=4, etc.
         //
         // `i` is the *virtual* cnode index — the same encoding covers
-        // both the big pool (i ∈ [0, MAX_CNODES)) and the small pool
-        // (i ∈ [MAX_CNODES, MAX_CNODES + MAX_SMALL_CNODES)). Dispatch
-        // happens in `cnode_slots_at`.
+        // big, small, and XL pools. Dispatch happens in `cnode_slots_at`.
         PPtr::<CNodeStorage>::new(((i as u64) + 1) << 1).expect("non-zero")
     }
     pub fn cnode_index(p: PPtr<CNodeStorage>) -> usize {
@@ -875,8 +897,8 @@ pub(crate) fn slot_in_pools(addr: usize) -> bool {
         s.small_cnodes.as_ptr() as *const u8,
         core::mem::size_of_val(&s.small_cnodes),
     ) || within(
-        s.xl_cnodes.as_ptr() as *const u8,
-        core::mem::size_of_val(&s.xl_cnodes),
+        core::ptr::addr_of!(XL_CNODES) as *const u8,
+        core::mem::size_of::<[XlCNodePage; MAX_XL_CNODES]>(),
     )
 }
 

@@ -1006,6 +1006,8 @@ pub mod spec {
         sys_send_through_cspace_to_endpoint();
         sys_call_then_reply_round_trip();
         marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller();
+        marked_reply_cap_call_hands_off_independent_sc_to_lower_priority_caller();
+        reply_cap_fault_reply_restores_unknown_syscall_context();
         recv_bound_notification_does_not_stage_reply_cap();
         recv_bound_notification_rotates_behind_ready_peer();
         blocked_recv_bound_notification_clears_reply_offer();
@@ -1434,6 +1436,185 @@ pub mod spec {
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ marked Reply-cap active-SC return hands off to the caller\n");
+    }
+
+    #[inline(never)]
+    fn reply_cap_fault_reply_restores_unknown_syscall_context() {
+        use crate::cap::Cap;
+        use crate::cte::Cte;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+        use crate::types::seL4_Word as Word;
+
+        #[repr(C, align(4096))]
+        struct IpcPage([u64; 512]);
+        static mut SERVER_BUF: IpcPage = IpcPage([0; 512]);
+
+        let status = 0x1234_5678u64;
+        let resume_ip = 0x0000_0000_801f_0c4eu64;
+        let resume_sp = 0x0000_0100_105c_3cf8u64;
+        let resume_flags = 0x202u64;
+
+        let (server, caller, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            let cn = 10;
+            let reply_idx = 12;
+            for slot in s.cnodes[cn].0.iter_mut() {
+                slot.set_cap(&Cap::Null);
+            }
+            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.replies[reply_idx] = Reply::new();
+
+            let mut caller_t = Tcb::default();
+            caller_t.priority = 40;
+            caller_t.state = ThreadStateType::BlockedOnReply;
+            caller_t.pending_fault = 2;
+            caller_t.user_context.rsp = 0xaaaa;
+            let caller = s.scheduler.admit(caller_t);
+
+            let mut server_t = Tcb::default();
+            server_t.priority = 255;
+            server_t.state = ThreadStateType::Running;
+            server_t.ipc_buffer_paddr =
+                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut SERVER_BUF) as u64);
+            server_t.cspace_root = Cap::CNode {
+                ptr: KernelState::cnode_ptr(cn),
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            let server = s.scheduler.admit(server_t);
+
+            s.replies[reply_idx] = Reply {
+                bound_tcb: Some(caller),
+            };
+            s.scheduler.set_current(Some(server));
+            (server, caller, reply_idx)
+        };
+
+        unsafe {
+            let buf = (&raw mut SERVER_BUF) as *mut u64;
+            for i in 4..18 {
+                core::ptr::write_volatile(buf.add(1 + i), 0);
+            }
+            core::ptr::write_volatile(buf.add(1 + 15), resume_ip);
+            core::ptr::write_volatile(buf.add(1 + 16), resume_sp);
+            core::ptr::write_volatile(buf.add(1 + 17), resume_flags);
+        }
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysCall,
+            &SyscallArgs {
+                a0: 2,
+                a1: 18,
+                a2: status as Word,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            let caller_t = s.scheduler.slab.get(caller);
+            assert_eq!(caller_t.state, ThreadStateType::Running);
+            assert_eq!(caller_t.pending_fault, 0);
+            assert_eq!(caller_t.user_context.rax, status);
+            assert_eq!(caller_t.user_context.rsp, resume_sp);
+            assert_eq!(crate::fault::resume_ip(caller_t), resume_ip);
+            assert_eq!(crate::fault::resume_flags(caller_t), resume_flags);
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            s.cnodes[10].0[2] = Cte::null();
+            s.replies[reply_idx] = Reply::new();
+            free_temp_tcb(caller);
+            free_temp_tcb(server);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ Reply-cap fault reply restores UnknownSyscall resume context\n");
+    }
+
+    #[inline(never)]
+    fn marked_reply_cap_call_hands_off_independent_sc_to_lower_priority_caller() {
+        use crate::cap::Cap;
+        use crate::cte::Cte;
+        use crate::invocation::REPLY_HANDOFF_MAGIC;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+        use crate::types::seL4_Word as Word;
+
+        let (server, caller, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            let cn = 11;
+            let reply_idx = 9;
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.replies[reply_idx] = Reply::new();
+
+            let mut caller_t = Tcb::default();
+            caller_t.priority = 40;
+            caller_t.state = ThreadStateType::BlockedOnReply;
+            caller_t.sc = Some(1);
+            let caller = s.scheduler.admit(caller_t);
+
+            let mut server_t = Tcb::default();
+            server_t.priority = 255;
+            server_t.state = ThreadStateType::Running;
+            server_t.sc = Some(0);
+            #[cfg(target_arch = "x86_64")]
+            {
+                server_t.user_context.r13 = REPLY_HANDOFF_MAGIC;
+            }
+            server_t.cspace_root = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            let server = s.scheduler.admit(server_t);
+
+            s.replies[reply_idx] = Reply {
+                bound_tcb: Some(caller),
+            };
+            s.scheduler.set_current(Some(server));
+            (server, caller, reply_idx)
+        };
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysCall,
+            &SyscallArgs {
+                a0: 2,
+                a1: 1,
+                a2: 0x6261 as Word,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0x6261);
+            assert_eq!(s.scheduler.slab.get(server).active_sc, None);
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            assert_eq!(s.scheduler.current(), Some(caller));
+            s.cnodes[11].0[2] = Cte::null();
+            s.replies[reply_idx] = Reply::new();
+            free_temp_tcb(caller);
+            free_temp_tcb(server);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ marked Reply-cap independent-SC return hands off to the caller\n");
     }
 
     #[inline(never)]

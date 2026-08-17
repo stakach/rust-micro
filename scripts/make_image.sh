@@ -224,6 +224,21 @@ fi
 if [ -f .tmp/reactos/.profiles-ok ] && [ -d .tmp/reactos/Profiles ]; then
   mcopy -s -i "$IMAGE" .tmp/reactos/Profiles ::
   echo "user-profile tree added: ::Profiles ($(find .tmp/reactos/Profiles -mindepth 1 | wc -l | tr -d ' ') entries, incl. 'Default User')"
+  # ReactOS setup.c creates the physical user-profile folder table before any
+  # per-user profile is copied. The LiveCD cache already has most of that tree,
+  # but it lacks Default User\Local Settings\Temp, while hivedef.inf points
+  # TEMP/TMP at %USERPROFILE%\Local Settings\Temp. Put the setup-owned directory
+  # on the installed image so winlogon's real CopyDirectory carries it into the
+  # Administrator profile.
+  setup_profile_temp="::Profiles/Default User/Local Settings/Temp"
+  if mmd -i "$IMAGE" "$setup_profile_temp" 2>/dev/null; then
+    echo "setup profile dir added: $setup_profile_temp"
+  elif mdir -i "$IMAGE" "$setup_profile_temp" >/dev/null 2>&1; then
+    echo "setup profile dir already present: $setup_profile_temp"
+  else
+    echo "ERROR: failed to create setup profile dir: $setup_profile_temp" >&2
+    exit 1
+  fi
 else
   echo "note: user-profile tree not staged (.tmp/reactos/.profiles-ok absent) — CreateUserProfileW has no copy source"
 fi

@@ -1704,11 +1704,6 @@ static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 
 pub(crate) const REPLY_HANDOFF_MAGIC: Word = 0x4e54_4f53_5245_5431;
 
-fn reply_returns_active_sc_to_caller(s: &KernelState, invoker: TcbId, caller: TcbId) -> bool {
-    let active_sc = s.scheduler.slab.get(invoker).active_sc;
-    active_sc.is_some() && active_sc == s.scheduler.slab.get(caller).sc
-}
-
 fn reply_handoff_requested(s: &KernelState, invoker: TcbId) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1721,13 +1716,13 @@ fn reply_handoff_requested(s: &KernelState, invoker: TcbId) -> bool {
     }
 }
 
-fn handoff_replied_active_sc(
+fn handoff_marked_reply_to_caller(
     s: &mut KernelState,
     invoker: TcbId,
     caller: TcbId,
-    active_sc_returned: bool,
+    handoff_requested: bool,
 ) {
-    if !active_sc_returned || s.scheduler.current() != Some(invoker) {
+    if !handoff_requested || s.scheduler.current() != Some(invoker) {
         return;
     }
     let Some(invoker_tcb) = s.scheduler.slab.try_get(invoker) else {
@@ -1763,10 +1758,9 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
                 )))
             }
         };
-        let active_sc_returned = reply_handoff_requested(s, invoker)
-            && reply_returns_active_sc_to_caller(s, invoker, caller);
+        let handoff_requested = reply_handoff_requested(s, invoker);
         #[cfg(target_arch = "x86_64")]
-        if reply_handoff_requested(s, invoker) {
+        if handoff_requested {
             s.scheduler.slab.get_mut(invoker).user_context.r13 = 0;
         }
         // Stage the reply message on the invoker so the existing
@@ -1824,7 +1818,7 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             crate::sched_context::return_donated_sc(s, caller);
             if restart {
                 s.scheduler.make_runnable(caller);
-                handoff_replied_active_sc(s, invoker, caller, active_sc_returned);
+                handoff_marked_reply_to_caller(s, invoker, caller, handoff_requested);
             } else {
                 s.scheduler
                     .block(caller, crate::tcb::ThreadStateType::Inactive);
@@ -1847,7 +1841,7 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         // the caller schedulable.
         crate::sched_context::return_donated_sc(s, caller);
         s.scheduler.make_runnable(caller);
-        handoff_replied_active_sc(s, invoker, caller, active_sc_returned);
+        handoff_marked_reply_to_caller(s, invoker, caller, handoff_requested);
         // Clear the reply binding — the slot is reusable for the
         // next Call once the receiver Recv's on the same Reply
         // cap (or a different one).
