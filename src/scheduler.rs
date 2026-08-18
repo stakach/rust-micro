@@ -810,6 +810,41 @@ impl Scheduler {
         }
     }
 
+    /// Consume a composite reply marker after an external notification
+    /// signal wakes `receiver`.
+    ///
+    /// If the reply target was already the interrupted current thread,
+    /// the reply-consumption guarantee has been satisfied. In that case
+    /// only consume the marker; forcing another direct handoff would undo
+    /// the notification wake and can starve a higher-priority server that
+    /// owns the bound timer/IRQ.
+    pub fn handoff_composite_reply_wake_after_signal(
+        &mut self,
+        receiver: TcbId,
+        interrupted_current: Option<TcbId>,
+    ) {
+        let Some(target) = self
+            .slab
+            .try_get(receiver)
+            .and_then(|t| t.composite_reply_handoff)
+        else {
+            return;
+        };
+
+        if interrupted_current == Some(target) {
+            self.slab.get_mut(receiver).composite_reply_handoff = None;
+            if let Some(target_tcb) = self.slab.try_get(target) {
+                let cpu = target_tcb.affinity as usize;
+                if self.nodes[cpu].direct_handoff == Some(target) {
+                    self.nodes[cpu].direct_handoff = None;
+                }
+            }
+            return;
+        }
+
+        self.handoff_composite_reply_wake(receiver);
+    }
+
     /// Rotate `current` behind an already-ready peer of equal or
     /// higher priority. Used when a receive completes from a bound
     /// notification: the receiver's return registers already contain

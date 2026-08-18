@@ -1015,6 +1015,7 @@ pub mod spec {
         replyrecv_reply_wake_hands_off_after_bound_notification();
         nbsendrecv_reply_wake_yields_after_bound_notification();
         nbsendrecv_deferred_reply_wake_survives_later_bound_notification();
+        nbsendrecv_stale_reply_handoff_does_not_starve_bound_receiver();
         nbrecv_with_reply_cap_does_not_leave_pending_offer();
         plain_send_recv_with_reply_cap_does_not_leave_pending_offer();
         arch::log("Syscall dispatcher tests completed\n");
@@ -2344,6 +2345,131 @@ pub mod spec {
             free_temp_tcb(server);
         }
         arch::log("  ✓ NBSendRecv deferred reply wake survives later bound-notification receive\n");
+    }
+
+    #[inline(never)]
+    fn nbsendrecv_stale_reply_handoff_does_not_starve_bound_receiver() {
+        use crate::cap::{Badge, Cap, EndpointRights};
+        use crate::cte::Cte;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::notification::{Notification, NtfnState};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (server, caller, ntfn_idx, reply_idx, ep_idx) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            let cn = 12;
+            let ep_idx = 9;
+            let ntfn_idx = 9;
+            let reply_idx = 10;
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(ep_idx),
+                badge: Badge(0xE9),
+                rights: EndpointRights {
+                    can_send: true,
+                    can_receive: true,
+                    can_grant: true,
+                    can_grant_reply: true,
+                },
+            });
+            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            s.notifications[ntfn_idx] = Notification {
+                state: NtfnState::Idle,
+                ..Notification::new()
+            };
+
+            let cspace = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            let mut server_t = Tcb::default();
+            server_t.priority = 255;
+            server_t.state = ThreadStateType::Running;
+            server_t.sc = Some(0);
+            server_t.cspace_root = cspace;
+            server_t.bound_notification = Some(ntfn_idx as u16);
+            #[cfg(target_arch = "x86_64")]
+            {
+                server_t.user_context.r12 = 2;
+                server_t.user_context.r13 = 2;
+            }
+            let server = s.scheduler.admit(server_t);
+            s.notifications[ntfn_idx].bound_tcb = Some(server);
+
+            let mut caller_t = Tcb::default();
+            caller_t.priority = 100;
+            caller_t.state = ThreadStateType::BlockedOnReply;
+            caller_t.sc = Some(1);
+            let caller = s.scheduler.admit(caller_t);
+            s.replies[reply_idx] = Reply {
+                bound_tcb: Some(caller),
+            };
+            s.scheduler.set_current(Some(server));
+            (server, caller, ntfn_idx, reply_idx, ep_idx)
+        };
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysNBSendRecv,
+            &SyscallArgs {
+                a0: 1,
+                a1: 1,
+                a2: 0xCDEF,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(
+                s.scheduler.slab.get(server).state,
+                ThreadStateType::BlockedOnReceive
+            );
+            assert_eq!(
+                s.scheduler.slab.get(server).composite_reply_handoff,
+                Some(caller)
+            );
+            assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
+
+            // Model the real interrupt path after the reply target has
+            // already been dispatched and is interrupted by the bound
+            // timer notification.
+            s.scheduler.set_current(Some(caller));
+            let s_ptr: *mut KernelState = s;
+            let woke = crate::notification::signal(
+                &mut (*s_ptr).notifications[ntfn_idx],
+                &mut (*s_ptr).scheduler,
+                0xD3,
+            );
+            assert_eq!(woke, Some(server));
+            assert_eq!(
+                (*s_ptr).scheduler.slab.get(server).composite_reply_handoff,
+                None
+            );
+            assert_eq!((*s_ptr).scheduler.slab.get(server).user_context.rdi, 0xD3);
+            assert_eq!((*s_ptr).scheduler.current(), None);
+            assert_eq!((*s_ptr).scheduler.take_direct_handoff(), None);
+            assert_eq!((*s_ptr).scheduler.choose_thread(), Some(server));
+
+            (*s_ptr).notifications[ntfn_idx] = Notification::new();
+            (*s_ptr).replies[reply_idx] = Reply::new();
+            (*s_ptr).endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            (*s_ptr).cnodes[12].0[1] = Cte::null();
+            (*s_ptr).cnodes[12].0[2] = Cte::null();
+            (*s_ptr).scheduler.set_current(Some(crate::tcb::TcbId(0)));
+            free_temp_tcb(caller);
+            free_temp_tcb(server);
+        }
+        arch::log("  ✓ NBSendRecv stale reply handoff does not starve bound receiver\n");
     }
 
     #[inline(never)]
