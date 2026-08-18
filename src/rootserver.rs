@@ -23,9 +23,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::arch::x86_64::paging::{
-    install_kernel_page_tables, kernel_virt_to_phys, make_user_pml4,
-};
+use crate::arch::x86_64::paging::{install_kernel_page_tables, make_user_pml4};
 use crate::arch::x86_64::syscall_entry::{
     enter_user_via_sysret, set_syscall_kernel_rsp, UserContext,
 };
@@ -152,28 +150,331 @@ pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::CNODE_RADIX;
 #[cfg(feature = "extern-rootserver")]
 pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::XL_CNODE_RADIX;
 
-/// The device untypeds exposed to the root task, as `(paddr, size_bits)`. This is
-/// the SINGLE SOURCE OF TRUTH used both to stamp the untyped caps into the CSpace
-/// (slots 21..) and to build the matching `BootInfo.untypedList` — they MUST agree,
-/// or `bi.untyped` advertises a slot whose cap is missing/wrong (a device UT would
-/// alias the first user-image-frame slot → retype yields a bad cap → map #PFs).
+/// The always-present architectural device untypeds exposed to the root task, as
+/// `(paddr, size_bits)`.
+///
+/// Extern-rootserver boots append PCI MMIO BAR untypeds discovered from live
+/// config-space enumeration. This keeps the NT executive's MMIO catalogue tied to
+/// real bus assignment instead of a single QEMU layout. The combined list remains
+/// the single source of truth for both CSpace cap planting and BootInfo metadata.
 ///   * 0x00080000 (512 KiB): low 1 MiB — BIOS/ACPI/legacy (sel4test ACPI discovery).
 ///   * 0xFEC00000 / 0xFED00000 / 0xFEE00000 (4 KiB each): IOAPIC / HPET / LAPIC MMIO.
-///   * 0x81040000 (128 KiB): the e1000 NIC BAR0 (QEMU q35 assigns the explicit
-///     `-device e1000` here; the PCI hole is at 0x80000000+ with 1 GiB RAM). Exposed
-///     so a driver host maps its regs.
 pub const DEVICE_UTS: &[(u64, u8)] = &[
     (0x00080000, 19),
     (0xFEC00000, 12),
     (0xFED00000, 12),
     (0xFEE00000, 12),
-    (0x81040000, 17), // e1000 (82540EM) NIC BAR0
-    (0x81061000, 12), // AHCI ABAR (BAR5) of the add-in `-device ahci` (00:2.0) — boot disk on port 0
 ];
+
+#[derive(Copy, Clone)]
+struct DeviceUntypedSpec {
+    paddr: u64,
+    size_bits: u8,
+}
+
+const MAX_ROOTSERVER_DEVICE_UNTYPEDS: usize = CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS - 2;
+
+#[derive(Copy, Clone)]
+struct DeviceUntypedList {
+    entries: [DeviceUntypedSpec; MAX_ROOTSERVER_DEVICE_UNTYPEDS],
+    len: usize,
+}
+
+impl DeviceUntypedList {
+    const fn new() -> Self {
+        Self {
+            entries: [DeviceUntypedSpec {
+                paddr: 0,
+                size_bits: 0,
+            }; MAX_ROOTSERVER_DEVICE_UNTYPEDS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, paddr: u64, size_bits: u8) {
+        if paddr == 0 || size_bits < 12 || self.len >= self.entries.len() {
+            return;
+        }
+        if self
+            .entries
+            .iter()
+            .take(self.len)
+            .any(|entry| entry.paddr == paddr)
+        {
+            return;
+        }
+        self.entries[self.len] = DeviceUntypedSpec { paddr, size_bits };
+        self.len += 1;
+    }
+
+    fn get(&self, index: usize) -> Option<DeviceUntypedSpec> {
+        (index < self.len).then_some(self.entries[index])
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[cfg(feature = "extern-rootserver")]
+fn device_block_bits(size_bytes: u64) -> u8 {
+    let mut bits = 12u8;
+    let mut span = 1u64 << bits;
+    while span < size_bytes.max(0x1000) && bits < 63 {
+        bits += 1;
+        span <<= 1;
+    }
+    bits
+}
+
+#[cfg(not(feature = "extern-rootserver"))]
+fn rootserver_device_untypeds() -> DeviceUntypedList {
+    let mut list = DeviceUntypedList::new();
+    for &(paddr, size_bits) in DEVICE_UTS {
+        list.push(paddr, size_bits);
+    }
+    list
+}
+
+#[cfg(feature = "extern-rootserver")]
+const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
+#[cfg(feature = "extern-rootserver")]
+const PCI_CONFIG_DATA: u16 = 0xCFC;
+
+#[cfg(feature = "extern-rootserver")]
+unsafe fn port_out32(port: u16, value: u32) {
+    core::arch::asm!(
+        "out dx, eax",
+        in("dx") port,
+        in("eax") value,
+        options(nomem, nostack, preserves_flags)
+    );
+}
+
+#[cfg(feature = "extern-rootserver")]
+unsafe fn port_in32(port: u16) -> u32 {
+    let value: u32;
+    core::arch::asm!(
+        "in eax, dx",
+        in("dx") port,
+        out("eax") value,
+        options(nomem, nostack, preserves_flags)
+    );
+    value
+}
+
+#[cfg(feature = "extern-rootserver")]
+unsafe fn pci_config_read32(bus: u8, dev: u8, func: u8, reg: u8) -> u32 {
+    let address = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((reg as u32) & 0xFC);
+    port_out32(PCI_CONFIG_ADDRESS, address);
+    port_in32(PCI_CONFIG_DATA)
+}
+
+#[cfg(feature = "extern-rootserver")]
+unsafe fn pci_config_write32(bus: u8, dev: u8, func: u8, reg: u8, value: u32) {
+    let address = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | ((reg as u32) & 0xFC);
+    port_out32(PCI_CONFIG_ADDRESS, address);
+    port_out32(PCI_CONFIG_DATA, value);
+}
+
+#[cfg(feature = "extern-rootserver")]
+fn overlaps(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {
+    let Some(a_end) = a_base.checked_add(a_len) else {
+        return true;
+    };
+    let Some(b_end) = b_base.checked_add(b_len) else {
+        return true;
+    };
+    a_base < b_end && b_base < a_end
+}
+
+#[cfg(feature = "extern-rootserver")]
+fn overlaps_boot_framebuffer(paddr: u64, size: u64) -> bool {
+    if let Some((fb_paddr, _, fb)) = fb_device_untyped() {
+        return overlaps(paddr, size, fb_paddr, fb.size as u64);
+    }
+    false
+}
+
+#[cfg(feature = "extern-rootserver")]
+unsafe fn pci_memory_bar(bus: u8, dev: u8, func: u8, bar_index: u8) -> Option<(u64, u64, bool)> {
+    let reg = 0x10u8 + bar_index * 4;
+    let original_low = pci_config_read32(bus, dev, func, reg);
+    if original_low == 0 || original_low == 0xFFFF_FFFF || (original_low & 1) != 0 {
+        return None;
+    }
+    let memory_type = (original_low >> 1) & 0x3;
+    let is_64 = memory_type == 0x2;
+    if memory_type == 0x1 || (is_64 && bar_index >= 5) {
+        return None;
+    }
+    let original_high = if is_64 {
+        pci_config_read32(bus, dev, func, reg + 4)
+    } else {
+        0
+    };
+    let command = pci_config_read32(bus, dev, func, 0x04) & 0xFFFF;
+    pci_config_write32(bus, dev, func, 0x04, command & !0x3);
+    pci_config_write32(bus, dev, func, reg, 0xFFFF_FFFF);
+    if is_64 {
+        pci_config_write32(bus, dev, func, reg + 4, 0xFFFF_FFFF);
+    }
+    let mask_low = pci_config_read32(bus, dev, func, reg);
+    let mask_high = if is_64 {
+        pci_config_read32(bus, dev, func, reg + 4)
+    } else {
+        0
+    };
+    pci_config_write32(bus, dev, func, reg, original_low);
+    if is_64 {
+        pci_config_write32(bus, dev, func, reg + 4, original_high);
+    }
+    pci_config_write32(bus, dev, func, 0x04, command);
+
+    let base = if is_64 {
+        ((original_high as u64) << 32) | ((original_low & 0xFFFF_FFF0) as u64)
+    } else {
+        (original_low & 0xFFFF_FFF0) as u64
+    };
+    if base == 0 || (base & 0xFFF) != 0 {
+        return None;
+    }
+
+    let size = if is_64 {
+        let mask = ((mask_high as u64) << 32) | ((mask_low & 0xFFFF_FFF0) as u64);
+        if mask == 0 || mask == u64::MAX {
+            return None;
+        }
+        (!mask).wrapping_add(1)
+    } else {
+        let mask = mask_low & 0xFFFF_FFF0;
+        if mask == 0 || mask == 0xFFFF_FFF0 {
+            return None;
+        }
+        (!mask).wrapping_add(1) as u64
+    };
+    if size < 0x1000 || size & (size - 1) != 0 {
+        return None;
+    }
+    Some((base, size, is_64))
+}
+
+#[cfg(feature = "extern-rootserver")]
+unsafe fn append_pci_mmio_device_untypeds(list: &mut DeviceUntypedList) {
+    for bus in 0u8..=u8::MAX {
+        for dev in 0..32u8 {
+            let id0 = pci_config_read32(bus, dev, 0, 0x00);
+            if id0 == 0xFFFF_FFFF || (id0 & 0xFFFF) == 0xFFFF {
+                continue;
+            }
+            let header0 = ((pci_config_read32(bus, dev, 0, 0x0C) >> 16) & 0xFF) as u8;
+            let functions = if header0 & 0x80 != 0 { 8 } else { 1 };
+            for func in 0..functions {
+                let id = pci_config_read32(bus, dev, func, 0x00);
+                if id == 0xFFFF_FFFF || (id & 0xFFFF) == 0xFFFF {
+                    continue;
+                }
+                let header = ((pci_config_read32(bus, dev, func, 0x0C) >> 16) & 0x7F) as u8;
+                if header != 0 {
+                    continue;
+                }
+                let mut bar = 0u8;
+                while bar < 6 {
+                    if let Some((base, size, is_64)) = pci_memory_bar(bus, dev, func, bar) {
+                        if !overlaps_boot_framebuffer(base, size) {
+                            list.push(base, device_block_bits(size));
+                        }
+                        bar += if is_64 { 2 } else { 1 };
+                    } else {
+                        bar += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "extern-rootserver")]
+fn rootserver_device_untypeds() -> DeviceUntypedList {
+    let mut list = DeviceUntypedList::new();
+    for &(paddr, size_bits) in DEVICE_UTS {
+        list.push(paddr, size_bits);
+    }
+    unsafe {
+        append_pci_mmio_device_untypeds(&mut list);
+    }
+    list
+}
+
+#[cfg(feature = "extern-rootserver")]
+fn log_rootserver_dec(mut value: usize) {
+    if value == 0 {
+        crate::arch::log("0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    unsafe {
+        crate::arch::log(core::str::from_utf8_unchecked(&buf[i..]));
+    }
+}
+
+#[cfg(feature = "extern-rootserver")]
+fn log_rootserver_hex(mut value: u64) {
+    if value == 0 {
+        crate::arch::log("0");
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    while value > 0 {
+        i -= 1;
+        let digit = (value & 0xF) as u8;
+        buf[i] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + (digit - 10)
+        };
+        value >>= 4;
+    }
+    unsafe {
+        crate::arch::log(core::str::from_utf8_unchecked(&buf[i..]));
+    }
+}
+
+#[cfg(feature = "extern-rootserver")]
+fn log_device_untyped_list(list: &DeviceUntypedList) {
+    crate::arch::log("[rootserver] device-untypeds=");
+    log_rootserver_dec(list.len());
+    crate::arch::log("\n");
+    for index in 0..list.len() {
+        let Some(spec) = list.get(index) else {
+            continue;
+        };
+        crate::arch::log("[rootserver]   paddr=0x");
+        log_rootserver_hex(spec.paddr);
+        crate::arch::log(" bits=");
+        log_rootserver_dec(spec.size_bits as usize);
+        crate::arch::log("\n");
+    }
+}
 
 /// Phase 0a (extern-rootserver only) — the BOOTBOOT linear framebuffer,
 /// exposed to the NT rootserver as one extra DEVICE untyped appended
-/// after `DEVICE_UTS`. Returns `(paddr, block_bits, geometry)` where the
+/// after the boot-computed device-untyped list. Returns `(paddr, block_bits, geometry)` where the
 /// untyped covers `[fb_paddr, fb_paddr + 2^block_bits)` — `block_bits`
 /// is the smallest power-of-two size (≥ the framebuffer's byte size, ≥
 /// one 4 KiB frame) so the rootserver can retype every framebuffer
@@ -704,23 +1005,28 @@ pub unsafe fn launch_rootserver() -> ! {
         },
     );
     // Phase 42 — device untypeds at slots 21.., paralleling
-    // build_bootinfo's untypedList[1..]. Single source of truth is the
-    // module-level DEVICE_UTS so the caps here and the BootInfo metadata
-    // can't drift (see DEVICE_UTS doc).
-    for (i, &(paddr, sb)) in DEVICE_UTS.iter().enumerate() {
+    // build_bootinfo's untypedList[1..]. The boot-computed list is the
+    // single source of truth, so caps and BootInfo metadata cannot drift.
+    let device_untypeds = rootserver_device_untypeds();
+    #[cfg(feature = "extern-rootserver")]
+    log_device_untyped_list(&device_untypeds);
+    for i in 0..device_untypeds.len() {
+        let Some(spec) = device_untypeds.get(i) else {
+            continue;
+        };
         rs_set(
             s,
             untyped_slot + 1 + i,
             &Cap::Untyped {
-                ptr: PPtr::<UntypedStorage>::new(paddr.max(1)).expect("dev ut paddr"),
-                block_bits: sb,
+                ptr: PPtr::<UntypedStorage>::new(spec.paddr.max(1)).expect("dev ut paddr"),
+                block_bits: spec.size_bits,
                 free_index: 0,
                 is_device: true,
             },
         );
     }
     // Phase 0a — the BOOTBOOT framebuffer as one more device untyped,
-    // in the slot immediately after the DEVICE_UTS block. `n_extra_uts`
+    // in the slot immediately after the boot-computed device-untyped block. `n_extra_uts`
     // (0 or 1) shifts `user_image_start` by the same amount build_bootinfo
     // shifts `untyped_end`, so caps and BootInfo metadata can't drift.
     // Fully gated so the default (sel4test) build path is unchanged.
@@ -728,7 +1034,7 @@ pub unsafe fn launch_rootserver() -> ! {
     let n_extra_uts: usize = if let Some((fb_paddr, fb_bits, _)) = fb_device_untyped() {
         rs_set(
             s,
-            untyped_slot + 1 + DEVICE_UTS.len(),
+            untyped_slot + 1 + device_untypeds.len(),
             &Cap::Untyped {
                 ptr: PPtr::<UntypedStorage>::new(fb_paddr.max(1)).expect("fb ut paddr"),
                 block_bits: fb_bits,
@@ -750,10 +1056,10 @@ pub unsafe fn launch_rootserver() -> ! {
     // with `seL4_DeleteFirst` whenever it tries to reuse a PD slot
     // the loader already populated).
     #[cfg(not(feature = "extern-rootserver"))]
-    let user_image_start: Word = (untyped_slot as Word) + 1 + DEVICE_UTS.len() as Word;
+    let user_image_start: Word = (untyped_slot as Word) + 1 + device_untypeds.len() as Word;
     #[cfg(feature = "extern-rootserver")]
     let user_image_start: Word =
-        (untyped_slot as Word) + 1 + DEVICE_UTS.len() as Word + n_extra_uts as Word;
+        (untyped_slot as Word) + 1 + device_untypeds.len() as Word + n_extra_uts as Word;
     let n_image_pages = IMAGE_PAGE_COUNT;
     for i in 0..n_image_pages {
         let pm = IMAGE_PAGES[i];
@@ -810,6 +1116,7 @@ pub unsafe fn launch_rootserver() -> ! {
     // user-half mapping after sysretq.
     let bi_ptr = phys_to_kernel_virt(img.bootinfo_paddr) as *mut seL4_BootInfo;
     let bi = build_bootinfo(
+        &device_untypeds,
         img.ipc_buffer_vaddr,
         ut_paddr,
         ut_size_bits,
@@ -896,6 +1203,7 @@ unsafe fn phys_to_kernel_virt(paddr: u64) -> u64 {
 }
 
 unsafe fn build_bootinfo(
+    device_untypeds: &DeviceUntypedList,
     ipc_buffer_vaddr: u64,
     untyped_paddr: u64,
     untyped_size_bits: u8,
@@ -913,25 +1221,28 @@ unsafe fn build_bootinfo(
         isDevice: 0,
         padding: [0; 6],
     };
-    // Phase 42 — device untypeds (BIOS/ACPI low 1 MiB, IOAPIC/HPET/LAPIC
-    // MMIO, e1000 NIC BAR). Built from the SAME `DEVICE_UTS` the cap
-    // placement uses, so `untypedList` and the CSpace caps can never drift.
-    for (i, &(paddr, sb)) in DEVICE_UTS.iter().enumerate() {
+    // Phase 42 — device untypeds. Built from the same boot-computed list
+    // the cap placement consumed, so `untypedList` and the CSpace caps never
+    // drift.
+    for i in 0..device_untypeds.len() {
+        let Some(spec) = device_untypeds.get(i) else {
+            continue;
+        };
         empty_untypeds[1 + i] = seL4_UntypedDesc {
-            paddr,
-            sizeBits: sb,
+            paddr: spec.paddr,
+            sizeBits: spec.size_bits,
             isDevice: 1,
             padding: [0; 6],
         };
     }
     #[cfg(not(feature = "extern-rootserver"))]
-    let untyped_count: Word = 1 + DEVICE_UTS.len() as Word;
+    let untyped_count: Word = 1 + device_untypeds.len() as Word;
     // Phase 0a — append the framebuffer device untyped (extern-rootserver).
     // Kept in lockstep with the cap placed in launch_rootserver (same slot,
     // same paddr/size_bits) so `untypedList[fb]` and the CSpace cap agree.
     #[cfg(feature = "extern-rootserver")]
     let untyped_count: Word = {
-        let mut untyped_count: Word = 1 + DEVICE_UTS.len() as Word;
+        let mut untyped_count: Word = 1 + device_untypeds.len() as Word;
         if let Some((fb_paddr, fb_bits, _)) = fb_device_untyped() {
             empty_untypeds[untyped_count as usize] = seL4_UntypedDesc {
                 paddr: fb_paddr,
