@@ -991,6 +991,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // caller TCB, CPU reality still proves a live user thread entered the
             // kernel. Return through the asm tail to that captured context instead
             // of turning a serial byte into a scheduler decision point.
+            unsafe {
+                KERNEL.get().scheduler.nodes[arch::get_cpu_id() as usize].direct_handoff = None;
+            }
             return;
         }
     }
@@ -1336,6 +1339,7 @@ pub mod spec {
         debug_put_char_prefers_active_user_after_domain_slice_expiry();
         debug_put_char_from_live_user_returns_without_scheduler_identity();
         debug_put_char_ignores_stale_hosted_current_without_entry_identity();
+        debug_put_char_no_identity_clears_stale_direct_handoff();
         preferred_invoker_budget_failure_falls_back_to_ready_thread();
         tcb_resume_syscall_returns_to_invoker();
         marked_reply_cap_syscall_hands_off_to_caller();
@@ -1919,6 +1923,62 @@ pub mod spec {
             s.scheduler.reset_queues();
         }
         arch::log("  ✓ SysDebugPutChar ignores stale hosted current\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_no_identity_clears_stale_direct_handoff() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (stale, peer) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let mut stale_tcb = Tcb::default();
+            stale_tcb.priority = 100;
+            stale_tcb.state = ThreadStateType::Running;
+            stale_tcb.sc = Some(0);
+            stale_tcb.cpu_context.cr3 =
+                (super::super::paging::read_cr3() & super::CR3_PADDR_MASK).wrapping_add(0x1000);
+            stale_tcb.hosted_syscalls = true;
+            let stale = s.scheduler.admit(stale_tcb);
+
+            let mut peer_tcb = Tcb::default();
+            peer_tcb.priority = 90;
+            peer_tcb.state = ThreadStateType::Running;
+            peer_tcb.sc = Some(1);
+            peer_tcb.user_context.rax = 0xaaaa;
+            let peer = s.scheduler.admit(peer_tcb);
+
+            s.scheduler.set_current(Some(stale));
+            s.scheduler.set_active_user(None);
+            s.scheduler.nodes[crate::arch::get_cpu_id() as usize].direct_handoff = Some(peer);
+
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = UserContext::new_zero();
+            ctx.rax = 0xbbbb;
+            ctx.rdi = b'-' as u64;
+            (stale, peer)
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 1);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(stale));
+            assert_eq!(
+                s.scheduler.nodes[crate::arch::get_cpu_id() as usize].direct_handoff,
+                None
+            );
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0xbbbb);
+            assert_eq!(s.scheduler.slab.get(peer).user_context.rax, 0xaaaa);
+            s.scheduler.block(peer, ThreadStateType::Inactive);
+            s.scheduler.block(stale, ThreadStateType::Inactive);
+            s.scheduler.slab.free(peer);
+            s.scheduler.slab.free(stale);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar clears stale handoff without identity\n");
     }
 
     #[inline(never)]
