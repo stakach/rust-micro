@@ -1,5 +1,18 @@
 use super::interrupts::{interrupt, interrupt_with_error, IdtEntry, IDT};
 
+const X86_DEBUG_SERVICE_GP_ERROR: u64 = (0x2d << 3) | 2;
+const X86_DEBUG_SERVICE_SKIP_BYTES: u64 = 3;
+
+#[inline]
+fn is_debug_service_gp(error_code: u64) -> bool {
+    error_code == X86_DEBUG_SERVICE_GP_ERROR
+}
+
+#[inline]
+fn debug_service_resume_ip(ip: u64) -> u64 {
+    ip.wrapping_add(X86_DEBUG_SERVICE_SKIP_BYTES)
+}
+
 /// RAII guard for the BKL — releases on drop. Same shape as the
 /// one in `syscall_entry.rs`; duplicated rather than moved into
 /// `smp::` to keep the lock surface area visible at each entry
@@ -409,6 +422,41 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
     }
 }
 
+/// Resume the current user thread directly after an observation-only fault.
+///
+/// The CPU reached this code through a user exception entry that already saved
+/// the full user context and swapped into the kernel GS regime. Unlike a real
+/// user fault, DebugService must not become a scheduling boundary: debug output
+/// is not IPC and must not strand a loader callout between a diagnostic trap and
+/// the instruction that publishes real process state.
+unsafe fn resume_current_user_via_iretq(current: crate::tcb::TcbId) -> ! {
+    let s = crate::kernel::KERNEL.get();
+    s.scheduler.set_current(Some(current));
+    crate::sched_context::complete_yield_if_pending(current);
+    let tcb = s.scheduler.slab.get(current);
+    let next_cr3 = tcb.cpu_context.cr3;
+    let next_fs_base = tcb.cpu_context.fs_base;
+    let next_gs_base = tcb.cpu_context.gs_base;
+    let next_ctx = tcb.user_context;
+    if next_cr3 != 0 {
+        let cur_cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
+            options(nomem, nostack, preserves_flags));
+        if next_cr3 != cur_cr3 {
+            core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
+                options(nostack, preserves_flags));
+        }
+    }
+    crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
+    crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE, next_gs_base);
+    crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(s.scheduler.slab.get(current));
+    crate::arch::x86_64::syscall_entry::apply_debug_state_for(s.scheduler.slab.get(current));
+    let pcc = crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
+    *pcc = next_ctx;
+    crate::smp::bkl_release();
+    crate::arch::x86_64::syscall_entry::enter_user_via_iretq(pcc as *const _);
+}
+
 /// Custom #UD (Invalid Opcode, vector 6) entry. No error code.
 /// Same full fault-time capture as the #PF entry: TRUE rcx/r11 in
 /// the GPR slots, frame RIP/RFLAGS/RSP in the dedicated iretq
@@ -637,7 +685,7 @@ extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u
     // exactly why process init fails; PROMPT (EAX=2) answers 'Ignore' into the response buffer
     // (RCX). Then skip past `int 0x2d; int3` (3 bytes) and RESUME the thread (no fault delivered).
     // This keeps assertions from spinning forever.
-    if error_code == 0x16a {
+    if is_debug_service_gp(error_code) {
         unsafe {
             let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
             let s = crate::kernel::KERNEL.get();
@@ -681,9 +729,12 @@ extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u
             } else {
                 t.user_context.rax = 0;
             }
-            t.user_context.rip = t.user_context.rip.wrapping_add(3);
+            t.user_context.rip = debug_service_resume_ip(t.user_context.rip);
             t.use_iretq_resume = true;
-            dispatch_next_or_idle("[int 0x2d: no next thread, idling CPU]\n")
+            if t.is_runnable() {
+                resume_current_user_via_iretq(faulter);
+            }
+            dispatch_next_or_idle("[int 0x2d: no runnable current, idling CPU]\n")
         }
     }
     unsafe {
@@ -1219,6 +1270,25 @@ fn log_hex64(v: u64) {
     }
     if let Ok(s) = core::str::from_utf8(&buf) {
         crate::arch::log(s);
+    }
+}
+
+#[cfg(feature = "spec")]
+pub mod spec {
+    use super::*;
+
+    pub fn test_exceptions() {
+        crate::arch::log("Running exception tests...\n");
+        debug_service_gp_is_recognized_and_skips_trap_bundle();
+        crate::arch::log("Exception tests completed\n");
+    }
+
+    fn debug_service_gp_is_recognized_and_skips_trap_bundle() {
+        assert!(is_debug_service_gp(0x16a));
+        assert!(!is_debug_service_gp(0x16b));
+        assert_eq!(debug_service_resume_ip(0x1000), 0x1003);
+        assert_eq!(debug_service_resume_ip(u64::MAX - 1), 1);
+        crate::arch::log("  ✓ int 0x2d DebugService resumes after trap bundle\n");
     }
 }
 

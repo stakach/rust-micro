@@ -12,6 +12,8 @@ pub fn test_main() {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::gdt::spec::test_gdt();
     #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::exceptions::spec::test_exceptions();
+    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall_entry::spec::test_syscall_msrs();
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::paging::spec::test_paging();
