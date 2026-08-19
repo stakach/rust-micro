@@ -220,7 +220,14 @@ extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
     PIT_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let from_user = (ctx.cs & 3) == 3;
-    let interrupted = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+    let interrupted = unsafe {
+        let scheduler = &crate::kernel::KERNEL.get().scheduler;
+        if from_user {
+            scheduler.user_entry_thread()
+        } else {
+            scheduler.current()
+        }
+    };
 
     super::pic::eoi(0);
 

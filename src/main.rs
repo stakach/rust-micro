@@ -462,6 +462,7 @@ fn ap_scheduler_loop() -> ! {
 
                         let pcc = crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
                         *pcc = next_user_ctx;
+                        s.scheduler.set_active_user(Some(tcb_id));
                         pcc as *const crate::arch::x86_64::syscall_entry::UserContext
                     };
 
@@ -499,6 +500,9 @@ fn ap_scheduler_loop() -> ! {
             crate::arch::x86_64::fpu_ctx::flush_local_fpu(
                 &mut crate::kernel::KERNEL.get().scheduler.slab,
             );
+        }
+        unsafe {
+            crate::kernel::KERNEL.get().scheduler.set_active_user(None);
         }
         // Park on the kernel root page table before idling: a user
         // vspace left in CR3 can be freed by another core's process

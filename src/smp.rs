@@ -303,7 +303,11 @@ pub fn remote_tcb_stall(tcb: TcbId) -> bool {
     let (aff, running_there) = unsafe {
         let s = crate::kernel::KERNEL.get();
         let aff = s.scheduler.slab.get(tcb).affinity;
-        (aff, s.scheduler.current_for_cpu(aff) == Some(tcb))
+        (
+            aff,
+            s.scheduler.current_for_cpu(aff) == Some(tcb)
+                || s.scheduler.active_user_for_cpu(aff) == Some(tcb),
+        )
     };
     // Stall the source core not only when it is actively running `tcb`,
     // but also when `tcb`'s FPU image is still resident in that core's
@@ -366,11 +370,8 @@ pub fn shootdown_tlb(vaddr: u64) {
         // teardown) would otherwise wake the 3 idle APs on every unmap,
         // and they burn emulator cycles spinning on the BKL.
         let running = unsafe {
-            crate::kernel::KERNEL
-                .get()
-                .scheduler
-                .current_for_cpu(cpu)
-                .is_some()
+            let scheduler = &crate::kernel::KERNEL.get().scheduler;
+            scheduler.current_for_cpu(cpu).is_some() || scheduler.active_user_for_cpu(cpu).is_some()
         };
         if !running {
             continue;

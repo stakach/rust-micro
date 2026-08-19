@@ -200,7 +200,7 @@ pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Op
                                 tcb.user_context.rsi = 0;
                             }
                         }
-                        let interrupted_current = sched.current();
+                        let interrupted_current = sched.user_entry_thread();
                         sched.make_runnable(bt);
                         sched.handoff_composite_reply_wake_after_signal(bt, interrupted_current);
                         return Some(bt);
@@ -255,7 +255,7 @@ pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Op
                     sched.slab.get_mut(t).sc = Some(sc_idx);
                 }
             }
-            let interrupted_current = sched.current();
+            let interrupted_current = sched.user_entry_thread();
             sched.make_runnable(t);
             sched.handoff_composite_reply_wake_after_signal(t, interrupted_current);
             if ntfn.head.is_none() {

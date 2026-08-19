@@ -268,7 +268,14 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
     let _bkl = IrqBklGuard;
 
     let from_user = (ctx.cs & 3) == 3;
-    let interrupted = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+    let interrupted = unsafe {
+        let scheduler = &crate::kernel::KERNEL.get().scheduler;
+        if from_user {
+            scheduler.user_entry_thread()
+        } else {
+            scheduler.current()
+        }
+    };
 
     // Phase 33b — signal any notification bound to this IRQ.
     // `handle_interrupt` returns `Some(tcb)` if a thread woke up;
@@ -366,6 +373,7 @@ pub(crate) fn swap_iretq_context_if_preempted(
                     prev_tcb.use_iretq_resume = true;
                 }
                 s.scheduler.set_current(None);
+                s.scheduler.set_active_user(None);
                 // IRQ entry does not swap GS. Normalize to the kernel GS
                 // regime expected by dispatch_next_or_idle: active GS is the
                 // per-CPU area and KERNEL_GS_BASE is the outgoing user value.
@@ -384,6 +392,7 @@ pub(crate) fn swap_iretq_context_if_preempted(
         #[cfg(not(feature = "smp"))]
         if Some(next) == interrupted {
             s.scheduler.set_current(Some(next));
+            s.scheduler.set_active_user(Some(next));
             return;
         }
         if let Some(prev) = interrupted {
@@ -421,6 +430,7 @@ pub(crate) fn swap_iretq_context_if_preempted(
         #[cfg(feature = "smp")]
         if Some(next) == interrupted {
             s.scheduler.set_current(Some(next));
+            s.scheduler.set_active_user(Some(next));
             return;
         }
         // `use_iretq_resume` tracks the SAVE flavor (IRQ-preempted = true,
@@ -511,6 +521,7 @@ pub(crate) fn swap_iretq_context_if_preempted(
         #[cfg(feature = "smp")]
         crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next);
         s.scheduler.set_current(Some(next));
+        s.scheduler.set_active_user(Some(next));
     }
 }
 

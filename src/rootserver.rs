@@ -1191,6 +1191,7 @@ pub unsafe fn launch_rootserver() -> ! {
     crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, id);
 
     let ctx = s.scheduler.slab.get(id).user_context;
+    s.scheduler.set_active_user(Some(id));
     enter_user_via_sysret(&ctx);
 }
 

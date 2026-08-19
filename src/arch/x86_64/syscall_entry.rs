@@ -107,6 +107,39 @@ fn syscall_debug_return_is_transparent(syscall: crate::syscalls::Syscall) -> boo
     )
 }
 
+const CR3_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+#[derive(Copy, Clone)]
+struct LiveUserThreadIdentity {
+    cr3: u64,
+    fs_base: u64,
+    gs_base: u64,
+    cpu: u32,
+}
+
+fn live_user_thread_identity() -> LiveUserThreadIdentity {
+    LiveUserThreadIdentity {
+        cr3: super::paging::read_cr3() & CR3_PADDR_MASK,
+        fs_base: unsafe { rdmsr(IA32_FS_BASE) },
+        // After SYSCALL entry's swapgs, IA32_KERNEL_GS_BASE holds the
+        // userspace GS base that the exit path installed for this thread.
+        gs_base: unsafe { rdmsr(IA32_KERNEL_GS_BASE) },
+        cpu: crate::arch::get_cpu_id(),
+    }
+}
+
+fn tcb_matches_live_user_thread(tcb: &crate::tcb::Tcb, identity: LiveUserThreadIdentity) -> bool {
+    tcb.cpu_context.cr3 != 0
+        && tcb.cpu_context.cr3 == identity.cr3
+        && tcb.cpu_context.fs_base == identity.fs_base
+        && tcb.cpu_context.gs_base == identity.gs_base
+        && tcb.affinity == identity.cpu
+        && !matches!(
+            tcb.state,
+            crate::tcb::ThreadStateType::Inactive | crate::tcb::ThreadStateType::Idle
+        )
+}
+
 /// Initialise the MSRs. Must run after the GDT is loaded (so the
 /// CS / SS selectors in IA32_STAR refer to a real GDT entry).
 pub fn init_syscall_msrs() {
@@ -660,8 +693,44 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // returning a different current thread.
     use crate::kernel::KERNEL;
     let entry_invoker = unsafe {
-        if let Some(prev) = KERNEL.get().scheduler.current() {
-            KERNEL.get().scheduler.slab.get_mut(prev).user_context = *ctx;
+        let s = KERNEL.get();
+        let live_identity = if from_user != 0 {
+            Some(live_user_thread_identity())
+        } else {
+            None
+        };
+        let mut entry = s.scheduler.current();
+        if let Some(identity) = live_identity {
+            let active = s.scheduler.active_user();
+            let active_match = active
+                .and_then(|id| s.scheduler.slab.try_get(id).map(|tcb| (id, tcb)))
+                .filter(|(_, tcb)| tcb_matches_live_user_thread(tcb, identity))
+                .map(|(id, _)| id);
+            if let Some(active) = active_match {
+                entry = Some(active);
+            } else {
+                let current_matches = entry
+                    .and_then(|id| s.scheduler.slab.try_get(id))
+                    .is_some_and(|tcb| tcb_matches_live_user_thread(tcb, identity));
+                if !current_matches {
+                    entry = None;
+                    for (index, slot) in s.scheduler.slab.entries.iter().enumerate() {
+                        let Some(tcb) = slot.as_ref() else {
+                            continue;
+                        };
+                        if tcb_matches_live_user_thread(tcb, identity) {
+                            entry = Some(crate::tcb::TcbId(index as u16));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(prev) = entry {
+            s.scheduler.set_current(Some(prev));
+            let tcb = s.scheduler.slab.get_mut(prev);
+            tcb.user_context = *ctx;
             // This thread entered via SYSCALL, so its resume RIP lives in
             // rcx (sysret convention) — clear use_iretq_resume so a later
             // dispatch sysrets rather than iretq'ing to a stale
@@ -670,7 +739,13 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // "resume mode = last user exit" invariant correct (without
             // it, a thread preempted then making a syscall would resume
             // via iretq to the wrong RIP — boot rootserver → RIP=0).
-            KERNEL.get().scheduler.slab.get_mut(prev).use_iretq_resume = false;
+            tcb.use_iretq_resume = false;
+            if from_user != 0 && !tcb.state.is_runnable() {
+                // The CPU reached the kernel from this thread's user context, so
+                // stale blocked bookkeeping must be reconciled before syscall
+                // handling. This is state repair, not a wakeup policy decision.
+                tcb.state = crate::tcb::ThreadStateType::Running;
+            }
             Some(prev)
         } else {
             None
@@ -889,6 +964,30 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         }
     }
 
+    if transparent_debug_return {
+        if let Some(invoker) = entry_invoker {
+            unsafe {
+                let s = KERNEL.get();
+                let cpu = arch::get_cpu_id() as usize;
+                s.scheduler.nodes[cpu].direct_handoff = None;
+                {
+                    let tcb = s.scheduler.slab.get_mut(invoker);
+                    tcb.user_context = *ctx;
+                    if !tcb.state.is_runnable() {
+                        // Debug syscalls are observation only. If the entry thread reached the
+                        // kernel while bookkeeping still says it is blocked, the CPU reality wins:
+                        // return directly to that thread and repair the state instead of letting
+                        // serial output become a scheduler decision.
+                        tcb.state = crate::tcb::ThreadStateType::Running;
+                    }
+                }
+                s.scheduler.set_current(Some(invoker));
+                s.scheduler.set_active_user(Some(invoker));
+            }
+            return;
+        }
+    }
+
     // If the current thread blocked on a Send/Recv, scheduler.current
     // is None; pick the next runnable. If none is runnable we fall
     // through with the original ctx, which is fine for the tests
@@ -948,6 +1047,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         }
         if let Some(next) = next {
             s.scheduler.set_current(Some(next));
+            s.scheduler.set_active_user(Some(next));
             // Phase 24: if next thread runs in a different vspace,
             // swap CR3. Kernel half is identical across user
             // PML4s so the swap is safe — the next instruction
@@ -1108,6 +1208,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // already be in its TCB (FPU0002 flakiness fix).
             #[cfg(feature = "smp")]
             crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
+            s.scheduler.set_active_user(None);
             loop {
                 // SMP: this core is about to go idle (no runnable
                 // thread). `shootdown_tlb` SKIPS idle cores, so any
@@ -1144,6 +1245,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 };
                 if let Some(next_id) = next {
                     s.scheduler.set_current(Some(next_id));
+                    s.scheduler.set_active_user(Some(next_id));
                     crate::sched_context::complete_yield_if_pending(next_id);
                     let tcb = s.scheduler.slab.get(next_id);
                     let next_cr3 = tcb.cpu_context.cr3;
@@ -1221,6 +1323,10 @@ pub mod spec {
         repeated_debug_put_char_keeps_entry_invoker_running();
         debug_put_char_returns_to_budget_ready_invoker();
         debug_put_char_budget_miss_still_returns_to_invoker();
+        debug_put_char_repairs_stale_blocked_invoker_state();
+        debug_put_char_resolves_invoker_from_live_cpu_identity();
+        debug_put_char_prefers_active_user_over_same_identity_current();
+        debug_put_char_prefers_active_user_after_domain_slice_expiry();
         preferred_invoker_budget_failure_falls_back_to_ready_thread();
         tcb_resume_syscall_returns_to_invoker();
         marked_reply_cap_syscall_hands_off_to_caller();
@@ -1528,6 +1634,214 @@ pub mod spec {
             s.scheduler.reset_queues();
         }
         arch::log("  ✓ SysDebugPutChar ignores caller budget miss\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_repairs_stale_blocked_invoker_state() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let executive = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let mut executive_tcb = Tcb::default();
+            executive_tcb.priority = 100;
+            executive_tcb.state = ThreadStateType::Running;
+            executive_tcb.sc = Some(0);
+            executive_tcb.user_context.rax = 0x3333;
+            let executive = s.scheduler.admit(executive_tcb);
+            s.scheduler.reset_queues();
+            s.scheduler.slab.get_mut(executive).state = ThreadStateType::BlockedOnReceive;
+            s.scheduler.set_current(Some(executive));
+
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(executive).user_context;
+            ctx.rdi = b'&' as u64;
+            executive
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 0);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(executive));
+            assert_eq!(
+                s.scheduler.slab.get(executive).state,
+                ThreadStateType::Running
+            );
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x3333);
+            s.scheduler.block(executive, ThreadStateType::Inactive);
+            s.scheduler.slab.free(executive);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar repairs stale blocked invoker state\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_resolves_invoker_from_live_cpu_identity() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (actual, stale) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let live_cr3 = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
+            let live_fs = super::rdmsr(super::IA32_FS_BASE);
+            let live_gs = super::rdmsr(super::IA32_KERNEL_GS_BASE);
+
+            let mut actual_tcb = Tcb::default();
+            actual_tcb.priority = 100;
+            actual_tcb.state = ThreadStateType::Running;
+            actual_tcb.sc = Some(0);
+            actual_tcb.cpu_context.cr3 = live_cr3;
+            actual_tcb.cpu_context.fs_base = live_fs;
+            actual_tcb.cpu_context.gs_base = live_gs;
+            actual_tcb.user_context.rax = 0x4444;
+            let actual = s.scheduler.admit(actual_tcb);
+
+            let mut stale_tcb = Tcb::default();
+            stale_tcb.priority = 90;
+            stale_tcb.state = ThreadStateType::BlockedOnReceive;
+            stale_tcb.sc = Some(1);
+            stale_tcb.cpu_context.cr3 = live_cr3.wrapping_add(0x1000);
+            stale_tcb.user_context.rax = 0x5555;
+            let stale = s.scheduler.admit(stale_tcb);
+
+            s.scheduler.set_current(Some(stale));
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(actual).user_context;
+            ctx.rdi = b'@' as u64;
+            (actual, stale)
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 1);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(actual));
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x4444);
+            assert_eq!(
+                s.scheduler.slab.get(stale).state,
+                ThreadStateType::BlockedOnReceive
+            );
+            s.scheduler.block(actual, ThreadStateType::Inactive);
+            s.scheduler.slab.free(actual);
+            s.scheduler.slab.free(stale);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar resolves invoker from live CPU identity\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_prefers_active_user_over_same_identity_current() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (actual, stale) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let live_cr3 = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
+            let live_fs = super::rdmsr(super::IA32_FS_BASE);
+            let live_gs = super::rdmsr(super::IA32_KERNEL_GS_BASE);
+
+            let mut stale_tcb = Tcb::default();
+            stale_tcb.priority = 90;
+            stale_tcb.state = ThreadStateType::Running;
+            stale_tcb.sc = Some(1);
+            stale_tcb.cpu_context.cr3 = live_cr3;
+            stale_tcb.cpu_context.fs_base = live_fs;
+            stale_tcb.cpu_context.gs_base = live_gs;
+            stale_tcb.user_context.rax = 0x5555;
+            let stale = s.scheduler.admit(stale_tcb);
+
+            let mut actual_tcb = Tcb::default();
+            actual_tcb.priority = 100;
+            actual_tcb.state = ThreadStateType::Running;
+            actual_tcb.sc = Some(0);
+            actual_tcb.cpu_context.cr3 = live_cr3;
+            actual_tcb.cpu_context.fs_base = live_fs;
+            actual_tcb.cpu_context.gs_base = live_gs;
+            actual_tcb.user_context.rax = 0x6666;
+            let actual = s.scheduler.admit(actual_tcb);
+
+            s.scheduler.set_current(Some(stale));
+            s.scheduler.set_active_user(Some(actual));
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(actual).user_context;
+            ctx.rdi = b'^' as u64;
+            (actual, stale)
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 1);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(actual));
+            assert_eq!(s.scheduler.active_user(), Some(actual));
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x6666);
+            assert_eq!(
+                s.scheduler.slab.get(stale).user_context.rax,
+                0x5555,
+                "stale current must not receive the active user's syscall frame"
+            );
+            s.scheduler.block(actual, ThreadStateType::Inactive);
+            s.scheduler.block(stale, ThreadStateType::Inactive);
+            s.scheduler.slab.free(actual);
+            s.scheduler.slab.free(stale);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar prefers active user over same-vspace current\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_prefers_active_user_after_domain_slice_expiry() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let actual = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let live_cr3 = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
+            let live_fs = super::rdmsr(super::IA32_FS_BASE);
+            let live_gs = super::rdmsr(super::IA32_KERNEL_GS_BASE);
+
+            let mut actual_tcb = Tcb::default();
+            actual_tcb.priority = 100;
+            actual_tcb.state = ThreadStateType::Running;
+            actual_tcb.sc = Some(0);
+            actual_tcb.domain = 3;
+            actual_tcb.cpu_context.cr3 = live_cr3;
+            actual_tcb.cpu_context.fs_base = live_fs;
+            actual_tcb.cpu_context.gs_base = live_gs;
+            actual_tcb.user_context.rax = 0x7777;
+            let actual = s.scheduler.admit(actual_tcb);
+
+            s.scheduler.cur_domain = 0;
+            s.scheduler.set_current(None);
+            s.scheduler.set_active_user(Some(actual));
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(actual).user_context;
+            ctx.rdi = b'~' as u64;
+            actual
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 1);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(actual));
+            assert_eq!(s.scheduler.active_user(), Some(actual));
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x7777);
+            s.scheduler.block(actual, ThreadStateType::Inactive);
+            s.scheduler.slab.free(actual);
+            s.scheduler.cur_domain = 0;
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar ignores current-domain drift for active user\n");
     }
 
     #[inline(never)]

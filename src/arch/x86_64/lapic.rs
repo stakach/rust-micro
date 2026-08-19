@@ -131,7 +131,14 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
     // Capture the interrupted context up front — mirrors the LAPIC
     // tick path so the swap tail can save the preempted thread.
     let from_user = (ctx.cs & 3) == 3;
-    let interrupted = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+    let interrupted = unsafe {
+        let scheduler = &crate::kernel::KERNEL.get().scheduler;
+        if from_user {
+            scheduler.user_entry_thread()
+        } else {
+            scheduler.current()
+        }
+    };
     let me = crate::arch::get_cpu_id();
 
     // Drain pending IPIs and dispatch by kind. We snapshot the
@@ -210,6 +217,7 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
             #[cfg(feature = "smp")]
             crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
             s.scheduler.set_current(None);
+            s.scheduler.set_active_user(None);
         }
         eoi();
         // Acknowledge: we are now off the thread.
@@ -537,7 +545,14 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
     }
 
     let from_user = (ctx.cs & 3) == 3;
-    let interrupted = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+    let interrupted = unsafe {
+        let scheduler = &crate::kernel::KERNEL.get().scheduler;
+        if from_user {
+            scheduler.user_entry_thread()
+        } else {
+            scheduler.current()
+        }
+    };
 
     if delta_ms > 0 {
         unsafe {

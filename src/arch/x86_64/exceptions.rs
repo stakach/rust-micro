@@ -225,7 +225,7 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
 
     unsafe {
         let s = crate::kernel::KERNEL.get();
-        let current = match s.scheduler.current() {
+        let current = match s.scheduler.user_entry_thread() {
             Some(c) => c,
             None => {
                 // No current thread — shouldn't happen from user
@@ -266,6 +266,7 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
         let next = s.scheduler.choose_thread();
         if let Some(next_id) = next {
             s.scheduler.set_current(Some(next_id));
+            s.scheduler.set_active_user(Some(next_id));
             let tcb = s.scheduler.slab.get(next_id);
             let next_cr3 = tcb.cpu_context.cr3;
             let next_fs_base = tcb.cpu_context.fs_base;
@@ -310,6 +311,7 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
         // migration off this idle core restores fresh state.
         #[cfg(feature = "smp")]
         crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
+        s.scheduler.set_active_user(None);
         drop(_bkl);
         loop {
             core::arch::asm!("sti", "hlt");
@@ -335,6 +337,7 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
     loop {
         if let Some(next_id) = s.scheduler.choose_thread() {
             s.scheduler.set_current(Some(next_id));
+            s.scheduler.set_active_user(Some(next_id));
             crate::sched_context::complete_yield_if_pending(next_id);
             let tcb = s.scheduler.slab.get(next_id);
             let next_cr3 = tcb.cpu_context.cr3;
@@ -401,6 +404,7 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         // would restore stale TCB state and FPU0002 corrupts (flaky).
         #[cfg(feature = "smp")]
         crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
+        s.scheduler.set_active_user(None);
         // Idle: drop the lock so the timer ISR can run, halt until an
         // interrupt, then re-acquire and loop back to choose_thread.
         // Mark went-idle so the next dispatch flushes a possibly-stale TLB.
@@ -432,6 +436,7 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
 unsafe fn resume_current_user_via_iretq(current: crate::tcb::TcbId) -> ! {
     let s = crate::kernel::KERNEL.get();
     s.scheduler.set_current(Some(current));
+    s.scheduler.set_active_user(Some(current));
     crate::sched_context::complete_yield_if_pending(current);
     let tcb = s.scheduler.slab.get(current);
     let next_cr3 = tcb.cpu_context.cr3;
@@ -538,7 +543,7 @@ extern "C" fn handle_invalid_opcode_typed(saved_rip: u64, saved_cs: u64) {
         fatal_exception(6, 0);
     }
     crate::smp::bkl_acquire();
-    let current = crate::kernel::current_thread();
+    let current = unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() };
     let Some(faulter) = current else {
         // Same race as the #PF no-current path: another CPU blocked
         // us mid-flight. Dispatch whatever is runnable.
@@ -673,7 +678,7 @@ extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u
         fatal_exception(13, error_code);
     }
     crate::smp::bkl_acquire();
-    let current = crate::kernel::current_thread();
+    let current = unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() };
     let Some(faulter) = current else {
         unsafe { dispatch_next_or_idle("[#GP: no current, idling CPU]\n") }
     };
@@ -925,15 +930,10 @@ extern "C" fn handle_page_fault_typed(cr2: u64, error_code: u64, saved_cs: u64, 
     // User-mode page fault — try to deliver to the thread's
     // fault handler. If delivery fails (no handler / bad cap),
     // we kill the thread by parking it Inactive.
-    let current = crate::kernel::current_thread();
+    let current = unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() };
     if current.is_none() {
-        // We took a user-mode #PF on a CPU whose `current` is
-        // None. Most common cause: another CPU blocked the thread
-        // we were running (e.g. as the receiver in a Call) — its
-        // `block()` cleared the per-CPU `current` everywhere
-        // before we trapped, so by the time we acquired the BKL
-        // and looked, the slot was empty. Don't refault forever;
-        // dispatch the next runnable thread or idle.
+        // We took a user-mode #PF before this CPU had a published user-entry
+        // owner. Don't refault forever; dispatch whatever is runnable.
         unsafe { dispatch_next_or_idle("[USER #PF no current, no runnable — idle]\n") }
     }
     let faulter = current.unwrap();
@@ -1145,7 +1145,7 @@ extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
         crate::smp::bkl_release();
         return;
     }
-    let faulter = match crate::kernel::current_thread() {
+    let faulter = match unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() } {
         Some(t) => t,
         None => unsafe { dispatch_next_or_idle("[#DB no current]\n") },
     };
@@ -1220,7 +1220,7 @@ extern "C" fn handle_int3_typed(saved_cs: u64, saved_rip: u64) {
         crate::smp::bkl_release();
         return;
     }
-    let faulter = match crate::kernel::current_thread() {
+    let faulter = match unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() } {
         Some(t) => t,
         None => unsafe { dispatch_next_or_idle("[INT3 no current]\n") },
     };

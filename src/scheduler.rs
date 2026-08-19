@@ -365,6 +365,14 @@ pub struct SchedulerNode {
     /// run while its domain is current (`Scheduler::cur_domain`).
     pub queues: [ReadyQueues; NUM_DOMAINS],
     pub current: Option<TcbId>,
+    /// The thread whose user context this CPU most recently entered.
+    ///
+    /// `current` is scheduler policy state and may be cleared or redirected by
+    /// reply handoffs, notifications, and remote wakeups while the CPU is still
+    /// executing the old user context. Trap/syscall entry needs the concrete
+    /// user TCB that reached the kernel, so return-to-user tails publish it
+    /// here and entry paths consume it before falling back to policy state.
+    pub active_user: Option<TcbId>,
     pub direct_handoff: Option<TcbId>,
     pub idle: Option<TcbId>,
 }
@@ -374,6 +382,7 @@ impl Default for SchedulerNode {
         Self {
             queues: [ReadyQueues::new(); NUM_DOMAINS],
             current: None,
+            active_user: None,
             direct_handoff: None,
             idle: None,
         }
@@ -414,6 +423,7 @@ impl Scheduler {
         const NODE: SchedulerNode = SchedulerNode {
             queues: [ReadyQueues::new(); NUM_DOMAINS],
             current: None,
+            active_user: None,
             direct_handoff: None,
             idle: None,
         };
@@ -554,6 +564,26 @@ impl Scheduler {
         self.nodes[cpu].current = val;
     }
 
+    /// Read this CPU's last entered user thread.
+    #[inline]
+    pub fn active_user(&self) -> Option<TcbId> {
+        self.nodes[crate::arch::get_cpu_id() as usize].active_user
+    }
+
+    /// Publish the thread this CPU is about to enter in user mode.
+    #[inline]
+    pub fn set_active_user(&mut self, val: Option<TcbId>) {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        self.nodes[cpu].active_user = val;
+    }
+
+    /// TCB to charge a user-mode trap/IRQ/syscall entry to on this CPU.
+    #[inline]
+    pub fn user_entry_thread(&self) -> Option<TcbId> {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        self.nodes[cpu].active_user.or(self.nodes[cpu].current)
+    }
+
     /// Consume a one-shot direct handoff target for this CPU.
     ///
     /// Composite reply/receive syscalls can legally return a bound
@@ -588,6 +618,11 @@ impl Scheduler {
     }
 
     #[inline]
+    pub fn active_user_for_cpu(&self, cpu: u32) -> Option<TcbId> {
+        self.nodes[cpu as usize].active_user
+    }
+
+    #[inline]
     pub fn set_current_for_cpu(&mut self, cpu: u32, val: Option<TcbId>) {
         self.nodes[cpu as usize].current = val;
     }
@@ -612,6 +647,7 @@ impl Scheduler {
     pub fn reset_queues(&mut self) {
         for node in self.nodes.iter_mut() {
             node.queues = [ReadyQueues::new(); NUM_DOMAINS];
+            node.active_user = None;
             node.direct_handoff = None;
         }
         // Clear the per-TCB `enqueued` flags too, otherwise a thread
@@ -1021,6 +1057,7 @@ pub mod spec {
         tick_decrements_timeslice();
         tick_with_no_current_is_noop();
         per_cpu_queues_are_isolated();
+        active_user_tracks_entry_independently_of_current();
         direct_handoff_beats_higher_priority_current();
         arch::log("Scheduler tests completed\n");
     }
@@ -1051,6 +1088,26 @@ pub mod spec {
         assert_eq!(s.current_for_cpu(0), Some(crate::tcb::TcbId(0)));
         assert_eq!(s.current_for_cpu(1), Some(crate::tcb::TcbId(1)));
         arch::log("  ✓ per-CPU queues + current are independent\n");
+    }
+
+    #[inline(never)]
+    fn active_user_tracks_entry_independently_of_current() {
+        let mut s = Scheduler::new();
+        let actual = s.admit(runnable(70));
+        let stale_current = s.admit(runnable(40));
+
+        s.set_current(Some(stale_current));
+        s.set_active_user(Some(actual));
+        assert_eq!(s.current(), Some(stale_current));
+        assert_eq!(s.active_user(), Some(actual));
+        assert_eq!(s.user_entry_thread(), Some(actual));
+
+        s.set_active_user(None);
+        assert_eq!(s.user_entry_thread(), Some(stale_current));
+        s.set_active_user(Some(actual));
+        s.reset_queues();
+        assert_eq!(s.active_user(), None);
+        arch::log("  ✓ active user tracks trap ownership apart from current\n");
     }
 
     #[inline(never)]
