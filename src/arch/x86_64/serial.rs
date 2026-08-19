@@ -1,4 +1,7 @@
 const SERIAL_PORT: u16 = 0x3F8; // COM1
+const SERIAL_LINE_STATUS: u16 = SERIAL_PORT + 5;
+const SERIAL_THR_EMPTY: u8 = 0x20;
+const SERIAL_WRITE_SPIN_LIMIT: usize = 256;
 
 pub fn init_serial() {
     unsafe {
@@ -21,8 +24,22 @@ pub fn log(msg: &str) {
 }
 
 unsafe fn write_byte(byte: u8) {
-    while (inb(SERIAL_PORT + 5) & 0x20) == 0 {} // Wait until THR empty
-    outb(SERIAL_PORT, byte);
+    for _ in 0..SERIAL_WRITE_SPIN_LIMIT {
+        if serial_thr_empty(unsafe { inb(SERIAL_LINE_STATUS) }) {
+            unsafe {
+                outb(SERIAL_PORT, byte);
+            }
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    // Debug output must not become a kernel liveness dependency. If the UART or host-side serial
+    // sink is backed up, drop this byte and let the caller continue.
+}
+
+#[inline(always)]
+fn serial_thr_empty(line_status: u8) -> bool {
+    line_status & SERIAL_THR_EMPTY != 0
 }
 
 #[inline(always)]

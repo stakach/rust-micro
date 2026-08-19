@@ -30,6 +30,9 @@ mod cap;
 // MDB bookkeeping.
 mod cte;
 
+// x86 ASID-pool bookkeeping.
+mod asid;
+
 // CSpace lookup — resolveAddressBits, lookupCap, lookupSlot.
 mod cspace;
 

@@ -1008,9 +1008,11 @@ pub mod spec {
         marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller();
         marked_reply_cap_call_hands_off_independent_sc_to_lower_priority_caller();
         reply_cap_fault_reply_restores_unknown_syscall_context();
+        nbsendrecv_fault_reply_rearms_endpoint_receive();
         recv_bound_notification_does_not_stage_reply_cap();
         recv_bound_notification_rotates_behind_ready_peer();
         blocked_recv_bound_notification_clears_reply_offer();
+        irq_bound_notification_wakes_blocked_endpoint_recv();
         recv_prefers_queued_endpoint_over_bound_notification();
         replyrecv_reply_wake_hands_off_after_bound_notification();
         nbsendrecv_reply_wake_yields_after_bound_notification();
@@ -1446,7 +1448,6 @@ pub mod spec {
         use crate::kernel::{KernelState, KERNEL};
         use crate::reply::Reply;
         use crate::tcb::{Tcb, ThreadStateType};
-        use crate::types::seL4_Word as Word;
 
         #[repr(C, align(4096))]
         struct IpcPage([u64; 512]);
@@ -1537,6 +1538,136 @@ pub mod spec {
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ Reply-cap fault reply restores UnknownSyscall resume context\n");
+    }
+
+    #[inline(never)]
+    fn nbsendrecv_fault_reply_rearms_endpoint_receive() {
+        use crate::cap::{Badge, Cap, EndpointRights};
+        use crate::cte::Cte;
+        use crate::endpoint::EpState;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        #[repr(C, align(4096))]
+        struct IpcPage([u64; 512]);
+        static mut SERVER_BUF: IpcPage = IpcPage([0; 512]);
+
+        let initial_rax = 0x7777_8888u64;
+        let resume_ip = 0x0000_0100_0085_76b8u64;
+        let resume_sp = 0x0000_0100_105b_feb0u64;
+        let resume_flags = 0x202u64;
+
+        let (server, caller, ep_idx, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            let cn = 13;
+            let ep_idx = 10;
+            let reply_idx = 11;
+            for slot in s.cnodes[cn].0.iter_mut() {
+                slot.set_cap(&Cap::Null);
+            }
+            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(ep_idx),
+                badge: Badge(0xF1),
+                rights: EndpointRights {
+                    can_send: true,
+                    can_receive: true,
+                    can_grant: true,
+                    can_grant_reply: true,
+                },
+            });
+            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            s.replies[reply_idx] = Reply { bound_tcb: None };
+
+            let mut caller_t = Tcb::default();
+            caller_t.priority = 40;
+            caller_t.state = ThreadStateType::BlockedOnReply;
+            caller_t.pending_fault = 6;
+            caller_t.user_context.rax = initial_rax;
+            caller_t.user_context.rsp = resume_sp;
+            crate::fault::set_resume_ip(&mut caller_t, resume_ip);
+            crate::fault::set_resume_flags(&mut caller_t, resume_flags);
+            caller_t.sc = Some(1);
+            let caller = s.scheduler.admit(caller_t);
+
+            let mut server_t = Tcb::default();
+            server_t.priority = 255;
+            server_t.state = ThreadStateType::Running;
+            server_t.sc = Some(0);
+            server_t.ipc_buffer_paddr =
+                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut SERVER_BUF) as u64);
+            server_t.cspace_root = Cap::CNode {
+                ptr: KernelState::cnode_ptr(cn),
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            #[cfg(target_arch = "x86_64")]
+            {
+                server_t.user_context.r12 = 2;
+                server_t.user_context.r13 = 2;
+            }
+            let server = s.scheduler.admit(server_t);
+
+            s.replies[reply_idx] = Reply {
+                bound_tcb: Some(caller),
+            };
+            s.scheduler.set_current(Some(server));
+            (server, caller, ep_idx, reply_idx)
+        };
+
+        unsafe {
+            let buf = (&raw mut SERVER_BUF) as *mut u64;
+            for i in 4..18 {
+                core::ptr::write_volatile(buf.add(1 + i), 0);
+            }
+            core::ptr::write_volatile(buf.add(1 + 15), resume_ip);
+            core::ptr::write_volatile(buf.add(1 + 16), resume_sp);
+            core::ptr::write_volatile(buf.add(1 + 17), resume_flags);
+        }
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysNBSendRecv,
+            &SyscallArgs {
+                a0: 1,
+                a1: 0,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            let caller_t = s.scheduler.slab.get(caller);
+            assert_eq!(caller_t.state, ThreadStateType::Running);
+            assert_eq!(caller_t.pending_fault, 0);
+            assert_eq!(caller_t.user_context.rax, initial_rax);
+            assert_eq!(caller_t.user_context.rsp, resume_sp);
+            assert_eq!(crate::fault::resume_ip(caller_t), resume_ip);
+            assert_eq!(crate::fault::resume_flags(caller_t), resume_flags);
+
+            let server_t = s.scheduler.slab.get(server);
+            assert_eq!(server_t.state, ThreadStateType::BlockedOnReceive);
+            assert_eq!(server_t.pending_reply, Some(reply_idx as u16));
+            assert_eq!(server_t.composite_reply_handoff, Some(caller));
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            assert!(matches!(s.endpoints[ep_idx].state, EpState::Recv));
+
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            s.cnodes[13].0[1] = Cte::null();
+            s.cnodes[13].0[2] = Cte::null();
+            s.replies[reply_idx] = Reply::new();
+            free_temp_tcb(caller);
+            free_temp_tcb(server);
+            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ NBSendRecv fault reply re-arms endpoint receive\n");
     }
 
     #[inline(never)]
@@ -1909,6 +2040,127 @@ pub mod spec {
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ bound-notification wake clears blocked Recv reply offer\n");
+    }
+
+    #[inline(never)]
+    fn irq_bound_notification_wakes_blocked_endpoint_recv() {
+        use crate::cap::{Badge, Cap, EndpointRights};
+        use crate::cte::Cte;
+        use crate::endpoint::EpState;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::notification::{Notification, NtfnState};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        const IRQ: u16 = 31;
+        const IRQ_BADGE: u64 = 0x4000_0000_0000_0000;
+
+        let (server, ep_idx, ntfn_idx, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            let cn = 13;
+            let ep_idx = 10;
+            let ntfn_idx = 10;
+            let reply_idx = 11;
+            let cnode_ptr = KernelState::cnode_ptr(cn);
+            s.scheduler.reset_queues();
+            s.irqs = crate::interrupt::IrqTable::new();
+            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(ep_idx),
+                badge: Badge(0xE1F0),
+                rights: EndpointRights {
+                    can_send: true,
+                    can_receive: true,
+                    can_grant: true,
+                    can_grant_reply: true,
+                },
+            });
+            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            s.notifications[ntfn_idx] = Notification::new();
+            s.replies[reply_idx] = Reply::new();
+
+            let mut server_t = Tcb::default();
+            server_t.priority = 100;
+            server_t.state = ThreadStateType::Running;
+            server_t.sc = Some(0);
+            server_t.cspace_root = Cap::CNode {
+                ptr: cnode_ptr,
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            server_t.bound_notification = Some(ntfn_idx as u16);
+            #[cfg(target_arch = "x86_64")]
+            {
+                server_t.user_context.r12 = 2;
+            }
+            let server = s.scheduler.admit(server_t);
+            s.notifications[ntfn_idx] = Notification {
+                bound_tcb: Some(server),
+                ..Notification::new()
+            };
+            crate::interrupt::set_notification(&mut s.irqs, IRQ, ntfn_idx as u16, IRQ_BADGE)
+                .unwrap();
+            s.scheduler.set_current(Some(server));
+            (server, ep_idx, ntfn_idx, reply_idx)
+        };
+
+        let mut sink = BufferSink::new();
+        let r = handle_syscall(
+            Syscall::SysRecv,
+            &SyscallArgs {
+                a0: 1,
+                ..Default::default()
+            },
+            &mut sink,
+        );
+        assert!(r.is_ok());
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(
+                s.scheduler.slab.get(server).state,
+                ThreadStateType::BlockedOnReceive
+            );
+            assert_eq!(
+                s.scheduler.slab.get(server).pending_reply,
+                Some(reply_idx as u16)
+            );
+            assert_eq!(s.endpoints[ep_idx].state, EpState::Recv);
+
+            let s_ptr: *mut KernelState = s;
+            let woke = crate::interrupt::handle_interrupt(
+                &mut (*s_ptr).irqs,
+                &mut (*s_ptr).notifications,
+                &mut (*s_ptr).scheduler,
+                IRQ,
+            );
+            let server_t = (*s_ptr).scheduler.slab.get(server);
+            assert_eq!(woke, Some(server));
+            assert_eq!(server_t.state, ThreadStateType::Running);
+            assert_eq!(server_t.pending_reply, None);
+            assert_eq!((*s_ptr).replies[reply_idx].bound_tcb, None);
+            assert_eq!((*s_ptr).endpoints[ep_idx].state, EpState::Idle);
+            assert_eq!((*s_ptr).notifications[ntfn_idx].state, NtfnState::Idle);
+            assert!((*s_ptr).irqs.get(IRQ).unwrap().pending);
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert_eq!(server_t.user_context.rdi, IRQ_BADGE);
+                assert_eq!(server_t.user_context.rsi, 0);
+            }
+
+            (*s_ptr).notifications[ntfn_idx] = Notification::new();
+            (*s_ptr).replies[reply_idx] = Reply::new();
+            (*s_ptr).endpoints[ep_idx] = crate::endpoint::Endpoint::new();
+            (*s_ptr).cnodes[13].0[1] = Cte::null();
+            (*s_ptr).cnodes[13].0[2] = Cte::null();
+            (*s_ptr).irqs = crate::interrupt::IrqTable::new();
+            free_temp_tcb(server);
+            (*s_ptr).scheduler.set_current(Some(crate::tcb::TcbId(0)));
+        }
+        arch::log("  ✓ IRQ-bound notification wakes blocked endpoint Recv\n");
     }
 
     #[inline(never)]

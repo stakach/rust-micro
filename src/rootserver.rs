@@ -767,8 +767,11 @@ pub fn microtest_check_byte(b: u8) -> bool {
 /// worked when the root CNode lived in the big pool.
 #[inline]
 unsafe fn rs_set(s: &mut KernelState, si: usize, cap: &Cap) {
-    *s.cnode_slot_mut(ROOTSERVER_CNODE_IDX, si)
-        .expect("rootserver cnode slot in range") = Cte::with_cap(cap);
+    let slot = s
+        .cnode_slot_mut(ROOTSERVER_CNODE_IDX, si)
+        .expect("rootserver cnode slot in range");
+    slot.set_cap(cap);
+    slot.set_parent(None);
 }
 
 pub unsafe fn launch_rootserver() -> ! {
@@ -1158,6 +1161,7 @@ pub unsafe fn launch_rootserver() -> ! {
     // (VSPACE0005 overassigns a freshly-made pool and counts exactly
     // 512 ASIDs).
     crate::invocation::reset_asid_state();
+    crate::asid::register_boot_mapping(ROOTSERVER_ASID, img.pml4_paddr);
 
     // LAPIC-timer migration — the kernel's preemption clock
     // (TICK_COUNT + scheduler.tick + mcs_tick) is the LAPIC timer,

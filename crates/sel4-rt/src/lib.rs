@@ -16,6 +16,9 @@
 //!   verify by behaviour, not the return value.
 //! - Cap invocations use the 5-arg form: `rdi=cap_ptr, rsi=MessageInfo,
 //!   r10/r8/r9 = msg_reg[0..2]` (mirrors upstream seL4's x86-64 stubs).
+//! - Ordinary syscall helpers clear the MCS reply register (`r12`) and this
+//!   tree's direct-handoff marker register (`r13`). Helpers that intentionally
+//!   offer or consume a reply cap must pass those registers explicitly.
 
 #![no_std]
 
@@ -93,6 +96,8 @@ pub unsafe fn syscall1(nr: i64, a0: u64) -> u64 {
         "syscall",
         in("rdx") nr as u64,
         in("rdi") a0,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _,
         lateout("rcx") _,
         lateout("r11") _,
@@ -107,6 +112,8 @@ pub unsafe fn syscall0(nr: i64) -> u64 {
     asm!(
         "syscall",
         in("rdx") nr as u64,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _,
         lateout("rcx") _,
         lateout("r11") _,
@@ -127,6 +134,8 @@ pub unsafe fn syscall5(nr: i64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> 
         in("r10") a2,
         in("r8")  a3,
         in("r9")  a4,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _,
         lateout("rcx") _,
         lateout("r11") _,
@@ -331,6 +340,8 @@ pub unsafe fn ep_recv(endpoint: u64) -> (u64, u64, u64, u64) {
         "syscall",
         in("rdx") SYS_RECV as u64,
         inout("rdi") endpoint => rdi,
+        in("r12") 0u64,
+        in("r13") 0u64,
         lateout("rax") _,
         lateout("rsi") rsi,
         lateout("r10") r10,

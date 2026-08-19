@@ -62,6 +62,7 @@ impl Cte {
         if crate::kernel::slot_in_pools(self as *const _ as usize) {
             let old = self.cap();
             crate::kernel::note_cap_write(&old, cap);
+            crate::asid::note_cap_write(&old, cap);
         }
         self.cap_words = to_words(cap);
     }

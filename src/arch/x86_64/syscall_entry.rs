@@ -51,6 +51,62 @@ const HOSTED_NT_NATIVE_CALL_CAP: u64 = 6;
 const HOSTED_NT_NATIVE_CALL_LABEL: u64 = 0x4E54;
 const HOSTED_NT_NATIVE_CALL_MSGINFO: u64 = (HOSTED_NT_NATIVE_CALL_LABEL << 12) | 6;
 
+fn syscall_may_consume_direct_handoff(
+    syscall: crate::syscalls::Syscall,
+    reply_register: u64,
+) -> bool {
+    use crate::syscalls::Syscall;
+
+    matches!(
+        syscall,
+        Syscall::SysReplyRecv | Syscall::SysNBSendRecv | Syscall::SysNBSendWait
+    ) || (matches!(syscall, Syscall::SysCall)
+        && reply_register == crate::invocation::REPLY_HANDOFF_MAGIC)
+}
+
+fn syscall_prefers_entry_invoker_return(
+    syscall: crate::syscalls::Syscall,
+    reply_register: u64,
+) -> bool {
+    use crate::syscalls::Syscall;
+
+    if matches!(syscall, Syscall::SysCall)
+        && reply_register == crate::invocation::REPLY_HANDOFF_MAGIC
+    {
+        return false;
+    }
+
+    matches!(
+        syscall,
+        Syscall::SysCall
+            | Syscall::SysDebugPutChar
+            | Syscall::SysDebugDumpScheduler
+            | Syscall::SysDebugHalt
+            | Syscall::SysDebugCapIdentify
+            | Syscall::SysDebugSnapshot
+            | Syscall::SysDebugNameThread
+            | Syscall::SysDebugSendIPI
+            | Syscall::SysX86DangerousWRMSR
+            | Syscall::SysX86DangerousRDMSR
+            | Syscall::SysSetTLSBase
+    )
+}
+
+fn syscall_debug_return_is_transparent(syscall: crate::syscalls::Syscall) -> bool {
+    use crate::syscalls::Syscall;
+
+    matches!(
+        syscall,
+        Syscall::SysDebugPutChar
+            | Syscall::SysDebugDumpScheduler
+            | Syscall::SysDebugHalt
+            | Syscall::SysDebugCapIdentify
+            | Syscall::SysDebugSnapshot
+            | Syscall::SysDebugNameThread
+            | Syscall::SysDebugSendIPI
+    )
+}
+
 /// Initialise the MSRs. Must run after the GDT is loaded (so the
 /// CS / SS selectors in IA32_STAR refer to a real GDT entry).
 pub fn init_syscall_msrs() {
@@ -603,8 +659,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // TCB, so the per-thread user_context survives schedule()
     // returning a different current thread.
     use crate::kernel::KERNEL;
-    use core::sync::atomic::Ordering as AtomOrd;
-    unsafe {
+    let entry_invoker = unsafe {
         if let Some(prev) = KERNEL.get().scheduler.current() {
             KERNEL.get().scheduler.slab.get_mut(prev).user_context = *ctx;
             // This thread entered via SYSCALL, so its resume RIP lives in
@@ -616,11 +671,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // it, a thread preempted then making a syscall would resume
             // via iretq to the wrong RIP — boot rootserver → RIP=0).
             KERNEL.get().scheduler.slab.get_mut(prev).use_iretq_resume = false;
-            IN_FLIGHT_INVOKER.store(prev.0 as u32, AtomOrd::Relaxed);
+            Some(prev)
         } else {
-            IN_FLIGHT_INVOKER.store(u32::MAX, AtomOrd::Relaxed);
+            None
         }
-    }
+    };
 
     // Upstream seL4 x86_64 SYSCALL ABI: rdi = capRegister (a0),
     // rsi = msgInfoRegister (a1), r10/r8/r9/r15 = msg_regs[0..3]
@@ -731,6 +786,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             return;
         }
     };
+    let may_consume_direct_handoff = syscall_may_consume_direct_handoff(syscall, ctx.r13);
+    let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13);
+    let transparent_debug_return = syscall_debug_return_is_transparent(syscall);
     let mut sink = SerialSink;
     let result = handle_syscall(syscall, &args, &mut sink);
 
@@ -837,16 +895,53 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // that don't end up parking the caller.
     unsafe {
         let s = KERNEL.get();
+        if !may_consume_direct_handoff {
+            s.scheduler.nodes[arch::get_cpu_id() as usize].direct_handoff = None;
+        }
+        let resumable_entry_invoker = entry_invoker.filter(|&candidate| {
+            let Some(tcb) = s.scheduler.slab.try_get(candidate) else {
+                return false;
+            };
+            let has_execution_context =
+                tcb.sc.is_some() || tcb.active_sc.is_some() || tcb.donated_sc.is_some();
+            tcb.is_runnable()
+                && has_execution_context
+                && tcb.affinity as usize == arch::get_cpu_id() as usize
+                && tcb.domain == s.scheduler.cur_domain
+        });
+        let mut transparent_entry_invoker = if transparent_debug_return {
+            resumable_entry_invoker
+        } else {
+            None
+        };
+        // Debug syscalls are observation only. They must not turn a long kernel
+        // diagnostic line into a sequence of scheduling decisions that can
+        // strand the caller halfway through publishing state.
+        let mut preferred_entry_invoker =
+            if prefer_entry_invoker_return && !transparent_debug_return {
+                resumable_entry_invoker
+                    .filter(|&candidate| s.scheduler.slab.get(candidate).is_schedulable())
+            } else {
+                None
+            };
         let mut next;
         loop {
-            next = match s.scheduler.take_direct_handoff() {
+            next = match if may_consume_direct_handoff {
+                s.scheduler.take_direct_handoff()
+            } else {
+                None
+            } {
                 Some(t) => Some(t),
-                None => match s.scheduler.current() {
-                    Some(t) => Some(t),
-                    None => s.scheduler.choose_thread(),
-                },
+                None => transparent_entry_invoker
+                    .take()
+                    .or_else(|| preferred_entry_invoker.take())
+                    .or_else(|| match s.scheduler.current() {
+                        Some(t) => Some(t),
+                        None => s.scheduler.choose_thread(),
+                    }),
             };
             match next {
+                Some(t) if transparent_debug_return && Some(t) == resumable_entry_invoker => break,
                 Some(t) if !crate::sched_context::dispatch_budget_check(t) => continue,
                 _ => break,
             }
@@ -913,7 +1008,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // overwrite its rdi/rdx with the receiver's view.
             // Distinguish by checking whether `next` is the same
             // thread that just issued the syscall.
-            let invoker = current_in_flight_invoker();
+            let invoker = entry_invoker;
             if was_recv_path && Some(next) == invoker {
                 // Pack MessageInfo back into rsi: bits 0..6 length,
                 // bits 7..8 extraCaps (caps transferred into the recv
@@ -1105,22 +1200,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     }
 }
 
-/// Best-effort — return the TCB that issued the in-flight syscall.
-/// We track this via a static populated at the top of the
-/// dispatcher (before any block() may clear scheduler.current).
-fn current_in_flight_invoker() -> Option<crate::tcb::TcbId> {
-    use core::sync::atomic::Ordering;
-    let raw = IN_FLIGHT_INVOKER.load(Ordering::Relaxed);
-    if raw == u32::MAX {
-        None
-    } else {
-        Some(crate::tcb::TcbId(raw as u16))
-    }
-}
-
-static IN_FLIGHT_INVOKER: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
-
 // ---------------------------------------------------------------------------
 // Specs
 // ---------------------------------------------------------------------------
@@ -1138,6 +1217,13 @@ pub mod spec {
         fmask_clears_interrupt_flag();
         per_cpu_kernel_gs_base_set();
         dispatcher_emits_byte_for_sys_debug_put_char();
+        debug_put_char_does_not_consume_stale_direct_handoff();
+        repeated_debug_put_char_keeps_entry_invoker_running();
+        debug_put_char_returns_to_budget_ready_invoker();
+        debug_put_char_budget_miss_still_returns_to_invoker();
+        preferred_invoker_budget_failure_falls_back_to_ready_thread();
+        tcb_resume_syscall_returns_to_invoker();
+        marked_reply_cap_syscall_hands_off_to_caller();
         dispatcher_signals_unknown_via_max_rax();
         arch::log("SYSCALL MSR tests completed\n");
     }
@@ -1217,6 +1303,447 @@ pub mod spec {
             "dispatcher must preserve user's rax (upstream ABI)"
         );
         arch::log("  ✓ rust_syscall_dispatch handles SysDebugPutChar\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_does_not_consume_stale_direct_handoff() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (executive, target) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let mut executive_tcb = Tcb::default();
+            executive_tcb.priority = 100;
+            executive_tcb.state = ThreadStateType::Running;
+            executive_tcb.sc = Some(0);
+            executive_tcb.user_context.rax = 0x1111;
+            let executive = s.scheduler.admit(executive_tcb);
+
+            let mut target_tcb = Tcb::default();
+            target_tcb.priority = 100;
+            target_tcb.state = ThreadStateType::Running;
+            target_tcb.sc = Some(1);
+            target_tcb.user_context.rax = 0x2222;
+            let target = s.scheduler.admit(target_tcb);
+
+            s.scheduler.set_current(Some(executive));
+            s.scheduler.nodes[crate::arch::get_cpu_id() as usize].direct_handoff = Some(target);
+
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(executive).user_context;
+            ctx.rdi = b'?' as u64;
+            (executive, target)
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 0);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(executive));
+            assert_eq!(
+                s.scheduler.nodes[crate::arch::get_cpu_id() as usize].direct_handoff,
+                None
+            );
+            s.scheduler.block(target, ThreadStateType::Inactive);
+            s.scheduler.block(executive, ThreadStateType::Inactive);
+            s.scheduler.slab.free(target);
+            s.scheduler.slab.free(executive);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar ignores stale direct handoff\n");
+    }
+
+    #[inline(never)]
+    fn repeated_debug_put_char_keeps_entry_invoker_running() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (executive, peer) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let mut executive_tcb = Tcb::default();
+            executive_tcb.priority = 100;
+            executive_tcb.state = ThreadStateType::Running;
+            executive_tcb.sc = Some(0);
+            executive_tcb.user_context.rax = 0x1111;
+            let executive = s.scheduler.admit(executive_tcb);
+
+            let mut peer_tcb = Tcb::default();
+            peer_tcb.priority = 100;
+            peer_tcb.state = ThreadStateType::Running;
+            peer_tcb.sc = Some(1);
+            peer_tcb.user_context.rax = 0x2222;
+            let peer = s.scheduler.admit(peer_tcb);
+
+            s.scheduler.set_current(Some(executive));
+            (executive, peer)
+        };
+
+        for &byte in b"serial-pressure" {
+            unsafe {
+                let s = KERNEL.get();
+                s.scheduler.nodes[crate::arch::get_cpu_id() as usize].direct_handoff = Some(peer);
+                let ctx = super::current_cpu_user_ctx_mut();
+                *ctx = s.scheduler.slab.get(executive).user_context;
+                ctx.rdi = byte as u64;
+                ctx.r13 = crate::invocation::REPLY_HANDOFF_MAGIC;
+            }
+
+            super::rust_syscall_dispatch(-12i64 as u64, 0);
+
+            unsafe {
+                let s = KERNEL.get();
+                assert_eq!(s.scheduler.current(), Some(executive));
+                assert_eq!(
+                    s.scheduler.nodes[crate::arch::get_cpu_id() as usize].direct_handoff,
+                    None
+                );
+                assert_eq!(s.scheduler.slab.get(peer).state, ThreadStateType::Running);
+            }
+        }
+
+        unsafe {
+            let s = KERNEL.get();
+            s.scheduler.block(peer, ThreadStateType::Inactive);
+            s.scheduler.block(executive, ThreadStateType::Inactive);
+            s.scheduler.slab.free(peer);
+            s.scheduler.slab.free(executive);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ repeated SysDebugPutChar returns to the entry invoker\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_returns_to_budget_ready_invoker() {
+        use crate::kernel::KERNEL;
+        use crate::sched_context::SchedContext;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (executive, peer) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let mut executive_tcb = Tcb::default();
+            executive_tcb.priority = 100;
+            executive_tcb.state = ThreadStateType::Running;
+            executive_tcb.sc = Some(0);
+            executive_tcb.user_context.rax = 0x1111;
+            let executive = s.scheduler.admit(executive_tcb);
+            s.sched_contexts[0] = SchedContext::new(10, 10);
+            s.sched_contexts[0].bound_tcb = Some(executive);
+
+            let mut peer_tcb = Tcb::default();
+            peer_tcb.priority = 100;
+            peer_tcb.state = ThreadStateType::Running;
+            peer_tcb.sc = Some(1);
+            peer_tcb.user_context.rax = 0x2222;
+            let peer = s.scheduler.admit(peer_tcb);
+            s.sched_contexts[1] = SchedContext::new(10, 10);
+            s.sched_contexts[1].bound_tcb = Some(peer);
+
+            s.scheduler.set_current(Some(executive));
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(executive).user_context;
+            ctx.rdi = b'#' as u64;
+            (executive, peer)
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 0);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(executive));
+            assert_eq!(
+                s.scheduler.slab.get(executive).state,
+                ThreadStateType::Running
+            );
+            assert_eq!(s.scheduler.slab.get(peer).state, ThreadStateType::Running);
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x1111);
+            s.sched_contexts[0] = SchedContext::new(0, 0);
+            s.sched_contexts[1] = SchedContext::new(0, 0);
+            s.scheduler.block(peer, ThreadStateType::Inactive);
+            s.scheduler.block(executive, ThreadStateType::Inactive);
+            s.scheduler.slab.free(peer);
+            s.scheduler.slab.free(executive);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar returns to budget-ready invoker\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_budget_miss_still_returns_to_invoker() {
+        use crate::kernel::KERNEL;
+        use crate::sched_context::SchedContext;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (executive, peer) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let mut executive_tcb = Tcb::default();
+            executive_tcb.priority = 100;
+            executive_tcb.state = ThreadStateType::Running;
+            executive_tcb.sc = Some(0);
+            executive_tcb.user_context.rax = 0x1111;
+            let executive = s.scheduler.admit(executive_tcb);
+            s.sched_contexts[0] = SchedContext::new(100, 1);
+            s.sched_contexts[0].bound_tcb = Some(executive);
+
+            let mut peer_tcb = Tcb::default();
+            peer_tcb.priority = 90;
+            peer_tcb.state = ThreadStateType::Running;
+            peer_tcb.sc = Some(1);
+            peer_tcb.user_context.rax = 0x2222;
+            let peer = s.scheduler.admit(peer_tcb);
+            s.sched_contexts[1] = SchedContext::new(10, 10);
+            s.sched_contexts[1].bound_tcb = Some(peer);
+
+            s.scheduler.set_current(Some(executive));
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(executive).user_context;
+            ctx.rdi = b'%' as u64;
+            (executive, peer)
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 0);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(executive));
+            assert_eq!(
+                s.scheduler.slab.get(executive).state,
+                ThreadStateType::Running
+            );
+            assert_eq!(s.scheduler.slab.get(peer).state, ThreadStateType::Running);
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x1111);
+            s.sched_contexts[0] = SchedContext::new(0, 0);
+            s.sched_contexts[1] = SchedContext::new(0, 0);
+            s.scheduler.block(peer, ThreadStateType::Inactive);
+            s.scheduler.block(executive, ThreadStateType::Inactive);
+            s.scheduler.slab.free(peer);
+            s.scheduler.slab.free(executive);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar ignores caller budget miss\n");
+    }
+
+    #[inline(never)]
+    fn preferred_invoker_budget_failure_falls_back_to_ready_thread() {
+        use crate::cap::{Cap, PPtr};
+        use crate::cte::Cte;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::sched_context::SchedContext;
+        use crate::syscalls::InvocationLabel;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (invoker, target, peer) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let cnode_idx = 13;
+            let target_slot = 3;
+
+            let mut invoker_tcb = Tcb::default();
+            invoker_tcb.priority = 50;
+            invoker_tcb.state = ThreadStateType::Running;
+            invoker_tcb.sc = Some(0);
+            let invoker = s.scheduler.admit(invoker_tcb);
+            s.sched_contexts[0] = SchedContext::new(100, 1);
+            s.sched_contexts[0].bound_tcb = Some(invoker);
+
+            let mut target_tcb = Tcb::default();
+            target_tcb.priority = 80;
+            target_tcb.state = ThreadStateType::Inactive;
+            target_tcb.sc = Some(1);
+            let target = s.scheduler.admit(target_tcb);
+            s.sched_contexts[1] = SchedContext::new(10, 10);
+            s.sched_contexts[1].bound_tcb = Some(target);
+
+            let mut peer_tcb = Tcb::default();
+            peer_tcb.priority = 100;
+            peer_tcb.state = ThreadStateType::Running;
+            peer_tcb.sc = Some(2);
+            let peer = s.scheduler.admit(peer_tcb);
+            s.sched_contexts[2] = SchedContext::new(10, 10);
+            s.sched_contexts[2].bound_tcb = Some(peer);
+
+            let cnode_cap = Cap::CNode {
+                ptr: KernelState::cnode_ptr(cnode_idx),
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            s.cnodes[cnode_idx].0[target_slot] = Cte::with_cap(&Cap::Thread {
+                tcb: PPtr::<crate::cap::Tcb>::new(target.0 as u64).expect("nonzero tcb id"),
+            });
+            s.scheduler.slab.get_mut(invoker).cspace_root = cnode_cap;
+            s.scheduler.set_current(Some(invoker));
+
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(invoker).user_context;
+            ctx.rdi = target_slot as u64;
+            ctx.rsi = (InvocationLabel::TCBResume as u64) << 12;
+            (invoker, target, peer)
+        };
+
+        super::rust_syscall_dispatch(-1i64 as u64, 0);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_ne!(s.scheduler.current(), Some(invoker));
+            assert_eq!(
+                s.scheduler.slab.get(invoker).state,
+                ThreadStateType::BlockedOnBudget
+            );
+            assert_eq!(s.scheduler.slab.get(target).state, ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(peer).state, ThreadStateType::Running);
+            s.cnodes[13].0[3] = Cte::null();
+            s.sched_contexts[0] = SchedContext::new(0, 0);
+            s.sched_contexts[1] = SchedContext::new(0, 0);
+            s.sched_contexts[2] = SchedContext::new(0, 0);
+            s.scheduler.block(peer, ThreadStateType::Inactive);
+            s.scheduler.block(target, ThreadStateType::Inactive);
+            s.scheduler.block(invoker, ThreadStateType::Inactive);
+            s.scheduler.slab.free(peer);
+            s.scheduler.slab.free(target);
+            s.scheduler.slab.free(invoker);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ preferred invoker budget miss falls back once\n");
+    }
+
+    #[inline(never)]
+    fn tcb_resume_syscall_returns_to_invoker() {
+        use crate::cap::{Cap, PPtr};
+        use crate::cte::Cte;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::syscalls::InvocationLabel;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (invoker, target) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let mut invoker_tcb = Tcb::default();
+            invoker_tcb.priority = 50;
+            invoker_tcb.state = ThreadStateType::Running;
+            invoker_tcb.sc = Some(0);
+            let invoker = s.scheduler.admit(invoker_tcb);
+
+            let mut target_tcb = Tcb::default();
+            target_tcb.priority = 100;
+            target_tcb.state = ThreadStateType::Inactive;
+            target_tcb.sc = Some(1);
+            let target = s.scheduler.admit(target_tcb);
+
+            let cnode_cap = Cap::CNode {
+                ptr: KernelState::cnode_ptr(0),
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            s.cnodes[0].0[1] = Cte::with_cap(&Cap::Thread {
+                tcb: PPtr::<crate::cap::Tcb>::new(target.0 as u64).expect("nonzero tcb id"),
+            });
+            s.scheduler.slab.get_mut(invoker).cspace_root = cnode_cap;
+            s.scheduler.set_current(Some(invoker));
+
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(invoker).user_context;
+            ctx.rdi = 1;
+            ctx.rsi = (InvocationLabel::TCBResume as u64) << 12;
+            (invoker, target)
+        };
+
+        super::rust_syscall_dispatch(-1i64 as u64, 0);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(invoker));
+            assert_eq!(s.scheduler.slab.get(target).state, ThreadStateType::Running);
+            s.cnodes[0].0[1] = Cte::null();
+            s.scheduler.block(target, ThreadStateType::Inactive);
+            s.scheduler.block(invoker, ThreadStateType::Inactive);
+            s.scheduler.slab.free(target);
+            s.scheduler.slab.free(invoker);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ TCBResume syscall return keeps the invoker\n");
+    }
+
+    #[inline(never)]
+    fn marked_reply_cap_syscall_hands_off_to_caller() {
+        use crate::cap::Cap;
+        use crate::cte::Cte;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::reply::Reply;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (server, caller, reply_idx) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let cnode_idx = 12;
+            let reply_idx = 10;
+            s.cnodes[cnode_idx].0[2] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+
+            let mut caller_tcb = Tcb::default();
+            caller_tcb.priority = 40;
+            caller_tcb.state = ThreadStateType::BlockedOnReply;
+            caller_tcb.sc = Some(1);
+            let caller = s.scheduler.admit(caller_tcb);
+
+            let mut server_tcb = Tcb::default();
+            server_tcb.priority = 255;
+            server_tcb.state = ThreadStateType::Running;
+            server_tcb.sc = Some(0);
+            server_tcb.active_sc = Some(1);
+            server_tcb.cspace_root = Cap::CNode {
+                ptr: KernelState::cnode_ptr(cnode_idx),
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            let server = s.scheduler.admit(server_tcb);
+
+            s.replies[reply_idx] = Reply {
+                bound_tcb: Some(caller),
+            };
+            s.scheduler.set_current(Some(server));
+
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = s.scheduler.slab.get(server).user_context;
+            ctx.rdi = 2;
+            ctx.rsi = 1;
+            ctx.r10 = 0x5250;
+            ctx.r13 = crate::invocation::REPLY_HANDOFF_MAGIC;
+            (server, caller, reply_idx)
+        };
+
+        super::rust_syscall_dispatch(-1i64 as u64, 0);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(caller));
+            assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0x5250);
+            assert_eq!(s.scheduler.slab.get(server).active_sc, None);
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            s.cnodes[12].0[2] = Cte::null();
+            s.replies[reply_idx] = Reply::new();
+            s.scheduler.block(caller, ThreadStateType::Inactive);
+            s.scheduler.block(server, ThreadStateType::Inactive);
+            s.scheduler.slab.free(caller);
+            s.scheduler.slab.free(server);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ marked Reply-cap SysCall dispatch hands off to the caller\n");
     }
 
     /// Phase 38c-followup — unknown syscalls are still rejected,

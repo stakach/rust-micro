@@ -14,7 +14,7 @@
 //! word of the IPC MessageInfo carries the label in its high bits.
 //! We expose helpers on the generated `InvocationLabel` enum.
 
-use crate::cap::{CNodeStorage, Cap, PPtr};
+use crate::cap::{Cap, PPtr};
 use crate::cspace::lookup_cap;
 use crate::cte::Cte;
 use crate::error::{KException, KResult, SyscallError};
@@ -278,63 +278,40 @@ fn decode_frame(
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum FrameSlotUpdateResult {
-    Updated,
-    NoMatchingInvokedSlot,
-}
-
 unsafe fn update_invoked_frame_slot(
     args: &SyscallArgs,
     invoker: TcbId,
     paddr: u64,
     new_cap: Cap,
-) -> FrameSlotUpdateResult {
+) -> KResult<()> {
     let s = KERNEL.get();
     let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
     let Ok(res) =
         crate::cspace::resolve_address_bits(s, &cspace_root, args.a0, crate::cspace::WORD_BITS)
     else {
-        return FrameSlotUpdateResult::NoMatchingInvokedSlot;
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
     };
     if res.bits_remaining != 0 {
-        return FrameSlotUpdateResult::NoMatchingInvokedSlot;
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
     }
     let cnode_idx = KernelState::cnode_index(res.slot_ptr);
     let Some(slot) = s.cnode_slot_mut(cnode_idx, res.slot_index) else {
-        return FrameSlotUpdateResult::NoMatchingInvokedSlot;
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
     };
     match slot.cap() {
         Cap::Frame { ptr, .. } if ptr.addr() == paddr => {
             slot.set_cap(&new_cap);
-            FrameSlotUpdateResult::Updated
+            Ok(())
         }
-        _ => FrameSlotUpdateResult::NoMatchingInvokedSlot,
-    }
-}
-
-unsafe fn update_any_matching_frame_slot(
-    invoker: TcbId,
-    paddr: u64,
-    mapped_vaddr: Option<u64>,
-    new_cap: Cap,
-) {
-    let s = KERNEL.get();
-    let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-    let cnode_ptr = match cspace_root {
-        Cap::CNode { ptr, .. } => ptr,
-        _ => return,
-    };
-    let cnode_idx = KernelState::cnode_index(cnode_ptr);
-    if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
-        for slot in slots.iter_mut() {
-            if let Cap::Frame { ptr, mapped, .. } = slot.cap() {
-                if ptr.addr() == paddr && mapped == mapped_vaddr {
-                    slot.set_cap(&new_cap);
-                    break;
-                }
-            }
-        }
+        _ => Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        ))),
     }
 }
 
@@ -511,47 +488,16 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         map_type: crate::cap::FrameMapType::VSpace,
     };
     unsafe {
-        if update_invoked_frame_slot(args, invoker, paddr, updated)
-            == FrameSlotUpdateResult::NoMatchingInvokedSlot
-        {
-            // Direct unit tests call `decode_invocation` with a standalone `Cap`, bypassing the
-            // syscall path that supplies a real target cptr. Keep that harness working without
-            // affecting production invocations, where `args.a0` resolves to the frame slot above.
-            update_any_matching_frame_slot(invoker, paddr, None, updated);
-        }
+        update_invoked_frame_slot(args, invoker, paddr, updated)?;
     }
     Ok(())
 }
 
-/// Phase 43 — find the PML4 paddr for a given ASID by scanning every
-/// CNode for a `Cap::PML4` whose `asid` field matches. Returns 0 if
-/// no match (caller should treat as a no-op).
-///
-/// Linear scan — fine for single-tenant sel4test where a handful of
-/// PML4 caps exist. A proper ASID-pool lookup would be the upstream
-/// way; deferring until we have multi-process workloads.
+/// Phase 44 — indexed ASID-pool lookup. Returns 0 if the ASID is
+/// unassigned; callers treat that as an idempotent unmap/delete.
 #[cfg(target_arch = "x86_64")]
 fn pml4_paddr_for_asid(asid: u16) -> u64 {
-    if asid == 0 {
-        return 0;
-    }
-    unsafe {
-        let s = KERNEL.get();
-        for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-            let slots = match s.cnode_slots_at(ci) {
-                Some(s) => s,
-                None => continue,
-            };
-            for slot in slots.iter() {
-                if let Cap::PML4 { ptr, asid: a, .. } = slot.cap() {
-                    if a == asid {
-                        return ptr.addr();
-                    }
-                }
-            }
-        }
-    }
-    0
+    crate::asid::pml4_paddr(asid)
 }
 
 fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
@@ -624,11 +570,7 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
         map_type: crate::cap::FrameMapType::None,
     };
     unsafe {
-        if update_invoked_frame_slot(args, invoker, paddr, unmapped)
-            == FrameSlotUpdateResult::NoMatchingInvokedSlot
-        {
-            update_any_matching_frame_slot(invoker, paddr, mapped_vaddr, unmapped);
-        }
+        update_invoked_frame_slot(args, invoker, paddr, unmapped)?;
     }
     Ok(())
 }
@@ -650,30 +592,6 @@ fn take_single_extra_cap(invoker: TcbId) -> Cap {
         };
         inv_tcb.pending_extra_caps_count = 0;
         cap
-    }
-}
-
-/// Overwrite the IoPageTable cap (identified by its unique base paddr)
-/// in the invoker's root CNode with `new_cap`.
-fn rewrite_iopt_cap_in_cspace(invoker: TcbId, base_paddr: u64, new_cap: &Cap) {
-    unsafe {
-        let s = KERNEL.get();
-        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-        let cnode_ptr = match cspace_root {
-            Cap::CNode { ptr, .. } => ptr,
-            _ => return,
-        };
-        let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
-            for slot in slots.iter_mut() {
-                if let Cap::IoPageTable { ptr, .. } = slot.cap() {
-                    if ptr.addr() == base_paddr {
-                        slot.set_cap(new_cap);
-                        return;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -711,7 +629,7 @@ fn decode_x86_iopt(
                 mapped_address: 0,
                 ioasid: 0,
             };
-            rewrite_iopt_cap_in_cspace(invoker, base_paddr, &new_cap);
+            update_invoked_iopt_slot(args, invoker, base_paddr, new_cap)?;
             return Ok(());
         }
 
@@ -773,7 +691,7 @@ fn decode_x86_iopt(
                 mapped_address: 0,
                 ioasid: pci_request_id,
             };
-            rewrite_iopt_cap_in_cspace(invoker, base_paddr, &new_cap);
+            update_invoked_iopt_slot(args, invoker, base_paddr, new_cap)?;
             return Ok(());
         }
 
@@ -801,7 +719,7 @@ fn decode_x86_iopt(
             mapped_address: io_address,
             ioasid: pci_request_id,
         };
-        rewrite_iopt_cap_in_cspace(invoker, base_paddr, &new_cap);
+        update_invoked_iopt_slot(args, invoker, base_paddr, new_cap)?;
         Ok(())
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -981,7 +899,9 @@ fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             is_device: frame_device,
             map_type: crate::cap::FrameMapType::IoSpace,
         };
-        rewrite_frame_cap_in_cspace(invoker, frame_paddr, &new_cap);
+        unsafe {
+            update_invoked_frame_slot(args, invoker, frame_paddr, new_cap)?;
+        }
         Ok(())
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -993,31 +913,44 @@ fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     }
 }
 
-/// Overwrite the (unmapped) Frame cap with `base_paddr` in the
-/// invoker's root CNode. Used by the IO-map path to record the
-/// IO-space mapping on the fresh frame cap.
+/// Overwrite the invoked IO page-table cap. The cptr in `args.a0` is the source of truth; scanning
+/// by physical address can mutate an alias and scales poorly for the NT root CSpace.
 #[cfg(target_arch = "x86_64")]
-fn rewrite_frame_cap_in_cspace(invoker: TcbId, base_paddr: u64, new_cap: &Cap) {
+fn update_invoked_iopt_slot(
+    args: &SyscallArgs,
+    invoker: TcbId,
+    base_paddr: u64,
+    new_cap: Cap,
+) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
         let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-        let cnode_ptr = match cspace_root {
-            Cap::CNode { ptr, .. } => ptr,
-            _ => return,
+        let Ok(res) =
+            crate::cspace::resolve_address_bits(s, &cspace_root, args.a0, crate::cspace::WORD_BITS)
+        else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
         };
-        let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        if let Some(slots) = s.cnode_slots_at_mut(cnode_idx) {
-            for slot in slots.iter_mut() {
-                if let Cap::Frame {
-                    ptr, mapped: None, ..
-                } = slot.cap()
-                {
-                    if ptr.addr() == base_paddr {
-                        slot.set_cap(new_cap);
-                        return;
-                    }
-                }
+        if res.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
+        };
+        let cnode_idx = KernelState::cnode_index(res.slot_ptr);
+        let Some(slot) = s.cnode_slot_mut(cnode_idx, res.slot_index) else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
+        };
+        match slot.cap() {
+            Cap::IoPageTable { ptr, .. } if ptr.addr() == base_paddr => {
+                slot.set_cap(&new_cap);
+                Ok(())
             }
+            _ => Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            ))),
         }
     }
 }
@@ -1062,7 +995,7 @@ fn decode_page_table(
 ) -> KResult<()> {
     match label {
         InvocationLabel::X86PageTableMap => decode_pt_map(target, args, invoker),
-        InvocationLabel::X86PageTableUnmap => decode_pt_unmap(target, invoker),
+        InvocationLabel::X86PageTableUnmap => decode_pt_unmap(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
@@ -1077,7 +1010,7 @@ fn decode_page_directory(
 ) -> KResult<()> {
     match label {
         InvocationLabel::X86PageDirectoryMap => decode_pd_map(target, args, invoker),
-        InvocationLabel::X86PageDirectoryUnmap => decode_pd_unmap(target, invoker),
+        InvocationLabel::X86PageDirectoryUnmap => decode_pd_unmap(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
@@ -1092,7 +1025,7 @@ fn decode_pdpt(
 ) -> KResult<()> {
     match label {
         InvocationLabel::X86PDPTMap => decode_pdpt_map(target, args, invoker),
-        InvocationLabel::X86PDPTUnmap => decode_pdpt_unmap(target, invoker),
+        InvocationLabel::X86PDPTUnmap => decode_pdpt_unmap(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
@@ -1209,12 +1142,12 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
         )));
     }
 
-    rewrite_paging_cap_in_cspace(invoker, &target, Some(vaddr));
+    update_invoked_paging_slot(args, invoker, &target, Some(vaddr))?;
     Ok(())
 }
 
-fn unmap_paging_struct(target: Cap, invoker: TcbId) -> KResult<()> {
-    rewrite_paging_cap_in_cspace(invoker, &target, None);
+fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    update_invoked_paging_slot(args, invoker, &target, None)?;
     Ok(())
 }
 
@@ -1227,47 +1160,64 @@ fn paging_struct_state(cap: &Cap) -> (u64, Option<u64>) {
     }
 }
 
-fn rewrite_paging_cap_in_cspace(invoker: TcbId, cap: &Cap, new_mapped: Option<u64>) {
+fn paging_cap_with_mapping(cap: Cap, target_paddr: u64, new_mapped: Option<u64>) -> Option<Cap> {
+    match cap {
+        Cap::PageTable { ptr, asid, .. } if ptr.addr() == target_paddr => Some(Cap::PageTable {
+            ptr,
+            mapped: new_mapped,
+            asid,
+        }),
+        Cap::PageDirectory { ptr, asid, .. } if ptr.addr() == target_paddr => {
+            Some(Cap::PageDirectory {
+                ptr,
+                mapped: new_mapped,
+                asid,
+            })
+        }
+        Cap::Pdpt { ptr, asid, .. } if ptr.addr() == target_paddr => Some(Cap::Pdpt {
+            ptr,
+            mapped: new_mapped,
+            asid,
+        }),
+        _ => None,
+    }
+}
+
+fn update_invoked_paging_slot(
+    args: &SyscallArgs,
+    invoker: TcbId,
+    cap: &Cap,
+    new_mapped: Option<u64>,
+) -> KResult<()> {
     let target_paddr = paging_struct_state(cap).0;
     unsafe {
         let s = KERNEL.get();
         let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-        let cnode_ptr = match cspace_root {
-            Cap::CNode { ptr, .. } => ptr,
-            _ => return,
+        let Ok(res) =
+            crate::cspace::resolve_address_bits(s, &cspace_root, args.a0, crate::cspace::WORD_BITS)
+        else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
         };
-        let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        let slots = match s.cnode_slots_at_mut(cnode_idx) {
-            Some(s) => s,
-            None => return,
+        if res.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
+        }
+        let cnode_idx = KernelState::cnode_index(res.slot_ptr);
+        let Some(slot) = s.cnode_slot_mut(cnode_idx, res.slot_index) else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
         };
-        for slot in slots.iter_mut() {
-            let updated = match slot.cap() {
-                Cap::PageTable { ptr, asid, .. } if ptr.addr() == target_paddr => {
-                    Some(Cap::PageTable {
-                        ptr,
-                        mapped: new_mapped,
-                        asid,
-                    })
-                }
-                Cap::PageDirectory { ptr, asid, .. } if ptr.addr() == target_paddr => {
-                    Some(Cap::PageDirectory {
-                        ptr,
-                        mapped: new_mapped,
-                        asid,
-                    })
-                }
-                Cap::Pdpt { ptr, asid, .. } if ptr.addr() == target_paddr => Some(Cap::Pdpt {
-                    ptr,
-                    mapped: new_mapped,
-                    asid,
-                }),
-                _ => None,
-            };
-            if let Some(cap) = updated {
-                slot.set_cap(&cap);
-                break;
-            }
+        if let Some(updated) = paging_cap_with_mapping(slot.cap(), target_paddr, new_mapped) {
+            slot.set_cap(&updated);
+            Ok(())
+        } else {
+            Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )))
         }
     }
 }
@@ -1281,14 +1231,14 @@ fn decode_pd_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()>
 fn decode_pdpt_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     map_paging_struct(target, args, invoker, 3)
 }
-fn decode_pt_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
-    unmap_paging_struct(target, invoker)
+fn decode_pt_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    unmap_paging_struct(target, args, invoker)
 }
-fn decode_pd_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
-    unmap_paging_struct(target, invoker)
+fn decode_pd_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    unmap_paging_struct(target, args, invoker)
 }
-fn decode_pdpt_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
-    unmap_paging_struct(target, invoker)
+fn decode_pdpt_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    unmap_paging_struct(target, args, invoker)
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,7 +1263,7 @@ fn decode_pdpt_unmap(target: Cap, invoker: TcbId) -> KResult<()> {
 /// 1..8, so `asid_base = index * 512`. Bounded + recyclable pool
 /// indices keep the per-pool bookkeeping arrays small and stable
 /// across create/free cycles (vs an ever-growing base counter).
-const MAX_ASID_POOLS: usize = 1 << 3;
+const MAX_ASID_POOLS: usize = crate::asid::MAX_ASID_POOLS;
 
 /// Bitmap of in-use pool indices (bit i = index i). Bit 0 (the init
 /// pool) is permanently set. MakePool allocates the lowest clear bit
@@ -1359,6 +1309,7 @@ fn free_asid_pool_index(idx: usize) {
     let bits = ASID_POOL_INUSE.load(Ordering::Relaxed);
     ASID_POOL_INUSE.store(bits & !(1u16 << idx), Ordering::Relaxed);
     ASID_POOL_USED[idx].store(0, Ordering::Relaxed);
+    crate::asid::clear_pool((idx * crate::asid::ASIDS_PER_POOL) as u16);
 }
 
 /// Reset the ASID-allocator statics to their post-boot defaults.
@@ -1370,6 +1321,7 @@ pub fn reset_asid_state() {
     for u in ASID_POOL_USED.iter() {
         u.store(0, Ordering::Relaxed);
     }
+    crate::asid::reset();
     NEXT_ASID_OFFSET.store(2, Ordering::Relaxed);
 }
 
@@ -1685,14 +1637,8 @@ fn decode_asid_pool(
     }
 }
 
-/// Per-pool offset bumper. Coarse — Phase 31+ replaces with a
-/// proper per-pool free-bitmap living in the AsidPool storage page.
-///
-/// Phase 43 — starts at 2 so the first user-process assignment doesn't
-/// collide with `ROOTSERVER_ASID = 1` (set in `rootserver::launch_rootserver`).
-/// A duplicate ASID confuses `pml4_paddr_for_asid`'s linear scan: it
-/// returns the first match, and a test-process Frame::Unmap could
-/// land on the rootserver's PML4 instead of the test process's.
+/// Per-pool offset bumper for the init ASID pool. Starts at 2 so the
+/// first user-process assignment doesn't collide with rootserver ASID 1.
 static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
 
 // ---------------------------------------------------------------------------
@@ -6119,6 +6065,7 @@ pub mod spec {
         irq_handler_set_clear_ack();
         frame_map_unmap_get_address();
         page_table_map_unmap();
+        page_table_map_updates_invoked_slot_not_first_alias();
         tcb_write_read_registers();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         tcb_set_space_and_bind_notification();
@@ -6191,6 +6138,12 @@ pub mod spec {
             ..Default::default()
         };
         decode_invocation(pool, &args, invoker).expect("Assign ok");
+        let assigned_asid = unsafe {
+            match KERNEL.get().cnodes[0].0[6].cap() {
+                Cap::PML4 { asid, .. } => asid,
+                other => panic!("expected Cap::PML4, got {:?}", other),
+            }
+        };
         unsafe {
             match KERNEL.get().cnodes[0].0[6].cap() {
                 Cap::PML4 { asid, .. } => {
@@ -6203,6 +6156,16 @@ pub mod spec {
                 other => panic!("expected Cap::PML4, got {:?}", other),
             }
         }
+        assert_eq!(
+            crate::asid::pml4_paddr(assigned_asid),
+            0x0050_8000,
+            "Assign should publish the ASID -> PML4 mapping"
+        );
+        assert_eq!(
+            crate::asid::pml4_refcount(assigned_asid),
+            1,
+            "one live CSpace PML4 cap should hold one ASID reference"
+        );
 
         // Re-assigning a PML4 that already has an ASID surfaces
         // InvalidCapability (upstream decodeX86ASIDPoolAssign;
@@ -6217,6 +6180,20 @@ pub mod spec {
                 }))
             ),
             "second Assign on a non-zero-ASID PML4 should InvalidCapability"
+        );
+
+        unsafe {
+            KERNEL.get().cnodes[0].0[6].set_cap(&Cap::Null);
+        }
+        assert_eq!(
+            crate::asid::pml4_paddr(assigned_asid),
+            0,
+            "deleting the last PML4 cap should unpublish the ASID mapping"
+        );
+        assert_eq!(
+            crate::asid::pml4_refcount(assigned_asid),
+            0,
+            "ASID refcount should drain when the PML4 cap is deleted"
         );
 
         teardown_invoker(invoker);
@@ -6353,6 +6330,7 @@ pub mod spec {
         // Map at a 2 MiB-aligned vaddr (PD-entry granularity).
         let vaddr = 0x0000_0100_0080_0000u64;
         let args = SyscallArgs {
+            a0: 2,
             a1: (InvocationLabel::X86PageTableMap as u64) << 12,
             a2: vaddr,
             ..Default::default()
@@ -6380,6 +6358,7 @@ pub mod spec {
 
         // Unmap clears the mapping.
         let args = SyscallArgs {
+            a0: 2,
             a1: (InvocationLabel::X86PageTableUnmap as u64) << 12,
             ..Default::default()
         };
@@ -6393,6 +6372,53 @@ pub mod spec {
 
         teardown_invoker(invoker);
         arch::log("  ✓ Cap::PageTable Map / Unmap updates cap shadow\n");
+    }
+
+    /// Page-structure map must update the cap slot the caller invoked, not the first sibling cap
+    /// with the same object paddr. The NT rootserver keeps copied aliases and a large root CSpace; a
+    /// full-CNode scan both mutates the wrong sibling and becomes a boot-time cliff.
+    #[inline(never)]
+    fn page_table_map_updates_invoked_slot_not_first_alias() {
+        use crate::cap::PageTableStorage;
+        let invoker = setup_invoker(0);
+        let pt_paddr = 0x0000_0000_00B1_0000u64;
+        let pt_cap = Cap::PageTable {
+            ptr: PPtr::<PageTableStorage>::new(pt_paddr).unwrap(),
+            mapped: None,
+            asid: 0,
+        };
+        const EARLY_ALIAS_SLOT: usize = 2;
+        const INVOKED_SLOT: usize = 28;
+        unsafe {
+            let s = KERNEL.get();
+            s.cnodes[0].0[EARLY_ALIAS_SLOT] = Cte::with_cap(&pt_cap);
+            s.cnodes[0].0[INVOKED_SLOT] = Cte::with_cap(&pt_cap);
+        }
+
+        let vaddr = 0x0000_0100_0140_0000u64;
+        let args = SyscallArgs {
+            a0: INVOKED_SLOT as u64,
+            a1: (InvocationLabel::X86PageTableMap as u64) << 12,
+            a2: vaddr,
+            ..Default::default()
+        };
+        decode_invocation(pt_cap, &args, invoker).expect("PT map ok");
+
+        unsafe {
+            match KERNEL.get().cnodes[0].0[EARLY_ALIAS_SLOT].cap() {
+                Cap::PageTable { mapped: None, .. } => {}
+                other => panic!("early alias should remain unmapped, got {:?}", other),
+            }
+            match KERNEL.get().cnodes[0].0[INVOKED_SLOT].cap() {
+                Cap::PageTable {
+                    mapped: Some(v), ..
+                } if v == vaddr => {}
+                other => panic!("invoked slot should be mapped, got {:?}", other),
+            }
+        }
+
+        teardown_invoker(invoker);
+        arch::log("  ✓ Cap::PageTable Map updates invoked slot, not first alias\n");
     }
 
     /// Build a fresh state for one test: invoker TCB id, and a
