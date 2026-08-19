@@ -477,7 +477,7 @@ pub(crate) fn swap_iretq_context_if_preempted(
         // Whatever the source, never iretq into user mode with IF
         // clear — a spinning thread would shut the CPU off from
         // every maskable interrupt (timer ticks included).
-        ctx.rflags = (ctx.rflags & 0xDD5) | 0x202;
+        ctx.rflags = crate::arch::x86_64::syscall_entry::sanitize_user_rflags(ctx.rflags);
         let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
         if next_cr3 != 0 {
             // This is a preemption of a *running* user thread (from_user

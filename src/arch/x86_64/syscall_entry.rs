@@ -50,6 +50,13 @@ const FMASK_VALUE: u64 = (1 << 9) | (1 << 10) | (1 << 8) | (1 << 18);
 const HOSTED_NT_NATIVE_CALL_CAP: u64 = 6;
 const HOSTED_NT_NATIVE_CALL_LABEL: u64 = 0x4E54;
 const HOSTED_NT_NATIVE_CALL_MSGINFO: u64 = (HOSTED_NT_NATIVE_CALL_LABEL << 12) | 6;
+const USER_RFLAGS_PRESERVED_MASK: u64 = 0xDD5;
+const USER_RFLAGS_FORCED_BITS: u64 = 0x202;
+
+#[inline]
+pub(crate) const fn sanitize_user_rflags(flags: u64) -> u64 {
+    (flags & USER_RFLAGS_PRESERVED_MASK) | USER_RFLAGS_FORCED_BITS
+}
 
 fn syscall_may_consume_direct_handoff(
     syscall: crate::syscalls::Syscall,
@@ -631,6 +638,13 @@ pub unsafe extern "C" fn syscall_entry() {
         "mov r9,  gs:[16 + 64]",
         "mov r10, gs:[16 + 72]",
         "mov r11, gs:[16 + 80]",
+        // This hot syscall-return tail is the path used by Reply/Recv after
+        // servicing a hosted fault or native NT syscall. Keep the same
+        // invariant as the explicit enter_user helpers: userspace must always
+        // run with maskable interrupts enabled, or a tight user loop can
+        // starve scheduler/deadman timer delivery.
+        "and r11, 0xDD5",
+        "or r11, 0x202",
         "mov r12, gs:[16 + 88]",
         "mov r13, gs:[16 + 96]",
         "mov r14, gs:[16 + 104]",
@@ -1327,6 +1341,7 @@ pub mod spec {
         star_kernel_user_pair();
         lstar_points_at_entry();
         fmask_clears_interrupt_flag();
+        user_rflags_sanitizer_forces_interrupts();
         per_cpu_kernel_gs_base_set();
         dispatcher_emits_byte_for_sys_debug_put_char();
         debug_put_char_does_not_consume_stale_direct_handoff();
@@ -1393,6 +1408,20 @@ pub mod spec {
         assert!(mask & (1 << 9) != 0, "FMASK must clear IF on entry");
         assert!(mask & (1 << 10) != 0, "FMASK must clear DF on entry");
         arch::log("  ✓ FMASK clears IF and DF on entry\n");
+    }
+
+    #[inline(never)]
+    fn user_rflags_sanitizer_forces_interrupts() {
+        assert_eq!(sanitize_user_rflags(0), 0x202);
+        assert_eq!(sanitize_user_rflags(1 << 9) & (1 << 9), 1 << 9);
+        assert_eq!(sanitize_user_rflags(1 << 10) & (1 << 10), 1 << 10);
+        assert_eq!(
+            sanitize_user_rflags(1 << 8) & (1 << 8),
+            1 << 8,
+            "single-step remains debugger-controlled"
+        );
+        assert_eq!(sanitize_user_rflags(1 << 18) & (1 << 18), 0);
+        arch::log("  ✓ user RFLAGS sanitizer keeps interrupts enabled\n");
     }
 
     /// Phase 11d — integration test of the dispatcher. Builds a
