@@ -1593,6 +1593,13 @@ pub mod spec {
             crate::fault::set_resume_ip(&mut caller_t, resume_ip);
             crate::fault::set_resume_flags(&mut caller_t, resume_flags);
             caller_t.sc = Some(1);
+            caller_t.cspace_root = Cap::CNode {
+                ptr: KernelState::cnode_ptr(cn),
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            caller_t.fault_handler = 1;
             let caller = s.scheduler.admit(caller_t);
 
             let mut server_t = Tcb::default();
@@ -1658,6 +1665,34 @@ pub mod spec {
             assert_eq!(server_t.composite_reply_handoff, Some(caller));
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             assert!(matches!(s.endpoints[ep_idx].state, EpState::Recv));
+
+            s.scheduler.set_current(Some(caller));
+            assert_eq!(s.scheduler.choose_thread(), Some(caller));
+            crate::fault::deliver_fault(
+                caller,
+                crate::fault::FaultMessage::VMFault {
+                    addr: 0x0000_0100_0094_46b8,
+                    fsr: 0x7,
+                    instruction: false,
+                },
+            )
+            .expect("second VM fault should meet the server's re-armed receive");
+
+            let caller_t = s.scheduler.slab.get(caller);
+            assert_eq!(caller_t.state, ThreadStateType::BlockedOnReply);
+            assert_eq!(caller_t.pending_fault, 6);
+            let server_t = s.scheduler.slab.get(server);
+            assert_eq!(server_t.state, ThreadStateType::Running);
+            assert_eq!(server_t.pending_reply, None);
+            assert_eq!(server_t.reply_to, Some(caller));
+            assert_eq!(server_t.user_context.rdi, 0xF1);
+            assert_eq!(server_t.user_context.rsi, 6 << 12 | 4);
+            assert_eq!(server_t.user_context.r10, resume_ip);
+            assert_eq!(server_t.user_context.r8, 0x0000_0100_0094_46b8);
+            assert_eq!(server_t.user_context.r9, 0);
+            assert_eq!(server_t.user_context.r15, 0x7);
+            assert_eq!(s.replies[reply_idx].bound_tcb, Some(caller));
+            assert!(matches!(s.endpoints[ep_idx].state, EpState::Idle));
 
             s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
             s.cnodes[13].0[1] = Cte::null();
