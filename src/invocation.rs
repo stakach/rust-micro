@@ -1688,6 +1688,21 @@ fn handoff_marked_reply_to_caller(
     s.scheduler.set_current(Some(caller));
 }
 
+fn clear_receiver_call_state_for_reply_caller(s: &mut KernelState, caller: TcbId) {
+    for entry in s.scheduler.slab.entries.iter_mut() {
+        let Some(tcb) = entry.as_mut() else {
+            continue;
+        };
+        if tcb.reply_to == Some(caller) {
+            tcb.reply_to = None;
+            tcb.active_sc = None;
+        }
+        if tcb.composite_reply_handoff == Some(caller) {
+            tcb.composite_reply_handoff = None;
+        }
+    }
+}
+
 fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     let reply_ptr = match target {
         Cap::Reply { ptr, .. } => ptr,
@@ -4239,19 +4254,26 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap, depth
         Cap::Reply { ptr, .. } => {
             if cap_refcount(cap) == 0 {
                 let idx = KernelState::reply_index(*ptr);
-                // If a caller is still parked BlockedOnReply on this
-                // reply (its Call never got a reply), deleting the reply
-                // returns the donated scheduling context to that caller
-                // and, via sc_donate's on_sc_lost, stops whoever was
-                // running on it (SCHED_CONTEXT_0009). Guard on
-                // BlockedOnReply so we don't disturb SC loans unrelated
-                // to an in-flight Call (INTERRUPT0005).
+                // If a caller is still parked on this reply, deleting
+                // the Reply cap cancels the in-flight call. Clear the
+                // receiver's reply/temporary-charge state just like a
+                // real reply transfer would; otherwise a non-passive
+                // server keeps `active_sc` pointing at a caller SC that
+                // may be deleted immediately afterwards.
                 if let Some(caller) = s.replies[idx].bound_tcb {
-                    if matches!(
-                        s.scheduler.slab.get(caller).state,
-                        crate::tcb::ThreadStateType::BlockedOnReply
-                    ) {
-                        crate::sched_context::return_donated_sc(s, caller);
+                    clear_receiver_call_state_for_reply_caller(s, caller);
+                    if let Some(caller_tcb) = s.scheduler.slab.try_get(caller) {
+                        // Passive-server call donation still has to be
+                        // returned to the caller before the reply object
+                        // disappears. Guard on BlockedOnReply so we do
+                        // not disturb SC loans unrelated to the canceled
+                        // call (INTERRUPT0005).
+                        if matches!(
+                            caller_tcb.state,
+                            crate::tcb::ThreadStateType::BlockedOnReply
+                        ) {
+                            crate::sched_context::return_donated_sc(s, caller);
+                        }
                     }
                 }
                 s.free_reply(idx);
@@ -6079,6 +6101,7 @@ pub mod spec {
         page_table_map_updates_invoked_slot_not_first_alias();
         tcb_write_read_registers();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
+        reply_delete_clears_receiver_call_state();
         tcb_set_space_and_bind_notification();
         tcb_set_space_pml4_pins_cr3();
         tcb_configure_one_shot_setup();
@@ -7268,6 +7291,75 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ TCB::ReadDebugState reports scheduler and reply binding\n");
+    }
+
+    #[inline(never)]
+    fn reply_delete_clears_receiver_call_state() {
+        let invoker = setup_invoker(0);
+        let reply_idx = 10usize;
+        let caller_sc = 14usize;
+        let server_sc = 15usize;
+        let (caller, server) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            s.replies[reply_idx] = crate::reply::Reply::new();
+            s.cnodes[0].0[4] = Cte::with_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx),
+                can_grant: true,
+            });
+            s.sched_contexts[caller_sc] =
+                crate::sched_context::SchedContext::new(/* period */ 10, /* budget */ 10);
+            s.sched_contexts[server_sc] =
+                crate::sched_context::SchedContext::new(/* period */ 10, /* budget */ 10);
+
+            let mut caller_t = crate::tcb::Tcb::default();
+            caller_t.priority = 80;
+            caller_t.state = crate::tcb::ThreadStateType::BlockedOnReply;
+            caller_t.sc = Some(caller_sc as u16);
+            let caller = s.scheduler.admit(caller_t);
+            s.sched_contexts[caller_sc].bound_tcb = Some(caller);
+
+            let mut server_t = crate::tcb::Tcb::default();
+            server_t.priority = 100;
+            server_t.state = crate::tcb::ThreadStateType::Running;
+            server_t.sc = Some(server_sc as u16);
+            server_t.active_sc = Some(caller_sc as u16);
+            server_t.reply_to = Some(caller);
+            let server = s.scheduler.admit(server_t);
+            s.sched_contexts[server_sc].bound_tcb = Some(server);
+            s.replies[reply_idx].bound_tcb = Some(caller);
+            s.scheduler.set_current(Some(invoker));
+            (caller, server)
+        };
+
+        let root_cnode = Cap::CNode {
+            ptr: KernelState::cnode_ptr(0),
+            radix: 5,
+            guard_size: 59,
+            guard: 0,
+        };
+        let args = SyscallArgs {
+            a1: (InvocationLabel::CNodeDelete as u64) << 12,
+            a2: 4,
+            ..Default::default()
+        };
+        decode_invocation(root_cnode, &args, invoker).expect("delete bound reply");
+        unsafe {
+            let s = KERNEL.get();
+            let server_t = s.scheduler.slab.get(server);
+            assert_eq!(server_t.reply_to, None);
+            assert_eq!(server_t.active_sc, None);
+            assert_eq!(server_t.sc, Some(server_sc as u16));
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            assert_eq!(s.scheduler.current(), Some(invoker));
+            s.scheduler.slab.free(caller);
+            s.scheduler.slab.free(server);
+            s.sched_contexts[caller_sc] = crate::sched_context::SchedContext::new(0, 0);
+            s.sched_contexts[server_sc] = crate::sched_context::SchedContext::new(0, 0);
+            s.scheduler.reset_queues();
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ Reply delete clears receiver call state\n");
     }
 
     #[inline(never)]
