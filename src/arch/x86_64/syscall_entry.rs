@@ -772,15 +772,15 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // it deliberately uses a real seL4 Call to the thread's CT_FAULT cap
     // with the "NT" request label, so let that envelope dispatch.
     //
-    // Reading the bool here (via the current TcbId + slab) drops all
-    // borrows before the match, so it never conflicts with the None
-    // arm's own KERNEL.get()/scheduler.current() access. Threads with
-    // the flag unset remain bit-identical to before.
+    // Use the recovered entry invoker, not `scheduler.current()`: debug
+    // prints and rootserver calls can arrive while bookkeeping still names
+    // a parked hosted thread as current. Letting that stale TCB force the
+    // rootserver's seL4 syscall into the hosted-unknown path can strand the
+    // caller halfway through serial output.
     let hosted_syscalls = unsafe {
-        match KERNEL.get().scheduler.current() {
-            Some(cur) => KERNEL.get().scheduler.slab.get(cur).hosted_syscalls,
-            None => false,
-        }
+        entry_invoker
+            .map(|invoker| KERNEL.get().scheduler.slab.get(invoker).hosted_syscalls)
+            .unwrap_or(false)
     };
     let is_nt_native_call = (number as i32) == Syscall::SysCall as i32
         && args.a0 == HOSTED_NT_NATIVE_CALL_CAP
@@ -984,6 +984,13 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 s.scheduler.set_current(Some(invoker));
                 s.scheduler.set_active_user(Some(invoker));
             }
+            return;
+        }
+        if from_user != 0 {
+            // Debug syscalls are observation-only. If bookkeeping cannot recover the
+            // caller TCB, CPU reality still proves a live user thread entered the
+            // kernel. Return through the asm tail to that captured context instead
+            // of turning a serial byte into a scheduler decision point.
             return;
         }
     }
@@ -1327,6 +1334,8 @@ pub mod spec {
         debug_put_char_resolves_invoker_from_live_cpu_identity();
         debug_put_char_prefers_active_user_over_same_identity_current();
         debug_put_char_prefers_active_user_after_domain_slice_expiry();
+        debug_put_char_from_live_user_returns_without_scheduler_identity();
+        debug_put_char_ignores_stale_hosted_current_without_entry_identity();
         preferred_invoker_budget_failure_falls_back_to_ready_thread();
         tcb_resume_syscall_returns_to_invoker();
         marked_reply_cap_syscall_hands_off_to_caller();
@@ -1842,6 +1851,74 @@ pub mod spec {
             s.scheduler.reset_queues();
         }
         arch::log("  ✓ SysDebugPutChar ignores current-domain drift for active user\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_from_live_user_returns_without_scheduler_identity() {
+        use crate::kernel::KERNEL;
+
+        unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
+            s.scheduler.set_active_user(None);
+
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = UserContext::new_zero();
+            ctx.rax = 0x8888;
+            ctx.rdi = b'?' as u64;
+        }
+
+        super::rust_syscall_dispatch(-12i64 as u64, 1);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), None);
+            assert_eq!(s.scheduler.active_user(), None);
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x8888);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar returns without scheduler identity\n");
+    }
+
+    #[inline(never)]
+    fn debug_put_char_ignores_stale_hosted_current_without_entry_identity() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let stale = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let mut stale_tcb = Tcb::default();
+            stale_tcb.priority = 100;
+            stale_tcb.state = ThreadStateType::Running;
+            stale_tcb.sc = Some(0);
+            stale_tcb.cpu_context.cr3 =
+                (super::super::paging::read_cr3() & super::CR3_PADDR_MASK).wrapping_add(0x1000);
+            stale_tcb.hosted_syscalls = true;
+            let stale = s.scheduler.admit(stale_tcb);
+            s.scheduler.set_current(Some(stale));
+            s.scheduler.set_active_user(None);
+
+            let ctx = super::current_cpu_user_ctx_mut();
+            *ctx = UserContext::new_zero();
+            ctx.rax = 0x9999;
+            ctx.rdi = b'+' as u64;
+            stale
+        };
+
+        super::rust_syscall_dispatch(-12i64 as u64, 1);
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.current(), Some(stale));
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x9999);
+            s.scheduler.block(stale, ThreadStateType::Inactive);
+            s.scheduler.slab.free(stale);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ SysDebugPutChar ignores stale hosted current\n");
     }
 
     #[inline(never)]
