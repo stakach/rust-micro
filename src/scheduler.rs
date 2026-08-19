@@ -926,6 +926,9 @@ impl Scheduler {
             if node.current == Some(id) {
                 node.current = None;
             }
+            if node.active_user == Some(id) {
+                node.active_user = None;
+            }
             if node.direct_handoff == Some(id) {
                 node.direct_handoff = None;
             }
@@ -950,6 +953,9 @@ impl Scheduler {
         for node in self.nodes.iter_mut() {
             if node.current == Some(id) {
                 node.current = None;
+            }
+            if node.active_user == Some(id) {
+                node.active_user = None;
             }
             if node.direct_handoff == Some(id) {
                 node.direct_handoff = None;
@@ -1058,6 +1064,7 @@ pub mod spec {
         tick_with_no_current_is_noop();
         per_cpu_queues_are_isolated();
         active_user_tracks_entry_independently_of_current();
+        block_and_sc_loss_clear_active_user();
         direct_handoff_beats_higher_priority_current();
         arch::log("Scheduler tests completed\n");
     }
@@ -1108,6 +1115,31 @@ pub mod spec {
         s.reset_queues();
         assert_eq!(s.active_user(), None);
         arch::log("  ✓ active user tracks trap ownership apart from current\n");
+    }
+
+    #[inline(never)]
+    fn block_and_sc_loss_clear_active_user() {
+        let mut s = Scheduler::new();
+        let victim = s.admit(runnable(70));
+
+        s.set_current(Some(victim));
+        s.set_active_user(Some(victim));
+        s.nodes[0].direct_handoff = Some(victim);
+        s.block(victim, ThreadStateType::BlockedOnReceive);
+        assert_eq!(s.current(), None);
+        assert_eq!(s.active_user(), None);
+        assert_eq!(s.nodes[0].direct_handoff, None);
+
+        s.slab.get_mut(victim).state = ThreadStateType::Running;
+        s.nodes[0].queues[0].enqueue(&mut s.slab, victim);
+        s.set_current(Some(victim));
+        s.set_active_user(Some(victim));
+        s.nodes[0].direct_handoff = Some(victim);
+        s.on_sc_lost(victim);
+        assert_eq!(s.current(), None);
+        assert_eq!(s.active_user(), None);
+        assert_eq!(s.nodes[0].direct_handoff, None);
+        arch::log("  ✓ blocking and SC loss clear trap ownership\n");
     }
 
     #[inline(never)]
