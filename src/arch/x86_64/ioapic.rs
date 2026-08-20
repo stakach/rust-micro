@@ -90,21 +90,35 @@ unsafe fn rte_index(gsi: u32) -> u32 {
     gsi.saturating_sub(IOAPIC_GSI_BASE)
 }
 
-/// Set the mask bit (16) of `pin`'s redirection entry (read-modify-write so the
-/// vector / trigger / polarity bits are preserved). The kernel masks a level-
-/// triggered line on delivery so a still-asserted source can't storm the CPU; the
-/// owning IRQHandler::Ack unmasks it once the driver has cleared the device cause.
-pub unsafe fn mask_pin(pin: u32) {
-    let lo_reg = IOAPIC_REG_REDTBL_BASE + rte_index(pin) * 2;
-    let lo = read_reg(lo_reg);
-    write_reg(lo_reg, lo | (1 << 16));
-}
+/// Number of redirection entries to consider. 24 covers the standard PC IOAPIC.
+const IOAPIC_REDTBL_ENTRIES: u32 = 24;
 
-/// Clear the mask bit (16) of `pin`'s redirection entry.
-pub unsafe fn unmask_pin(pin: u32) {
-    let lo_reg = IOAPIC_REG_REDTBL_BASE + rte_index(pin) * 2;
-    let lo = read_reg(lo_reg);
-    write_reg(lo_reg, lo & !(1 << 16));
+/// Set/clear the mask bit on EVERY redirection entry that delivers `cpu_vector`.
+///
+/// The kernel cannot always know which pin an IRQ arrives on. A handler issued through the plain
+/// `IRQControl_Get` path records no pin, and guessing the identity-mapped GSI is wrong for PCI
+/// INTx: on q35 those lines map to GSI 16..23 while the device's legacy IRQ number (from PCI
+/// config INTERRUPT_LINE) is something like 11. Masking the guessed pin then does nothing while
+/// the real line keeps asserting.
+///
+/// The redirection table itself is the authority: mask whatever is programmed to deliver the
+/// vector that just fired. Exact, needs no bookkeeping, and costs a bounded 24-entry scan only on
+/// the delivery path.
+pub unsafe fn set_mask_for_vector(cpu_vector: u32, masked: bool) -> u32 {
+    let mut touched = 0;
+    for index in 0..IOAPIC_REDTBL_ENTRIES {
+        let lo_reg = IOAPIC_REG_REDTBL_BASE + index * 2;
+        let lo = read_reg(lo_reg);
+        if lo & 0xFF != cpu_vector {
+            continue;
+        }
+        let next = if masked { lo | (1 << 16) } else { lo & !(1 << 16) };
+        if next != lo {
+            write_reg(lo_reg, next);
+        }
+        touched += 1;
+    }
+    touched
 }
 
 /// Program the IOAPIC redirection-table entry for `pin` to deliver

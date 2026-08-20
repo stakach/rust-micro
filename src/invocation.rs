@@ -2793,16 +2793,14 @@ fn decode_irq_handler(
                 crate::interrupt::ack_irq(&mut s.irqs, irq).map_err(|_| {
                     KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
                 })?;
-                // Unmask the IOAPIC line the kernel masked on delivery (level-
-                // triggered lines only). The driver has serviced the device by now, so
-                // it's safe to let the line fire again.
+                // Unmask the IOAPIC line the kernel masked on delivery. Delivery masks EVERY
+                // IOAPIC-routed IRQ (see `irq_dispatch`), so Ack must unmask every one of them
+                // too, or the second interrupt on that line would never arrive.
                 #[cfg(target_arch = "x86_64")]
-                if let Some(entry) = s.irqs.get(irq) {
-                    if entry.level_triggered {
-                        if let Some(pin) = entry.ioapic_pin {
-                            crate::arch::x86_64::ioapic::unmask_pin(pin as u32);
-                        }
-                    }
+                if s.irqs.get(irq).is_some() {
+                    let cpu_vector =
+                        (irq as u32) + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
+                    let _ = crate::arch::x86_64::ioapic::set_mask_for_vector(cpu_vector, false);
                 }
                 Ok(())
             }

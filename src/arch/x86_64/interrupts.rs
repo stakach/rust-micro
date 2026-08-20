@@ -255,6 +255,26 @@ irq_entry!(irq13_entry, 13);
 irq_entry!(irq14_entry, 14);
 irq_entry!(irq15_entry, 15);
 
+/// Bounded diagnostic for the one case the kernel still cannot mask.
+static IRQ_NOPIN_TRACE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn log_u64(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    if v == 0 {
+        crate::arch::log("0");
+        return;
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+        crate::arch::log(s);
+    }
+}
+
 struct IrqBklGuard;
 impl Drop for IrqBklGuard {
     fn drop(&mut self) {
@@ -292,15 +312,28 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
             &mut (*s_ptr).scheduler,
             irq as u16,
         );
-        // Mask a level-triggered IOAPIC line BEFORE the EOI: a still-asserted level
-        // source (e.g. PCI INTx, held until the driver clears the device cause) would
-        // otherwise re-fire immediately after EOI and storm the CPU. The owning
-        // IRQHandler::Ack unmasks it once the driver has serviced the device.
-        if let Some(entry) = (*s_ptr).irqs.get(irq as u16) {
-            if entry.level_triggered {
-                if let Some(pin) = entry.ioapic_pin {
-                    super::ioapic::mask_pin(pin as u32);
-                }
+        // Mask the IOAPIC line BEFORE the EOI, for EVERY delivered IRQ — not just the ones
+        // userspace declared level-triggered. This is what seL4 does (`handleInterrupt` masks and
+        // `IRQHandler_Ack` unmasks), and the reason is that the kernel cannot trust the declared
+        // trigger mode to predict whether the source is still asserting.
+        //
+        // Gating on `level_triggered` left a self-sustaining storm reachable: if the source is
+        // still asserting when we EOI, the line re-fires immediately, and it re-fires FASTER than
+        // the owning userspace thread can be scheduled to service the device. The kernel then
+        // spins delivering an interrupt nobody can consume. Measured with a TCG instruction-count
+        // plugin on a hosted boot: 169M kernel instructions per second in `irq12_entry` ->
+        // `irq_dispatch` -> `notification::signal`, with USER MODE RETIRING ZERO INSTRUCTIONS for
+        // minutes at a time — the executive could not run, so no fix in userspace could have
+        // helped. Masking unconditionally makes the storm unreachable by construction: one
+        // delivery per Ack, always.
+        if (*s_ptr).irqs.get(irq as u16).is_some() {
+            let cpu_vector = (irq as u32) + super::pic::PIC1_VECTOR_BASE as u32;
+            let touched = super::ioapic::set_mask_for_vector(cpu_vector, true);
+            if touched == 0 && IRQ_NOPIN_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8
+            {
+                crate::arch::log("[irq-mask] irq=");
+                log_u64(irq);
+                crate::arch::log(" no redirection entry delivers this vector\n");
             }
         }
     }
