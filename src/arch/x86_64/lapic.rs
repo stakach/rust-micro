@@ -377,7 +377,25 @@ pub fn timer_current_count() -> u32 {
 pub const LAPIC_TIMER_VECTOR: u8 = 0x41;
 const LAPIC_TIMER_DIVIDE_LOG2: u8 = 3; // ÷16
 
-/// Calibrated initial count for a ~1 ms LAPIC timer period. Set by
+/// Kernel tick period, in milliseconds.
+///
+/// The tick ISR charges MEASURED TSC time (see `lapic_timer_irq_dispatch`), not fire counts, so
+/// the period sets preemption/budget GRANULARITY only — never how much time gets accounted. That
+/// makes the rate a pure cost/granularity trade.
+///
+/// sel4test's SCHED / TIMEOUTFAULT families measure preemption at millisecond granularity, so the
+/// conformance build keeps the historical 1 kHz tick and stays byte-identical. The hosted NTOS
+/// boot (`extern-rootserver`) does not need it: it runs essentially one service thread and takes
+/// its own time from the HPET. Under TCG the emulated ISR — 15 GPR pushes, BKL acquire,
+/// `mcs_tick`, and the iretq context swap — costs a large fraction of a millisecond of REAL time,
+/// so a 1 ms period spends most of the machine servicing its own clock. Sampling the running vCPU
+/// during a hosted boot measured ~85% of it inside interrupt handling and only ~11% in user code.
+#[cfg(feature = "extern-rootserver")]
+const LAPIC_TICK_MS: u32 = 10;
+#[cfg(not(feature = "extern-rootserver"))]
+const LAPIC_TICK_MS: u32 = 1;
+
+/// Calibrated initial count for one `LAPIC_TICK_MS` LAPIC timer period. Set by
 /// `calibrate_timer_with_pit` on the BSP before user space owns any
 /// hardware.
 static mut LAPIC_TIMER_INITIAL_COUNT: u32 = 0;
@@ -435,7 +453,7 @@ pub fn calibrate_timer_with_pit() -> u32 {
     let elapsed = u32::MAX.wrapping_sub(timer_current_count());
     let per_ms = (elapsed / CAL_MS).max(1);
     unsafe {
-        LAPIC_TIMER_INITIAL_COUNT = per_ms;
+        LAPIC_TIMER_INITIAL_COUNT = per_ms.saturating_mul(LAPIC_TICK_MS);
         // TSC rate over the same window — used by the tick ISR to
         // charge measured time rather than fire counts.
         TSC_PER_MS = (tsc1.wrapping_sub(tsc0) / CAL_MS as u64).max(1);
