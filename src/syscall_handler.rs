@@ -702,7 +702,11 @@ fn handle_send(
                 let result = crate::invocation::decode_invocation(other, args, current);
                 if result.is_ok() {
                     if let Some(caller) = composite_reply_caller {
-                        s.scheduler.slab.get_mut(current).composite_reply_handoff = Some(caller);
+                        if let Some(inv_tcb) =
+                            s.scheduler.slab.entries[current.0 as usize].as_mut()
+                        {
+                            inv_tcb.composite_reply_handoff = Some(caller);
+                        }
                     }
                 }
                 if call {
@@ -711,7 +715,10 @@ fn handle_send(
                         Err(KException::SyscallError(SyscallError { code })) => *code as u64,
                         Err(_) => 0xFFFF,
                     };
-                    let inv_tcb = s.scheduler.slab.get_mut(current);
+                    let Some(inv_tcb) = s.scheduler.slab.entries[current.0 as usize].as_mut()
+                    else {
+                        return Ok(());
+                    };
                     let length = inv_tcb.ipc_length as u64 & 0x7F;
                     let mi = (label << 12) | length;
                     inv_tcb.user_context.rsi = mi;

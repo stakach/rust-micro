@@ -115,6 +115,51 @@ fn queue_remove(ep: &mut Endpoint, sched: &mut Scheduler, t: TcbId) {
     tcb.ep_prev = None;
 }
 
+fn queue_unlink_id(ep: &mut Endpoint, sched: &mut Scheduler, target: TcbId) -> bool {
+    let mut prev = None;
+    let mut cur = ep.head;
+    let mut guard = 0usize;
+    while let Some(id) = cur {
+        guard += 1;
+        if guard > crate::tcb::MAX_TCBS {
+            break;
+        }
+        let next = sched.slab.try_get(id).and_then(|t| t.ep_next);
+        if id != target {
+            prev = cur;
+            cur = next;
+            continue;
+        }
+
+        match prev {
+            Some(prev_id) => {
+                if let Some(prev_tcb) = sched.slab.entries[prev_id.0 as usize].as_mut() {
+                    prev_tcb.ep_next = next;
+                } else {
+                    ep.head = next;
+                }
+            }
+            None => ep.head = next,
+        }
+        match next {
+            Some(next_id) => {
+                if let Some(next_tcb) = sched.slab.entries[next_id.0 as usize].as_mut() {
+                    next_tcb.ep_prev = prev;
+                } else {
+                    ep.tail = prev;
+                }
+            }
+            None => ep.tail = prev,
+        }
+        if let Some(tcb) = sched.slab.entries[target.0 as usize].as_mut() {
+            tcb.ep_next = None;
+            tcb.ep_prev = None;
+        }
+        return true;
+    }
+    false
+}
+
 fn queue_is_empty(ep: &Endpoint) -> bool {
     ep.head.is_none()
 }
@@ -371,25 +416,24 @@ pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
     let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
     for i in 0..crate::kernel::MAX_ENDPOINTS {
         let ep = unsafe { &mut (*s_ptr).endpoints[i] };
-        if !ep_queue_contains(ep, sched, thread) {
-            continue;
-        }
-        let was_receive = matches!(
-            sched.slab.get(thread).state,
-            ThreadStateType::BlockedOnReceive
-        );
-        queue_remove(ep, sched, thread);
-        if queue_is_empty(ep) {
-            ep.state = EpState::Idle;
-        }
-        if sched.slab.try_get(thread).is_some() {
-            let tcb = sched.slab.get_mut(thread);
-            tcb.state = ThreadStateType::Inactive;
-            if was_receive {
-                tcb.pending_reply = None;
+        loop {
+            let was_receive = match sched.slab.try_get(thread) {
+                Some(tcb) => matches!(tcb.state, ThreadStateType::BlockedOnReceive),
+                None => false,
+            };
+            if !queue_unlink_id(ep, sched, thread) {
+                break;
+            }
+            if queue_is_empty(ep) {
+                ep.state = EpState::Idle;
+            }
+            if let Some(tcb) = sched.slab.entries[thread.0 as usize].as_mut() {
+                tcb.state = ThreadStateType::Inactive;
+                if was_receive {
+                    tcb.pending_reply = None;
+                }
             }
         }
-        return;
     }
     // Phase 43 — also clear notification queues. cnode_delete on a
     // TCB cap calls this to flush IPC references before freeing the

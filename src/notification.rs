@@ -135,6 +135,51 @@ fn queue_remove(ntfn: &mut Notification, sched: &mut Scheduler, t: TcbId) {
     tcb.ep_prev = None;
 }
 
+fn queue_unlink_id(ntfn: &mut Notification, sched: &mut Scheduler, target: TcbId) -> bool {
+    let mut prev = None;
+    let mut cur = ntfn.head;
+    let mut guard = 0usize;
+    while let Some(id) = cur {
+        guard += 1;
+        if guard > crate::tcb::MAX_TCBS {
+            break;
+        }
+        let next = sched.slab.try_get(id).and_then(|t| t.ep_next);
+        if id != target {
+            prev = cur;
+            cur = next;
+            continue;
+        }
+
+        match prev {
+            Some(prev_id) => {
+                if let Some(prev_tcb) = sched.slab.entries[prev_id.0 as usize].as_mut() {
+                    prev_tcb.ep_next = next;
+                } else {
+                    ntfn.head = next;
+                }
+            }
+            None => ntfn.head = next,
+        }
+        match next {
+            Some(next_id) => {
+                if let Some(next_tcb) = sched.slab.entries[next_id.0 as usize].as_mut() {
+                    next_tcb.ep_prev = prev;
+                } else {
+                    ntfn.tail = prev;
+                }
+            }
+            None => ntfn.tail = prev,
+        }
+        if let Some(tcb) = sched.slab.entries[target.0 as usize].as_mut() {
+            tcb.ep_next = None;
+            tcb.ep_prev = None;
+        }
+        return true;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Public operations.
 // ---------------------------------------------------------------------------
@@ -363,26 +408,17 @@ pub fn cancel_wait_anywhere(sched: &mut Scheduler, thread: TcbId) {
     let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
     for i in 0..crate::kernel::MAX_NTFNS {
         let ntfn = unsafe { &mut (*s_ptr).notifications[i] };
-        let mut found = false;
-        let mut cur = ntfn.head;
-        while let Some(c) = cur {
-            if c == thread {
-                found = true;
+        loop {
+            if !queue_unlink_id(ntfn, sched, thread) {
                 break;
             }
-            cur = sched.slab.try_get(c).and_then(|t| t.ep_next);
+            if ntfn.head.is_none() {
+                ntfn.state = NtfnState::Idle;
+            }
+            if let Some(tcb) = sched.slab.entries[thread.0 as usize].as_mut() {
+                tcb.state = ThreadStateType::Inactive;
+            }
         }
-        if !found {
-            continue;
-        }
-        queue_remove(ntfn, sched, thread);
-        if ntfn.head.is_none() {
-            ntfn.state = NtfnState::Idle;
-        }
-        if sched.slab.try_get(thread).is_some() {
-            sched.slab.get_mut(thread).state = ThreadStateType::Inactive;
-        }
-        return;
     }
 }
 

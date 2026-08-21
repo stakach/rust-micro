@@ -4137,17 +4137,8 @@ fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) ->
 /// allocated TCB doesn't inherit dangling back-references from a
 /// previous occupant of its slab slot.
 unsafe fn scrub_tcb_refs(s: &mut crate::kernel::KernelState, id: TcbId) {
-    for node in s.scheduler.nodes.iter_mut() {
-        if node.current == Some(id) {
-            node.current = None;
-        }
-        if node.active_user == Some(id) {
-            node.active_user = None;
-        }
-        if node.direct_handoff == Some(id) {
-            node.direct_handoff = None;
-        }
-    }
+    crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
+    s.scheduler.scrub_tcb(id);
     for n in s.notifications.iter_mut() {
         if n.bound_tcb == Some(id) {
             n.bound_tcb = None;

@@ -522,6 +522,7 @@ impl TcbSlab {
         self.entries.get(id.0 as usize).and_then(|e| e.as_ref())
     }
 
+    #[track_caller]
     pub fn get_mut(&mut self, id: TcbId) -> &mut Tcb {
         self.entries[id.0 as usize]
             .as_mut()

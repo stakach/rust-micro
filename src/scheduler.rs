@@ -104,6 +104,65 @@ impl ReadyQueues {
         }
     }
 
+    /// Remove `target` from this queue set if it appears anywhere in it.
+    ///
+    /// This is stronger than `dequeue`: destruction and slab-slot reuse must
+    /// scrub stale IDs even if an earlier bug left the TCB linked under a
+    /// priority different from its current `priority` field, or left the
+    /// `enqueued` bit out of sync with the intrusive list.
+    pub fn remove_id(&mut self, slab: &mut TcbSlab, target: TcbId) -> bool {
+        let mut removed = false;
+        for prio in 0..NUM_PRIORITIES {
+            let mut prev = None;
+            let mut cur = self.heads[prio];
+            let mut guard = 0usize;
+            while let Some(id) = cur {
+                guard += 1;
+                if guard > MAX_TCBS {
+                    break;
+                }
+                let next = slab.try_get(id).and_then(|t| t.sched_next);
+                if id != target {
+                    prev = cur;
+                    cur = next;
+                    continue;
+                }
+
+                match prev {
+                    Some(prev_id) => {
+                        if let Some(prev_tcb) = slab.entries[prev_id.0 as usize].as_mut() {
+                            prev_tcb.sched_next = next;
+                        } else {
+                            self.heads[prio] = next;
+                        }
+                    }
+                    None => self.heads[prio] = next,
+                }
+                match next {
+                    Some(next_id) => {
+                        if let Some(next_tcb) = slab.entries[next_id.0 as usize].as_mut() {
+                            next_tcb.sched_prev = prev;
+                        } else {
+                            self.tails[prio] = prev;
+                        }
+                    }
+                    None => self.tails[prio] = prev,
+                }
+                if let Some(tcb) = slab.entries[target.0 as usize].as_mut() {
+                    tcb.sched_prev = None;
+                    tcb.sched_next = None;
+                    tcb.enqueued = false;
+                }
+                if self.heads[prio].is_none() {
+                    self.bitmap.clear(prio as u8);
+                }
+                removed = true;
+                cur = next;
+            }
+        }
+        removed
+    }
+
     /// Insert `tcb` at the HEAD of its priority's queue. Mirrors
     /// upstream `tcbSchedEnqueue` (SCHED_ENQUEUE): threads woken by
     /// IPC / signal / refill-maturity resume BEFORE round-robin
@@ -935,6 +994,28 @@ impl Scheduler {
         }
     }
 
+    /// Remove every ready-queue/current/handoff reference to a TCB ID.
+    ///
+    /// TCB destruction must be stronger than normal blocking: a stale ready
+    /// queue entry on any CPU/domain is enough for a later scheduler walk to
+    /// dereference a freed slab slot.
+    pub fn scrub_tcb(&mut self, id: TcbId) {
+        for node in self.nodes.iter_mut() {
+            for domain in 0..NUM_DOMAINS {
+                node.queues[domain].remove_id(&mut self.slab, id);
+            }
+            if node.current == Some(id) {
+                node.current = None;
+            }
+            if node.active_user == Some(id) {
+                node.active_user = None;
+            }
+            if node.direct_handoff == Some(id) {
+                node.direct_handoff = None;
+            }
+        }
+    }
+
     /// Block a thread. Removes from its affinity CPU's queue (if
     /// runnable), updates state, and surrenders the CPU if it was
     /// current on any node.
@@ -1065,6 +1146,7 @@ pub mod spec {
         per_cpu_queues_are_isolated();
         active_user_tracks_entry_independently_of_current();
         block_and_sc_loss_clear_active_user();
+        scrub_tcb_removes_stale_ready_queue_entries();
         direct_handoff_beats_higher_priority_current();
         arch::log("Scheduler tests completed\n");
     }
@@ -1140,6 +1222,23 @@ pub mod spec {
         assert_eq!(s.active_user(), None);
         assert_eq!(s.nodes[0].direct_handoff, None);
         arch::log("  ✓ blocking and SC loss clear trap ownership\n");
+    }
+
+    #[inline(never)]
+    fn scrub_tcb_removes_stale_ready_queue_entries() {
+        let mut s = Scheduler::new();
+        let victim = s.admit(runnable(70));
+
+        // Simulate a lifecycle bug where metadata changed after enqueue:
+        // normal `block` would consult priority 10 and miss the old prio-70
+        // queue, leaving a freed TCB ID behind.
+        s.slab.get_mut(victim).priority = 10;
+        s.scrub_tcb(victim);
+        assert_eq!(s.nodes[0].queues[0].len_at(&s.slab, 70), 0);
+        assert!(!s.slab.get(victim).enqueued);
+        s.slab.free(victim);
+        assert_ne!(s.choose_thread(), Some(victim));
+        arch::log("  ✓ TCB scrub removes stale ready-queue IDs before free\n");
     }
 
     #[inline(never)]
