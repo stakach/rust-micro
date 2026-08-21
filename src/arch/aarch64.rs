@@ -1,6 +1,6 @@
 pub mod serial;
 
-#[cfg(feature = "spec")]
+#[cfg(any(feature = "spec", feature = "extern-rootserver"))]
 pub mod qemu;
 
 pub mod cpu;

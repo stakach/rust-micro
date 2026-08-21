@@ -329,7 +329,8 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
         if (*s_ptr).irqs.get(irq as u16).is_some() {
             let cpu_vector = (irq as u32) + super::pic::PIC1_VECTOR_BASE as u32;
             let touched = super::ioapic::set_mask_for_vector(cpu_vector, true);
-            if touched == 0 && IRQ_NOPIN_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8
+            if touched == 0
+                && IRQ_NOPIN_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8
             {
                 crate::arch::log("[irq-mask] irq=");
                 log_u64(irq);

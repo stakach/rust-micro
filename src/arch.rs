@@ -14,14 +14,20 @@ pub trait Architecture {
     fn init_interrupts();
     fn init_exceptions();
 
-    #[cfg(feature = "spec")]
+    #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
     fn qemu_exit(code: u32) -> !;
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "spec"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "spec", feature = "extern-rootserver")
+))]
 pub use x86_64::qemu::qemu_exit;
 
-#[cfg(all(target_arch = "aarch64", feature = "spec"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "spec", feature = "extern-rootserver")
+))]
 pub use aarch64::qemu::qemu_exit;
 
 #[cfg(all(target_arch = "x86_64"))]

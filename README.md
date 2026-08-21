@@ -78,7 +78,7 @@ echo $?                          # 0 = all specs passed, 255 = panic
 1. builds the **rootserver** ELF and stages it at `.tmp/rootserver.elf`
    (the default Rust rootserver, or a variant — see features below),
 2. builds the **kernel** with `-Z build-std=core` against
-   `triplets/mykernel-x86.json` (always with the `spec` feature),
+   `triplets/mykernel-x86.json`,
 3. chains **`make_image.sh`**, which packs `kernel` + `rootserver` into a USTAR
    initrd and writes a FAT32 EFI image to `.tmp/disk.img` (fetching
    `bootboot.efi` once into `.tmp/`).
@@ -87,6 +87,8 @@ echo $?                          # 0 = all specs passed, 255 = panic
 ./scripts/build_kernel.sh                 # default build (spec)
 ./scripts/build_kernel.sh smp             # extra cargo features are appended
 ./scripts/build_kernel.sh smp fastpath    # multiple features
+./scripts/build_kernel.sh extern-rootserver # hosted rootserver build, specs off by default
+KERNEL_SPECS=1 ./scripts/build_kernel.sh extern-rootserver # hosted build with specs
 ```
 
 You can re-run the stages individually:
@@ -97,11 +99,13 @@ You can re-run the stages individually:
 
 ### Build options (cargo features)
 
-Passed positionally to `build_kernel.sh`; `spec` is always included.
+Passed positionally to `build_kernel.sh`. Standalone builds include `spec` by
+default; `extern-rootserver` builds omit it unless you pass `spec` explicitly or
+set `KERNEL_SPECS=1`.
 
 | Feature         | Effect |
 |-----------------|--------|
-| `spec`          | (always on) compile + run kernel-internal specs; enable `qemu_exit`. |
+| `spec`          | Compile + run kernel-internal specs. Standalone builds enable it by default; `extern-rootserver` builds do not. |
 | `smp`           | Multi-CPU: per-CPU state, IPI dispatch, eager per-core FPU. Needed for the MULTICORE / SCHED_CONTEXT_0014 / FPU0002 sel4test families. |
 | `fastpath`      | Hot-path IPC that bypasses the slowpath. |
 | `fpu`           | Lazy FPU state-switch (single-node model). |

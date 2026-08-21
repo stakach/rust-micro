@@ -444,7 +444,7 @@ const OFF_CTX: usize = 16;
 /// likewise `swapgs` so the round-trip preserves the invariant.
 ///
 /// Setting both at init also covers the very first user dispatch:
-/// the rootserver-launch path calls `enter_user_via_sysret` from
+/// the rootserver-launch path calls an `enter_user` helper from
 /// fresh kernel mode (no prior SYSCALL entry), so without seeding
 /// the active register the post-swapgs value would be the boot
 /// default of 0 and the next SYSCALL would land in the kernel with

@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::arch::x86_64::paging::{install_kernel_page_tables, make_user_pml4};
 use crate::arch::x86_64::syscall_entry::{
-    enter_user_via_sysret, set_syscall_kernel_rsp, UserContext,
+    enter_user_via_iretq, set_syscall_kernel_rsp, UserContext,
 };
 use crate::arch::x86_64::usermode::map_user_4k_into_pml4;
 use crate::cap::{Cap, FrameRights, FrameSize, FrameStorage, PPtr, Pml4Storage, UntypedStorage};
@@ -779,6 +779,15 @@ pub unsafe fn launch_rootserver() -> ! {
 
     let img = load().expect("rootserver loads");
 
+    // Standalone spec boots register the bootstrap TCB while running
+    // `kernel::spec::test_kernel_state`; lean extern-rootserver boots do not.
+    // Do it here when needed so the real initial thread never depends on spec
+    // side effects and never receives slab id 0, which cannot be represented by
+    // the non-null `PPtr<Tcb>` stored in a Thread cap.
+    if crate::kernel::current_thread().is_none() {
+        crate::kernel::bootstrap_boot_thread();
+    }
+
     let s = KERNEL.get();
 
     // Build the rootserver's CNode (slot 2 of itself = `seL4_CapInitThreadCNode`).
@@ -885,8 +894,9 @@ pub unsafe fn launch_rootserver() -> ! {
         1,
         &Cap::Thread {
             // `decode_tcb` recovers the TcbId via `tcb_ptr.addr() as u16`,
-            // so we encode the TcbId directly (slab IDs start from 1
-            // after the boot thread, so `PPtr::new` always succeeds).
+            // so we encode the TcbId directly. `launch_rootserver` ensures
+            // the bootstrap TCB occupies slab id 0 first, so this rootserver
+            // TCB id is nonzero and can be represented as a `PPtr`.
             tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64).expect("nonzero tcb id"),
         },
     );
@@ -1190,9 +1200,38 @@ pub unsafe fn launch_rootserver() -> ! {
     #[cfg(feature = "smp")]
     crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, id);
 
-    let ctx = s.scheduler.slab.get(id).user_context;
+    let launch_fs_base = s.scheduler.slab.get(id).cpu_context.fs_base;
+    let launch_gs_base = s.scheduler.slab.get(id).cpu_context.gs_base;
+    unsafe {
+        crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, launch_fs_base);
+        crate::arch::x86_64::msr::wrmsr(
+            crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
+            launch_gs_base,
+        );
+    }
+
+    #[cfg(feature = "extern-rootserver")]
+    {
+        let ctx = s.scheduler.slab.get(id).user_context;
+        crate::arch::log("[rootserver-enter] tcb=");
+        log_rootserver_dec(id.0 as usize);
+        crate::arch::log(" entry=0x");
+        log_rootserver_hex(ctx.rcx);
+        crate::arch::log(" rsp=0x");
+        log_rootserver_hex(ctx.rsp);
+        crate::arch::log(" bootinfo=0x");
+        log_rootserver_hex(img.bootinfo_vaddr);
+        crate::arch::log(" rdi=0x");
+        log_rootserver_hex(ctx.rdi);
+        crate::arch::log(" fs=0x");
+        log_rootserver_hex(launch_fs_base);
+        crate::arch::log(" gs-shadow=0x");
+        log_rootserver_hex(launch_gs_base);
+        crate::arch::log("\n");
+    }
+    let ctx = &s.scheduler.slab.get(id).user_context as *const UserContext;
     s.scheduler.set_active_user(Some(id));
-    enter_user_via_sysret(&ctx);
+    enter_user_via_iretq(ctx);
 }
 
 /// Convert a physical address to its kernel-virt counterpart. The

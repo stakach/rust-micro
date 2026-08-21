@@ -549,9 +549,9 @@ fn panic(info: &PanicInfo) -> ! {
     }
     arch::log("\n");
 
-    #[cfg(feature = "spec")]
+    #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
     arch::qemu_exit(255);
 
-    #[cfg(not(feature = "spec"))]
+    #[cfg(not(any(feature = "spec", feature = "extern-rootserver")))]
     loop {}
 }

@@ -112,7 +112,11 @@ pub unsafe fn set_mask_for_vector(cpu_vector: u32, masked: bool) -> u32 {
         if lo & 0xFF != cpu_vector {
             continue;
         }
-        let next = if masked { lo | (1 << 16) } else { lo & !(1 << 16) };
+        let next = if masked {
+            lo | (1 << 16)
+        } else {
+            lo & !(1 << 16)
+        };
         if next != lo {
             write_reg(lo_reg, next);
         }

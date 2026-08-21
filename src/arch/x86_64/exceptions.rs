@@ -917,12 +917,12 @@ extern "C" fn handle_page_fault_typed(cr2: u64, error_code: u64, saved_cs: u64, 
         log_hex64(error_code);
         crate::arch::log("\nfatal — halting\n");
         crate::smp::bkl_release();
-        #[cfg(feature = "spec")]
+        #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
         crate::arch::qemu_exit(255);
-        #[cfg(not(feature = "spec"))]
+        #[cfg(not(any(feature = "spec", feature = "extern-rootserver")))]
         loop {
             unsafe {
-                asm!("hlt");
+                core::arch::asm!("hlt");
             }
         }
     }
@@ -1324,13 +1324,13 @@ fn fatal_exception(exception_num: u64, error_code: u64) -> ! {
     print_hex(error_code);
     crate::arch::log("\nSystem halted due to unrecoverable error\n");
 
-    #[cfg(feature = "spec")]
+    #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
     crate::arch::qemu_exit(255);
 
-    #[cfg(not(feature = "spec"))]
+    #[cfg(not(any(feature = "spec", feature = "extern-rootserver")))]
     loop {
         unsafe {
-            asm!("hlt");
+            core::arch::asm!("hlt");
         }
     }
 }
