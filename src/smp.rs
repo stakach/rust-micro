@@ -333,14 +333,19 @@ pub fn remote_tcb_stall(tcb: TcbId) -> bool {
     // and acknowledge; spin until it does.
     bkl_release();
     let mut spins: u64 = 0;
+    let mut acknowledged = true;
     while !STALL_ACK[a].load(Ordering::Acquire) {
         core::hint::spin_loop();
         spins += 1;
         if spins > 10_000_000_000 {
-            break; // safety valve — never wedge the controlling core.
+            acknowledged = false;
+            break;
         }
     }
     bkl_acquire();
+    if !acknowledged {
+        panic!("remote TCB stall was not acknowledged");
+    }
     // The remote core is now parked on `bkl_acquire` (inside its stall
     // wait-loop). Clear the request: it can't observe this until it
     // re-acquires the BKL, which it cannot do until we finish our

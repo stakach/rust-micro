@@ -147,6 +147,51 @@ fn tcb_matches_live_user_thread(tcb: &crate::tcb::Tcb, identity: LiveUserThreadI
         )
 }
 
+fn resolve_live_user_thread_in(
+    scheduler: &crate::scheduler::Scheduler,
+    identity: LiveUserThreadIdentity,
+) -> Option<crate::tcb::TcbId> {
+    let matches = |id| {
+        scheduler
+            .slab
+            .try_get(id)
+            .is_some_and(|tcb| tcb_matches_live_user_thread(tcb, identity))
+    };
+
+    if let Some(active) = scheduler.active_user().filter(|&id| matches(id)) {
+        return Some(active);
+    }
+    if let Some(current) = scheduler.current().filter(|&id| matches(id)) {
+        return Some(current);
+    }
+
+    let mut resolved = None;
+    for (index, slot) in scheduler.slab.entries.iter().enumerate() {
+        let Some(tcb) = slot.as_ref() else {
+            continue;
+        };
+        if !tcb_matches_live_user_thread(tcb, identity) {
+            continue;
+        }
+        if resolved.is_some() {
+            return None;
+        }
+        resolved = Some(crate::tcb::TcbId(index as u16));
+    }
+    resolved
+}
+
+/// Resolve the TCB that entered the kernel from the CPU's live user context.
+///
+/// User exception stubs have already executed `swapgs`, so CR3 plus the saved
+/// user FS/GS bases are architectural facts even when remote lifecycle work has
+/// cleared the scheduler's advisory `active_user` marker. Never fall back to an
+/// unrelated `current` TCB, and never guess when two TCBs have the same identity.
+pub(crate) fn resolve_live_user_thread() -> Option<crate::tcb::TcbId> {
+    let identity = live_user_thread_identity();
+    unsafe { resolve_live_user_thread_in(&crate::kernel::KERNEL.get().scheduler, identity) }
+}
+
 /// Initialise the MSRs. Must run after the GDT is loaded (so the
 /// CS / SS selectors in IA32_STAR refer to a real GDT entry).
 pub fn init_syscall_msrs() {
@@ -706,40 +751,14 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // TCB, so the per-thread user_context survives schedule()
     // returning a different current thread.
     use crate::kernel::KERNEL;
+    let live_entry_invoker = (from_user != 0).then(resolve_live_user_thread).flatten();
     let entry_invoker = unsafe {
         let s = KERNEL.get();
-        let live_identity = if from_user != 0 {
-            Some(live_user_thread_identity())
+        let entry = if from_user != 0 {
+            live_entry_invoker
         } else {
-            None
+            s.scheduler.current()
         };
-        let mut entry = s.scheduler.current();
-        if let Some(identity) = live_identity {
-            let active = s.scheduler.active_user();
-            let active_match = active
-                .and_then(|id| s.scheduler.slab.try_get(id).map(|tcb| (id, tcb)))
-                .filter(|(_, tcb)| tcb_matches_live_user_thread(tcb, identity))
-                .map(|(id, _)| id);
-            if let Some(active) = active_match {
-                entry = Some(active);
-            } else {
-                let current_matches = entry
-                    .and_then(|id| s.scheduler.slab.try_get(id))
-                    .is_some_and(|tcb| tcb_matches_live_user_thread(tcb, identity));
-                if !current_matches {
-                    entry = None;
-                    for (index, slot) in s.scheduler.slab.entries.iter().enumerate() {
-                        let Some(tcb) = slot.as_ref() else {
-                            continue;
-                        };
-                        if tcb_matches_live_user_thread(tcb, identity) {
-                            entry = Some(crate::tcb::TcbId(index as u16));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
 
         if let Some(prev) = entry {
             s.scheduler.set_current(Some(prev));
@@ -1350,6 +1369,7 @@ pub mod spec {
         debug_put_char_budget_miss_still_returns_to_invoker();
         debug_put_char_repairs_stale_blocked_invoker_state();
         debug_put_char_resolves_invoker_from_live_cpu_identity();
+        live_identity_resolution_rejects_stale_and_ambiguous_owners();
         debug_put_char_prefers_active_user_over_same_identity_current();
         debug_put_char_prefers_active_user_after_domain_slice_expiry();
         debug_put_char_from_live_user_returns_without_scheduler_identity();
@@ -1360,6 +1380,91 @@ pub mod spec {
         marked_reply_cap_syscall_hands_off_to_caller();
         dispatcher_signals_unknown_via_max_rax();
         arch::log("SYSCALL MSR tests completed\n");
+    }
+
+    #[inline(never)]
+    fn live_identity_resolution_rejects_stale_and_ambiguous_owners() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (actual, duplicate, stale, identity) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+
+            let identity = super::LiveUserThreadIdentity {
+                cr3: super::super::paging::read_cr3() & super::CR3_PADDR_MASK,
+                fs_base: super::rdmsr(super::IA32_FS_BASE),
+                gs_base: super::rdmsr(super::IA32_KERNEL_GS_BASE),
+                cpu: crate::arch::get_cpu_id(),
+            };
+
+            let mut actual_tcb = Tcb::default();
+            actual_tcb.state = ThreadStateType::Running;
+            actual_tcb.sc = Some(0);
+            actual_tcb.affinity = identity.cpu;
+            actual_tcb.cpu_context.cr3 = identity.cr3;
+            actual_tcb.cpu_context.fs_base = identity.fs_base;
+            actual_tcb.cpu_context.gs_base = identity.gs_base;
+            let actual = s.scheduler.admit(actual_tcb);
+
+            let mut duplicate_tcb = Tcb::default();
+            duplicate_tcb.state = ThreadStateType::Running;
+            duplicate_tcb.sc = Some(1);
+            duplicate_tcb.affinity = identity.cpu;
+            duplicate_tcb.cpu_context.cr3 = identity.cr3;
+            duplicate_tcb.cpu_context.fs_base = identity.fs_base;
+            duplicate_tcb.cpu_context.gs_base = identity.gs_base;
+            let duplicate = s.scheduler.admit(duplicate_tcb);
+
+            let mut stale_tcb = Tcb::default();
+            stale_tcb.state = ThreadStateType::Running;
+            stale_tcb.sc = Some(2);
+            stale_tcb.affinity = identity.cpu;
+            stale_tcb.cpu_context.cr3 = identity.cr3.wrapping_add(0x1000);
+            stale_tcb.user_context.rax = 0xfeed_face;
+            let stale = s.scheduler.admit(stale_tcb);
+
+            s.scheduler.set_current(Some(stale));
+            s.scheduler.set_active_user(None);
+            (actual, duplicate, stale, identity)
+        };
+
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(
+                super::resolve_live_user_thread_in(&s.scheduler, identity),
+                None,
+                "an ambiguous architectural identity must never fall back to current"
+            );
+            s.scheduler.set_active_user(Some(actual));
+            assert_eq!(
+                super::resolve_live_user_thread_in(&s.scheduler, identity),
+                Some(actual),
+                "the exact active owner disambiguates same-address-space threads"
+            );
+            s.scheduler.set_active_user(None);
+            s.scheduler.block(duplicate, ThreadStateType::Inactive);
+            assert_eq!(
+                super::resolve_live_user_thread_in(&s.scheduler, identity),
+                Some(actual),
+                "one exact architectural match must beat an unrelated current"
+            );
+
+            s.scheduler.block(actual, ThreadStateType::Inactive);
+            assert_eq!(
+                super::resolve_live_user_thread_in(&s.scheduler, identity),
+                None,
+                "no architectural match must not select the unrelated current"
+            );
+            assert_eq!(s.scheduler.slab.get(stale).state, ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(stale).user_context.rax, 0xfeed_face);
+            s.scheduler.block(stale, ThreadStateType::Inactive);
+            s.scheduler.slab.free(actual);
+            s.scheduler.slab.free(duplicate);
+            s.scheduler.slab.free(stale);
+            s.scheduler.reset_queues();
+        }
+        arch::log("  ✓ live user identity rejects stale and ambiguous owners\n");
     }
 
     /// Phase 28f — `IA32_KERNEL_GS_BASE` on this CPU should point

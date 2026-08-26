@@ -1998,6 +1998,8 @@ fn decode_sched_context(
             unsafe {
                 let s = KERNEL.get();
                 if let Some(tcb_id) = s.sched_contexts[sc_id as usize].bound_tcb {
+                    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                    crate::smp::remote_tcb_stall(tcb_id);
                     // Remove from the ready queue / surrender the CPU
                     // before clearing the SC so a runnable thread that
                     // loses its SC can't keep being scheduled. IPC0017
@@ -2049,6 +2051,8 @@ fn decode_sched_context(
                                 seL4_Error::seL4_IllegalOperation,
                             )));
                         }
+                        #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                        crate::smp::remote_tcb_stall(tcb_id);
                         s.scheduler.on_sc_lost(tcb_id);
                         s.scheduler.slab.get_mut(tcb_id).sc = None;
                         s.sched_contexts[sc_id as usize].bound_tcb = None;
@@ -2647,6 +2651,8 @@ fn decode_domain(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> 
                     Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
                     _ => return err(seL4_Error::seL4_InvalidArgument),
                 };
+                #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                crate::smp::remote_tcb_stall(tcb_id);
                 // setDomain: re-queues the thread under the new domain.
                 s.scheduler.set_domain(tcb_id, domain as u8);
             }

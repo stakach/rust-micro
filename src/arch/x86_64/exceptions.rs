@@ -223,17 +223,19 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
     crate::smp::bkl_acquire();
     let _bkl = BklGuard;
 
+    let current = match crate::arch::x86_64::syscall_entry::resolve_live_user_thread() {
+        Some(c) => c,
+        None => {
+            // No current thread — shouldn't happen from user
+            // mode but be defensive.
+            unsafe {
+                crate::arch::x86_64::syscall_entry::set_cr0_ts(false);
+            }
+            return;
+        }
+    };
     unsafe {
         let s = crate::kernel::KERNEL.get();
-        let current = match s.scheduler.user_entry_thread() {
-            Some(c) => c,
-            None => {
-                // No current thread — shouldn't happen from user
-                // mode but be defensive.
-                crate::arch::x86_64::syscall_entry::set_cr0_ts(false);
-                return;
-            }
-        };
         const FPU_DISABLED: u64 = 0x1;
         let flags = s.scheduler.slab.get(current).flags;
         if (flags & FPU_DISABLED) == 0 {
@@ -543,7 +545,7 @@ extern "C" fn handle_invalid_opcode_typed(saved_rip: u64, saved_cs: u64) {
         fatal_exception(6, 0);
     }
     crate::smp::bkl_acquire();
-    let current = unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() };
+    let current = crate::arch::x86_64::syscall_entry::resolve_live_user_thread();
     let Some(faulter) = current else {
         // Same race as the #PF no-current path: another CPU blocked
         // us mid-flight. Dispatch whatever is runnable.
@@ -678,7 +680,7 @@ extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u
         fatal_exception(13, error_code);
     }
     crate::smp::bkl_acquire();
-    let current = unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() };
+    let current = crate::arch::x86_64::syscall_entry::resolve_live_user_thread();
     let Some(faulter) = current else {
         unsafe { dispatch_next_or_idle("[#GP: no current, idling CPU]\n") }
     };
@@ -930,7 +932,7 @@ extern "C" fn handle_page_fault_typed(cr2: u64, error_code: u64, saved_cs: u64, 
     // User-mode page fault — try to deliver to the thread's
     // fault handler. If delivery fails (no handler / bad cap),
     // we kill the thread by parking it Inactive.
-    let current = unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() };
+    let current = crate::arch::x86_64::syscall_entry::resolve_live_user_thread();
     if current.is_none() {
         // We took a user-mode #PF before this CPU had a published user-entry
         // owner. Don't refault forever; dispatch whatever is runnable.
@@ -1145,7 +1147,7 @@ extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
         crate::smp::bkl_release();
         return;
     }
-    let faulter = match unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() } {
+    let faulter = match crate::arch::x86_64::syscall_entry::resolve_live_user_thread() {
         Some(t) => t,
         None => unsafe { dispatch_next_or_idle("[#DB no current]\n") },
     };
@@ -1220,7 +1222,7 @@ extern "C" fn handle_int3_typed(saved_cs: u64, saved_rip: u64) {
         crate::smp::bkl_release();
         return;
     }
-    let faulter = match unsafe { crate::kernel::KERNEL.get().scheduler.user_entry_thread() } {
+    let faulter = match crate::arch::x86_64::syscall_entry::resolve_live_user_thread() {
         Some(t) => t,
         None => unsafe { dispatch_next_or_idle("[INT3 no current]\n") },
     };
