@@ -4312,13 +4312,13 @@ fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) ->
             log_dec(dest_res.slot_index as u64);
             crate::arch::log("]\n");
         }
-        // Snapshot src cap before mutating either slot — both might
+        // Snapshot the complete source ownership state before mutating either slot — both might
         // be in the same CNode, in which case the borrow checker
         // would object to two simultaneous &mut on the same array.
-        let src_cap = s
+        let (src_cap, src_parent) = s
             .cnode_slot(src_cnode_idx, src_res.slot_index)
-            .map(|c| c.cap())
-            .unwrap_or(Cap::Null);
+            .map(|c| (c.cap(), c.parent()))
+            .unwrap_or((Cap::Null, None));
         // Upstream order: dest-not-empty check first (DeleteFirst),
         // then src-empty check (FailedLookup). Matches sel4test's
         // `is_slot_empty` helper in helpers.c.
@@ -4338,9 +4338,11 @@ fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) ->
         }
         if let Some(slot) = s.cnode_slot_mut(dest_cnode_idx, dest_res.slot_index) {
             slot.set_cap(&src_cap);
+            slot.set_parent(src_parent);
         }
         if let Some(slot) = s.cnode_slot_mut(src_cnode_idx, src_res.slot_index) {
             slot.set_cap(&Cap::Null);
+            slot.set_parent(None);
         }
     }
     Ok(())
@@ -7181,13 +7183,22 @@ pub mod spec {
     #[inline(never)]
     fn cnode_move_clears_source() {
         let invoker = setup_invoker(0);
+        let parent = crate::cte::MdbId::pack(0, 5);
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[1] = Cte::with_cap(&Cap::Endpoint {
-                ptr: PPtr::<EndpointObj>::new(0x456).unwrap(),
+            s.cnodes[0].0[5] = Cte::with_cap(&Cap::Endpoint {
+                ptr: PPtr::<EndpointObj>::new(3).unwrap(),
                 badge: Badge(0),
                 rights: EndpointRights::default(),
             });
+            s.cnodes[0].0[1] = Cte::with_cap(&Cap::Endpoint {
+                ptr: PPtr::<EndpointObj>::new(1).unwrap(),
+                badge: Badge(0),
+                rights: EndpointRights::default(),
+            });
+            s.cnodes[0].0[1].set_parent(Some(parent));
+            s.cnodes[0].0[3].set_parent(Some(crate::cte::MdbId::pack(0, 7)));
+            child_count_inc(parent, 1);
         }
         let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
         let args = SyscallArgs {
@@ -7200,10 +7211,33 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             assert!(s.cnodes[0].0[1].cap().is_null());
+            assert_eq!(s.cnodes[0].0[1].parent(), None);
             assert!(matches!(s.cnodes[0].0[3].cap(), Cap::Endpoint { .. }));
+            assert_eq!(s.cnodes[0].0[3].parent(), Some(parent));
+
+            // Reuse the moved-from slot with an unrelated root cap. Revoking the old parent must
+            // follow the moved MDB edge to slot 3, never the stale slot 1 location.
+            s.cnodes[0].0[1].set_cap(&Cap::Endpoint {
+                ptr: PPtr::<EndpointObj>::new(2).unwrap(),
+                badge: Badge(0),
+                rights: EndpointRights::default(),
+            });
+            s.cnodes[0].0[1].set_parent(None);
+        }
+        let revoke = SyscallArgs {
+            a1: (InvocationLabel::CNodeRevoke as u64) << 12,
+            a2: 5,
+            ..Default::default()
+        };
+        decode_invocation(cnode_cap, &revoke, invoker).expect("revoke moved cap parent");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(matches!(s.cnodes[0].0[1].cap(), Cap::Endpoint { .. }));
+            assert!(s.cnodes[0].0[3].cap().is_null());
+            assert_eq!(s.cnodes[0].0[3].parent(), None);
         }
         teardown_invoker(invoker);
-        arch::log("  ✓ CNode::Move transfers cap and zeroes source\n");
+        arch::log("  ✓ CNode::Move transfers cap + MDB ownership and zeroes source\n");
     }
 
     /// Revoke walks the cap tree and zeroes every derived cap.
