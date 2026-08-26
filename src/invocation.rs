@@ -392,7 +392,12 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             };
             inv_tcb.pending_extra_caps_count = 0;
             match cap {
-                Some(Cap::PML4 { ptr, asid, .. }) => Some((ptr.addr(), asid)),
+                Some(Cap::PML4 { ptr, asid, .. }) if asid != 0 => Some((ptr.addr(), asid)),
+                Some(Cap::PML4 { .. }) => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
                 _ => {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability,
@@ -403,7 +408,12 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
             let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a4)?;
             match pml4_cap {
-                Cap::PML4 { ptr, asid, .. } => Some((ptr.addr(), asid)),
+                Cap::PML4 { ptr, asid, .. } if asid != 0 => Some((ptr.addr(), asid)),
+                Cap::PML4 { .. } => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
                 _ => {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability,
@@ -1080,7 +1090,12 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
             };
             inv_tcb.pending_extra_caps_count = 0;
             match cap {
-                Some(Cap::PML4 { ptr, .. }) => Some(ptr.addr()),
+                Some(Cap::PML4 { ptr, asid, .. }) if asid != 0 => Some(ptr.addr()),
+                Some(Cap::PML4 { .. }) => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
                 _ => {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability,
@@ -1091,7 +1106,12 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
             let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
             let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a3)?;
             match pml4_cap {
-                Cap::PML4 { ptr, .. } => Some(ptr.addr()),
+                Cap::PML4 { ptr, asid, .. } if asid != 0 => Some(ptr.addr()),
+                Cap::PML4 { .. } => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
                 _ => {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability,
@@ -6092,6 +6112,7 @@ pub mod spec {
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
         frame_map_unmap_get_address();
+        paging_maps_reject_unassigned_explicit_vspace();
         page_table_map_unmap();
         page_table_map_updates_invoked_slot_not_first_alias();
         tcb_write_read_registers();
@@ -7159,6 +7180,84 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Frame::Map / Unmap / GetAddress round-trip\n");
+    }
+
+    /// Explicit frame maps need a real ASID so later unmap/delete can find the same VSpace.
+    #[inline(never)]
+    fn paging_maps_reject_unassigned_explicit_vspace() {
+        use crate::cap::{FrameRights, FrameSize, FrameStorage, PageTableStorage, Pml4Storage};
+
+        let invoker = setup_invoker(0);
+        let frame_cap = Cap::Frame {
+            ptr: PPtr::<FrameStorage>::new(0x0000_0000_0091_0000).unwrap(),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadWrite,
+            mapped: None,
+            asid: 0,
+            is_device: false,
+            map_type: crate::cap::FrameMapType::None,
+        };
+        let pml4_cap = Cap::PML4 {
+            ptr: PPtr::<Pml4Storage>::new(0x0000_0000_0092_0000).unwrap(),
+            mapped: true,
+            asid: 0,
+        };
+        let page_table_cap = Cap::PageTable {
+            ptr: PPtr::<PageTableStorage>::new(0x0000_0000_0093_0000).unwrap(),
+            mapped: None,
+            asid: 0,
+        };
+        unsafe {
+            KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&frame_cap);
+            KERNEL.get().cnodes[0].0[3] = Cte::with_cap(&pml4_cap);
+            KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&page_table_cap);
+        }
+
+        let args = SyscallArgs {
+            a0: 2,
+            a1: (InvocationLabel::X86PageMap as u64) << 12,
+            a2: 0x0000_0100_0060_0000,
+            a3: FrameRights::ReadWrite.to_word(),
+            a4: 3,
+            ..Default::default()
+        };
+        let result = decode_invocation(frame_cap, &args, invoker);
+        assert!(matches!(
+            result,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_InvalidCapability
+            }))
+        ));
+        unsafe {
+            assert!(matches!(
+                KERNEL.get().cnodes[0].0[2].cap(),
+                Cap::Frame { mapped: None, .. }
+            ));
+        }
+
+        let page_table_args = SyscallArgs {
+            a0: 4,
+            a1: (InvocationLabel::X86PageTableMap as u64) << 12,
+            a2: 0x0000_0100_0080_0000,
+            a3: 3,
+            ..Default::default()
+        };
+        let result = decode_invocation(page_table_cap, &page_table_args, invoker);
+        assert!(matches!(
+            result,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_InvalidCapability
+            }))
+        ));
+        unsafe {
+            assert!(matches!(
+                KERNEL.get().cnodes[0].0[4].cap(),
+                Cap::PageTable { mapped: None, .. }
+            ));
+        }
+
+        teardown_invoker(invoker);
+        arch::log("  ✓ paging maps reject an unassigned explicit VSpace\n");
     }
 
     #[inline(never)]

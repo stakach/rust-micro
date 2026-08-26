@@ -390,6 +390,8 @@ unsafe fn multi_vspace_demo() {
     let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4,
                            PAGING_BITS, 1, slot_new_pml4());
     if r != 0 { print_str(b"[mvs retype PML4 FAILED]\n"); return; }
+    let r = vspace_assign_asid(slot_new_pml4());
+    if r != 0 { print_str(b"[mvs ASID assign FAILED]\n"); return; }
     let r = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT,
                            PAGING_BITS, 1, slot_new_pdpt());
     if r != 0 { print_str(b"[mvs retype PDPT FAILED]\n"); return; }

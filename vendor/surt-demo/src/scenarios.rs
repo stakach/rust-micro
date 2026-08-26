@@ -340,6 +340,9 @@ unsafe fn build_component_vspace() -> u64 {
     let img_count = IMAGE_FRAMES_COUNT.load(AtomicOrdering::Relaxed);
     let pml4 = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+    if vspace_assign_asid(pml4) != 0 {
+        panic!("component VSpace ASID assignment failed");
+    }
     let pdpt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
     let pd = alloc_slot();
@@ -848,6 +851,9 @@ fn multiprocess() -> DemoResult {
 
         let pml4 = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PML4, PAGING_BITS, 1, pml4);
+        if vspace_assign_asid(pml4) != 0 {
+            panic!("multiprocess VSpace ASID assignment failed");
+        }
         let pdpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PDPT, PAGING_BITS, 1, pdpt);
         let pd = alloc_slot();

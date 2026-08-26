@@ -55,6 +55,7 @@ pub const LBL_X86_PAGE_DIRECTORY_MAP: u64 = 45;
 pub const LBL_X86_PAGE_TABLE_MAP: u64 = 47;
 pub const LBL_X86_PAGE_MAP: u64 = 51;
 pub const LBL_X86_PAGE_UNMAP: u64 = 52;
+pub const LBL_X86_ASID_POOL_ASSIGN: u64 = 56;
 pub const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
 pub const LBL_TCB_READ_DEBUG_STATE: u64 = 67;
 
@@ -82,6 +83,7 @@ pub const MSG_EXTRA_CAPS_SHIFT: u64 = 7;
 pub const CAP_INIT_THREAD_CNODE: u64 = 2;
 pub const CAP_INIT_THREAD_VSPACE: u64 = 3;
 pub const SLOT_IRQ_CONTROL: u64 = 4;
+pub const CAP_INIT_THREAD_ASID_POOL: u64 = 6;
 pub const SLOT_SCHED_CONTROL: u64 = 16;
 pub const CAP_INIT_UNTYPED: u64 = 20;
 
@@ -144,6 +146,28 @@ pub unsafe fn syscall5(nr: i64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> 
     0
 }
 
+/// Five-argument cap invocation that waits for a reply and returns its MessageInfo error label.
+#[inline(always)]
+pub unsafe fn syscall5_call(a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let reply: u64;
+    asm!(
+        "syscall",
+        in("rdx") SYS_CALL as u64,
+        in("rdi") a0,
+        inout("rsi") a1 => reply,
+        in("r10") a2,
+        in("r8")  a3,
+        in("r9")  a4,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("rax") _,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack, preserves_flags),
+    );
+    reply >> 12
+}
+
 #[inline(always)]
 pub fn debug_put_char(c: u8) {
     unsafe {
@@ -182,6 +206,23 @@ pub fn untyped_retype(
             obj_type,
             size_num,
             dest_offset,
+        )
+    }
+}
+
+/// Assign a freshly retyped PML4 an ASID from the initial pool.
+///
+/// This must run before installing paging structures or frames in the new VSpace. Frame caps retain
+/// the assigned ASID so their later Unmap/Delete operation can locate the correct page-table root.
+#[inline(always)]
+pub fn vspace_assign_asid(pml4_cap_ptr: u64) -> u64 {
+    unsafe {
+        syscall5_call(
+            CAP_INIT_THREAD_ASID_POOL,
+            LBL_X86_ASID_POOL_ASSIGN << 12,
+            pml4_cap_ptr,
+            0,
+            0,
         )
     }
 }
