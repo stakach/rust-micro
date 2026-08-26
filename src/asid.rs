@@ -37,6 +37,16 @@ pub fn pml4_paddr(asid: u16) -> u64 {
         .unwrap_or(0)
 }
 
+pub fn asid_for_pml4(pml4_paddr: u64) -> Option<u16> {
+    use core::sync::atomic::Ordering;
+    if pml4_paddr == 0 {
+        return None;
+    }
+    (1..MAX_ASIDS)
+        .find(|&idx| PML4_BY_ASID[idx].load(Ordering::Relaxed) == pml4_paddr)
+        .map(|idx| idx as u16)
+}
+
 pub fn reset() {
     use core::sync::atomic::Ordering;
     for idx in 0..MAX_ASIDS {

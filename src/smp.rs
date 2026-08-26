@@ -385,6 +385,39 @@ pub fn shootdown_tlb(vaddr: u64) {
     }
 }
 
+/// Flush every cached translation belonging to one vspace after an
+/// intermediate paging structure is detached. Invalidating a single address
+/// is insufficient because one PT/PD/PDPT covers an entire range.
+#[cfg(target_arch = "x86_64")]
+pub fn shootdown_vspace(pml4_paddr: u64) {
+    let target = pml4_paddr & 0x000F_FFFF_FFFF_F000;
+    let live = crate::arch::x86_64::paging::read_cr3() & 0x000F_FFFF_FFFF_F000;
+    if live == target {
+        unsafe {
+            core::arch::asm!(
+                "mov cr3, {}",
+                in(reg) live,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    let me = crate::arch::get_cpu_id();
+    let n_cores = crate::bootboot::get_num_cores() as u32;
+    for cpu in 0..n_cores.min(MAX_CPUS as u32) {
+        if cpu == me {
+            continue;
+        }
+        let running = unsafe {
+            let scheduler = &crate::kernel::KERNEL.get().scheduler;
+            scheduler.current_for_cpu(cpu).is_some() || scheduler.active_user_for_cpu(cpu).is_some()
+        };
+        if running {
+            send_ipi(cpu, IpiKind::InvalidateVspace { pml4_paddr: target });
+        }
+    }
+}
+
 /// Maximum CPUs we'll ever run on. Picked small so the per-CPU
 /// arrays fit on the stack inside specs and on the BSS in the
 /// production kernel without alloc().
@@ -445,6 +478,8 @@ pub enum IpiKind {
     /// Invalidate a TLB entry. The vaddr fits in a u64 — simplification
     /// for the spec; production carries an asid+range pair.
     InvalidateTlb { vaddr: u64 },
+    /// Reload CR3 when the target CPU is running this address space.
+    InvalidateVspace { pml4_paddr: u64 },
     /// Stop the target CPU (used during shutdown).
     Stop,
 }

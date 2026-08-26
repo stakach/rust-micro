@@ -526,15 +526,15 @@ pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool, execute
 /// uses a 1G/2M page, leaves the structure alone (the cap-state
 /// invariant says we only Unmap pages that Frame::Map installed
 /// at 4 KiB granularity, but we're defensive).
-pub unsafe fn unmap_user_4k_public(vaddr: u64) {
+pub unsafe fn unmap_user_4k_public(vaddr: u64, expected_paddr: u64) -> bool {
     let pml4_paddr = read_cr3() & 0x000F_FFFF_FFFF_F000;
-    unmap_user_4k_in_pml4(pml4_paddr, vaddr);
+    unmap_user_4k_in_pml4(pml4_paddr, vaddr, expected_paddr)
 }
 
 /// Phase 43 — unmap a 4 KiB page from a SPECIFIC vspace (identified
 /// by its PML4 paddr). Used by Frame::Unmap so the kernel walks the
 /// vspace the cap was mapped in, not whatever happens to be current.
-pub unsafe fn unmap_user_4k_in_pml4(pml4_paddr: u64, vaddr: u64) {
+pub unsafe fn unmap_user_4k_in_pml4(pml4_paddr: u64, vaddr: u64, expected_paddr: u64) -> bool {
     use super::paging::{PTE_PRESENT, PTE_PS};
     let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
@@ -544,22 +544,30 @@ pub unsafe fn unmap_user_4k_in_pml4(pml4_paddr: u64, vaddr: u64) {
 
     let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
     if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
-        return;
+        return false;
     }
     let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
     if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
-        return;
+        return false;
     }
     let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pde = core::ptr::read_volatile(pd.add(pd_idx));
     if pde & PTE_PRESENT == 0 || pde & PTE_PS != 0 {
-        return;
+        return false;
     }
     let pt = super::paging::phys_to_lin(pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pte = core::ptr::read_volatile(pt.add(pt_idx));
+    if pte & PTE_PRESENT == 0
+        || pte & PTE_PS != 0
+        || pte & 0x000F_FFFF_FFFF_F000 != expected_paddr & 0x000F_FFFF_FFFF_F000
+    {
+        return false;
+    }
 
     core::ptr::write_volatile(pt.add(pt_idx), 0);
     asm!("invlpg [{a}]", a = in(reg) vaddr, options(nostack, preserves_flags));
+    true
 }
 
 /// Phase 24 — install a 4 KiB mapping into an explicit PML4
@@ -697,6 +705,77 @@ pub unsafe fn install_user_table_in_paddr(
     // physical address < 1 GiB also names a kernel-virt address.
     let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     install_user_table_in(pml4, level, vaddr, table_paddr)
+}
+
+pub fn current_pml4_paddr() -> u64 {
+    read_cr3() & 0x000F_FFFF_FFFF_F000
+}
+
+/// Remove an intermediate paging structure only when the parent entry still
+/// names the capability's physical page. A stale paging cap must not detach a
+/// replacement table that now covers the same virtual range.
+unsafe fn user_table_entry_in_paddr(pml4_paddr: u64, level: u32, vaddr: u64) -> Option<*mut u64> {
+    use super::paging::{PTE_PRESENT, PTE_PS};
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+
+    let entry = match level {
+        3 => pml4.add(pml4_idx),
+        2 => {
+            let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+            if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+                return None;
+            }
+            let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+            pdpt.add(pdpt_idx)
+        }
+        1 => {
+            let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+            if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+                return None;
+            }
+            let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+            let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+            if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
+                return None;
+            }
+            let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+            pd.add(pd_idx)
+        }
+        _ => return None,
+    };
+    Some(entry)
+}
+
+pub unsafe fn user_table_matches_in_paddr(
+    pml4_paddr: u64,
+    level: u32,
+    vaddr: u64,
+    expected_paddr: u64,
+) -> bool {
+    let Some(entry) = user_table_entry_in_paddr(pml4_paddr, level, vaddr) else {
+        return false;
+    };
+    let current = core::ptr::read_volatile(entry);
+    current & super::paging::PTE_PRESENT != 0
+        && current & super::paging::PTE_PS == 0
+        && current & 0x000F_FFFF_FFFF_F000 == expected_paddr & 0x000F_FFFF_FFFF_F000
+}
+
+pub unsafe fn unmap_user_table_in_paddr(
+    pml4_paddr: u64,
+    level: u32,
+    vaddr: u64,
+    expected_paddr: u64,
+) -> bool {
+    if !user_table_matches_in_paddr(pml4_paddr, level, vaddr, expected_paddr) {
+        return false;
+    }
+    let entry = user_table_entry_in_paddr(pml4_paddr, level, vaddr).unwrap();
+    core::ptr::write_volatile(entry, 0);
+    true
 }
 
 /// Diagnostic helper — prints a one-line trace of a page-table walk
@@ -882,7 +961,7 @@ pub unsafe fn map_user_1g_into_foreign_pml4(
 
 /// Unmap a 2 MiB Large frame from a specific vspace. Bails if the
 /// PD entry isn't actually a 2 MiB leaf.
-pub unsafe fn unmap_user_2m_in_pml4(pml4_paddr: u64, vaddr: u64) {
+pub unsafe fn unmap_user_2m_in_pml4(pml4_paddr: u64, vaddr: u64, expected_paddr: u64) -> bool {
     use super::paging::{PTE_PRESENT, PTE_PS};
     let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
@@ -891,41 +970,49 @@ pub unsafe fn unmap_user_2m_in_pml4(pml4_paddr: u64, vaddr: u64) {
 
     let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
     if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
-        return;
+        return false;
     }
     let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
     if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
-        return;
+        return false;
     }
     let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pde = core::ptr::read_volatile(pd.add(pd_idx));
     if pde & PTE_PRESENT == 0 || pde & PTE_PS == 0 {
         // Not a 2 MiB leaf — nothing to do.
-        return;
+        return false;
+    }
+    if pde & 0x000F_FFFF_FFE0_0000 != expected_paddr & 0x000F_FFFF_FFE0_0000 {
+        return false;
     }
     core::ptr::write_volatile(pd.add(pd_idx), 0);
     asm!("invlpg [{a}]", a = in(reg) vaddr, options(nostack, preserves_flags));
+    true
 }
 
 /// Unmap a 1 GiB Huge frame from a specific vspace.
-pub unsafe fn unmap_user_1g_in_pml4(pml4_paddr: u64, vaddr: u64) {
+pub unsafe fn unmap_user_1g_in_pml4(pml4_paddr: u64, vaddr: u64, expected_paddr: u64) -> bool {
     use super::paging::{PTE_PRESENT, PTE_PS};
     let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
     if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
-        return;
+        return false;
     }
     let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
     if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS == 0 {
         // Not a 1 GiB leaf — nothing to do.
-        return;
+        return false;
+    }
+    if pdpte & 0x000F_FFFF_C000_0000 != expected_paddr & 0x000F_FFFF_C000_0000 {
+        return false;
     }
     core::ptr::write_volatile(pdpt.add(pdpt_idx), 0);
     asm!("invlpg [{a}]", a = in(reg) vaddr, options(nostack, preserves_flags));
+    true
 }
 
 /// Install a paging-structure entry. Returns Ok(()) on success.

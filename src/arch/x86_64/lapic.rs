@@ -160,6 +160,16 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
                 );
             }
         }
+        IpiKind::InvalidateVspace { pml4_paddr } => unsafe {
+            let live = super::paging::read_cr3() & 0x000F_FFFF_FFFF_F000;
+            if live == pml4_paddr & 0x000F_FFFF_FFFF_F000 {
+                core::arch::asm!(
+                    "mov cr3, {}",
+                    in(reg) live,
+                    options(nostack, preserves_flags),
+                );
+            }
+        },
         IpiKind::Stop => {
             // Halt-loop forever. Used at shutdown — no graceful
             // unwinding needed since we never resume an AP after

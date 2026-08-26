@@ -547,18 +547,26 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
         unsafe {
             let pml4_paddr = pml4_paddr_for_asid(asid);
             if pml4_paddr != 0 {
-                match size {
+                let unmapped = match size {
                     crate::cap::FrameSize::Small => {
-                        crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(pml4_paddr, vaddr);
+                        crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                            pml4_paddr, vaddr, paddr,
+                        )
                     }
                     crate::cap::FrameSize::Large => {
-                        crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(pml4_paddr, vaddr);
+                        crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
+                            pml4_paddr, vaddr, paddr,
+                        )
                     }
                     crate::cap::FrameSize::Huge => {
-                        crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(pml4_paddr, vaddr);
+                        crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
+                            pml4_paddr, vaddr, paddr,
+                        )
                     }
+                };
+                if unmapped {
+                    crate::smp::shootdown_tlb(vaddr);
                 }
-                crate::smp::shootdown_tlb(vaddr);
             }
         }
     }
@@ -986,10 +994,9 @@ fn decode_frame_get_address(target: Cap, _args: &SyscallArgs, invoker: TcbId) ->
 // Phase 26 — PT / PD / PDPT invocations.
 //
 // Each Map(vaddr) installs the cap into the parent paging structure
-// at the matching index in the *invoker's vspace* (today: live CR3).
-// Unmap clears the mapped flag in the cap; we don't yet tear down
-// the hardware entry — the slot will get overwritten when the cap is
-// re-mapped or freed.
+// at the matching index and records both virtual address and ASID.
+// Unmap verifies the parent entry still names this physical paging
+// structure before detaching it and flushing the affected vspace.
 //
 // Layering reminder:
 //   Cap::Pdpt        Map → installs at PML4[idx]   level=3
@@ -1079,8 +1086,8 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
 
-    let installed = unsafe {
-        let pml4_paddr_opt: Option<u64> = if upstream {
+    let (installed, mapped_asid) = unsafe {
+        let vspace: Option<(u64, u16)> = if upstream {
             let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
             let count = inv_tcb.pending_extra_caps_count as usize;
             let cap = if count > 0 {
@@ -1090,7 +1097,7 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
             };
             inv_tcb.pending_extra_caps_count = 0;
             match cap {
-                Some(Cap::PML4 { ptr, asid, .. }) if asid != 0 => Some(ptr.addr()),
+                Some(Cap::PML4 { ptr, asid, .. }) if asid != 0 => Some((ptr.addr(), asid)),
                 Some(Cap::PML4 { .. }) => {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability,
@@ -1106,7 +1113,7 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
             let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
             let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a3)?;
             match pml4_cap {
-                Cap::PML4 { ptr, asid, .. } if asid != 0 => Some(ptr.addr()),
+                Cap::PML4 { ptr, asid, .. } if asid != 0 => Some((ptr.addr(), asid)),
                 Cap::PML4 { .. } => {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_InvalidCapability,
@@ -1119,10 +1126,24 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
                 }
             }
         } else {
-            None
+            #[cfg(not(feature = "spec"))]
+            {
+                let pml4_paddr = usermode::current_pml4_paddr();
+                let Some(asid) = crate::asid::asid_for_pml4(pml4_paddr) else {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )));
+                };
+                Some((pml4_paddr, asid))
+            }
+            #[cfg(feature = "spec")]
+            {
+                None
+            }
         };
 
-        if let Some(pml4_paddr) = pml4_paddr_opt {
+        let mapped_asid = vspace.map(|(_, asid)| asid).unwrap_or(0);
+        let installed = if let Some((pml4_paddr, _)) = vspace {
             usermode::install_user_table_in_paddr(pml4_paddr, level, vaddr, paddr)
         } else {
             #[cfg(not(feature = "spec"))]
@@ -1134,7 +1155,8 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
                 let _ = (level, vaddr, paddr);
                 Ok(())
             }
-        }
+        };
+        (installed, mapped_asid)
     };
     if let Err(missing_level) = installed {
         if missing_level == 0 {
@@ -1162,12 +1184,18 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
         )));
     }
 
-    update_invoked_paging_slot(args, invoker, &target, Some(vaddr))?;
+    update_invoked_paging_slot(args, invoker, &target, Some(vaddr), mapped_asid)?;
     Ok(())
 }
 
 fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    update_invoked_paging_slot(args, invoker, &target, None)?;
+    if !paging_structure_mapping_valid(&target) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+    detach_paging_structure(&target);
+    update_invoked_paging_slot(args, invoker, &target, None, 0)?;
     Ok(())
 }
 
@@ -1180,24 +1208,161 @@ fn paging_struct_state(cap: &Cap) -> (u64, Option<u64>) {
     }
 }
 
-fn paging_cap_with_mapping(cap: Cap, target_paddr: u64, new_mapped: Option<u64>) -> Option<Cap> {
-    match cap {
-        Cap::PageTable { ptr, asid, .. } if ptr.addr() == target_paddr => Some(Cap::PageTable {
+fn paging_structure_mapping(cap: &Cap) -> Option<(u64, u64, u16, u32)> {
+    match *cap {
+        Cap::PageTable {
             ptr,
-            mapped: new_mapped,
+            mapped: Some(vaddr),
             asid,
-        }),
-        Cap::PageDirectory { ptr, asid, .. } if ptr.addr() == target_paddr => {
-            Some(Cap::PageDirectory {
-                ptr,
-                mapped: new_mapped,
-                asid,
-            })
+        } => Some((ptr.addr(), vaddr, asid, 1)),
+        Cap::PageDirectory {
+            ptr,
+            mapped: Some(vaddr),
+            asid,
+        } => Some((ptr.addr(), vaddr, asid, 2)),
+        Cap::Pdpt {
+            ptr,
+            mapped: Some(vaddr),
+            asid,
+        } => Some((ptr.addr(), vaddr, asid, 3)),
+        _ => None,
+    }
+}
+
+fn paging_structure_mapping_valid(cap: &Cap) -> bool {
+    let is_paging = matches!(
+        cap,
+        Cap::PageTable { .. } | Cap::PageDirectory { .. } | Cap::Pdpt { .. }
+    );
+    let Some((paddr, vaddr, asid, level)) = paging_structure_mapping(cap) else {
+        return !is_paging || paging_struct_state(cap).1.is_none();
+    };
+    let pml4_paddr = pml4_paddr_for_asid(asid);
+    pml4_paddr != 0
+        && unsafe {
+            crate::arch::x86_64::usermode::user_table_matches_in_paddr(
+                pml4_paddr, level, vaddr, paddr,
+            )
         }
-        Cap::Pdpt { ptr, asid, .. } if ptr.addr() == target_paddr => Some(Cap::Pdpt {
+}
+
+fn detach_paging_structure(cap: &Cap) -> bool {
+    let Some((paddr, vaddr, asid, level)) = paging_structure_mapping(cap) else {
+        return false;
+    };
+    let pml4_paddr = pml4_paddr_for_asid(asid);
+    if pml4_paddr == 0 {
+        return false;
+    }
+    let detached = unsafe {
+        crate::arch::x86_64::usermode::unmap_user_table_in_paddr(pml4_paddr, level, vaddr, paddr)
+    };
+    if detached {
+        crate::smp::shootdown_vspace(pml4_paddr);
+    }
+    detached
+}
+
+fn detach_cap_mapping(cap: &Cap) {
+    if let Cap::Frame {
+        ptr,
+        size,
+        mapped: Some(vaddr),
+        asid,
+        map_type,
+        ..
+    } = *cap
+    {
+        unsafe {
+            if map_type == crate::cap::FrameMapType::IoSpace {
+                unmap_io_page(asid, vaddr, ptr.addr());
+            } else if map_type == crate::cap::FrameMapType::VSpace {
+                let pml4_paddr = pml4_paddr_for_asid(asid);
+                if pml4_paddr != 0 {
+                    let unmapped = match size {
+                        crate::cap::FrameSize::Small => {
+                            crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                                pml4_paddr,
+                                vaddr,
+                                ptr.addr(),
+                            )
+                        }
+                        crate::cap::FrameSize::Large => {
+                            crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
+                                pml4_paddr,
+                                vaddr,
+                                ptr.addr(),
+                            )
+                        }
+                        crate::cap::FrameSize::Huge => {
+                            crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
+                                pml4_paddr,
+                                vaddr,
+                                ptr.addr(),
+                            )
+                        }
+                    };
+                    if unmapped {
+                        crate::smp::shootdown_tlb(vaddr);
+                    }
+                }
+            }
+        }
+    } else {
+        detach_paging_structure(cap);
+    }
+}
+
+unsafe fn cap_tree_mappings_valid(s: &crate::kernel::KernelState, cap: &Cap, depth: u8) -> bool {
+    if !paging_structure_mapping_valid(cap) {
+        return false;
+    }
+    let Cap::CNode { ptr, .. } = cap else {
+        return true;
+    };
+    if depth >= 4 {
+        return false;
+    }
+    let vi = KernelState::cnode_index(*ptr);
+    let slot_count = s.cnode_slots_at(vi).map(|slots| slots.len()).unwrap_or(0);
+    for slot_index in 0..slot_count {
+        let inner = s
+            .cnode_slot(vi, slot_index)
+            .map(|cte| cte.cap())
+            .unwrap_or(Cap::Null);
+        if inner.is_null()
+            || matches!(inner, Cap::CNode { ptr: inner_ptr, .. } if inner_ptr.addr() == ptr.addr())
+        {
+            continue;
+        }
+        if !cap_tree_mappings_valid(s, &inner, depth + 1) {
+            return false;
+        }
+    }
+    true
+}
+
+fn paging_cap_with_mapping(
+    cap: Cap,
+    target_paddr: u64,
+    new_mapped: Option<u64>,
+    new_asid: u16,
+) -> Option<Cap> {
+    match cap {
+        Cap::PageTable { ptr, .. } if ptr.addr() == target_paddr => Some(Cap::PageTable {
             ptr,
             mapped: new_mapped,
-            asid,
+            asid: new_asid,
+        }),
+        Cap::PageDirectory { ptr, .. } if ptr.addr() == target_paddr => Some(Cap::PageDirectory {
+            ptr,
+            mapped: new_mapped,
+            asid: new_asid,
+        }),
+        Cap::Pdpt { ptr, .. } if ptr.addr() == target_paddr => Some(Cap::Pdpt {
+            ptr,
+            mapped: new_mapped,
+            asid: new_asid,
         }),
         _ => None,
     }
@@ -1208,6 +1373,7 @@ fn update_invoked_paging_slot(
     invoker: TcbId,
     cap: &Cap,
     new_mapped: Option<u64>,
+    new_asid: u16,
 ) -> KResult<()> {
     let target_paddr = paging_struct_state(cap).0;
     unsafe {
@@ -1231,7 +1397,9 @@ fn update_invoked_paging_slot(
                 seL4_Error::seL4_InvalidCapability,
             )));
         };
-        if let Some(updated) = paging_cap_with_mapping(slot.cap(), target_paddr, new_mapped) {
+        if let Some(updated) =
+            paging_cap_with_mapping(slot.cap(), target_paddr, new_mapped, new_asid)
+        {
             slot.set_cap(&updated);
             Ok(())
         } else {
@@ -3736,6 +3904,26 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             }
         }
 
+        // Validate every hardware paging edge before changing any CTE. A
+        // failed exact match must leave the revoke operation atomic.
+        for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
+            let slot_count = s.cnode_slots_at(ci).map(|slots| slots.len()).unwrap_or(0);
+            for si in 0..slot_count {
+                if !is_revoked(ci, si) || (ci == cnode_idx && si == src_index) {
+                    continue;
+                }
+                let cap = s
+                    .cnode_slot(ci, si)
+                    .map(|cte| cte.cap())
+                    .unwrap_or(Cap::Null);
+                if !cap_tree_mappings_valid(s, &cap, 0) {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_IllegalOperation,
+                    )));
+                }
+            }
+        }
+
         // Clear every revoked slot except the source itself.
         // Also reset the child_count for both the cleared slot
         // (no longer holds anything that has children) and decrement
@@ -3755,6 +3943,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 // would call free again for the same pool slot
                 // which is harmless (free is idempotent).
                 let cap_to_free = s.cnode_slot(ci, si).map(|c| c.cap()).unwrap_or(Cap::Null);
+                detach_cap_mapping(&cap_to_free);
                 // Phase 44 — clear the slot FIRST (the set_cap hook
                 // drops the refcount), then release the object if
                 // that was its last reference. Replaces the
@@ -4355,6 +4544,7 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap, depth
                 if inner_cap.is_null() {
                     continue;
                 }
+                detach_cap_mapping(&inner_cap);
                 if let Some(slot) = s.cnode_slot_mut(vi, si) {
                     slot.set_cap(&Cap::Null);
                     slot.set_parent(None);
@@ -4421,6 +4611,14 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             None => (Cap::Null, None),
         };
 
+        if !cap_tree_mappings_valid(s, &deleted_cap, 0) {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_IllegalOperation,
+            )));
+        }
+
+        detach_cap_mapping(&deleted_cap);
+
         if let Some(slot) = s.cnode_slot_mut(cnode_idx, res.slot_index) {
             slot.set_cap(&Cap::Null);
             slot.set_parent(None);
@@ -4438,54 +4636,8 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // with the master still live used to wipe queued senders.)
         // Match by (discriminator, ptr) so cross-pool index collisions
         // (TCB id N == endpoint slot N+1 etc.) don't keep the object
-        // pinned spuriously.
-        // Frame caps need PT-entry cleanup BEFORE the cap is gone:
-        // FRAMEDIPC0003 deletes a mapped frame cap and expects later
-        // user accesses to that vaddr to fault. Without this, the page
-        // stays mapped via stale PTE and the test thread silently
-        // continues into corrupted state.
-        if let Cap::Frame {
-            ptr,
-            size,
-            mapped: Some(vaddr),
-            asid,
-            map_type,
-            ..
-        } = deleted_cap
-        {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                if map_type == crate::cap::FrameMapType::IoSpace {
-                    // Phase 44 — a deleted IO-mapped frame clears its
-                    // VT-d leaf PTE so the mapping doesn't leak into the
-                    // next test that reuses the same PCI request-id.
-                    unmap_io_page(asid, vaddr, ptr.addr());
-                } else {
-                    let pml4_paddr = pml4_paddr_for_asid(asid);
-                    if pml4_paddr != 0 {
-                        match size {
-                            crate::cap::FrameSize::Small => {
-                                crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
-                                    pml4_paddr, vaddr,
-                                );
-                            }
-                            crate::cap::FrameSize::Large => {
-                                crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
-                                    pml4_paddr, vaddr,
-                                );
-                            }
-                            crate::cap::FrameSize::Huge => {
-                                crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
-                                    pml4_paddr, vaddr,
-                                );
-                            }
-                        }
-                        crate::smp::shootdown_tlb(vaddr);
-                    }
-                }
-            }
-            let _ = (ptr, asid, vaddr, size);
-        }
+        // pinned spuriously. Any hardware mapping was detached above,
+        // before the CTE and its Untyped ownership edge were cleared.
         // Phase 44 — refcount-driven release replaces the old
         // whole-pool same_obj_lives sweep (O(pool) per delete; the
         // CNode arm nested ANOTHER full sweep per contained slot).
@@ -6113,7 +6265,8 @@ pub mod spec {
         irq_handler_set_clear_ack();
         frame_map_unmap_get_address();
         paging_maps_reject_unassigned_explicit_vspace();
-        page_table_map_unmap();
+        paging_unmap_requires_exact_physical_identity();
+        page_table_invocation_tracks_asid_and_detaches_hardware();
         page_table_map_updates_invoked_slot_not_first_alias();
         tcb_write_read_registers();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
@@ -6359,69 +6512,218 @@ pub mod spec {
         arch::log("  ✓ Revoke walks derivation graph transitively (MDB)\n");
     }
 
-    /// Phase 26d — `Cap::PageTable` `Map` / `Unmap` round-trip.
-    /// Installs a PT cap, records the mapped vaddr, then unmaps.
-    /// We don't verify the hardware install here — the spec build
-    /// stubs that out (no live PD to walk in this fixture).
     #[inline(never)]
-    fn page_table_map_unmap() {
-        use crate::cap::PageTableStorage;
+    fn paging_unmap_requires_exact_physical_identity() {
+        #[repr(C, align(4096))]
+        struct Table([u64; 512]);
+
+        static mut PML4: Table = Table([0; 512]);
+        static mut PDPT: Table = Table([0; 512]);
+        static mut PD: Table = Table([0; 512]);
+        static mut PT: Table = Table([0; 512]);
+
+        use crate::arch::x86_64::paging::{
+            kernel_virt_to_phys, PTE_PRESENT, PTE_PS, PTE_RW, PTE_USER,
+        };
+        use crate::arch::x86_64::usermode::{
+            unmap_user_1g_in_pml4, unmap_user_2m_in_pml4, unmap_user_4k_in_pml4,
+            unmap_user_table_in_paddr,
+        };
+
+        unsafe {
+            let pml4 = core::ptr::addr_of_mut!(PML4) as *mut u64;
+            let pdpt = core::ptr::addr_of_mut!(PDPT) as *mut u64;
+            let pd = core::ptr::addr_of_mut!(PD) as *mut u64;
+            let pt = core::ptr::addr_of_mut!(PT) as *mut u64;
+            core::ptr::write_bytes(pml4, 0, 512);
+            core::ptr::write_bytes(pdpt, 0, 512);
+            core::ptr::write_bytes(pd, 0, 512);
+            core::ptr::write_bytes(pt, 0, 512);
+
+            let pml4_paddr = kernel_virt_to_phys(pml4 as u64);
+            let pdpt_paddr = kernel_virt_to_phys(pdpt as u64);
+            let pd_paddr = kernel_virt_to_phys(pd as u64);
+            let pt_paddr = kernel_virt_to_phys(pt as u64);
+            let flags = PTE_PRESENT | PTE_RW | PTE_USER;
+            let vaddr = 0x0000_0080_4020_1000u64;
+            let pml4_i = ((vaddr >> 39) & 0x1ff) as usize;
+            let pdpt_i = ((vaddr >> 30) & 0x1ff) as usize;
+            let pd_i = ((vaddr >> 21) & 0x1ff) as usize;
+            let pt_i = ((vaddr >> 12) & 0x1ff) as usize;
+
+            core::ptr::write_volatile(pml4.add(pml4_i), pdpt_paddr | flags);
+            core::ptr::write_volatile(pdpt.add(pdpt_i), pd_paddr | flags);
+            core::ptr::write_volatile(pd.add(pd_i), pt_paddr | flags);
+
+            assert!(!unmap_user_table_in_paddr(
+                pml4_paddr,
+                1,
+                vaddr,
+                pt_paddr + 0x1000,
+            ));
+            assert_eq!(
+                core::ptr::read_volatile(pd.add(pd_i)) & 0x000F_FFFF_FFFF_F000,
+                pt_paddr,
+            );
+            assert!(unmap_user_table_in_paddr(pml4_paddr, 1, vaddr, pt_paddr,));
+
+            core::ptr::write_volatile(pdpt.add(pdpt_i), pd_paddr | flags);
+            assert!(!unmap_user_table_in_paddr(
+                pml4_paddr,
+                2,
+                vaddr,
+                pd_paddr + 0x1000,
+            ));
+            assert!(unmap_user_table_in_paddr(pml4_paddr, 2, vaddr, pd_paddr,));
+
+            core::ptr::write_volatile(pml4.add(pml4_i), pdpt_paddr | flags);
+            assert!(!unmap_user_table_in_paddr(
+                pml4_paddr,
+                3,
+                vaddr,
+                pdpt_paddr + 0x1000,
+            ));
+            assert!(unmap_user_table_in_paddr(pml4_paddr, 3, vaddr, pdpt_paddr,));
+
+            core::ptr::write_volatile(pml4.add(pml4_i), pdpt_paddr | flags);
+            core::ptr::write_volatile(pdpt.add(pdpt_i), pd_paddr | flags);
+            core::ptr::write_volatile(pd.add(pd_i), pt_paddr | flags);
+            let frame_4k = 0x0000_0000_0400_0000u64;
+            core::ptr::write_volatile(pt.add(pt_i), frame_4k | flags);
+            assert!(!unmap_user_4k_in_pml4(pml4_paddr, vaddr, frame_4k + 0x1000));
+            assert!(unmap_user_4k_in_pml4(pml4_paddr, vaddr, frame_4k));
+
+            let frame_2m = 0x0000_0000_0800_0000u64;
+            core::ptr::write_volatile(pd.add(pd_i), frame_2m | flags | PTE_PS);
+            assert!(!unmap_user_2m_in_pml4(
+                pml4_paddr,
+                vaddr,
+                frame_2m + 0x20_0000
+            ));
+            assert!(unmap_user_2m_in_pml4(pml4_paddr, vaddr, frame_2m));
+
+            let frame_1g = 0x0000_0000_4000_0000u64;
+            core::ptr::write_volatile(pdpt.add(pdpt_i), frame_1g | flags | PTE_PS);
+            assert!(!unmap_user_1g_in_pml4(
+                pml4_paddr,
+                vaddr,
+                frame_1g + 0x4000_0000
+            ));
+            assert!(unmap_user_1g_in_pml4(pml4_paddr, vaddr, frame_1g));
+        }
+
+        arch::log("  ✓ paging unmap requires exact physical identity at every level\n");
+    }
+
+    #[inline(never)]
+    fn page_table_invocation_tracks_asid_and_detaches_hardware() {
+        #[repr(C, align(4096))]
+        struct Table([u64; 512]);
+
+        static mut PML4: Table = Table([0; 512]);
+        static mut PDPT: Table = Table([0; 512]);
+        static mut PD: Table = Table([0; 512]);
+        static mut PT: Table = Table([0; 512]);
+
+        use crate::arch::x86_64::paging::{kernel_virt_to_phys, PTE_PRESENT, PTE_RW, PTE_USER};
+        use crate::cap::{PageTableStorage, Pml4Storage};
+
+        const ASID: u16 = 4095;
         let invoker = setup_invoker(0);
-        let pt_paddr = 0x0000_0000_00B0_0000u64;
-        let pt_cap = Cap::PageTable {
-            ptr: PPtr::<PageTableStorage>::new(pt_paddr).unwrap(),
-            mapped: None,
-            asid: 0,
-        };
         unsafe {
+            let pml4 = core::ptr::addr_of_mut!(PML4) as *mut u64;
+            let pdpt = core::ptr::addr_of_mut!(PDPT) as *mut u64;
+            let pd = core::ptr::addr_of_mut!(PD) as *mut u64;
+            let pt = core::ptr::addr_of_mut!(PT) as *mut u64;
+            core::ptr::write_bytes(pml4, 0, 512);
+            core::ptr::write_bytes(pdpt, 0, 512);
+            core::ptr::write_bytes(pd, 0, 512);
+            core::ptr::write_bytes(pt, 0, 512);
+
+            let pml4_paddr = kernel_virt_to_phys(pml4 as u64);
+            let pdpt_paddr = kernel_virt_to_phys(pdpt as u64);
+            let pd_paddr = kernel_virt_to_phys(pd as u64);
+            let pt_paddr = kernel_virt_to_phys(pt as u64);
+            let flags = PTE_PRESENT | PTE_RW | PTE_USER;
+            let vaddr = 0x0000_0090_4040_0000u64;
+            let pml4_i = ((vaddr >> 39) & 0x1ff) as usize;
+            let pdpt_i = ((vaddr >> 30) & 0x1ff) as usize;
+            let pd_i = ((vaddr >> 21) & 0x1ff) as usize;
+            core::ptr::write_volatile(pml4.add(pml4_i), pdpt_paddr | flags);
+            core::ptr::write_volatile(pdpt.add(pdpt_i), pd_paddr | flags);
+
+            crate::asid::register_boot_mapping(ASID, pml4_paddr);
+            let pt_cap = Cap::PageTable {
+                ptr: PPtr::<PageTableStorage>::new(pt_paddr).unwrap(),
+                mapped: None,
+                asid: 0,
+            };
+            let pml4_cap = Cap::PML4 {
+                ptr: PPtr::<Pml4Storage>::new(pml4_paddr).unwrap(),
+                mapped: true,
+                asid: ASID,
+            };
             KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&pt_cap);
-        }
+            KERNEL.get().cnodes[0].0[3] = Cte::with_cap(&pml4_cap);
 
-        // Map at a 2 MiB-aligned vaddr (PD-entry granularity).
-        let vaddr = 0x0000_0100_0080_0000u64;
-        let args = SyscallArgs {
-            a0: 2,
-            a1: (InvocationLabel::X86PageTableMap as u64) << 12,
-            a2: vaddr,
-            ..Default::default()
-        };
-        decode_invocation(pt_cap, &args, invoker).expect("PT map ok");
-
-        unsafe {
-            match KERNEL.get().cnodes[0].0[2].cap() {
+            let map_args = SyscallArgs {
+                a0: 2,
+                a1: (InvocationLabel::X86PageTableMap as u64) << 12,
+                a2: vaddr,
+                a3: 3,
+                ..Default::default()
+            };
+            decode_invocation(pt_cap, &map_args, invoker).expect("explicit PT map");
+            assert_eq!(
+                core::ptr::read_volatile(pd.add(pd_i)) & 0x000F_FFFF_FFFF_F000,
+                pt_paddr,
+            );
+            let mapped_cap = KERNEL.get().cnodes[0].0[2].cap();
+            assert!(matches!(
+                mapped_cap,
                 Cap::PageTable {
-                    mapped: Some(v), ..
-                } if v == vaddr => {}
-                other => panic!("expected mapped PT, got {:?}", other),
-            }
+                    mapped: Some(v),
+                    asid: ASID,
+                    ..
+                } if v == vaddr
+            ));
+
+            let unmap_args = SyscallArgs {
+                a0: 2,
+                a1: (InvocationLabel::X86PageTableUnmap as u64) << 12,
+                ..Default::default()
+            };
+            core::ptr::write_volatile(pd.add(pd_i), (pt_paddr + 0x1000) | flags);
+            assert!(matches!(
+                decode_invocation(mapped_cap, &unmap_args, invoker),
+                Err(KException::SyscallError(SyscallError {
+                    code: seL4_Error::seL4_IllegalOperation,
+                }))
+            ));
+            assert!(matches!(
+                KERNEL.get().cnodes[0].0[2].cap(),
+                Cap::PageTable {
+                    mapped: Some(v),
+                    asid: ASID,
+                    ..
+                } if v == vaddr
+            ));
+            core::ptr::write_volatile(pd.add(pd_i), pt_paddr | flags);
+            decode_invocation(mapped_cap, &unmap_args, invoker).expect("explicit PT unmap");
+            assert_eq!(core::ptr::read_volatile(pd.add(pd_i)), 0);
+            assert!(matches!(
+                KERNEL.get().cnodes[0].0[2].cap(),
+                Cap::PageTable {
+                    mapped: None,
+                    asid: 0,
+                    ..
+                }
+            ));
+
+            crate::asid::clear_pool(ASID & !0x1ff);
         }
-
-        // Re-map → DeleteFirst.
-        let stored = unsafe { KERNEL.get().cnodes[0].0[2].cap() };
-        let r = decode_invocation(stored, &args, invoker);
-        assert!(matches!(
-            r,
-            Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_DeleteFirst
-            }))
-        ));
-
-        // Unmap clears the mapping.
-        let args = SyscallArgs {
-            a0: 2,
-            a1: (InvocationLabel::X86PageTableUnmap as u64) << 12,
-            ..Default::default()
-        };
-        decode_invocation(stored, &args, invoker).expect("PT unmap ok");
-        unsafe {
-            match KERNEL.get().cnodes[0].0[2].cap() {
-                Cap::PageTable { mapped: None, .. } => {}
-                other => panic!("expected unmapped PT, got {:?}", other),
-            }
-        }
-
         teardown_invoker(invoker);
-        arch::log("  ✓ Cap::PageTable Map / Unmap updates cap shadow\n");
+        arch::log("  ✓ PageTable Map/Unmap persists ASID and detaches hardware\n");
     }
 
     /// Page-structure map must update the cap slot the caller invoked, not the first sibling cap
@@ -7130,6 +7432,21 @@ pub mod spec {
         // page tables.
         let translated = crate::arch::x86_64::paging::live_virt_to_phys(vaddr);
         assert_eq!(translated, Some(paddr));
+
+        // A stale cap that names a different physical frame at the same
+        // virtual address must not clear the live leaf.
+        let live_pml4 = crate::arch::x86_64::usermode::current_pml4_paddr();
+        let stale_unmapped = unsafe {
+            crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(live_pml4, vaddr, paddr + 0x1000)
+        };
+        assert!(
+            !stale_unmapped,
+            "stale frame identity must not unmap a replacement leaf"
+        );
+        assert_eq!(
+            crate::arch::x86_64::paging::live_virt_to_phys(vaddr),
+            Some(paddr)
+        );
 
         // Re-mapping at the SAME vaddr is a no-op (mirrors upstream
         // `decodeX86FrameMapInvocation`), so it should succeed.
