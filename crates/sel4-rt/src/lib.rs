@@ -398,9 +398,9 @@ pub struct BootInfo {
     // Phase 0a — BOOTBOOT linear-framebuffer geometry, published by the
     // kernel when built with `extern-rootserver` (the only kernel that
     // boots this runtime). Mirrors the trailing gated fields of the
-    // kernel's `seL4_BootInfo`. `fb_paddr` == 0 ⇒ no framebuffer. The
-    // framebuffer's physical frames are the LAST device untyped in
-    // `untyped_list` (is_device == 1, paddr == fb_paddr).
+    // kernel's `seL4_BootInfo`. `fb_paddr` == 0 ⇒ no framebuffer. These
+    // fields are scanout geometry; physical authority is the single PCI
+    // BAR device untyped in `untyped_list` containing that range.
     pub fb_paddr: u64,
     pub fb_width: u32,
     pub fb_height: u32,

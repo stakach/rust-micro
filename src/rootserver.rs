@@ -172,7 +172,7 @@ struct DeviceUntypedSpec {
     size_bits: u8,
 }
 
-const MAX_ROOTSERVER_DEVICE_UNTYPEDS: usize = CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS - 2;
+const MAX_ROOTSERVER_DEVICE_UNTYPEDS: usize = CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS - 1;
 
 #[derive(Copy, Clone)]
 struct DeviceUntypedList {
@@ -213,6 +213,27 @@ impl DeviceUntypedList {
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    fn unique_containing(&self, paddr: u64, length: u64) -> Option<DeviceUntypedSpec> {
+        let range_end = paddr.checked_add(length)?;
+        if length == 0 {
+            return None;
+        }
+        let mut result = None;
+        for entry in self.entries.iter().take(self.len) {
+            let size = 1u64.checked_shl(entry.size_bits as u32)?;
+            let Some(end) = entry.paddr.checked_add(size) else {
+                continue;
+            };
+            if paddr >= entry.paddr && range_end <= end {
+                if result.is_some() {
+                    return None;
+                }
+                result = Some(*entry);
+            }
+        }
+        result
     }
 }
 
@@ -283,25 +304,6 @@ unsafe fn pci_config_write32(bus: u8, dev: u8, func: u8, reg: u8, value: u32) {
         | ((reg as u32) & 0xFC);
     port_out32(PCI_CONFIG_ADDRESS, address);
     port_out32(PCI_CONFIG_DATA, value);
-}
-
-#[cfg(feature = "extern-rootserver")]
-fn overlaps(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {
-    let Some(a_end) = a_base.checked_add(a_len) else {
-        return true;
-    };
-    let Some(b_end) = b_base.checked_add(b_len) else {
-        return true;
-    };
-    a_base < b_end && b_base < a_end
-}
-
-#[cfg(feature = "extern-rootserver")]
-fn overlaps_boot_framebuffer(paddr: u64, size: u64) -> bool {
-    if let Some((fb_paddr, _, fb)) = fb_device_untyped() {
-        return overlaps(paddr, size, fb_paddr, fb.size as u64);
-    }
-    false
 }
 
 #[cfg(feature = "extern-rootserver")]
@@ -389,9 +391,7 @@ unsafe fn append_pci_mmio_device_untypeds(list: &mut DeviceUntypedList) {
                 let mut bar = 0u8;
                 while bar < 6 {
                     if let Some((base, size, is_64)) = pci_memory_bar(bus, dev, func, bar) {
-                        if !overlaps_boot_framebuffer(base, size) {
-                            list.push(base, device_block_bits(size));
-                        }
+                        list.push(base, device_block_bits(size));
                         bar += if is_64 { 2 } else { 1 };
                     } else {
                         bar += 1;
@@ -410,6 +410,13 @@ fn rootserver_device_untypeds() -> DeviceUntypedList {
     }
     unsafe {
         append_pci_mmio_device_untypeds(&mut list);
+    }
+    if let Some(framebuffer) = crate::bootboot::framebuffer_info() {
+        assert!(
+            list.unique_containing(framebuffer.paddr, framebuffer.size as u64)
+                .is_some(),
+            "BOOTBOOT framebuffer must belong to exactly one PCI BAR device untyped",
+        );
     }
     list
 }
@@ -470,29 +477,6 @@ fn log_device_untyped_list(list: &DeviceUntypedList) {
         log_rootserver_dec(spec.size_bits as usize);
         crate::arch::log("\n");
     }
-}
-
-/// Phase 0a (extern-rootserver only) — the BOOTBOOT linear framebuffer,
-/// exposed to the NT rootserver as one extra DEVICE untyped appended
-/// after the boot-computed device-untyped list. Returns `(paddr, block_bits, geometry)` where the
-/// untyped covers `[fb_paddr, fb_paddr + 2^block_bits)` — `block_bits`
-/// is the smallest power-of-two size (≥ the framebuffer's byte size, ≥
-/// one 4 KiB frame) so the rootserver can retype every framebuffer
-/// frame out of it. `fb_paddr` is 4 KiB-aligned (BOOTBOOT hands out a
-/// page-aligned LFB); the kernel's `untyped_retype` hands out frames at
-/// `base + i*4K` and imposes no base-vs-size alignment, so a covering
-/// power-of-two block is all that's required. `None` when BOOTBOOT
-/// reported no framebuffer.
-#[cfg(feature = "extern-rootserver")]
-fn fb_device_untyped() -> Option<(u64, u8, crate::bootboot::FramebufferInfo)> {
-    let fb = crate::bootboot::framebuffer_info()?;
-    // Smallest block_bits with 2^block_bits >= fb.size, floored at 12
-    // (a single 4 KiB frame). `size` is u32, so 32 bits is ample.
-    let mut block_bits: u8 = 12;
-    while (1u64 << block_bits) < fb.size as u64 {
-        block_bits += 1;
-    }
-    Some((fb.paddr, block_bits, fb))
 }
 
 /// Phase 42 — backing memory for the rootserver's Untyped cap is
@@ -1038,28 +1022,6 @@ pub unsafe fn launch_rootserver() -> ! {
             },
         );
     }
-    // Phase 0a — the BOOTBOOT framebuffer as one more device untyped,
-    // in the slot immediately after the boot-computed device-untyped block. `n_extra_uts`
-    // (0 or 1) shifts `user_image_start` by the same amount build_bootinfo
-    // shifts `untyped_end`, so caps and BootInfo metadata can't drift.
-    // Fully gated so the default (sel4test) build path is unchanged.
-    #[cfg(feature = "extern-rootserver")]
-    let n_extra_uts: usize = if let Some((fb_paddr, fb_bits, _)) = fb_device_untyped() {
-        rs_set(
-            s,
-            untyped_slot + 1 + device_untypeds.len(),
-            &Cap::Untyped {
-                ptr: PPtr::<UntypedStorage>::new(fb_paddr.max(1)).expect("fb ut paddr"),
-                block_bits: fb_bits,
-                free_index: 0,
-                is_device: true,
-            },
-        );
-        1
-    } else {
-        0
-    };
-
     // Phase 42 — userImageFrames: install one `Cap::Frame` per page
     // the loader pre-mapped for the rootserver (image + stack + IPC
     // buffer + BootInfo). sel4utils' vspace bootstrap walks these
@@ -1068,11 +1030,7 @@ pub unsafe fn launch_rootserver() -> ! {
     // already-installed PTs (without this, allocman's PT_Map fails
     // with `seL4_DeleteFirst` whenever it tries to reuse a PD slot
     // the loader already populated).
-    #[cfg(not(feature = "extern-rootserver"))]
     let user_image_start: Word = (untyped_slot as Word) + 1 + device_untypeds.len() as Word;
-    #[cfg(feature = "extern-rootserver")]
-    let user_image_start: Word =
-        (untyped_slot as Word) + 1 + device_untypeds.len() as Word + n_extra_uts as Word;
     let n_image_pages = IMAGE_PAGE_COUNT;
     for i in 0..n_image_pages {
         let pm = IMAGE_PAGES[i];
@@ -1279,25 +1237,7 @@ unsafe fn build_bootinfo(
             padding: [0; 6],
         };
     }
-    #[cfg(not(feature = "extern-rootserver"))]
     let untyped_count: Word = 1 + device_untypeds.len() as Word;
-    // Phase 0a — append the framebuffer device untyped (extern-rootserver).
-    // Kept in lockstep with the cap placed in launch_rootserver (same slot,
-    // same paddr/size_bits) so `untypedList[fb]` and the CSpace cap agree.
-    #[cfg(feature = "extern-rootserver")]
-    let untyped_count: Word = {
-        let mut untyped_count: Word = 1 + device_untypeds.len() as Word;
-        if let Some((fb_paddr, fb_bits, _)) = fb_device_untyped() {
-            empty_untypeds[untyped_count as usize] = seL4_UntypedDesc {
-                paddr: fb_paddr,
-                sizeBits: fb_bits,
-                isDevice: 1,
-                padding: [0; 6],
-            };
-            untyped_count += 1;
-        }
-        untyped_count
-    };
 
     let n_cores = crate::bootboot::get_num_cores() as Word;
     // Phase 36e / 42 — canonical slot layout under MCS:
@@ -1310,6 +1250,8 @@ unsafe fn build_bootinfo(
     let untyped_start: Word = 20;
     let untyped_end: Word = untyped_start + untyped_count;
     let cnode_slots: Word = 1u64 << ROOTSERVER_CNODE_RADIX;
+    #[cfg(feature = "extern-rootserver")]
+    let framebuffer = crate::bootboot::framebuffer_info();
     seL4_BootInfo {
         extraLen: extra_bi_size,
         nodeID: 0,
@@ -1363,18 +1305,28 @@ unsafe fn build_bootinfo(
         // Phase 0a — framebuffer geometry (extern-rootserver). All-zero
         // when BOOTBOOT exposed no framebuffer.
         #[cfg(feature = "extern-rootserver")]
-        fb_paddr: fb_device_untyped().map(|(p, _, _)| p).unwrap_or(0),
+        fb_paddr: framebuffer
+            .map(|geometry| geometry.paddr)
+            .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_width: fb_device_untyped().map(|(_, _, g)| g.width).unwrap_or(0),
+        fb_width: framebuffer
+            .map(|geometry| geometry.width)
+            .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_height: fb_device_untyped().map(|(_, _, g)| g.height).unwrap_or(0),
+        fb_height: framebuffer
+            .map(|geometry| geometry.height)
+            .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_scanline: fb_device_untyped().map(|(_, _, g)| g.scanline).unwrap_or(0),
+        fb_scanline: framebuffer
+            .map(|geometry| geometry.scanline)
+            .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_size: fb_device_untyped().map(|(_, _, g)| g.size).unwrap_or(0),
+        fb_size: framebuffer
+            .map(|geometry| geometry.size)
+            .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_type: fb_device_untyped()
-            .map(|(_, _, g)| g.fb_type as u32)
+        fb_type: framebuffer
+            .map(|geometry| geometry.fb_type as u32)
             .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         userImageElfFrameCount: elf_image_frame_count,
@@ -1516,8 +1468,27 @@ pub mod spec {
 
     pub fn test_rootserver() {
         arch::log("Running rootserver loader tests...\n");
+        device_untyped_range_selection();
         loads_and_maps_segments();
         arch::log("Rootserver loader tests completed\n");
+    }
+
+    fn device_untyped_range_selection() {
+        let mut list = DeviceUntypedList::new();
+        list.push(0x8000_0000, 24);
+        assert_eq!(
+            list.unique_containing(0x8000_4000, 0x30_0000)
+                .map(|entry| (entry.paddr, entry.size_bits)),
+            Some((0x8000_0000, 24)),
+        );
+        assert!(list.unique_containing(0x7fff_f000, 0x2000).is_none());
+        assert!(list.unique_containing(u64::MAX - 0x1000, 0x2000).is_none());
+
+        list.push(0x8000_0000 + 0x20_0000, 22);
+        assert!(list
+            .unique_containing(0x8020_0000, 0x10_0000)
+            .is_none());
+        arch::log("  ✓ device-untyped range authority is unique and bounded\n");
     }
 
     /// Parse + load the embedded rootserver into a fresh VSpace and

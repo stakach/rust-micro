@@ -308,10 +308,9 @@ pub struct seL4_BootInfo {
     // drive the display. These trailing fields are gated on
     // `extern-rootserver` so the default (sel4test) kernel writes the
     // exact upstream `seL4_BootInfo` layout, byte-for-byte. `fb_paddr`
-    // == 0 means no framebuffer was exposed. The framebuffer's physical
-    // memory is handed over as the LAST device untyped in `untypedList`
-    // (isDevice=1, paddr == fb_paddr); retype 4 KiB frames from it and
-    // map them to reach the pixels.
+    // == 0 means no framebuffer was exposed. These fields describe a
+    // scanout view only; physical authority comes from the single PCI BAR
+    // device untyped in `untypedList` that contains the framebuffer range.
     #[cfg(feature = "extern-rootserver")]
     pub fb_paddr: seL4_Word,
     #[cfg(feature = "extern-rootserver")]
