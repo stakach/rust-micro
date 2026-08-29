@@ -46,16 +46,28 @@ const FMASK_VALUE: u64 = (1 << 9) | (1 << 10) | (1 << 8) | (1 << 18);
 /// userspace-ntos hybrid transport: hosted Windows threads normally
 /// turn every raw `syscall` into an UnknownSyscall NT fault, but our
 /// replacement ntdll issues one explicit seL4 `Call` envelope for
-/// Nt/Zw: cap slot CT_FAULT (6), msginfo label "NT" (0x4E54), length 6.
+/// Nt/Zw: cap slot CT_FAULT (6), msginfo label "NT" (0x4E54), and a
+/// complete bounded argument vector.
 const HOSTED_NT_NATIVE_CALL_CAP: u64 = 6;
 const HOSTED_NT_NATIVE_CALL_LABEL: u64 = 0x4E54;
-const HOSTED_NT_NATIVE_CALL_MSGINFO: u64 = (HOSTED_NT_NATIVE_CALL_LABEL << 12) | 6;
+const HOSTED_NT_NATIVE_CALL_MIN_WORDS: u64 = 2;
+const MSGINFO_LENGTH_MASK: u64 = 0x7f;
+const MSGINFO_CAP_FIELDS_MASK: u64 = 0xf80;
 const USER_RFLAGS_PRESERVED_MASK: u64 = 0xDD5;
 const USER_RFLAGS_FORCED_BITS: u64 = 0x202;
 
 #[inline]
 pub(crate) const fn sanitize_user_rflags(flags: u64) -> u64 {
     (flags & USER_RFLAGS_PRESERVED_MASK) | USER_RFLAGS_FORCED_BITS
+}
+
+#[inline]
+const fn is_hosted_nt_native_call_msginfo(msginfo: u64) -> bool {
+    let length = msginfo & MSGINFO_LENGTH_MASK;
+    msginfo >> 12 == HOSTED_NT_NATIVE_CALL_LABEL
+        && msginfo & MSGINFO_CAP_FIELDS_MASK == 0
+        && length >= HOSTED_NT_NATIVE_CALL_MIN_WORDS
+        && length <= crate::types::seL4_MsgMaxLength as u64
 }
 
 fn syscall_may_consume_direct_handoff(
@@ -817,7 +829,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     };
     let is_nt_native_call = (number as i32) == Syscall::SysCall as i32
         && args.a0 == HOSTED_NT_NATIVE_CALL_CAP
-        && args.a1 == HOSTED_NT_NATIVE_CALL_MSGINFO;
+        && is_hosted_nt_native_call_msginfo(args.a1);
     let force_unknown = hosted_syscalls && !is_nt_native_call;
     let syscall = match (force_unknown, Syscall::from_i32(number as i32)) {
         (false, Some(s)) => s,
@@ -1361,6 +1373,7 @@ pub mod spec {
         lstar_points_at_entry();
         fmask_clears_interrupt_flag();
         user_rflags_sanitizer_forces_interrupts();
+        hosted_nt_native_call_accepts_complete_vectors();
         per_cpu_kernel_gs_base_set();
         dispatcher_emits_byte_for_sys_debug_put_char();
         debug_put_char_does_not_consume_stale_direct_handoff();
@@ -1527,6 +1540,28 @@ pub mod spec {
         );
         assert_eq!(sanitize_user_rflags(1 << 18) & (1 << 18), 0);
         arch::log("  ✓ user RFLAGS sanitizer keeps interrupts enabled\n");
+    }
+
+    #[inline(never)]
+    fn hosted_nt_native_call_accepts_complete_vectors() {
+        for length in HOSTED_NT_NATIVE_CALL_MIN_WORDS..=16 {
+            let msginfo = (HOSTED_NT_NATIVE_CALL_LABEL << 12) | length;
+            assert!(is_hosted_nt_native_call_msginfo(msginfo));
+        }
+        assert!(!is_hosted_nt_native_call_msginfo(
+            HOSTED_NT_NATIVE_CALL_LABEL << 12
+        ));
+        assert!(!is_hosted_nt_native_call_msginfo(
+            (HOSTED_NT_NATIVE_CALL_LABEL << 12) | 1
+        ));
+        assert!(!is_hosted_nt_native_call_msginfo(
+            (HOSTED_NT_NATIVE_CALL_LABEL << 12) | 121
+        ));
+        assert!(!is_hosted_nt_native_call_msginfo(
+            (HOSTED_NT_NATIVE_CALL_LABEL << 12) | (1 << 9) | 6
+        ));
+        assert!(!is_hosted_nt_native_call_msginfo((0x4e55 << 12) | 6));
+        arch::log("  ✓ hosted NT native calls accept bounded complete vectors\n");
     }
 
     /// Phase 11d — integration test of the dispatcher. Builds a
