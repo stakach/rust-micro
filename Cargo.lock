@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "bootstrap-clock"
+version = "0.1.0"
+
+[[package]]
 name = "mykernel-rust"
 version = "0.0.1"
 dependencies = [
+ "bootstrap-clock",
  "rlibc",
 ]
 

@@ -329,6 +329,14 @@ pub struct seL4_BootInfo {
     /// of the executable image.
     #[cfg(feature = "extern-rootserver")]
     pub userImageElfFrameCount: seL4_Word,
+    /// Validated UTC snapshot supplied by the platform boot adapter. `wallClockFlags == 0` means
+    /// the boot source did not provide a usable real-time clock.
+    #[cfg(feature = "extern-rootserver")]
+    pub wallClockUnixSeconds: i64,
+    #[cfg(feature = "extern-rootserver")]
+    pub wallClockTimezoneMinutes: i32,
+    #[cfg(feature = "extern-rootserver")]
+    pub wallClockFlags: u32,
 }
 
 #[repr(C)]

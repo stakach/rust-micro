@@ -451,6 +451,10 @@ pub struct BootInfo {
     /// Leading `user_image_frames` caps that back ELF PT_LOAD pages.
     /// Later caps are mappings private to the initial root task.
     pub user_image_elf_frame_count: u64,
+    /// Validated UTC snapshot supplied by the platform boot adapter. Zero flags mean unavailable.
+    pub wall_clock_unix_seconds: i64,
+    pub wall_clock_timezone_minutes: i32,
+    pub wall_clock_flags: u32,
 }
 
 // ---------------------------------------------------------------------------

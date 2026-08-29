@@ -100,6 +100,13 @@ pub fn get_num_cores() -> u16 {
     bootboot_r.numcores
 }
 
+/// Validated boot wall-clock snapshot, converted from BOOTBOOT's BCD representation into a
+/// bootloader-neutral Unix epoch for the initial root task.
+pub fn wall_clock_snapshot() -> Option<bootstrap_clock::WallClockSnapshot> {
+    let bootboot = unsafe { &*(BOOTBOOT_INFO as *const BOOTBOOT) };
+    bootstrap_clock::decode_bcd_utc(bootboot.datetime, bootboot.timezone).ok()
+}
+
 /// Linear-framebuffer geometry as reported by BOOTBOOT. The
 /// framebuffer is a physically-contiguous region of device memory;
 /// `paddr` is its physical base (BOOTBOOT's `fb_ptr`, which the

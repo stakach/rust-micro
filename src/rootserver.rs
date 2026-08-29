@@ -1252,6 +1252,8 @@ unsafe fn build_bootinfo(
     let cnode_slots: Word = 1u64 << ROOTSERVER_CNODE_RADIX;
     #[cfg(feature = "extern-rootserver")]
     let framebuffer = crate::bootboot::framebuffer_info();
+    #[cfg(feature = "extern-rootserver")]
+    let wall_clock = crate::bootboot::wall_clock_snapshot();
     seL4_BootInfo {
         extraLen: extra_bi_size,
         nodeID: 0,
@@ -1330,6 +1332,12 @@ unsafe fn build_bootinfo(
             .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         userImageElfFrameCount: elf_image_frame_count,
+        #[cfg(feature = "extern-rootserver")]
+        wallClockUnixSeconds: wall_clock.map(|clock| clock.unix_seconds).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        wallClockTimezoneMinutes: wall_clock.map(|clock| clock.timezone_minutes).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        wallClockFlags: wall_clock.map(|clock| clock.flags).unwrap_or(0),
     }
 }
 

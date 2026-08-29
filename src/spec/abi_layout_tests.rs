@@ -122,6 +122,12 @@ fn test_runtime_offsets() {
         off(&bi.userImageElfFrameCount as *const _ as *const u8),
         (off(&bi.fb_type as *const _ as *const u8) + core::mem::size_of::<u32>() + 7) & !7,
     );
+    #[cfg(feature = "extern-rootserver")]
+    assert_eq!(
+        off(&bi.wallClockUnixSeconds as *const _ as *const u8),
+        off(&bi.userImageElfFrameCount as *const _ as *const u8)
+            + core::mem::size_of::<seL4_Word>(),
+    );
     arch::log("  ✓ seL4_BootInfo field offsets match libsel4 layout\n");
 }
 
