@@ -417,6 +417,14 @@ pub struct UntypedDesc {
 }
 
 pub const MAX_BI_UNTYPED: usize = 230;
+pub const BOOT_WALL_CLOCK_VALID: u32 = 1 << 0;
+pub const BOOT_WALL_CLOCK_UTC: u32 = 1 << 1;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BootWallClock {
+    pub unix_seconds: i64,
+    pub timezone_minutes: i32,
+}
 
 #[repr(C)]
 pub struct BootInfo {
@@ -455,6 +463,19 @@ pub struct BootInfo {
     pub wall_clock_unix_seconds: i64,
     pub wall_clock_timezone_minutes: i32,
     pub wall_clock_flags: u32,
+}
+
+impl BootInfo {
+    pub fn wall_clock(&self) -> Option<BootWallClock> {
+        let required = BOOT_WALL_CLOCK_VALID | BOOT_WALL_CLOCK_UTC;
+        if self.wall_clock_flags & required != required {
+            return None;
+        }
+        Some(BootWallClock {
+            unix_seconds: self.wall_clock_unix_seconds,
+            timezone_minutes: self.wall_clock_timezone_minutes,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
