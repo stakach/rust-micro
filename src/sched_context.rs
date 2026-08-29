@@ -60,6 +60,15 @@ pub struct SchedContext {
     /// `setConsumed`-style reset. seL4's `scConsumed`. Charged by
     /// `mcs_tick`; read + reset when a YieldTo completes.
     pub consumed: Ticks,
+    /// Cumulative time charged while the SC's bound TCB was executing.
+    /// Unlike `consumed`, this is never reset by the seL4 consumed-report
+    /// operations. A hosted personality can therefore reconcile durable
+    /// per-thread user time without sampling races.
+    pub bound_consumed: Ticks,
+    /// Cumulative time charged while this SC was donated to another TCB.
+    /// For hosted personalities this is kernel/server execution performed
+    /// on behalf of the bound thread.
+    pub donated_consumed: Ticks,
     /// Thread waiting on a SchedContext_YieldTo against this SC.
     /// seL4's `scYieldFrom`.
     pub yield_from: Option<TcbId>,
@@ -95,6 +104,8 @@ impl SchedContext {
             count: 0,
             bound_tcb: None,
             consumed: 0,
+            bound_consumed: 0,
+            donated_consumed: 0,
             yield_from: None,
             badge: 0,
             core: 0,
@@ -290,6 +301,11 @@ pub fn mcs_tick(delta_ticks: Ticks) {
         // scConsumed accounting — read + reset by YieldTo's
         // consumed-report (setConsumed in upstream).
         sc.consumed = sc.consumed.saturating_add(delta_ticks);
+        if sc.bound_tcb == Some(cur) {
+            sc.bound_consumed = sc.bound_consumed.saturating_add(delta_ticks);
+        } else {
+            sc.donated_consumed = sc.donated_consumed.saturating_add(delta_ticks);
+        }
         let exhausted = refill_charge(sc, delta_ticks);
         if exhausted {
             if round_robin {
@@ -655,6 +671,8 @@ pub mod spec {
                 s.sched_contexts[sc_caller].refills[0].amount, 4,
                 "caller's SC should have been debited via the server"
             );
+            assert_eq!(s.sched_contexts[sc_caller].bound_consumed, 0);
+            assert_eq!(s.sched_contexts[sc_caller].donated_consumed, 1);
 
             // Reply: clear donation. Production path is
             // `handle_reply`; spec mirrors the active_sc clear.
@@ -669,6 +687,13 @@ pub mod spec {
                 s.sched_contexts[sc_caller].refills[0].amount, 4,
                 "caller's SC must NOT be charged once donation is cleared"
             );
+
+            // Running the owner on its bound SC charges the independent
+            // bound counter while preserving the earlier donated sample.
+            s.scheduler.set_current(Some(caller_id));
+            crate::sched_context::mcs_tick(1);
+            assert_eq!(s.sched_contexts[sc_caller].bound_consumed, 1);
+            assert_eq!(s.sched_contexts[sc_caller].donated_consumed, 1);
 
             // Cleanup.
             super::set_test_time(None);

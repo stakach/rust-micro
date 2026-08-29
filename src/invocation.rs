@@ -2263,6 +2263,39 @@ fn decode_sched_context(
             }
             Ok(())
         }
+        // Upstream seL4_MCS `SchedContext_Consumed`: return the total
+        // execution charged since the previous consumed report and reset
+        // that report counter. Cumulative bound/donated accounting is a
+        // separate rust-micro extension below and is deliberately untouched.
+        InvocationLabel::SchedContextConsumed => {
+            unsafe {
+                let s = KERNEL.get();
+                let sc = &mut s.sched_contexts[sc_id as usize];
+                let consumed_us = sc.consumed.saturating_mul(1000);
+                sc.consumed = 0;
+                let inv = s.scheduler.slab.get_mut(invoker);
+                inv.msg_regs[0] = consumed_us;
+                inv.ipc_length = 1;
+            }
+            Ok(())
+        }
+        // rust-micro capability-scoped extension. Return cumulative time
+        // spent by the SC's bound TCB and time spent while the same SC was
+        // donated over IPC. The counters are monotonic for the lifetime of
+        // the SC and use seL4_Time microseconds on the wire.
+        InvocationLabel::SchedContextReadRuntime => {
+            unsafe {
+                let s = KERNEL.get();
+                let sc = &s.sched_contexts[sc_id as usize];
+                let bound_us = sc.bound_consumed.saturating_mul(1000);
+                let donated_us = sc.donated_consumed.saturating_mul(1000);
+                let inv = s.scheduler.slab.get_mut(invoker);
+                inv.msg_regs[0] = bound_us;
+                inv.msg_regs[1] = donated_us;
+                inv.ipc_length = 2;
+            }
+            Ok(())
+        }
         // SCHED0017 — SchedContext_YieldTo. Mirrors upstream
         // decodeSchedContext_YieldTo error paths:
         //   * unbound SC                          → IllegalOperation
@@ -2455,9 +2488,15 @@ fn decode_sched_control(
                 // YieldTo saw an "unbound" SC.
                 let keep_bound = sc.bound_tcb;
                 let keep_yield = sc.yield_from;
+                let keep_consumed = sc.consumed;
+                let keep_bound_consumed = sc.bound_consumed;
+                let keep_donated_consumed = sc.donated_consumed;
                 *sc = crate::sched_context::SchedContext::new(period, budget);
                 sc.bound_tcb = keep_bound;
                 sc.yield_from = keep_yield;
+                sc.consumed = keep_consumed;
+                sc.bound_consumed = keep_bound_consumed;
+                sc.donated_consumed = keep_donated_consumed;
                 // scBadge — mr3 (= a5) in ConfigureFlags; surfaced as
                 // seL4_Timeout_Data in a timeout fault (TIMEOUTFAULT).
                 // Legacy/spec callers leave a5 = 0.
@@ -6278,6 +6317,7 @@ pub mod spec {
         tcb_configure_one_shot_setup();
         asid_control_make_pool_then_assign();
         sched_context_bind_unbind();
+        sched_context_consumed_and_runtime_reports();
         sched_control_configure_sets_period_budget();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
@@ -8119,6 +8159,59 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ SchedContextBind / Unbind\n");
+    }
+
+    #[inline(never)]
+    fn sched_context_consumed_and_runtime_reports() {
+        let invoker = setup_invoker(0);
+        let (sc_idx, sc_cap) = unsafe {
+            let s = KERNEL.get();
+            let sc_idx = s.alloc_sched_context().expect("SC pool");
+            let sc = &mut s.sched_contexts[sc_idx];
+            *sc = crate::sched_context::SchedContext::new(10, 10);
+            sc.consumed = 9;
+            sc.bound_consumed = 7;
+            sc.donated_consumed = 2;
+            (
+                sc_idx,
+                Cap::SchedContext {
+                    ptr: KernelState::sched_context_ptr(sc_idx),
+                    size_bits: crate::object_type::MIN_SCHED_CONTEXT_BITS as u8,
+                },
+            )
+        };
+
+        let consumed = SyscallArgs {
+            a1: (InvocationLabel::SchedContextConsumed as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(sc_cap, &consumed, invoker).expect("Consumed");
+        unsafe {
+            let s = KERNEL.get();
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(inv.ipc_length, 1);
+            assert_eq!(inv.msg_regs[0], 9_000);
+            assert_eq!(s.sched_contexts[sc_idx].consumed, 0);
+            assert_eq!(s.sched_contexts[sc_idx].bound_consumed, 7);
+            assert_eq!(s.sched_contexts[sc_idx].donated_consumed, 2);
+        }
+
+        let runtime = SyscallArgs {
+            a1: (InvocationLabel::SchedContextReadRuntime as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(sc_cap, &runtime, invoker).expect("ReadRuntime");
+        unsafe {
+            let s = KERNEL.get();
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(inv.ipc_length, 2);
+            assert_eq!(inv.msg_regs[0], 7_000);
+            assert_eq!(inv.msg_regs[1], 2_000);
+            s.free_sched_context(sc_idx);
+        }
+
+        teardown_invoker(invoker);
+        arch::log("  ✓ SchedContext consumed reset + cumulative runtime split\n");
     }
 
     /// Phase 32d — SchedControl::Configure programs an SC's

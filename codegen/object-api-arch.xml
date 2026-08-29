@@ -1301,5 +1301,20 @@
             <param dir="out" name="enqueued" type="seL4_Word" description="1 when linked into a ready queue."/>
             <param dir="out" name="priority" type="seL4_Word" description="Thread priority."/>
         </method>
+        <method id="SchedContextReadRuntime" name="ReadRuntime" manual_name="Read Runtime" manual_label="schedcontext_readruntime">
+            <brief>
+                Read cumulative bound and donated execution time for a scheduling context.
+            </brief>
+            <description>
+                rust-micro accounting extension. The bound counter measures
+                execution by the scheduling context's bound TCB. The donated
+                counter measures execution by another TCB while carrying this
+                scheduling context through IPC donation. Both counters are
+                monotonic for the scheduling context's lifetime and are not
+                reset by Consumed, YieldTo, or timeout reports.
+            </description>
+            <param dir="out" name="bound" type="seL4_Time" description="Cumulative execution by the bound TCB."/>
+            <param dir="out" name="donated" type="seL4_Time" description="Cumulative execution while donated to another TCB."/>
+        </method>
     </interface>
 </api>

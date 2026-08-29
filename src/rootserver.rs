@@ -1311,25 +1311,15 @@ unsafe fn build_bootinfo(
         // Phase 0a — framebuffer geometry (extern-rootserver). All-zero
         // when BOOTBOOT exposed no framebuffer.
         #[cfg(feature = "extern-rootserver")]
-        fb_paddr: framebuffer
-            .map(|geometry| geometry.paddr)
-            .unwrap_or(0),
+        fb_paddr: framebuffer.map(|geometry| geometry.paddr).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_width: framebuffer
-            .map(|geometry| geometry.width)
-            .unwrap_or(0),
+        fb_width: framebuffer.map(|geometry| geometry.width).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_height: framebuffer
-            .map(|geometry| geometry.height)
-            .unwrap_or(0),
+        fb_height: framebuffer.map(|geometry| geometry.height).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_scanline: framebuffer
-            .map(|geometry| geometry.scanline)
-            .unwrap_or(0),
+        fb_scanline: framebuffer.map(|geometry| geometry.scanline).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
-        fb_size: framebuffer
-            .map(|geometry| geometry.size)
-            .unwrap_or(0),
+        fb_size: framebuffer.map(|geometry| geometry.size).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         fb_type: framebuffer
             .map(|geometry| geometry.fb_type as u32)
@@ -1522,9 +1512,7 @@ pub mod spec {
         assert!(list.unique_containing(u64::MAX - 0x1000, 0x2000).is_none());
 
         list.push(0x8000_0000 + 0x20_0000, 22);
-        assert!(list
-            .unique_containing(0x8020_0000, 0x10_0000)
-            .is_none());
+        assert!(list.unique_containing(0x8020_0000, 0x10_0000).is_none());
         arch::log("  ✓ device-untyped range authority is unique and bounded\n");
     }
 

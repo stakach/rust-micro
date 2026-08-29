@@ -346,8 +346,13 @@ pub fn deliver_timeout_fault(faulter: TcbId) -> bool {
         // seL4_Timeout_Data = the SC's badge; Consumed = ticks used.
         let (data, consumed) = match s.scheduler.slab.get(faulter).sc {
             Some(sc_idx) => {
-                let sc = &s.sched_contexts[sc_idx as usize];
-                (sc.badge, sc.consumed)
+                let sc = &mut s.sched_contexts[sc_idx as usize];
+                let report = (sc.badge, sc.consumed);
+                // Upstream timeout delivery performs the same consumed
+                // report reset as SchedContext_Consumed. Durable runtime
+                // counters remain monotonic.
+                sc.consumed = 0;
+                report
             }
             None => (0, 0),
         };

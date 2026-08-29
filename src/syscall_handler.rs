@@ -702,8 +702,7 @@ fn handle_send(
                 let result = crate::invocation::decode_invocation(other, args, current);
                 if result.is_ok() {
                     if let Some(caller) = composite_reply_caller {
-                        if let Some(inv_tcb) =
-                            s.scheduler.slab.entries[current.0 as usize].as_mut()
+                        if let Some(inv_tcb) = s.scheduler.slab.entries[current.0 as usize].as_mut()
                         {
                             inv_tcb.composite_reply_handoff = Some(caller);
                         }

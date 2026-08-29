@@ -50,6 +50,7 @@ pub const LBL_IRQ_ISSUE_IRQ_HANDLER: u64 = 30;
 pub const LBL_IRQ_SET_IRQ_HANDLER: u64 = 32;
 pub const LBL_SCHED_CONTROL_CONFIGURE: u64 = 37;
 pub const LBL_SCHED_CONTEXT_BIND: u64 = 38;
+pub const LBL_SCHED_CONTEXT_CONSUMED: u64 = 41;
 pub const LBL_X86_PDPT_MAP: u64 = 43;
 pub const LBL_X86_PAGE_DIRECTORY_MAP: u64 = 45;
 pub const LBL_X86_PAGE_TABLE_MAP: u64 = 47;
@@ -58,6 +59,7 @@ pub const LBL_X86_PAGE_UNMAP: u64 = 52;
 pub const LBL_X86_ASID_POOL_ASSIGN: u64 = 56;
 pub const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
 pub const LBL_TCB_READ_DEBUG_STATE: u64 = 67;
+pub const LBL_SCHED_CONTEXT_READ_RUNTIME: u64 = 68;
 
 // --- Object types -----------------------------------------------------------
 pub const OBJ_UNTYPED: u64 = 0;
@@ -166,6 +168,37 @@ pub unsafe fn syscall5_call(a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 
         options(nostack, preserves_flags),
     );
     reply >> 12
+}
+
+/// Five-argument cap invocation that waits for a reply and returns its
+/// MessageInfo error label plus the first two message registers.
+#[inline(always)]
+pub unsafe fn syscall5_call_mr2(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+) -> (u64, u64, u64) {
+    let reply: u64;
+    let mr0: u64;
+    let mr1: u64;
+    asm!(
+        "syscall",
+        in("rdx") SYS_CALL as u64,
+        in("rdi") a0,
+        inout("rsi") a1 => reply,
+        inout("r10") a2 => mr0,
+        inout("r8") a3 => mr1,
+        in("r9") a4,
+        in("r12") 0u64,
+        in("r13") 0u64,
+        lateout("rax") _,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack, preserves_flags),
+    );
+    (reply >> 12, mr0, mr1)
 }
 
 #[inline(always)]
@@ -300,6 +333,55 @@ pub fn sched_control_configure(
 pub fn sched_context_bind(sc_cptr: u64, tcb_cptr: u64) -> u64 {
     let msg_info = LBL_SCHED_CONTEXT_BIND << 12;
     unsafe { syscall5(SYS_SEND, sc_cptr, msg_info, tcb_cptr, 0, 0) }
+}
+
+/// Report and reset the standard seL4 MCS consumed counter.
+#[inline(always)]
+pub fn sched_context_consumed(sc_cptr: u64) -> Result<u64, u64> {
+    let (error, consumed_us, _) = unsafe {
+        syscall5_call_mr2(
+            sc_cptr,
+            LBL_SCHED_CONTEXT_CONSUMED << 12,
+            0,
+            0,
+            0,
+        )
+    };
+    if error == 0 {
+        Ok(consumed_us)
+    } else {
+        Err(error)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct SchedContextRuntime {
+    pub bound_time_us: u64,
+    pub donated_time_us: u64,
+}
+
+/// Read cumulative scheduler time for the SC without resetting either
+/// counter. This rust-micro extension preserves the standard consumed-report
+/// ABI while giving hosted kernels authoritative user/server accounting.
+#[inline(always)]
+pub fn sched_context_read_runtime(sc_cptr: u64) -> Result<SchedContextRuntime, u64> {
+    let (error, bound_time_us, donated_time_us) = unsafe {
+        syscall5_call_mr2(
+            sc_cptr,
+            LBL_SCHED_CONTEXT_READ_RUNTIME << 12,
+            0,
+            0,
+            0,
+        )
+    };
+    if error == 0 {
+        Ok(SchedContextRuntime {
+            bound_time_us,
+            donated_time_us,
+        })
+    } else {
+        Err(error)
+    }
 }
 
 /// `IRQControl::IssueIRQHandler(irq, dest_slot)`.
