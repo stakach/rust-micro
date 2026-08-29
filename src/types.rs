@@ -47,6 +47,9 @@ pub const seL4_CapRightsBits: usize = 4;
 
 /// Default from `config.cmake` (`KernelMaxNumBootinfoUntypedCaps`).
 pub const CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS: usize = 230;
+pub const BOOT_PERSISTENT_CLOCK_VALID: u16 = 1 << 0;
+pub const BOOT_PERSISTENT_CLOCK_CENTURY: u16 = 1 << 1;
+pub const BOOT_PERSISTENT_CLOCK_PC_CMOS: u16 = 1;
 
 /// Default from `config.cmake` (`KernelNumPriorities`).
 pub const CONFIG_NUM_PRIORITIES: usize = 256;
@@ -337,6 +340,19 @@ pub struct seL4_BootInfo {
     pub wallClockTimezoneMinutes: i32,
     #[cfg(feature = "extern-rootserver")]
     pub wallClockFlags: u32,
+    /// ACPI-discovered persistent clock resource. Kind zero means no writable provider was found.
+    #[cfg(feature = "extern-rootserver")]
+    pub persistentClockKind: u16,
+    #[cfg(feature = "extern-rootserver")]
+    pub persistentClockFlags: u16,
+    #[cfg(feature = "extern-rootserver")]
+    pub persistentClockIndexPort: u16,
+    #[cfg(feature = "extern-rootserver")]
+    pub persistentClockDataPort: u16,
+    #[cfg(feature = "extern-rootserver")]
+    pub persistentClockCenturyRegister: u8,
+    #[cfg(feature = "extern-rootserver")]
+    pub persistentClockReserved: [u8; 7],
 }
 
 #[repr(C)]

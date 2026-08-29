@@ -107,6 +107,12 @@ pub fn wall_clock_snapshot() -> Option<bootstrap_clock::WallClockSnapshot> {
     bootstrap_clock::decode_bcd_utc(bootboot.datetime, bootboot.timezone).ok()
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn acpi_table_address() -> u64 {
+    let bootboot = unsafe { &*(BOOTBOOT_INFO as *const BOOTBOOT) };
+    unsafe { bootboot.arch.x86_64 }.acpi_ptr
+}
+
 /// Linear-framebuffer geometry as reported by BOOTBOOT. The
 /// framebuffer is a physically-contiguous region of device memory;
 /// `paddr` is its physical base (BOOTBOOT's `fb_ptr`, which the

@@ -36,6 +36,7 @@ use crate::rootserver_image::rootserver_elf;
 use crate::tcb::{Tcb, ThreadStateType};
 use crate::types::{
     seL4_BootInfo, seL4_SlotPos, seL4_SlotRegion, seL4_UntypedDesc, seL4_Word as Word,
+    BOOT_PERSISTENT_CLOCK_CENTURY, BOOT_PERSISTENT_CLOCK_PC_CMOS, BOOT_PERSISTENT_CLOCK_VALID,
     CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS,
 };
 
@@ -1254,6 +1255,9 @@ unsafe fn build_bootinfo(
     let framebuffer = crate::bootboot::framebuffer_info();
     #[cfg(feature = "extern-rootserver")]
     let wall_clock = crate::bootboot::wall_clock_snapshot();
+    #[cfg(feature = "extern-rootserver")]
+    let persistent_clock =
+        crate::arch::x86_64::acpi::find_pc_rtc(crate::bootboot::acpi_table_address()).ok();
     seL4_BootInfo {
         extraLen: extra_bi_size,
         nodeID: 0,
@@ -1338,6 +1342,31 @@ unsafe fn build_bootinfo(
         wallClockTimezoneMinutes: wall_clock.map(|clock| clock.timezone_minutes).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         wallClockFlags: wall_clock.map(|clock| clock.flags).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        persistentClockKind: persistent_clock
+            .map(|_| BOOT_PERSISTENT_CLOCK_PC_CMOS)
+            .unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        persistentClockFlags: persistent_clock
+            .map(|clock| {
+                BOOT_PERSISTENT_CLOCK_VALID
+                    | if clock.century_register.is_some() {
+                        BOOT_PERSISTENT_CLOCK_CENTURY
+                    } else {
+                        0
+                    }
+            })
+            .unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        persistentClockIndexPort: persistent_clock.map(|clock| clock.index_port).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        persistentClockDataPort: persistent_clock.map(|clock| clock.data_port).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        persistentClockCenturyRegister: persistent_clock
+            .and_then(|clock| clock.century_register)
+            .unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        persistentClockReserved: [0; 7],
     }
 }
 

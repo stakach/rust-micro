@@ -76,7 +76,11 @@ pub fn validate_sdt(addr: u64) -> Result<&'static SdtHeader, AcpiError> {
         return Err(AcpiError::NoTable);
     }
     let hdr = unsafe { &*(addr as *const SdtHeader) };
-    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, hdr.length as usize) };
+    let length = unsafe { read_unaligned(&raw const hdr.length) } as usize;
+    if length < core::mem::size_of::<SdtHeader>() {
+        return Err(AcpiError::BadLength);
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, length) };
     if checksum8(bytes) != 0 {
         return Err(AcpiError::BadChecksum);
     }
@@ -186,8 +190,8 @@ pub fn iter_madt_entries<F: FnMut(MadtEntry)>(madt: &MadtHeader, mut f: F) -> us
 
 pub const DMAR_SIGNATURE: &[u8; 4] = b"DMAR";
 
-/// Walk the RSDT/XSDT for the DMAR table; returns its physical address.
-pub fn find_dmar(sdt_addr: u64) -> Result<u64, AcpiError> {
+/// Walk the loader-provided RSDT/XSDT for one checksummed table signature.
+pub fn find_table(sdt_addr: u64, wanted: &[u8; 4]) -> Result<u64, AcpiError> {
     let hdr = validate_sdt(sdt_addr)?;
     let sig: [u8; 4] = unsafe { read_unaligned(&raw const hdr.signature) };
     let length: u32 = unsafe { read_unaligned(&raw const hdr.length) };
@@ -196,22 +200,63 @@ pub fn find_dmar(sdt_addr: u64) -> Result<u64, AcpiError> {
         b"XSDT" => 8,
         _ => return Err(AcpiError::BadSignature),
     };
-    let entries_base = sdt_addr + core::mem::size_of::<SdtHeader>() as u64;
-    let entry_count = (length as usize - core::mem::size_of::<SdtHeader>()) / entry_size;
+    let header_size = core::mem::size_of::<SdtHeader>();
+    let entries_base = sdt_addr + header_size as u64;
+    let entry_count = (length as usize - header_size) / entry_size;
     for i in 0..entry_count {
         let entry_addr = entries_base + (i as u64) * entry_size as u64;
         let table_addr: u64 = match entry_size {
             4 => (unsafe { read_unaligned(entry_addr as *const u32) }) as u64,
             _ => unsafe { read_unaligned(entry_addr as *const u64) },
         };
-        if let Ok(hdr2) = validate_sdt(table_addr) {
-            let sig2: [u8; 4] = unsafe { read_unaligned(&raw const hdr2.signature) };
-            if sig2 == *DMAR_SIGNATURE {
+        if let Ok(candidate) = validate_sdt(table_addr) {
+            let candidate_signature: [u8; 4] =
+                unsafe { read_unaligned(&raw const candidate.signature) };
+            if candidate_signature == *wanted {
                 return Ok(table_addr);
             }
         }
     }
     Err(AcpiError::NoTable)
+}
+
+/// Walk the RSDT/XSDT for the DMAR table; returns its physical address.
+pub fn find_dmar(sdt_addr: u64) -> Result<u64, AcpiError> {
+    find_table(sdt_addr, DMAR_SIGNATURE)
+}
+
+pub const FADT_SIGNATURE: &[u8; 4] = b"FACP";
+const FADT_CENTURY_OFFSET: u64 = 108;
+const FADT_IAPC_BOOT_ARCH_OFFSET: u64 = 109;
+const FADT_IAPC_CMOS_RTC_NOT_PRESENT: u16 = 1 << 5;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PcRtcInfo {
+    pub index_port: u16,
+    pub data_port: u16,
+    pub century_register: Option<u8>,
+}
+
+/// Discover the fixed ACPI PC RTC resource. The FADT explicitly reports when CMOS RTC hardware is
+/// absent; the optional century byte is used only when firmware publishes a non-zero register.
+pub fn find_pc_rtc(sdt_addr: u64) -> Result<PcRtcInfo, AcpiError> {
+    let fadt_addr = find_table(sdt_addr, FADT_SIGNATURE)?;
+    let header = validate_sdt(fadt_addr)?;
+    let length = unsafe { read_unaligned(&raw const header.length) } as u64;
+    if length <= FADT_IAPC_BOOT_ARCH_OFFSET + 1 {
+        return Err(AcpiError::BadLength);
+    }
+    let boot_arch =
+        unsafe { read_unaligned((fadt_addr + FADT_IAPC_BOOT_ARCH_OFFSET) as *const u16) };
+    if boot_arch & FADT_IAPC_CMOS_RTC_NOT_PRESENT != 0 {
+        return Err(AcpiError::NoTable);
+    }
+    let century = unsafe { read_unaligned((fadt_addr + FADT_CENTURY_OFFSET) as *const u8) };
+    Ok(PcRtcInfo {
+        index_port: 0x70,
+        data_port: 0x71,
+        century_register: (century != 0).then_some(century),
+    })
 }
 
 /// Parse the DMAR remapping structures for the first DRHD (DMA
@@ -249,6 +294,7 @@ pub enum AcpiError {
     NoTable,
     BadSignature,
     BadChecksum,
+    BadLength,
 }
 
 fn checksum8(bytes: &[u8]) -> u8 {
@@ -266,30 +312,8 @@ fn checksum8(bytes: &[u8]) -> u8 {
 /// inside the loader. We accept either an RSDT (32-bit entries) or
 /// an XSDT (64-bit entries) and walk accordingly.
 pub fn find_madt(sdt_addr: u64) -> Result<&'static MadtHeader, AcpiError> {
-    let hdr = validate_sdt(sdt_addr)?;
-    let sig: [u8; 4] = unsafe { read_unaligned(&raw const hdr.signature) };
-    let length: u32 = unsafe { read_unaligned(&raw const hdr.length) };
-    let entry_size: usize = match &sig {
-        b"RSDT" => 4,
-        b"XSDT" => 8,
-        _ => return Err(AcpiError::BadSignature),
-    };
-    let entries_base = sdt_addr + core::mem::size_of::<SdtHeader>() as u64;
-    let entry_count = (length as usize - core::mem::size_of::<SdtHeader>()) / entry_size;
-    for i in 0..entry_count {
-        let entry_addr = entries_base + (i as u64) * entry_size as u64;
-        let table_addr: u64 = match entry_size {
-            4 => (unsafe { read_unaligned(entry_addr as *const u32) }) as u64,
-            _ => unsafe { read_unaligned(entry_addr as *const u64) },
-        };
-        if let Ok(hdr2) = validate_sdt(table_addr) {
-            let sig2: [u8; 4] = unsafe { read_unaligned(&raw const hdr2.signature) };
-            if sig2 == *MADT_SIGNATURE {
-                return Ok(unsafe { &*(table_addr as *const MadtHeader) });
-            }
-        }
-    }
-    Err(AcpiError::NoTable)
+    let table = find_table(sdt_addr, MADT_SIGNATURE)?;
+    Ok(unsafe { &*(table as *const MadtHeader) })
 }
 
 // ---------------------------------------------------------------------------

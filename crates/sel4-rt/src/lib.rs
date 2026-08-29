@@ -419,11 +419,21 @@ pub struct UntypedDesc {
 pub const MAX_BI_UNTYPED: usize = 230;
 pub const BOOT_WALL_CLOCK_VALID: u32 = 1 << 0;
 pub const BOOT_WALL_CLOCK_UTC: u32 = 1 << 1;
+pub const BOOT_PERSISTENT_CLOCK_VALID: u16 = 1 << 0;
+pub const BOOT_PERSISTENT_CLOCK_CENTURY: u16 = 1 << 1;
+pub const BOOT_PERSISTENT_CLOCK_PC_CMOS: u16 = 1;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BootWallClock {
     pub unix_seconds: i64,
     pub timezone_minutes: i32,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BootPcCmosClock {
+    pub index_port: u16,
+    pub data_port: u16,
+    pub century_register: Option<u8>,
 }
 
 #[repr(C)]
@@ -463,6 +473,12 @@ pub struct BootInfo {
     pub wall_clock_unix_seconds: i64,
     pub wall_clock_timezone_minutes: i32,
     pub wall_clock_flags: u32,
+    pub persistent_clock_kind: u16,
+    pub persistent_clock_flags: u16,
+    pub persistent_clock_index_port: u16,
+    pub persistent_clock_data_port: u16,
+    pub persistent_clock_century_register: u8,
+    pub persistent_clock_reserved: [u8; 7],
 }
 
 impl BootInfo {
@@ -474,6 +490,21 @@ impl BootInfo {
         Some(BootWallClock {
             unix_seconds: self.wall_clock_unix_seconds,
             timezone_minutes: self.wall_clock_timezone_minutes,
+        })
+    }
+
+    pub fn persistent_pc_cmos_clock(&self) -> Option<BootPcCmosClock> {
+        if self.persistent_clock_kind != BOOT_PERSISTENT_CLOCK_PC_CMOS
+            || self.persistent_clock_flags & BOOT_PERSISTENT_CLOCK_VALID == 0
+            || self.persistent_clock_index_port == self.persistent_clock_data_port
+        {
+            return None;
+        }
+        Some(BootPcCmosClock {
+            index_port: self.persistent_clock_index_port,
+            data_port: self.persistent_clock_data_port,
+            century_register: (self.persistent_clock_flags & BOOT_PERSISTENT_CLOCK_CENTURY != 0)
+                .then_some(self.persistent_clock_century_register),
         })
     }
 }
