@@ -1,0 +1,77 @@
+name: ReactOS ACPI provider
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/reactos-acpi-provider.yml"
+      - "vendor/reactos-acpi/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out integration source
+        uses: actions/checkout@v4
+        with:
+          path: integration
+
+      - name: Check out pinned ReactOS source
+        uses: actions/checkout@v4
+        with:
+          repository: reactos/reactos
+          ref: 4117217b61b97f022e441b11639ca6f2106aaa07
+          fetch-depth: 1
+          path: reactos
+
+      - name: Apply provider patch
+        shell: bash
+        run: git -C reactos apply --check ../integration/vendor/reactos-acpi/0001-ACPI-enumerate-provider-namespace-PDOs.patch && git -C reactos apply ../integration/vendor/reactos-acpi/0001-ACPI-enumerate-provider-namespace-PDOs.patch
+
+      - name: Install Ninja
+        run: choco install -y ninja
+
+      - name: Install Flex and Bison
+        shell: pwsh
+        run: |
+          curl.exe -fL -o flexbison.7z https://svn.reactos.org/storage/vperevertkin/flexbison.7z
+          7z x flexbison.7z -o"$env:GITHUB_WORKSPACE\bin"
+          "$env:GITHUB_WORKSPACE\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "BISON_PKGDATADIR=$env:GITHUB_WORKSPACE\bin\share\bison" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "M4=$env:GITHUB_WORKSPACE\bin\m4.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Activate MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+          toolset: "14"
+
+      - name: Configure pinned amd64 debug build
+        run: cmake -S reactos -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE:FILEPATH=toolchain-msvc.cmake -DARCH:STRING=amd64 -DCMAKE_BUILD_TYPE=Debug -DDLL_EXPORT_VERSION=0x502 -DENABLE_ROSTESTS=0 -DENABLE_ROSAPPS=0
+
+      - name: Build acpi.sys
+        run: cmake --build build --target acpi -- -k0
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          $artifact = "build\drivers\bus\acpi\acpi.sys"
+          if (!(Test-Path $artifact)) { throw "missing $artifact" }
+          $bytes = [System.IO.File]::ReadAllBytes($artifact)
+          if ($bytes.Length -lt 0x100 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "invalid PE artifact" }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($pe -lt 0x40 -or $pe + 6 -gt $bytes.Length) { throw "invalid PE header offset" }
+          if ($bytes[$pe] -ne 0x50 -or $bytes[$pe + 1] -ne 0x45 -or $bytes[$pe + 2] -ne 0 -or $bytes[$pe + 3] -ne 0) { throw "invalid PE signature" }
+          if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x8664) { throw "artifact is not amd64" }
+          Get-FileHash -Algorithm SHA256 $artifact
+
+      - name: Upload provider artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reactos-acpi-provider-amd64-msvc-debug
+          path: build/drivers/bus/acpi/acpi.sys
+          if-no-files-found: error
+          retention-days: 7
