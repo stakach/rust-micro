@@ -2644,6 +2644,16 @@ fn issue_x86_irq_handler(args: &SyscallArgs, invoker: TcbId, msi: bool) -> KResu
         let level = inv_tcb.msg_regs[4];
         let polarity = inv_tcb.msg_regs[5];
         let vector = inv_tcb.msg_regs[6];
+        if !msi
+            && (pin >= 24
+                || vector >= crate::interrupt::MAX_IRQ as u64
+                || level > 1
+                || polarity > 1)
+        {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidArgument,
+            )));
+        }
         let dest_root = if inv_tcb.pending_extra_caps_count > 0 {
             inv_tcb.pending_extra_caps[0]
         } else {
@@ -2705,6 +2715,7 @@ fn issue_x86_irq_handler(args: &SyscallArgs, invoker: TcbId, msi: bool) -> KResu
                     cpu_vec,
                     level as u32,
                     polarity as u32,
+                    true,
                 );
                 // Record the pin + trigger so a level-triggered line gets masked on
                 // delivery (and unmasked on Ack). Leaves the binding state Inactive
@@ -3073,15 +3084,27 @@ fn decode_irq_handler(
                 // recorded on the IRQ entry so handle_interrupt can
                 // signal with it (sel4test minted BIT(N) per timer).
                 let _ = crate::interrupt::clear_handler(&mut s.irqs, irq);
-                crate::interrupt::set_notification(&mut s.irqs, irq, ntfn_idx, ntfn_badge).map_err(
-                    |_| {
+                crate::interrupt::set_notification(&mut s.irqs, irq, ntfn_idx, ntfn_badge)
+                    .map_err(|_| {
                         KException::SyscallError(SyscallError::new(
                             seL4_Error::seL4_InvalidCapability,
                         ))
-                    },
-                )
+                    })?;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let cpu_vector =
+                        (irq as u32) + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
+                    let _ = crate::arch::x86_64::ioapic::set_mask_for_vector(cpu_vector, false);
+                }
+                Ok(())
             }
             InvocationLabel::IRQClearIRQHandler => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let cpu_vector =
+                        (irq as u32) + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
+                    let _ = crate::arch::x86_64::ioapic::set_mask_for_vector(cpu_vector, true);
+                }
                 crate::interrupt::clear_handler(&mut s.irqs, irq).map_err(|_| {
                     KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
                 })

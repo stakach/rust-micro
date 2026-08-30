@@ -135,7 +135,7 @@ pub unsafe fn set_mask_for_vector(cpu_vector: u32, masked: bool) -> u32 {
 /// the high half first (so the masked low half doesn't accidentally
 /// fire with a stale destination), then the low half last so the
 /// unmasked result becomes live atomically.
-pub unsafe fn program_redirection(pin: u32, vector: u32, level: u32, polarity: u32) {
+pub unsafe fn program_redirection(pin: u32, vector: u32, level: u32, polarity: u32, masked: bool) {
     let lo_reg = IOAPIC_REG_REDTBL_BASE + rte_index(pin) * 2;
     let hi_reg = lo_reg + 1;
 
@@ -150,10 +150,11 @@ pub unsafe fn program_redirection(pin: u32, vector: u32, level: u32, polarity: u
     //   bit 11      = destination mode (0 = Physical)
     //   bit 13      = polarity (0 = active high, 1 = active low)
     //   bit 15      = trigger (0 = edge, 1 = level)
-    //   bit 16      = mask (0 = unmasked) — write LAST so the
-    //                 redirection goes live with vector + dest set.
+    //   bit 16      = mask. IRQ issue installs a masked route; binding the handler to its
+    //                 notification is the commit point that unmasks it.
     let polarity_bit = if polarity != 0 { 1 << 13 } else { 0 };
     let trigger_bit = if level != 0 { 1 << 15 } else { 0 };
-    let low: u32 = (vector & 0xFF) | polarity_bit | trigger_bit;
+    let mask_bit = if masked { 1 << 16 } else { 0 };
+    let low: u32 = (vector & 0xFF) | polarity_bit | trigger_bit | mask_bit;
     write_reg(lo_reg, low);
 }
