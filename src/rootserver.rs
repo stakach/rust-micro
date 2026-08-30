@@ -159,9 +159,11 @@ pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::XL_CNODE_RADIX;
 /// config-space enumeration. This keeps the NT executive's MMIO catalogue tied to
 /// real bus assignment instead of a single QEMU layout. The combined list remains
 /// the single source of truth for both CSpace cap planting and BootInfo metadata.
-///   * 0x00080000 (512 KiB): low 1 MiB — BIOS/ACPI/legacy (sel4test ACPI discovery).
+///   * 0x00000000 (4 KiB): BIOS Data Area, including the ACPICA EBDA pointer at 0x40e.
+///   * 0x00080000 (512 KiB): upper conventional/BIOS memory, including the RSDP scan window.
 ///   * 0xFEC00000 / 0xFED00000 / 0xFEE00000 (4 KiB each): IOAPIC / HPET / LAPIC MMIO.
 pub const DEVICE_UTS: &[(u64, u8)] = &[
+    (0x00000000, 12),
     (0x00080000, 19),
     (0xFEC00000, 12),
     (0xFED00000, 12),
@@ -194,7 +196,7 @@ impl DeviceUntypedList {
     }
 
     fn try_push(&mut self, paddr: u64, size_bits: u8) -> bool {
-        if paddr == 0 || size_bits < 12 || self.len >= self.entries.len() {
+        if size_bits < 12 || self.len >= self.entries.len() {
             return false;
         }
         let Some(size) = 1u64.checked_shl(size_bits as u32) else {
@@ -436,7 +438,7 @@ unsafe fn append_pci_mmio_device_untypeds(list: &mut DeviceUntypedList) {
 
 fn append_device_region(list: &mut DeviceUntypedList, start: u64, end: u64) -> bool {
     const PAGE_SIZE: u64 = 0x1000;
-    if start == 0 || start >= end || start & (PAGE_SIZE - 1) != 0 || end & (PAGE_SIZE - 1) != 0 {
+    if start >= end || start & (PAGE_SIZE - 1) != 0 || end & (PAGE_SIZE - 1) != 0 {
         return false;
     }
     let mut cursor = start;
@@ -1619,6 +1621,8 @@ pub mod spec {
         assert!(list.unique_containing(0x8020_0000, 0x10_0000).is_some());
 
         let mut acpi = DeviceUntypedList::new();
+        assert!(append_device_region(&mut acpi, 0, 0x1000));
+        assert!(acpi.covers(0x40e, 2));
         assert!(append_device_region(&mut acpi, 0x7ffe_1000, 0x7ffe_a000));
         assert!(acpi.covers(0x7ffe_1000, 0x9000));
         assert!(!append_device_region(
