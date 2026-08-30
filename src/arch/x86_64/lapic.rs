@@ -473,6 +473,14 @@ pub fn calibrate_timer_with_pit() -> u32 {
     per_ms
 }
 
+/// Return the BSP TSC frequency measured by [`calibrate_timer_with_pit`]. The boot adapter calls
+/// this only after calibration and publishes the result to the initial task; zero is never exposed
+/// as a usable timing authority.
+pub fn calibrated_tsc_frequency_hz() -> Option<u64> {
+    let per_ms = unsafe { TSC_PER_MS };
+    per_ms.checked_mul(1000).filter(|frequency| *frequency != 0)
+}
+
 /// Install the LAPIC-tick IDT entry and start the periodic timer on
 /// the calling CPU at the calibrated ~1000 Hz rate. Requires
 /// `calibrate_timer_with_pit` to have run first.

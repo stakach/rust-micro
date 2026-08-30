@@ -1146,16 +1146,11 @@ pub unsafe fn launch_rootserver() -> ! {
     }
     let user_image_end: Word = user_image_start + n_image_pages as Word;
 
-    // Phase 42 — populate the extended BootInfo page with the
-    // TSC-frequency chunk sel4test's `x86_get_tsc_freq_from_simple`
-    // looks up. The header is `{ id: u64, len: u64 }` followed by
-    // a 4-byte TSC freq in MHz. We hardcode 1000 MHz (1 GHz) — the
-    // QEMU default for `-cpu host` is in this ballpark, and sel4test
-    // uses the value only for relative timing; off-by-a-factor is
-    // acceptable for getting the test suite running.
+    // Phase 42 — populate the extended BootInfo page with the TSC-frequency chunk sel4test's
+    // `x86_get_tsc_freq_from_simple` looks up. Calibration happens immediately before initial-task
+    // dispatch, so stage zero here and replace it with the measured MHz value below.
     const SEL4_BI_HEADER_SIZE: usize = 16; // u64 id + u64 len
     const TSC_FREQ_HEADER_ID: u64 = 5; // SEL4_BOOTINFO_HEADER_X86_TSC_FREQ
-    const TSC_FREQ_MHZ: u32 = 1000;
     let extra_bi_kvaddr = phys_to_kernel_virt(img.extra_bi_paddr);
     let extra_bi_ptr = extra_bi_kvaddr as *mut u8;
     // Header.id
@@ -1166,10 +1161,7 @@ pub unsafe fn launch_rootserver() -> ! {
         (SEL4_BI_HEADER_SIZE + 4) as u64,
     );
     // Payload: TSC freq in MHz (u32).
-    core::ptr::write_volatile(
-        extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut u32,
-        TSC_FREQ_MHZ,
-    );
+    core::ptr::write_volatile(extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut u32, 0);
     let extra_bi_total_len: Word = (SEL4_BI_HEADER_SIZE + 4) as Word;
 
     // Build + write the BootInfo struct into its page. We address
@@ -1233,6 +1225,21 @@ pub unsafe fn launch_rootserver() -> ! {
     // would otherwise leave IRQ 0 dead).
     crate::arch::x86_64::pic::init_pic();
     crate::arch::x86_64::lapic::calibrate_timer_with_pit();
+    let tsc_frequency_hz = crate::arch::x86_64::lapic::calibrated_tsc_frequency_hz()
+        .expect("PIT calibration must publish a nonzero TSC frequency");
+    core::ptr::write_volatile(
+        core::ptr::addr_of_mut!((*bi_ptr).tscFrequencyHz),
+        tsc_frequency_hz,
+    );
+    let tsc_frequency_mhz = tsc_frequency_hz
+        .saturating_add(500_000)
+        .checked_div(1_000_000)
+        .and_then(|frequency| u32::try_from(frequency).ok())
+        .expect("calibrated TSC frequency must fit the seL4 MHz boot-info payload");
+    core::ptr::write_volatile(
+        extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut u32,
+        tsc_frequency_mhz,
+    );
     crate::arch::x86_64::lapic::enable_periodic_kernel_timer();
     crate::arch::x86_64::pit::install_irq_handler();
 
@@ -1463,6 +1470,8 @@ unsafe fn build_bootinfo(
             .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         acpiRootTableFlags: acpi_root.map(|_| BOOT_ACPI_ROOT_VALID).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        tscFrequencyHz: 0,
     }
 }
 

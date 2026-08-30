@@ -581,6 +581,7 @@ pub struct BootInfo {
     pub acpi_root_table_length: u32,
     pub acpi_root_table_kind: u16,
     pub acpi_root_table_flags: u16,
+    pub tsc_frequency_hz: u64,
 }
 
 impl BootInfo {
@@ -627,6 +628,10 @@ impl BootInfo {
             length: self.acpi_root_table_length,
             kind,
         })
+    }
+
+    pub fn tsc_frequency_hz(&self) -> Option<u64> {
+        (self.tsc_frequency_hz != 0).then_some(self.tsc_frequency_hz)
     }
 }
 

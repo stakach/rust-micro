@@ -366,6 +366,9 @@ pub struct seL4_BootInfo {
     pub acpiRootTableKind: u16,
     #[cfg(feature = "extern-rootserver")]
     pub acpiRootTableFlags: u16,
+    /// BSP TSC frequency measured against the PIT before the initial task is dispatched.
+    #[cfg(feature = "extern-rootserver")]
+    pub tscFrequencyHz: u64,
 }
 
 #[repr(C)]
