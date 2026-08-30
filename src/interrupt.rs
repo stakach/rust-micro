@@ -10,17 +10,16 @@
 //!   - IpiSignal / Reserved — used for IPIs / kernel-internal IRQs;
 //!     we treat as Inactive for now
 //!
-//! The `IrqState` table is sized for the legacy 16 ISA IRQs plus
-//! a small range of IOAPIC redirection vectors. The actual hardware
-//! programming (PIC mask bits, IOAPIC RTE writes) lands when we wire
-//! a real timer in a later phase.
+//! The `IrqState` table is keyed by CPU delivery vector rather than by a controller-local pin.
+//! Each issued handler owns an exact hardware source until the last handler capability is deleted.
 
 use crate::notification::{signal, Notification};
 use crate::scheduler::Scheduler;
 
-/// Highest IRQ vector number we manage. The 8259 has 16 lines and
-/// the IOAPIC adds 24 more by default; 64 covers both with margin.
+/// Highest IRQ vector number represented by the kernel's IRQ capability table.
 pub const MAX_IRQ: usize = 64;
+pub const FIRST_IOAPIC_IRQ: u16 = 1;
+pub const LAST_IOAPIC_IRQ: u16 = 15;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum IrqState {
@@ -30,6 +29,17 @@ pub enum IrqState {
     Signal,
     /// IPI or a kernel-internal IRQ — stub for now.
     Reserved,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum IrqSource {
+    #[default]
+    None,
+    Generic,
+    IoApic {
+        controller: u16,
+        pin: u16,
+    },
 }
 
 /// Per-IRQ dispatch entry: state and (when state==Signal) the
@@ -48,14 +58,9 @@ pub struct IrqEntry {
     /// True while a delivered IRQ has not yet been ack'd. seL4 masks
     /// the line at the controller; we just track the flag.
     pub pending: bool,
-    /// The IOAPIC redirection-table pin this IRQ was issued on (for the
-    /// `X86IRQIssueIRQHandlerIOAPIC` path), or `None` for legacy/PIC IRQs.
-    /// Recorded so a level-triggered line can be masked on delivery.
-    pub ioapic_pin: Option<u16>,
-    /// True if the IOAPIC line is level-triggered. A held-asserted level
-    /// source (e.g. PCI INTx) would re-fire immediately after EOI and storm
-    /// the CPU, so the kernel masks it on delivery and unmasks on Ack.
-    pub level_triggered: bool,
+    /// Hardware source reserved by IRQControl for this vector. Binding and clearing a notification
+    /// never discards route ownership; only deletion of the last handler capability releases it.
+    pub source: IrqSource,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -77,8 +82,7 @@ impl IrqTable {
                 notification: None,
                 badge: 0,
                 pending: false,
-                ioapic_pin: None,
-                level_triggered: false,
+                source: IrqSource::None,
             }; MAX_IRQ],
         }
     }
@@ -100,6 +104,22 @@ pub enum IrqError {
     NotBound,
 }
 
+pub fn reserve_source(table: &mut IrqTable, irq: u16, source: IrqSource) -> Result<(), IrqError> {
+    can_reserve_source(table, irq, source)?;
+    let entry = table
+        .get_mut(irq)
+        .expect("source reservation validated the IRQ index");
+    entry.source = source;
+    Ok(())
+}
+
+pub fn source(table: &IrqTable, irq: u16) -> Result<IrqSource, IrqError> {
+    table
+        .get(irq)
+        .map(|entry| entry.source)
+        .ok_or(IrqError::Range)
+}
+
 /// Bind an IRQ to a notification slab index. Mirrors
 /// `IRQHandler::SetNotification` in seL4 (we don't implement
 /// `IRQControl::Get` because that's about cap construction).
@@ -119,25 +139,33 @@ pub fn set_notification(
     Ok(())
 }
 
-/// Record the IOAPIC pin + trigger mode for `irq` (from
-/// `X86IRQIssueIRQHandlerIOAPIC`). Leaves the binding state untouched — the handler
-/// is issued before `SetNotification`. Lets `handle_interrupt` mask a level line.
-pub fn set_ioapic_route(
-    table: &mut IrqTable,
-    irq: u16,
-    pin: u16,
-    level_triggered: bool,
-) -> Result<(), IrqError> {
-    let entry = table.get_mut(irq).ok_or(IrqError::Range)?;
-    entry.ioapic_pin = Some(pin);
-    entry.level_triggered = level_triggered;
-    Ok(())
-}
-
 /// Clear a binding. Mirrors `IRQHandler::Clear`.
 pub fn clear_handler(table: &mut IrqTable, irq: u16) -> Result<(), IrqError> {
     let entry = table.get_mut(irq).ok_or(IrqError::Range)?;
+    let source = entry.source;
     *entry = IrqEntry::default();
+    entry.source = source;
+    Ok(())
+}
+
+pub fn release_handler(table: &mut IrqTable, irq: u16) -> Result<IrqSource, IrqError> {
+    let entry = table.get_mut(irq).ok_or(IrqError::Range)?;
+    let source = entry.source;
+    *entry = IrqEntry::default();
+    Ok(source)
+}
+
+pub fn can_reserve_source(table: &IrqTable, irq: u16, source: IrqSource) -> Result<(), IrqError> {
+    let entry = table.get(irq).ok_or(IrqError::Range)?;
+    if entry.source != IrqSource::None || source == IrqSource::None {
+        return Err(IrqError::AlreadyBound);
+    }
+    if let IrqSource::IoApic { controller, pin } = source {
+        let route = IrqSource::IoApic { controller, pin };
+        if table.entries.iter().any(|entry| entry.source == route) {
+            return Err(IrqError::AlreadyBound);
+        }
+    }
     Ok(())
 }
 
@@ -216,6 +244,7 @@ pub mod spec {
         irq_to_notification_round_trip();
         bind_unbind_rebind();
         ack_clears_pending();
+        source_ownership_survives_binding_clear();
         out_of_range_irq_rejected();
         arch::log("IRQ tests completed\n");
     }
@@ -288,5 +317,25 @@ pub mod spec {
         assert_eq!(clear_handler(&mut table, 9999), Err(IrqError::Range));
         assert_eq!(ack_irq(&mut table, 9999), Err(IrqError::Range));
         arch::log("  ✓ out-of-range IRQ rejected\n");
+    }
+
+    #[inline(never)]
+    fn source_ownership_survives_binding_clear() {
+        let mut table = IrqTable::new();
+        let route = IrqSource::IoApic {
+            controller: 2,
+            pin: 19,
+        };
+        reserve_source(&mut table, 7, route).unwrap();
+        assert_eq!(
+            reserve_source(&mut table, 8, route),
+            Err(IrqError::AlreadyBound)
+        );
+        set_notification(&mut table, 7, 1, 0x40).unwrap();
+        clear_handler(&mut table, 7).unwrap();
+        assert_eq!(source(&table, 7), Ok(route));
+        assert_eq!(release_handler(&mut table, 7), Ok(route));
+        assert_eq!(source(&table, 7), Ok(IrqSource::None));
+        arch::log("  ✓ IRQ source ownership survives Clear until final release\n");
     }
 }

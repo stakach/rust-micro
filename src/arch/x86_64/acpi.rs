@@ -126,47 +126,70 @@ pub enum MadtEntry {
     Other { kind: u8, len: u8 },
 }
 
-/// Walk the MADT entries, calling `f` once per entry. Returns the
-/// number of entries iterated.
-pub fn iter_madt_entries<F: FnMut(MadtEntry)>(madt: &MadtHeader, mut f: F) -> usize {
-    let total_len = madt.sdt.length as usize;
+/// Walk the MADT entries, calling `f` once per entry. Known entry types must use their exact ACPI
+/// lengths; malformed framing is rejected instead of silently truncating the hardware topology.
+pub fn iter_madt_entries<F: FnMut(MadtEntry)>(
+    madt: &MadtHeader,
+    mut f: F,
+) -> Result<usize, AcpiError> {
+    let total_len = unsafe { read_unaligned(&raw const madt.sdt.length) } as usize;
     let header_len = core::mem::size_of::<MadtHeader>();
+    if total_len < header_len {
+        return Err(AcpiError::BadLength);
+    }
     let madt_addr = madt as *const MadtHeader as u64;
     let mut offset = header_len;
     let mut n = 0;
-    while offset + 2 <= total_len {
+    while offset < total_len {
+        if total_len - offset < 2 {
+            return Err(AcpiError::BadLength);
+        }
         let kind: u8 = unsafe { read_unaligned((madt_addr + offset as u64) as *const u8) };
         let len: u8 = unsafe { read_unaligned((madt_addr + (offset + 1) as u64) as *const u8) };
-        if len < 2 || offset + len as usize > total_len {
-            break;
+        let len = len as usize;
+        let end = offset.checked_add(len).ok_or(AcpiError::BadLength)?;
+        if len < 2 || end > total_len {
+            return Err(AcpiError::BadLength);
         }
         let entry_addr = madt_addr + offset as u64;
         let entry = match kind {
-            0 => unsafe {
+            0 if len == 8 => unsafe {
                 let processor_id = read_unaligned((entry_addr + 2) as *const u8);
                 let apic_id = read_unaligned((entry_addr + 3) as *const u8);
                 let flags = read_unaligned((entry_addr + 4) as *const u32);
+                if flags & !0x3 != 0 {
+                    return Err(AcpiError::BadValue);
+                }
                 MadtEntry::LocalApic {
                     processor_id,
                     apic_id,
                     flags,
                 }
             },
-            1 => unsafe {
+            1 if len == 12 => unsafe {
                 let ioapic_id = read_unaligned((entry_addr + 2) as *const u8);
+                let reserved = read_unaligned((entry_addr + 3) as *const u8);
                 let address = read_unaligned((entry_addr + 4) as *const u32);
                 let gsi_base = read_unaligned((entry_addr + 8) as *const u32);
+                if reserved != 0 {
+                    return Err(AcpiError::BadValue);
+                }
                 MadtEntry::IoApic {
                     ioapic_id,
                     address,
                     gsi_base,
                 }
             },
-            2 => unsafe {
+            2 if len == 10 => unsafe {
                 let bus = read_unaligned((entry_addr + 2) as *const u8);
                 let source = read_unaligned((entry_addr + 3) as *const u8);
                 let gsi = read_unaligned((entry_addr + 4) as *const u32);
                 let flags = read_unaligned((entry_addr + 8) as *const u16);
+                let polarity = flags & 0x3;
+                let trigger = (flags >> 2) & 0x3;
+                if bus != 0 || flags & !0xF != 0 || polarity == 2 || trigger == 2 {
+                    return Err(AcpiError::BadValue);
+                }
                 MadtEntry::IntSourceOverride {
                     bus,
                     source,
@@ -174,13 +197,17 @@ pub fn iter_madt_entries<F: FnMut(MadtEntry)>(madt: &MadtHeader, mut f: F) -> us
                     flags,
                 }
             },
-            _ => MadtEntry::Other { kind, len },
+            0..=2 => return Err(AcpiError::BadLength),
+            _ => MadtEntry::Other {
+                kind,
+                len: len as u8,
+            },
         };
         f(entry);
         n += 1;
-        offset += len as usize;
+        offset = end;
     }
-    n
+    Ok(n)
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +228,9 @@ pub fn find_table(sdt_addr: u64, wanted: &[u8; 4]) -> Result<u64, AcpiError> {
         _ => return Err(AcpiError::BadSignature),
     };
     let header_size = core::mem::size_of::<SdtHeader>();
+    if (length as usize - header_size) % entry_size != 0 {
+        return Err(AcpiError::BadLength);
+    }
     let entries_base = sdt_addr + header_size as u64;
     let entry_count = (length as usize - header_size) / entry_size;
     for i in 0..entry_count {
@@ -325,6 +355,7 @@ pub enum AcpiError {
     BadSignature,
     BadChecksum,
     BadLength,
+    BadValue,
 }
 
 fn checksum8(bytes: &[u8]) -> u8 {
@@ -343,7 +374,17 @@ fn checksum8(bytes: &[u8]) -> u8 {
 /// an XSDT (64-bit entries) and walk accordingly.
 pub fn find_madt(sdt_addr: u64) -> Result<&'static MadtHeader, AcpiError> {
     let table = find_table(sdt_addr, MADT_SIGNATURE)?;
-    Ok(unsafe { &*(table as *const MadtHeader) })
+    let header = validate_sdt(table)?;
+    let length = unsafe { read_unaligned(&raw const header.length) } as usize;
+    if length < core::mem::size_of::<MadtHeader>() {
+        return Err(AcpiError::BadLength);
+    }
+    let madt = unsafe { &*(table as *const MadtHeader) };
+    let flags = unsafe { read_unaligned(&raw const madt.flags) };
+    if flags & !1 != 0 {
+        return Err(AcpiError::BadValue);
+    }
+    Ok(madt)
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +403,7 @@ pub mod spec {
         sdt_signature_is_rsdt_or_xsdt();
         rsdt_walks_to_madt();
         madt_lists_at_least_one_lapic();
+        ioapic_catalog_matches_madt();
         arch::log("ACPI tests completed\n");
     }
 
@@ -415,9 +457,29 @@ pub mod spec {
             MadtEntry::LocalApic { .. } => n_lapic += 1,
             MadtEntry::IoApic { .. } => n_ioapic += 1,
             _ => {}
-        });
+        })
+        .expect("MADT entry framing must validate");
         assert!(n_lapic >= 1, "MADT must list ≥ 1 LocalApic entry");
         assert!(n_ioapic >= 1, "MADT must list ≥ 1 IoApic entry");
         arch::log("  ✓ MADT lists ≥1 LocalApic + ≥1 IoApic\n");
+    }
+
+    #[inline(never)]
+    fn ioapic_catalog_matches_madt() {
+        let madt = find_madt(rsdp_addr()).unwrap();
+        let mut expected = 0;
+        iter_madt_entries(madt, |entry| {
+            if matches!(entry, MadtEntry::IoApic { .. }) {
+                expected += 1;
+            }
+        })
+        .unwrap();
+        assert_eq!(crate::arch::x86_64::ioapic::controller_count(), expected);
+        assert!(crate::arch::x86_64::ioapic::validate_route(0, 0).is_ok());
+        assert_eq!(
+            crate::arch::x86_64::ioapic::validate_route(0, u32::MAX),
+            Err(crate::arch::x86_64::ioapic::IoApicError::PinOutOfRange)
+        );
+        arch::log("  ✓ IOAPIC catalog exactly matches MADT order\n");
     }
 }

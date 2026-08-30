@@ -153,6 +153,7 @@ pub const PTE_NX: u64 = 1 << 63;
 pub const KERNEL_MMIO_VBASE: u64 = 0xFFFF_FFFF_F800_0000;
 pub const KERNEL_LAPIC_VBASE: u64 = KERNEL_MMIO_VBASE; // first MMIO slot
 pub const KERNEL_IOMMU_VBASE: u64 = KERNEL_MMIO_VBASE + 0x1000; // second slot (VT-d regs)
+pub const KERNEL_IOAPIC_VBASE: u64 = KERNEL_MMIO_VBASE + 0x2000;
 
 /// Map a single 4 KiB MMIO page (strong-uncacheable) into the kernel
 /// half at `vaddr`, backing it with `paddr`. For device register files

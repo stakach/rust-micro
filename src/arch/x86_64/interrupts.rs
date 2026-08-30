@@ -255,26 +255,6 @@ irq_entry!(irq13_entry, 13);
 irq_entry!(irq14_entry, 14);
 irq_entry!(irq15_entry, 15);
 
-/// Bounded diagnostic for the one case the kernel still cannot mask.
-static IRQ_NOPIN_TRACE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-fn log_u64(mut v: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    if v == 0 {
-        crate::arch::log("0");
-        return;
-    }
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
-        crate::arch::log(s);
-    }
-}
-
 struct IrqBklGuard;
 impl Drop for IrqBklGuard {
     fn drop(&mut self) {
@@ -303,6 +283,11 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
     unsafe {
         let s = crate::kernel::KERNEL.get();
         let s_ptr: *mut crate::kernel::KernelState = s;
+        let source = (*s_ptr)
+            .irqs
+            .get(irq as u16)
+            .map(|entry| entry.source)
+            .unwrap_or_default();
         // Aliasing dance: `handle_interrupt` borrows three sibling
         // fields of `*s` mutably. Splitting via raw pointers keeps
         // the BKL the only enforcer of exclusivity.
@@ -326,16 +311,8 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
         // minutes at a time — the executive could not run, so no fix in userspace could have
         // helped. Masking unconditionally makes the storm unreachable by construction: one
         // delivery per Ack, always.
-        if (*s_ptr).irqs.get(irq as u16).is_some() {
-            let cpu_vector = (irq as u32) + super::pic::PIC1_VECTOR_BASE as u32;
-            let touched = super::ioapic::set_mask_for_vector(cpu_vector, true);
-            if touched == 0
-                && IRQ_NOPIN_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8
-            {
-                crate::arch::log("[irq-mask] irq=");
-                log_u64(irq);
-                crate::arch::log(" no redirection entry delivers this vector\n");
-            }
+        if let crate::interrupt::IrqSource::IoApic { controller, pin } = source {
+            let _ = super::ioapic::set_route_mask(controller as usize, pin as u32, true);
         }
     }
     super::pic::eoi(irq as u8);

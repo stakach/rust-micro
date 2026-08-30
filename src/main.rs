@@ -217,6 +217,13 @@ fn bsp_main_big_stack() -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         crate::arch::x86_64::paging::install_kernel_page_tables();
+        unsafe {
+            crate::arch::x86_64::ioapic::initialize(
+                crate::bootboot::acpi_table_address(),
+                crate::arch::get_cpu_id(),
+            )
+            .expect("firmware IOAPIC topology must validate");
+        }
         crate::arch::x86_64::lapic::init_lapic();
     }
 

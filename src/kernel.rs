@@ -772,7 +772,7 @@ impl KernelState {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 44 — per-object cap refcounts.
+// Phase 44 — per-object and per-IRQ-handler cap refcounts.
 //
 // `same_obj_lives` used to answer "does any other cap reference this
 // pool object?" by sweeping EVERY slot of EVERY CNode pool page on
@@ -791,12 +791,13 @@ impl KernelState {
 // ---------------------------------------------------------------------------
 
 struct ObjRefCounts {
-    endpoints: [u16; MAX_ENDPOINTS],
-    ntfns: [u16; MAX_NTFNS],
-    scs: [u16; MAX_SCHED_CONTEXTS],
-    replies: [u16; MAX_REPLIES],
-    cnodes: [u16; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES],
-    tcbs: [u16; crate::tcb::MAX_TCBS],
+    endpoints: [u32; MAX_ENDPOINTS],
+    ntfns: [u32; MAX_NTFNS],
+    scs: [u32; MAX_SCHED_CONTEXTS],
+    replies: [u32; MAX_REPLIES],
+    cnodes: [u32; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES],
+    tcbs: [u32; crate::tcb::MAX_TCBS],
+    irq_handlers: [u32; crate::interrupt::MAX_IRQ],
 }
 
 static mut OBJ_REFCOUNTS: ObjRefCounts = ObjRefCounts {
@@ -806,11 +807,12 @@ static mut OBJ_REFCOUNTS: ObjRefCounts = ObjRefCounts {
     replies: [0; MAX_REPLIES],
     cnodes: [0; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES],
     tcbs: [0; crate::tcb::MAX_TCBS],
+    irq_handlers: [0; crate::interrupt::MAX_IRQ],
 };
 
-/// Map a cap to the refcount cell of the pool object it references.
-/// Non-pooled caps (Frame, Untyped, IRQ, ...) have no cell.
-fn refcount_cell(cap: &Cap) -> Option<*mut u16> {
+/// Map a cap to the refcount cell of the object or exclusive IRQ vector it references.
+/// Other non-pooled caps (Frame, Untyped, ...) have no cell.
+fn refcount_cell(cap: &Cap) -> Option<*mut u32> {
     let rc = core::ptr::addr_of_mut!(OBJ_REFCOUNTS);
     unsafe {
         Some(match cap {
@@ -819,54 +821,58 @@ fn refcount_cell(cap: &Cap) -> Option<*mut u16> {
                 if i >= MAX_ENDPOINTS {
                     return None;
                 }
-                &mut (*rc).endpoints[i] as *mut u16
+                &mut (*rc).endpoints[i] as *mut u32
             }
             Cap::Notification { ptr, .. } => {
                 let i = KernelState::ntfn_index(*ptr);
                 if i >= MAX_NTFNS {
                     return None;
                 }
-                &mut (*rc).ntfns[i] as *mut u16
+                &mut (*rc).ntfns[i] as *mut u32
             }
             Cap::SchedContext { ptr, .. } => {
                 let i = KernelState::sched_context_index(*ptr);
                 if i >= MAX_SCHED_CONTEXTS {
                     return None;
                 }
-                &mut (*rc).scs[i] as *mut u16
+                &mut (*rc).scs[i] as *mut u32
             }
             Cap::Reply { ptr, .. } => {
                 let i = KernelState::reply_index(*ptr);
                 if i >= MAX_REPLIES {
                     return None;
                 }
-                &mut (*rc).replies[i] as *mut u16
+                &mut (*rc).replies[i] as *mut u32
             }
             Cap::CNode { ptr, .. } => {
                 let i = KernelState::cnode_index(*ptr);
                 if i >= KernelState::cnode_pool_count() {
                     return None;
                 }
-                &mut (*rc).cnodes[i] as *mut u16
+                &mut (*rc).cnodes[i] as *mut u32
             }
             Cap::Thread { tcb } => {
                 let i = tcb.addr() as usize;
                 if i >= crate::tcb::MAX_TCBS {
                     return None;
                 }
-                &mut (*rc).tcbs[i] as *mut u16
+                &mut (*rc).tcbs[i] as *mut u32
+            }
+            Cap::IrqHandler { irq } => {
+                let i = *irq as usize;
+                if i >= crate::interrupt::MAX_IRQ {
+                    return None;
+                }
+                &mut (*rc).irq_handlers[i] as *mut u32
             }
             _ => return None,
         })
     }
 }
 
-/// Live references to the pool object behind `cap` (0 for
-/// non-pooled caps).
+/// Live references to the tracked object or IRQ vector behind `cap` (0 for untracked caps).
 pub fn cap_refcount(cap: &Cap) -> u32 {
-    refcount_cell(cap)
-        .map(|p| unsafe { *p } as u32)
-        .unwrap_or(0)
+    refcount_cell(cap).map(|p| unsafe { *p }).unwrap_or(0)
 }
 
 /// Called by `Cte::set_cap` for slots inside the kernel CNode pools.
@@ -876,7 +882,7 @@ pub(crate) fn note_cap_write(old: &Cap, new: &Cap) {
             *p = (*p).saturating_sub(1);
         }
         if let Some(p) = refcount_cell(new) {
-            *p = (*p).saturating_add(1);
+            *p = (*p).checked_add(1).expect("cap refcount overflow");
         }
     }
 }
@@ -914,13 +920,14 @@ pub fn recount_refcounts() {
         (*rc).replies = [0; MAX_REPLIES];
         (*rc).cnodes = [0; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES];
         (*rc).tcbs = [0; crate::tcb::MAX_TCBS];
+        (*rc).irq_handlers = [0; crate::interrupt::MAX_IRQ];
         let s = KERNEL.get();
         for vi in 0..KernelState::cnode_pool_count() {
             let n = s.cnode_slots_at(vi).map(|sl| sl.len()).unwrap_or(0);
             for si in 0..n {
                 let cap = s.cnode_slot(vi, si).map(|c| c.cap()).unwrap_or(Cap::Null);
                 if let Some(p) = refcount_cell(&cap) {
-                    *p = (*p).saturating_add(1);
+                    *p = (*p).checked_add(1).expect("cap refcount overflow");
                 }
             }
         }

@@ -2557,6 +2557,11 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
     match label {
         InvocationLabel::IRQIssueIRQHandler => {
             // a2 = IRQ number, a3 = dest slot index
+            if args.a2 >= crate::interrupt::MAX_IRQ as u64 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_RangeError,
+                )));
+            }
             let irq = args.a2 as u16;
             let dest_index = args.a3 as usize;
             unsafe {
@@ -2571,7 +2576,7 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
                     }
                 };
                 let cnode_idx = KernelState::cnode_index(cnode_ptr);
-                let slots = match s.cnode_slots_at_mut(cnode_idx) {
+                let slots = match s.cnode_slots_at(cnode_idx) {
                     Some(s) => s,
                     None => {
                         return Err(KException::SyscallError(SyscallError::new(
@@ -2589,36 +2594,32 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
                         seL4_Error::seL4_DeleteFirst,
                     )));
                 }
-                slots[dest_index].set_cap(&Cap::IrqHandler { irq });
+                if crate::kernel::cap_refcount(&Cap::IrqHandler { irq }) != 0 {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_RevokeFirst,
+                    )));
+                }
+                crate::interrupt::reserve_source(
+                    &mut s.irqs,
+                    irq,
+                    crate::interrupt::IrqSource::Generic,
+                )
+                .map_err(|_| {
+                    KException::SyscallError(SyscallError::new(seL4_Error::seL4_RevokeFirst))
+                })?;
+                s.cnode_slot_mut(cnode_idx, dest_index)
+                    .expect("validated IRQ destination slot")
+                    .set_cap(&Cap::IrqHandler { irq });
             }
             Ok(())
         }
-        // Phase 42 — sel4test on x86 only uses the platform-specific
-        // IRQControl variants (the generic IRQIssueIRQHandler is for
-        // ARM/RISC-V). GetIOAPIC takes 7 message words plus the dest
-        // root cap as extraCap[0]:
-        //   msg_regs[0] = index (cptr to dest slot)
-        //   msg_regs[1] = depth (bits to resolve under root)
-        //   msg_regs[2] = ioapic id (ignored for now)
-        //   msg_regs[3] = pin       (ignored — we don't program IOAPIC
-        //                            redirection from this path yet;
-        //                            the kernel's existing PIT/PIC
-        //                            wiring delivers IRQs at fixed
-        //                            vectors)
-        //   msg_regs[4] = level     (ignored)
-        //   msg_regs[5] = polarity  (ignored)
-        //   msg_regs[6] = vector    — the IRQ number sel4test will
-        //                            ack/wait on; matches the kernel's
-        //                            internal `irq` numbering.
-        InvocationLabel::X86IRQIssueIRQHandlerIOAPIC => {
-            issue_x86_irq_handler(args, invoker, /* msi */ false)
-        }
+        InvocationLabel::X86IRQIssueIRQHandlerIOAPIC => issue_x86_ioapic_irq_handler(args, invoker),
         InvocationLabel::X86IRQIssueIRQHandlerMSI => {
-            // MSI variant — same dest-cap wiring, ignore PCI fields.
-            // msg_regs[6] is also the vector here (MSI handler-vector
-            // semantics differ from IOAPIC routing but the cap is
-            // analogous).
-            issue_x86_irq_handler(args, invoker, /* msi */ true)
+            // MSI needs an interrupt-remapping/configuration implementation. Never mint a handler
+            // for hardware the kernel has not actually programmed.
+            Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_IllegalOperation,
+            )))
         }
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
@@ -2626,34 +2627,19 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
     }
 }
 
-/// Common worker for `X86IRQIssueIRQHandlerIOAPIC` /
-/// `X86IRQIssueIRQHandlerMSI`. Resolves the destination slot via
-/// `extraCaps[0]` + `(index, depth)` and stamps a fresh
-/// `Cap::IrqHandler` at that slot. For the IOAPIC variant, also
-/// programs the IOAPIC redirection-table entry so the requested
-/// pin actually delivers `vector` to the BSP (otherwise the line
-/// stays masked and the user's handler never fires).
-fn issue_x86_irq_handler(args: &SyscallArgs, invoker: TcbId, msi: bool) -> KResult<()> {
+/// Resolve an IOAPIC request against the immutable boot catalog, then program the exact
+/// controller-local pin before publishing the handler capability.
+fn issue_x86_ioapic_irq_handler(_args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
-        let inv_tcb = s.scheduler.slab.get_mut(invoker);
+        let inv_tcb = s.scheduler.slab.get(invoker);
         let dest_cptr = inv_tcb.msg_regs[0];
         let depth = inv_tcb.msg_regs[1] as u32;
-        let _ioapic_id = inv_tcb.msg_regs[2];
+        let ioapic = inv_tcb.msg_regs[2];
         let pin = inv_tcb.msg_regs[3];
         let level = inv_tcb.msg_regs[4];
         let polarity = inv_tcb.msg_regs[5];
         let vector = inv_tcb.msg_regs[6];
-        if !msi
-            && (pin >= 24
-                || vector >= crate::interrupt::MAX_IRQ as u64
-                || level > 1
-                || polarity > 1)
-        {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidArgument,
-            )));
-        }
         let dest_root = if inv_tcb.pending_extra_caps_count > 0 {
             inv_tcb.pending_extra_caps[0]
         } else {
@@ -2661,7 +2647,40 @@ fn issue_x86_irq_handler(args: &SyscallArgs, invoker: TcbId, msi: bool) -> KResu
                 seL4_Error::seL4_InvalidCapability,
             )));
         };
-        inv_tcb.pending_extra_caps_count = 0;
+        s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+
+        if vector < crate::interrupt::FIRST_IOAPIC_IRQ as u64
+            || vector > crate::interrupt::LAST_IOAPIC_IRQ as u64
+            || ioapic > usize::MAX as u64
+            || pin > u32::MAX as u64
+            || level > 1
+            || polarity > 1
+        {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_RangeError,
+            )));
+        }
+        match crate::arch::x86_64::ioapic::validate_route(ioapic as usize, pin as u32) {
+            Ok(()) => {}
+            Err(crate::arch::x86_64::ioapic::IoApicError::NoTopology) => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_IllegalOperation,
+                )))
+            }
+            Err(
+                crate::arch::x86_64::ioapic::IoApicError::ControllerOutOfRange
+                | crate::arch::x86_64::ioapic::IoApicError::PinOutOfRange,
+            ) => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_RangeError,
+                )))
+            }
+            Err(_) => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_IllegalOperation,
+                )))
+            }
+        }
 
         if !matches!(dest_root, Cap::CNode { .. }) {
             return Err(KException::SyscallError(SyscallError::new(
@@ -2675,60 +2694,46 @@ fn issue_x86_irq_handler(args: &SyscallArgs, invoker: TcbId, msi: bool) -> KResu
             )));
         }
         let cnode_idx = KernelState::cnode_index(res.slot_ptr);
-        let slot = match s.cnode_slot_mut(cnode_idx, res.slot_index) {
-            Some(s) => s,
-            None => {
-                return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_InvalidCapability,
-                )))
-            }
+        let Some(slot) = s.cnode_slot(cnode_idx, res.slot_index) else {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
         };
         if !slot.cap().is_null() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst,
             )));
         }
-        // Phase 42 — store the user-visible "vector" as the IRQ
-        // table index in the cap. seL4_IRQHandler_Ack /
-        // SetNotification will resolve the same index against
-        // KernelState.irqs, and our generic IRQ ISR (irq{N}_entry →
-        // irq_dispatch) calls handle_interrupt with this index.
-        slot.set_cap(&Cap::IrqHandler { irq: vector as u16 });
-
-        // Program the hardware so the line actually fires.
-        //
-        // Upstream seL4 maps the user-visible vector to a CPU IDT
-        // vector via `cpu_vec = irq + IRQ_INT_OFFSET`; we mirror
-        // that with `cpu_vec = vector + PIC1_VECTOR_BASE` so the
-        // IOAPIC delivers to one of our `irq{N}_entry` stubs at
-        // IDT[0x20 + N], which routes through `irq_dispatch(_, N)`.
-        // Without this translation we'd write the raw user value
-        // (e.g. 2 for the PIT-via-IOAPIC pin 2) into the redirection
-        // table and the CPU would receive vector 2 (NMI).
-        // MSI variant goes through PCI config space — TODO.
-        if !msi {
-            #[cfg(target_arch = "x86_64")]
-            {
-                let cpu_vec = (vector as u32) + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
-                crate::arch::x86_64::ioapic::program_redirection(
-                    pin as u32,
-                    cpu_vec,
-                    level as u32,
-                    polarity as u32,
-                    true,
-                );
-                // Record the pin + trigger so a level-triggered line gets masked on
-                // delivery (and unmasked on Ack). Leaves the binding state Inactive
-                // until SetNotification.
-                let _ = crate::interrupt::set_ioapic_route(
-                    &mut s.irqs,
-                    vector as u16,
-                    pin as u16,
-                    level != 0,
-                );
-            }
+        let handler = Cap::IrqHandler { irq: vector as u16 };
+        if crate::kernel::cap_refcount(&handler) != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_RevokeFirst,
+            )));
         }
-        let _ = (pin, level, polarity);
+        let route_source = crate::interrupt::IrqSource::IoApic {
+            controller: ioapic as u16,
+            pin: pin as u16,
+        };
+        crate::interrupt::can_reserve_source(&s.irqs, vector as u16, route_source).map_err(
+            |_| KException::SyscallError(SyscallError::new(seL4_Error::seL4_RevokeFirst)),
+        )?;
+        let cpu_vector = vector as u32 + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
+        crate::arch::x86_64::ioapic::program_redirection(
+            ioapic as usize,
+            pin as u32,
+            cpu_vector,
+            level as u32,
+            polarity as u32,
+            true,
+        )
+        .map_err(|_| {
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation))
+        })?;
+        crate::interrupt::reserve_source(&mut s.irqs, vector as u16, route_source)
+            .expect("validated exclusive IRQ source");
+        s.cnode_slot_mut(cnode_idx, res.slot_index)
+            .expect("validated destination slot")
+            .set_cap(&handler);
     }
     Ok(())
 }
@@ -3037,14 +3042,15 @@ fn decode_irq_handler(
                 crate::interrupt::ack_irq(&mut s.irqs, irq).map_err(|_| {
                     KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
                 })?;
-                // Unmask the IOAPIC line the kernel masked on delivery. Delivery masks EVERY
-                // IOAPIC-routed IRQ (see `irq_dispatch`), so Ack must unmask every one of them
-                // too, or the second interrupt on that line would never arrive.
                 #[cfg(target_arch = "x86_64")]
-                if s.irqs.get(irq).is_some() {
-                    let cpu_vector =
-                        (irq as u32) + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
-                    let _ = crate::arch::x86_64::ioapic::set_mask_for_vector(cpu_vector, false);
+                if let Ok(crate::interrupt::IrqSource::IoApic { controller, pin }) =
+                    crate::interrupt::source(&s.irqs, irq)
+                {
+                    let _ = crate::arch::x86_64::ioapic::set_route_mask(
+                        controller as usize,
+                        pin as u32,
+                        false,
+                    );
                 }
                 Ok(())
             }
@@ -3092,18 +3098,30 @@ fn decode_irq_handler(
                     })?;
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let cpu_vector =
-                        (irq as u32) + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
-                    let _ = crate::arch::x86_64::ioapic::set_mask_for_vector(cpu_vector, false);
+                    if let Ok(crate::interrupt::IrqSource::IoApic { controller, pin }) =
+                        crate::interrupt::source(&s.irqs, irq)
+                    {
+                        let _ = crate::arch::x86_64::ioapic::set_route_mask(
+                            controller as usize,
+                            pin as u32,
+                            false,
+                        );
+                    }
                 }
                 Ok(())
             }
             InvocationLabel::IRQClearIRQHandler => {
                 #[cfg(target_arch = "x86_64")]
                 {
-                    let cpu_vector =
-                        (irq as u32) + crate::arch::x86_64::pic::PIC1_VECTOR_BASE as u32;
-                    let _ = crate::arch::x86_64::ioapic::set_mask_for_vector(cpu_vector, true);
+                    if let Ok(crate::interrupt::IrqSource::IoApic { controller, pin }) =
+                        crate::interrupt::source(&s.irqs, irq)
+                    {
+                        let _ = crate::arch::x86_64::ioapic::set_route_mask(
+                            controller as usize,
+                            pin as u32,
+                            true,
+                        );
+                    }
                 }
                 crate::interrupt::clear_handler(&mut s.irqs, irq).map_err(|_| {
                     KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
@@ -4489,7 +4507,7 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     s.scheduler.slab.entries[id.0 as usize] = None;
 }
 
-/// Phase 44 — release the pool object behind `cap` if the last
+/// Phase 44 — release the tracked object or IRQ vector behind `cap` if the last
 /// reference to it is gone (refcount already reflects the cleared
 /// slot — clear BEFORE calling). CNode pages release their contents
 /// recursively, preserving the per-inner-cap Untyped reclaim the old
@@ -4545,6 +4563,20 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap, depth
                     }
                 }
                 s.free_reply(idx);
+            }
+        }
+        Cap::IrqHandler { irq } => {
+            if cap_refcount(cap) == 0 {
+                let source = crate::interrupt::source(&s.irqs, *irq).unwrap_or_default();
+                #[cfg(target_arch = "x86_64")]
+                if let crate::interrupt::IrqSource::IoApic { controller, pin } = source {
+                    let _ = crate::arch::x86_64::ioapic::set_route_mask(
+                        controller as usize,
+                        pin as u32,
+                        true,
+                    );
+                }
+                let _ = crate::interrupt::release_handler(&mut s.irqs, *irq);
             }
         }
         Cap::IoPageTable {
@@ -7387,8 +7419,20 @@ pub mod spec {
                 other => panic!("expected IrqHandler{{7}}, got {:?}", other),
             }
         }
+        let duplicate = SyscallArgs {
+            a1: (InvocationLabel::IRQIssueIRQHandler as u64) << 12,
+            a2: 7,
+            a3: 3,
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_invocation(Cap::IrqControl, &duplicate, invoker),
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_RevokeFirst
+            }))
+        ));
         teardown_invoker(invoker);
-        arch::log("  ✓ IRQControl::IssueIRQHandler issues a handler cap\n");
+        arch::log("  ✓ IRQControl issues one exclusive handler per vector\n");
     }
 
     #[inline(never)]
