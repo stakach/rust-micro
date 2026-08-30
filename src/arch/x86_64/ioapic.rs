@@ -217,6 +217,11 @@ pub fn controller_count() -> usize {
     IOAPIC_COUNT.load(Ordering::Acquire)
 }
 
+pub fn controller_route_extent(ordinal: usize) -> Result<(u32, u16), IoApicError> {
+    let controller = published_controller(ordinal)?;
+    Ok((controller.gsi_base, controller.redirection_entries))
+}
+
 pub fn validate_route(ordinal: usize, pin: u32) -> Result<(), IoApicError> {
     let controller = published_controller(ordinal)?;
     if pin >= controller.redirection_entries as u32 {

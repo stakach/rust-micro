@@ -507,6 +507,8 @@ pub const BOOT_PERSISTENT_CLOCK_PC_CMOS: u16 = 1;
 pub const BOOT_ACPI_ROOT_VALID: u16 = 1 << 0;
 pub const BOOT_ACPI_ROOT_RSDT: u16 = 1;
 pub const BOOT_ACPI_ROOT_XSDT: u16 = 2;
+pub const MAX_BOOT_IOAPICS: usize = 16;
+pub const BOOTINFO_HEADER_IOAPIC_TOPOLOGY: u64 = u64::from_le_bytes(*b"NTIOAPIC");
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BootWallClock {
@@ -532,6 +534,21 @@ pub struct BootAcpiRootTable {
     pub paddr: u64,
     pub length: u32,
     pub kind: BootAcpiRootKind,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BootIoApic {
+    pub gsi_base: u32,
+    pub redirection_entries: u16,
+    pub reserved: u16,
+}
+
+#[repr(C)]
+struct BootIoApicTopology {
+    count: u16,
+    reserved: [u8; 6],
+    controllers: [BootIoApic; MAX_BOOT_IOAPICS],
 }
 
 #[repr(C)]
@@ -632,6 +649,68 @@ impl BootInfo {
 
     pub fn tsc_frequency_hz(&self) -> Option<u64> {
         (self.tsc_frequency_hz != 0).then_some(self.tsc_frequency_hz)
+    }
+
+    pub fn ioapic_topology(&self) -> Option<&[BootIoApic]> {
+        let topology = self
+            .extra_bootinfo_chunk(BOOTINFO_HEADER_IOAPIC_TOPOLOGY)
+            .and_then(|payload| {
+                if payload.len() != core::mem::size_of::<BootIoApicTopology>() {
+                    return None;
+                }
+                Some(unsafe { &*(payload.as_ptr() as *const BootIoApicTopology) })
+            })?;
+        if topology.reserved != [0; 6]
+            || topology.count == 0
+            || topology.count as usize > MAX_BOOT_IOAPICS
+        {
+            return None;
+        }
+        let controllers = &topology.controllers[..topology.count as usize];
+        for (left_index, left) in controllers.iter().enumerate() {
+            if left.reserved != 0 || left.redirection_entries == 0 {
+                return None;
+            }
+            let left_end = left
+                .gsi_base
+                .checked_add(left.redirection_entries as u32)?;
+            for right in &controllers[left_index + 1..] {
+                let right_end = right
+                    .gsi_base
+                    .checked_add(right.redirection_entries as u32)?;
+                if left.gsi_base < right_end && right.gsi_base < left_end {
+                    return None;
+                }
+            }
+        }
+        Some(controllers)
+    }
+
+    fn extra_bootinfo_chunk(&self, wanted: u64) -> Option<&[u8]> {
+        const HEADER_LEN: usize = 16;
+        let total = usize::try_from(self.extra_len).ok()?;
+        if total == 0 || total > 4096 {
+            return None;
+        }
+        let base = (self as *const Self as usize).checked_add(4096)? as *const u8;
+        let bytes = unsafe { core::slice::from_raw_parts(base, total) };
+        let mut offset = 0usize;
+        while offset < total {
+            let header_end = offset.checked_add(HEADER_LEN).filter(|end| *end <= total)?;
+            let id = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?);
+            let length = usize::try_from(u64::from_le_bytes(
+                bytes[offset + 8..header_end].try_into().ok()?,
+            ))
+            .ok()?;
+            let end = offset
+                .checked_add(length)
+                .filter(|end| length >= HEADER_LEN && *end <= total)?;
+            if id == wanted {
+                return Some(&bytes[header_end..end]);
+            }
+            offset = end;
+        }
+        None
     }
 }
 

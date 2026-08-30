@@ -281,6 +281,25 @@ pub struct seL4_IPCBuffer {
     pub receiveDepth: seL4_Word,
 }
 
+pub const CONFIG_MAX_NUM_BOOTINFO_IOAPICS: usize = 16;
+pub const SEL4_BOOTINFO_HEADER_NT_IOAPIC: u64 = u64::from_le_bytes(*b"NTIOAPIC");
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct seL4_BootIoApicDesc {
+    pub gsiBase: u32,
+    pub redirectionEntries: u16,
+    pub reserved: u16,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct seL4_BootIoApicTopology {
+    pub count: u16,
+    pub reserved: [u8; 6],
+    pub controllers: [seL4_BootIoApicDesc; CONFIG_MAX_NUM_BOOTINFO_IOAPICS],
+}
+
 /// The boot-info frame the kernel hands to the initial thread. The
 /// type is laid out exactly like the C `seL4_BootInfo` under
 /// `CONFIG_KERNEL_MCS=true` — Phase 32a flipped MCS on, and Phase

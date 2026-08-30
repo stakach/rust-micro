@@ -1146,23 +1146,55 @@ pub unsafe fn launch_rootserver() -> ! {
     }
     let user_image_end: Word = user_image_start + n_image_pages as Word;
 
-    // Phase 42 — populate the extended BootInfo page with the TSC-frequency chunk sel4test's
-    // `x86_get_tsc_freq_from_simple` looks up. Calibration happens immediately before initial-task
-    // dispatch, so stage zero here and replace it with the measured MHz value below.
+    // Publish the kernel-validated IOAPIC route extents as a private typed chunk before the
+    // standard TSC-frequency chunk. The controller records are firmware ordered and contain no
+    // MMIO authority. Keeping the 20-byte TSC chunk last preserves its standard declared length
+    // while every preceding header remains naturally aligned.
     const SEL4_BI_HEADER_SIZE: usize = 16; // u64 id + u64 len
     const TSC_FREQ_HEADER_ID: u64 = 5; // SEL4_BOOTINFO_HEADER_X86_TSC_FREQ
     let extra_bi_kvaddr = phys_to_kernel_virt(img.extra_bi_paddr);
     let extra_bi_ptr = extra_bi_kvaddr as *mut u8;
-    // Header.id
-    core::ptr::write_volatile(extra_bi_ptr as *mut u64, TSC_FREQ_HEADER_ID);
-    // Header.len (header + payload)
+    let ioapic_count = crate::arch::x86_64::ioapic::controller_count();
+    assert!(ioapic_count <= crate::types::CONFIG_MAX_NUM_BOOTINFO_IOAPICS);
+    let mut ioapic_topology = crate::types::seL4_BootIoApicTopology {
+        count: ioapic_count as u16,
+        reserved: [0; 6],
+        controllers: [crate::types::seL4_BootIoApicDesc::default();
+            crate::types::CONFIG_MAX_NUM_BOOTINFO_IOAPICS],
+    };
+    for (ordinal, description) in ioapic_topology.controllers[..ioapic_count]
+        .iter_mut()
+        .enumerate()
+    {
+        let (gsi_base, redirection_entries) =
+            crate::arch::x86_64::ioapic::controller_route_extent(ordinal)
+                .expect("published IOAPIC catalog entry must remain valid");
+        *description = crate::types::seL4_BootIoApicDesc {
+            gsiBase: gsi_base,
+            redirectionEntries: redirection_entries,
+            reserved: 0,
+        };
+    }
+    let topology_chunk_len =
+        SEL4_BI_HEADER_SIZE + core::mem::size_of::<crate::types::seL4_BootIoApicTopology>();
     core::ptr::write_volatile(
-        (extra_bi_ptr as *mut u64).add(1),
+        extra_bi_ptr as *mut u64,
+        crate::types::SEL4_BOOTINFO_HEADER_NT_IOAPIC,
+    );
+    core::ptr::write_volatile((extra_bi_ptr as *mut u64).add(1), topology_chunk_len as u64);
+    core::ptr::write(
+        extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut crate::types::seL4_BootIoApicTopology,
+        ioapic_topology,
+    );
+    let tsc_chunk = extra_bi_ptr.add(topology_chunk_len);
+    core::ptr::write_volatile(tsc_chunk as *mut u64, TSC_FREQ_HEADER_ID);
+    core::ptr::write_volatile(
+        (tsc_chunk as *mut u64).add(1),
         (SEL4_BI_HEADER_SIZE + 4) as u64,
     );
-    // Payload: TSC freq in MHz (u32).
-    core::ptr::write_volatile(extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut u32, 0);
-    let extra_bi_total_len: Word = (SEL4_BI_HEADER_SIZE + 4) as Word;
+    let tsc_frequency_payload = tsc_chunk.add(SEL4_BI_HEADER_SIZE) as *mut u32;
+    core::ptr::write_volatile(tsc_frequency_payload, 0);
+    let extra_bi_total_len: Word = (topology_chunk_len + SEL4_BI_HEADER_SIZE + 4) as Word;
 
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)
@@ -1236,10 +1268,7 @@ pub unsafe fn launch_rootserver() -> ! {
         .checked_div(1_000_000)
         .and_then(|frequency| u32::try_from(frequency).ok())
         .expect("calibrated TSC frequency must fit the seL4 MHz boot-info payload");
-    core::ptr::write_volatile(
-        extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut u32,
-        tsc_frequency_mhz,
-    );
+    core::ptr::write_volatile(tsc_frequency_payload, tsc_frequency_mhz);
     crate::arch::x86_64::lapic::enable_periodic_kernel_timer();
     crate::arch::x86_64::pit::install_irq_handler();
 
