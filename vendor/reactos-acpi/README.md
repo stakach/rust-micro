@@ -1,8 +1,9 @@
 # ReactOS ACPI provider overlay
 
 The stock x64 livecd used by this project does not implement the standard
-`IOCTL_ACPI_ENUM_CHILDREN` contract and aliases distinct ACPI namespace objects when they share a
-HID without `_UID`. The patch in this directory is applied to the exact livecd source commit:
+`IOCTL_ACPI_ENUM_CHILDREN` and `IOCTL_ACPI_EVAL_METHOD_EX` contracts and aliases distinct ACPI
+namespace objects when they share a HID without `_UID`. The patch in this directory is applied to
+the exact livecd source commit:
 
 ```
 4117217b61b97f022e441b11639ca6f2106aaa07

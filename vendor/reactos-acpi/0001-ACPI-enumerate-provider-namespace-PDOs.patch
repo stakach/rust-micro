@@ -1,17 +1,18 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From f120652efb8f26838b1649a485e136d39f9f6014 Mon Sep 17 00:00:00 2001
 From: Stephen von Takach <steve@place.technology>
 Date: Mon, 31 Aug 2026 07:53:55 +1000
-Subject: [PATCH] ACPI: enumerate provider namespace PDOs
+Subject: [PATCH] ACPI: enumerate and evaluate provider namespace
 
 ---
  drivers/bus/acpi/CMakeLists.txt    |   1 +
  drivers/bus/acpi/acpienum.c        |  92 ++++++---
  drivers/bus/acpi/buspdo.c          |  22 +-
- drivers/bus/acpi/include/acpisys.h |  17 ++
- drivers/bus/acpi/main.c            |   8 +
+ drivers/bus/acpi/eval.c            | 230 ++++++++++++++++++++-
+ drivers/bus/acpi/include/acpisys.h |  31 +++
+ drivers/bus/acpi/main.c            |  24 +++
  drivers/bus/acpi/namespace.c       | 317 +++++++++++++++++++++++++++++
  drivers/bus/acpi/pnp.c             |   6 +-
- 7 files changed, 423 insertions(+), 40 deletions(-)
+ 8 files changed, 673 insertions(+), 50 deletions(-)
  create mode 100644 drivers/bus/acpi/namespace.c
 
 diff --git a/drivers/bus/acpi/CMakeLists.txt b/drivers/bus/acpi/CMakeLists.txt
@@ -203,11 +204,299 @@ index 6beda9be..0adffa7c 100644
             length = _swprintf(temp, L"%ls", L"0");
          }
  
+diff --git a/drivers/bus/acpi/eval.c b/drivers/bus/acpi/eval.c
+index 2b758a7e..ae4d9d6b 100644
+--- a/drivers/bus/acpi/eval.c
++++ b/drivers/bus/acpi/eval.c
+@@ -446,6 +446,20 @@ EvalCreateParametersList(
+             break;
+         }
+ 
++        case ACPI_EVAL_INPUT_BUFFER_SIGNATURE_EX:
++        {
++            PACPI_EVAL_INPUT_BUFFER_EX ExtendedBuffer;
++
++            if (!AcpiVerifyInBuffer(IoStack, sizeof(*ExtendedBuffer)))
++            {
++                DPRINT1("Buffer too small\n");
++                return STATUS_INFO_LENGTH_MISMATCH;
++            }
++
++            ParamList->Count = 0;
++            break;
++        }
++
+         case ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_SIGNATURE:
+         {
+             PACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER SimpleInt;
+@@ -470,6 +484,28 @@ EvalCreateParametersList(
+             break;
+         }
+ 
++        case ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_SIGNATURE_EX:
++        {
++            PACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX SimpleInt;
++
++            if (!AcpiVerifyInBuffer(IoStack, sizeof(*SimpleInt)))
++            {
++                DPRINT1("Buffer too small\n");
++                return STATUS_INFO_LENGTH_MISMATCH;
++            }
++
++            Arg = ExAllocatePoolUninitialized(NonPagedPool, sizeof(*Arg), TAG_ACPI_PARAMETERS_LIST);
++            if (!Arg)
++                return STATUS_INSUFFICIENT_RESOURCES;
++
++            ParamList->Count = 1;
++            ParamList->Pointer = Arg;
++            SimpleInt = Irp->AssociatedIrp.SystemBuffer;
++            Arg->Type = ACPI_TYPE_INTEGER;
++            Arg->Integer.Value = SimpleInt->IntegerArgument;
++            break;
++        }
++
+         case ACPI_EVAL_INPUT_BUFFER_SIMPLE_STRING_SIGNATURE:
+         {
+             PACPI_EVAL_INPUT_BUFFER_SIMPLE_STRING SimpleStr;
+@@ -495,6 +531,40 @@ EvalCreateParametersList(
+             break;
+         }
+ 
++        case ACPI_EVAL_INPUT_BUFFER_SIMPLE_STRING_SIGNATURE_EX:
++        {
++            PACPI_EVAL_INPUT_BUFFER_SIMPLE_STRING_EX SimpleStr;
++            ULONG RequiredLength;
++
++            if (!AcpiVerifyInBuffer(IoStack, sizeof(*SimpleStr)))
++            {
++                DPRINT1("Buffer too small\n");
++                return STATUS_INFO_LENGTH_MISMATCH;
++            }
++            SimpleStr = Irp->AssociatedIrp.SystemBuffer;
++            if (SimpleStr->StringLength == 0 ||
++                !NT_SUCCESS(RtlULongAdd(FIELD_OFFSET(ACPI_EVAL_INPUT_BUFFER_SIMPLE_STRING_EX,
++                                                    String),
++                                       SimpleStr->StringLength,
++                                       &RequiredLength)) ||
++                !AcpiVerifyInBuffer(IoStack, RequiredLength) ||
++                SimpleStr->String[SimpleStr->StringLength - 1] != ANSI_NULL)
++            {
++                return STATUS_INFO_LENGTH_MISMATCH;
++            }
++
++            Arg = ExAllocatePoolUninitialized(NonPagedPool, sizeof(*Arg), TAG_ACPI_PARAMETERS_LIST);
++            if (!Arg)
++                return STATUS_INSUFFICIENT_RESOURCES;
++
++            ParamList->Count = 1;
++            ParamList->Pointer = Arg;
++            Arg->Type = ACPI_TYPE_STRING;
++            Arg->String.Pointer = (PCHAR)SimpleStr->String;
++            Arg->String.Length = SimpleStr->StringLength - sizeof(UCHAR);
++            break;
++        }
++
+         case ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE:
+         {
+             PACPI_EVAL_INPUT_BUFFER_COMPLEX ComplexBuffer;
+@@ -562,6 +632,78 @@ EvalCreateParametersList(
+             break;
+         }
+ 
++        case ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE_EX:
++        {
++            PACPI_EVAL_INPUT_BUFFER_COMPLEX_EX ComplexBuffer;
++            PACPI_METHOD_ARGUMENT Argument;
++            ULONG i, Length, Offset, ArgumentsSize;
++            NTSTATUS Status;
++
++            if (!AcpiVerifyInBuffer(IoStack, sizeof(*ComplexBuffer)))
++            {
++                DPRINT1("Buffer too small\n");
++                return STATUS_INFO_LENGTH_MISMATCH;
++            }
++
++            ComplexBuffer = Irp->AssociatedIrp.SystemBuffer;
++            if (ComplexBuffer->Size !=
++                IoStack->Parameters.DeviceIoControl.InputBufferLength)
++            {
++                return STATUS_INFO_LENGTH_MISMATCH;
++            }
++            ParamList->Count = ComplexBuffer->ArgumentCount;
++            if (ParamList->Count == 0)
++            {
++                DPRINT1("No arguments\n");
++                return STATUS_ACPI_INCORRECT_ARGUMENT_COUNT;
++            }
++
++            Status = RtlULongMult(ParamList->Count, sizeof(*Arg), &ArgumentsSize);
++            if (!NT_SUCCESS(Status))
++                return STATUS_ACPI_INCORRECT_ARGUMENT_COUNT;
++
++            Arg = ExAllocatePoolUninitialized(NonPagedPool,
++                                              ArgumentsSize,
++                                              TAG_ACPI_PARAMETERS_LIST);
++            if (!Arg)
++                return STATUS_INSUFFICIENT_RESOURCES;
++            ParamList->Pointer = Arg;
++            Argument = ComplexBuffer->Argument;
++            Length = FIELD_OFFSET(ACPI_EVAL_INPUT_BUFFER_COMPLEX_EX, Argument);
++
++            for (i = 0; i < ParamList->Count; i++)
++            {
++                ULONG ArgumentLength;
++
++                Offset = Length;
++                ArgumentLength = ACPI_METHOD_ARGUMENT_LENGTH_FROM_ARGUMENT(Argument);
++                if (!NT_SUCCESS(RtlULongAdd(Length, ArgumentLength, &Length)))
++                {
++                    ExFreePoolWithTag(ParamList->Pointer, TAG_ACPI_PARAMETERS_LIST);
++                    return STATUS_ACPI_INVALID_ARGTYPE;
++                }
++                if (!AcpiVerifyInBuffer(IoStack, Length))
++                {
++                    ExFreePoolWithTag(ParamList->Pointer, TAG_ACPI_PARAMETERS_LIST);
++                    return STATUS_ACPI_INVALID_ARGTYPE;
++                }
++                Status = EvalConvertParameterObjects(Arg, 0, Argument, IoStack, Offset);
++                if (!NT_SUCCESS(Status))
++                {
++                    ExFreePoolWithTag(ParamList->Pointer, TAG_ACPI_PARAMETERS_LIST);
++                    return Status;
++                }
++                Arg++;
++                Argument = ACPI_METHOD_NEXT_ARGUMENT(Argument);
++            }
++            if (Length != ComplexBuffer->Size)
++            {
++                ExFreePoolWithTag(ParamList->Pointer, TAG_ACPI_PARAMETERS_LIST);
++                return STATUS_INFO_LENGTH_MISMATCH;
++            }
++            break;
++        }
++
+         default:
+         {
+             DPRINT1("Unsupported input buffer signature: 0x%lx\n", EvalInputBuffer->Signature);
+@@ -678,19 +820,67 @@ DefaultStatus:
+  * @brief Evaluates an ACPI namespace object.
+  */
+ static
+-ACPI_STATUS
+-EvalEvaluateObject(
+-    _In_ PPDO_DEVICE_DATA DeviceData,
++BOOLEAN
++EvalIsExtendedSignature(
++    _In_ ULONG Signature)
++{
++    return Signature == ACPI_EVAL_INPUT_BUFFER_SIGNATURE_EX ||
++           Signature == ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_SIGNATURE_EX ||
++           Signature == ACPI_EVAL_INPUT_BUFFER_SIMPLE_STRING_SIGNATURE_EX ||
++           Signature == ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE_EX;
++}
++
++static
++NTSTATUS
++EvalGetMethodName(
++    _In_ PIO_STACK_LOCATION IoStack,
+     _In_ PACPI_EVAL_INPUT_BUFFER EvalInputBuffer,
+-    _In_ ACPI_OBJECT_LIST* ParamList,
+-    _In_ ACPI_BUFFER* ReturnBuffer)
++    _Out_writes_(ACPI_OBJECT_NAME_LENGTH) PCHAR ShortMethodName,
++    _Out_ PCHAR* MethodName)
+ {
+-    CHAR MethodName[ACPI_OBJECT_NAME_LENGTH];
++    ULONG Index;
+ 
+-    RtlCopyMemory(MethodName, EvalInputBuffer->MethodName, ACPI_OBJECT_NAME_LENGTH - 1);
+-    MethodName[ACPI_OBJECT_NAME_LENGTH - 1] = ANSI_NULL;
++    if (EvalIsExtendedSignature(EvalInputBuffer->Signature))
++    {
++        PACPI_EVAL_INPUT_BUFFER_EX ExtendedBuffer;
+ 
+-    return AcpiEvaluateObject(DeviceData->AcpiHandle, MethodName, ParamList, ReturnBuffer);
++        if (!AcpiVerifyInBuffer(IoStack, sizeof(*ExtendedBuffer)))
++            return STATUS_INFO_LENGTH_MISMATCH;
++        ExtendedBuffer = (PACPI_EVAL_INPUT_BUFFER_EX)EvalInputBuffer;
++        for (Index = 0; Index < RTL_NUMBER_OF(ExtendedBuffer->MethodName); Index++)
++        {
++            if (ExtendedBuffer->MethodName[Index] == ANSI_NULL)
++            {
++                if (Index == 0)
++                    return STATUS_INVALID_PARAMETER;
++                *MethodName = ExtendedBuffer->MethodName;
++                return STATUS_SUCCESS;
++            }
++        }
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    if (!AcpiVerifyInBuffer(IoStack, sizeof(*EvalInputBuffer)))
++        return STATUS_INFO_LENGTH_MISMATCH;
++    RtlCopyMemory(ShortMethodName,
++                  EvalInputBuffer->MethodName,
++                  ACPI_OBJECT_NAME_LENGTH - 1);
++    ShortMethodName[ACPI_OBJECT_NAME_LENGTH - 1] = ANSI_NULL;
++    *MethodName = ShortMethodName;
++    return STATUS_SUCCESS;
++}
++
++static
++BOOLEAN
++EvalIoctlMatchesSignature(
++    _In_ ULONG IoControlCode,
++    _In_ ULONG Signature)
++{
++    BOOLEAN ExtendedIoctl;
++
++    ExtendedIoctl = IoControlCode == IOCTL_ACPI_EVAL_METHOD_EX ||
++                    IoControlCode == IOCTL_ACPI_ASYNC_EVAL_METHOD_EX;
++    return ExtendedIoctl == EvalIsExtendedSignature(Signature);
+ }
+ 
+ /**
+@@ -772,15 +962,35 @@ Bus_PDO_EvalMethod(
+     ACPI_STATUS AcpiStatus;
+     NTSTATUS Status;
+     ACPI_BUFFER ReturnBuffer = { ACPI_ALLOCATE_BUFFER, NULL };
++    CHAR ShortMethodName[ACPI_OBJECT_NAME_LENGTH];
++    PCHAR MethodName;
+ 
+     IoStack = IoGetCurrentIrpStackLocation(Irp);
+     EvalInputBuffer = Irp->AssociatedIrp.SystemBuffer;
+ 
++    if (!EvalInputBuffer ||
++        !AcpiVerifyInBuffer(IoStack, sizeof(EvalInputBuffer->Signature)) ||
++        !EvalIoctlMatchesSignature(IoStack->Parameters.DeviceIoControl.IoControlCode,
++                                   EvalInputBuffer->Signature))
++    {
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    Status = EvalGetMethodName(IoStack,
++                               EvalInputBuffer,
++                               ShortMethodName,
++                               &MethodName);
++    if (!NT_SUCCESS(Status))
++        return Status;
++
+     Status = EvalCreateParametersList(Irp, IoStack, EvalInputBuffer, &ParamList);
+     if (!NT_SUCCESS(Status))
+         return Status;
+ 
+-    AcpiStatus = EvalEvaluateObject(DeviceData, EvalInputBuffer, &ParamList, &ReturnBuffer);
++    AcpiStatus = AcpiEvaluateObject(DeviceData->AcpiHandle,
++                                    MethodName,
++                                    &ParamList,
++                                    &ReturnBuffer);
+ 
+     if (ParamList.Count != 0)
+         EvalFreeParametersList(&ParamList);
 diff --git a/drivers/bus/acpi/include/acpisys.h b/drivers/bus/acpi/include/acpisys.h
-index 3442e424..c9ba45a3 100644
+index 3442e424..f4923018 100644
 --- a/drivers/bus/acpi/include/acpisys.h
 +++ b/drivers/bus/acpi/include/acpisys.h
-@@ -8,6 +8,16 @@ extern UNICODE_STRING ProcessorHardwareIds;
+@@ -8,6 +8,30 @@ extern UNICODE_STRING ProcessorHardwareIds;
  extern LPWSTR ProcessorIdString;
  extern LPWSTR ProcessorNameString;
  
@@ -221,10 +510,24 @@ index 3442e424..c9ba45a3 100644
 +    CTL_CODE(FILE_DEVICE_ACPI, 8, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 +#endif
 +
++#ifndef ACPI_EVAL_INPUT_BUFFER_SIGNATURE_EX
++#define ACPI_EVAL_INPUT_BUFFER_SIGNATURE_EX                'AieA'
++#define ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_SIGNATURE_EX 'DieA'
++#define ACPI_EVAL_INPUT_BUFFER_SIMPLE_STRING_SIGNATURE_EX  'EieA'
++#define ACPI_EVAL_INPUT_BUFFER_COMPLEX_SIGNATURE_EX        'FieA'
++#endif
++
++#ifndef IOCTL_ACPI_EVAL_METHOD_EX
++#define IOCTL_ACPI_EVAL_METHOD_EX \
++    CTL_CODE(FILE_DEVICE_ACPI, 6, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
++#define IOCTL_ACPI_ASYNC_EVAL_METHOD_EX \
++    CTL_CODE(FILE_DEVICE_ACPI, 7, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
++#endif
++
  typedef enum _DEVICE_PNP_STATE {
  
      NotStarted = 0,         // Not started yet
-@@ -42,6 +52,7 @@ typedef struct _PDO_DEVICE_DATA
+@@ -42,6 +66,7 @@ typedef struct _PDO_DEVICE_DATA
      // An array of (zero terminated wide character strings).
      // The array itself also null terminated
      PWCHAR      HardwareIDs;
@@ -232,7 +535,7 @@ index 3442e424..c9ba45a3 100644
      BOOLEAN     DockDevice;
      // Link point to hold all the PDOs for a single bus together
      LIST_ENTRY  Link;
-@@ -100,6 +111,12 @@ Bus_PDO_EvalMethod(
+@@ -100,6 +125,12 @@ Bus_PDO_EvalMethod(
      _In_ PPDO_DEVICE_DATA DeviceData,
      _Inout_ PIRP Irp);
  
@@ -246,13 +549,29 @@ index 3442e424..c9ba45a3 100644
  NTAPI
  Bus_CreateClose (
 diff --git a/drivers/bus/acpi/main.c b/drivers/bus/acpi/main.c
-index c903635b..f46c30b7 100644
+index c903635b..7a155680 100644
 --- a/drivers/bus/acpi/main.c
 +++ b/drivers/bus/acpi/main.c
-@@ -255,6 +255,14 @@ ACPIDispatchDeviceControl(
+@@ -255,6 +255,30 @@ ACPIDispatchDeviceControl(
                  break;
              }
  
++            case IOCTL_ACPI_ASYNC_EVAL_METHOD_EX:
++            {
++                ASSERT(KeGetCurrentIrql() <= DISPATCH_LEVEL);
++
++                status = Bus_PDO_EvalMethod((PPDO_DEVICE_DATA)commonData, Irp);
++                break;
++            }
++
++            case IOCTL_ACPI_EVAL_METHOD_EX:
++            {
++                ASSERT(KeGetCurrentIrql() < DISPATCH_LEVEL);
++
++                status = Bus_PDO_EvalMethod((PPDO_DEVICE_DATA)commonData, Irp);
++                break;
++            }
++
 +            case IOCTL_ACPI_ENUM_CHILDREN:
 +            {
 +                ASSERT(KeGetCurrentIrql() < DISPATCH_LEVEL);
@@ -608,3 +927,6 @@ index 9c87bbb0..70b1e8dc 100644
  #endif
  
 -
+-- 
+2.50.1 (Apple Git-155)
+
