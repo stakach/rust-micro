@@ -257,6 +257,21 @@ FIXTURES=../crates/nt-driver-test-fixtures/fixtures
 if [ ! -f .tmp/reactos/.fulltree-ok ] || [ ! -d .tmp/reactos/reactos ]; then
   mmd -i "$IMAGE" ::reactos ::reactos/system32 ::reactos/system32/drivers 2>/dev/null || true
 fi
+
+# The shipped livecd acpi.sys lacks standard namespace enumeration and aliases distinct no-UID
+# PDOs. The source-pinned provider overlay is mandatory: verify it before copying, overwrite the
+# stock tree entry, then read it back and verify the bytes that will actually boot. There is no
+# stock-driver fallback.
+ACPI_PROVIDER=vendor/reactos-acpi/acpi.sys
+./scripts/verify_reactos_acpi_provider.sh "$ACPI_PROVIDER"
+mcopy -o -i "$IMAGE" "$ACPI_PROVIDER" "::reactos/system32/drivers/acpi.sys"
+ACPI_IMAGE_VERIFY=.tmp/reactos-acpi-image-verify.sys
+rm -f "$ACPI_IMAGE_VERIFY"
+mcopy -i "$IMAGE" "::reactos/system32/drivers/acpi.sys" "$ACPI_IMAGE_VERIFY"
+./scripts/verify_reactos_acpi_provider.sh "$ACPI_IMAGE_VERIFY"
+rm -f "$ACPI_IMAGE_VERIFY"
+echo "patched ReactOS ACPI provider added: ::reactos/system32/drivers/acpi.sys"
+
 for fixture_path in "$FIXTURES"/*.sys; do
   [ -f "$fixture_path" ] || continue
   fx=$(basename "$fixture_path")

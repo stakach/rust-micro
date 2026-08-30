@@ -15,10 +15,76 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT=.tmp/reactos
 mkdir -p "$OUT"
+MANIFEST=vendor/reactos-acpi/manifest.txt
+
+manifest_value() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2); found = 1 } END { if (!found) exit 1 }' "$MANIFEST"
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "error: sha256sum or shasum is required" >&2
+    exit 1
+  fi
+}
+
+verify_sha256() {
+  local path="$1"
+  local expected="$2"
+  local actual
+  actual="$(sha256_file "$path")"
+  [ "$actual" = "$expected" ] || {
+    echo "error: SHA-256 mismatch for $path" >&2
+    echo "       expected $expected" >&2
+    echo "       actual   $actual" >&2
+    exit 1
+  }
+}
+
+single_iso() {
+  local found=""
+  local candidate
+  for candidate in "$OUT"/*.iso; do
+    [ -f "$candidate" ] || continue
+    [ -z "$found" ] || {
+      echo "error: multiple ReactOS ISOs are cached under $OUT" >&2
+      exit 1
+    }
+    found="$candidate"
+  done
+  [ -n "$found" ] || {
+    echo "error: no ReactOS ISO is cached under $OUT" >&2
+    exit 1
+  }
+  verify_sha256 "$found" "$ISO_SHA256"
+  printf '%s\n' "$found"
+}
 
 # Overridable via $REACTOS_7Z_URL. Defaults to a pinned GPL ReactOS x64 livecd
 # build (0.4.17-dev-478-g4117217); the binaries live directly in reactos/system32/.
 URL="${REACTOS_7Z_URL:-https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-478-g4117217-x64-msvc-win-dbg.7z}"
+ARCHIVE_SHA256="${REACTOS_7Z_SHA256:-$(manifest_value reactos_livecd_7z_sha256)}"
+ISO_SHA256="${REACTOS_ISO_SHA256:-$(manifest_value reactos_livecd_iso_sha256)}"
+STOCK_ACPI_SHA256="${REACTOS_STOCK_ACPI_SHA256:-$(manifest_value stock_acpi_sys_sha256)}"
+
+if [ -f "$OUT/reactos-x64.7z" ]; then
+  verify_sha256 "$OUT/reactos-x64.7z" "$ARCHIVE_SHA256"
+fi
+CACHED_ISO_PRESENT=0
+for CACHED_ISO in "$OUT"/*.iso; do
+  if [ -f "$CACHED_ISO" ]; then
+    CACHED_ISO_PRESENT=1
+    break
+  fi
+done
+if [ "$CACHED_ISO_PRESENT" = 1 ]; then
+  single_iso >/dev/null
+fi
 
 if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-csrss.exe" ] \
    && [ -f "$OUT/ros-csrsrv.dll" ] && [ -f "$OUT/ros-basesrv.dll" ] && [ -f "$OUT/ros-winsrv.dll" ] \
@@ -34,7 +100,9 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/ros-ftfd.dll" ] && [ -f "$OUT/ros-framebuf.dll" ] \
    && [ -f "$OUT/ros-winlogon.exe" ] \
    && [ -f "$OUT/ros-arial.ttf" ] \
-   && [ -f "$OUT/.fulltree-ok" ] && [ -f "$OUT/.profiles-ok" ]; then
+   && [ -f "$OUT/.fulltree-ok" ] && [ -f "$OUT/.profiles-ok" ] \
+   && [ -f "$OUT/reactos/system32/drivers/acpi.sys" ]; then
+  verify_sha256 "$OUT/reactos/system32/drivers/acpi.sys" "$STOCK_ACPI_SHA256"
   echo "ReactOS binaries + import table + NLS tables + full \\reactos tree already staged in $OUT/"
   exit 0
 fi
@@ -50,11 +118,13 @@ if [ ! -f "$OUT/ros-ntdll.dll" ] || [ ! -f "$OUT/ros-smss.exe" ] || [ ! -f "$OUT
    || [ ! -f "$OUT/ros-c20127.nls" ]; then
   if [ ! -f "$OUT/reactos-x64.7z" ]; then
     echo "downloading ReactOS x64 livecd (~29 MiB)..."
-    curl -fL --retry 3 -o "$OUT/reactos-x64.7z" "$URL"
+    curl -fL --retry 3 -o "$OUT/reactos-x64.7z.part" "$URL"
+    verify_sha256 "$OUT/reactos-x64.7z.part" "$ARCHIVE_SHA256"
+    mv "$OUT/reactos-x64.7z.part" "$OUT/reactos-x64.7z"
   fi
   # .7z -> ISO (bsdtar reads 7-Zip), then ISO -> the binaries + NLS tables (bsdtar reads ISO9660).
   ( cd "$OUT" && bsdtar -xf reactos-x64.7z )
-  ISO="$OUT/$(cd "$OUT" && ls *.iso | head -1)"
+  ISO="$(single_iso)"
   echo "extracting ntdll.dll + smss.exe + NLS tables + SYSTEM hive from $ISO ..."
   bsdtar -xf "$ISO" -C "$OUT" \
     reactos/system32/ntdll.dll reactos/system32/smss.exe reactos/system32/csrss.exe \
@@ -118,7 +188,7 @@ fi
 # + idempotently so an ALREADY-cached staging (the guard above short-circuits) still gains it on
 # the next run — no re-download needed (the ISO stays cached under $OUT/).
 if [ ! -f "$OUT/ros-win32k.sys" ]; then
-  W32K_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  W32K_ISO="$(single_iso)"
   if [ -f "$W32K_ISO" ]; then
     echo "extracting win32k.sys from $W32K_ISO ..."
     bsdtar -xf "$W32K_ISO" -C "$OUT" reactos/system32/win32k.sys
@@ -139,7 +209,7 @@ fi
 # ftfd is a static win32k import: the executive loads it at win32k bring-up + patches win32k's own IAT
 # for the FT_* entries against ftfd's export table. Directly in system32/ (like win32k.sys).
 if [ ! -f "$OUT/ros-ftfd.dll" ]; then
-  FTFD_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  FTFD_ISO="$(single_iso)"
   if [ -f "$FTFD_ISO" ]; then
     echo "extracting ftfd.dll from $FTFD_ISO ..."
     bsdtar -xf "$FTFD_ISO" -C "$OUT" reactos/system32/ftfd.dll
@@ -157,7 +227,7 @@ fi
 # miniport over EngDeviceIoControl; the executive intercepts those IOCTLs to feed it the BOOTBOOT
 # framebuffer, so framebuf enables the primary surface → PIXELS. Directly in system32/.
 if [ ! -f "$OUT/ros-framebuf.dll" ]; then
-  FB_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  FB_ISO="$(single_iso)"
   if [ -f "$FB_ISO" ]; then
     echo "extracting framebuf.dll from $FB_ISO ..."
     bsdtar -xf "$FB_ISO" -C "$OUT" reactos/system32/framebuf.dll
@@ -170,7 +240,7 @@ fi
 
 for drv in dxg dxgthk; do
   if [ ! -f "$OUT/ros-$drv.sys" ]; then
-    DRV_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+    DRV_ISO="$(single_iso)"
     if [ -f "$DRV_ISO" ]; then
       echo "extracting $drv.sys from $DRV_ISO ..."
       bsdtar -xf "$DRV_ISO" -C "$OUT" "reactos/system32/drivers/$drv.sys"
@@ -187,7 +257,7 @@ done
 # 3rd hosted process + run its ntdll loader (the winlogon bring-up). Extracted idempotently (like
 # win32k.sys) so an already-cached staging gains it on the next run without a re-download.
 if [ ! -f "$OUT/ros-winlogon.exe" ]; then
-  WL_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  WL_ISO="$(single_iso)"
   if [ -f "$WL_ISO" ]; then
     echo "extracting winlogon.exe from $WL_ISO ..."
     bsdtar -xf "$WL_ISO" -C "$OUT" reactos/system32/winlogon.exe
@@ -205,7 +275,7 @@ fi
 # idempotently (like win32k.sys) so an already-cached staging gains them without a re-download.
 for lib in userenv mpr; do
   if [ ! -f "$OUT/ros-$lib.dll" ]; then
-    LIB_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+    LIB_ISO="$(single_iso)"
     if [ -f "$LIB_ISO" ]; then
       echo "extracting $lib.dll from $LIB_ISO ..."
       bsdtar -xf "$LIB_ISO" -C "$OUT" "reactos/system32/$lib.dll"
@@ -222,7 +292,7 @@ done
 # empty + \SystemRoot\Fonts doesn't exist in this host, so the executive feeds these bytes to
 # win32k's IntGdiAddFontMemResource at bring-up. On the ISO at reactos/Fonts/arial.ttf.
 if [ ! -f "$OUT/ros-arial.ttf" ]; then
-  FONT_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  FONT_ISO="$(single_iso)"
   if [ -f "$FONT_ISO" ]; then
     echo "extracting arial.ttf from $FONT_ISO ..."
     bsdtar -xf "$FONT_ISO" -C "$OUT" reactos/Fonts/arial.ttf
@@ -245,10 +315,10 @@ echo "staged: ros-ntdll.dll ($(stat -f%z "$OUT/ros-ntdll.dll") bytes), ros-smss.
 # (guarded by the .fulltree-ok marker; the ISO stays cached under $OUT/). The first-run download is
 # still the ~29 MiB 7z above; only the on-disk extraction grows.
 if [ ! -f "$OUT/.fulltree-ok" ]; then
-  FT_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  FT_ISO="$(single_iso)"
   if [ ! -f "$FT_ISO" ] && [ -f "$OUT/reactos-x64.7z" ]; then
     ( cd "$OUT" && bsdtar -xf reactos-x64.7z )
-    FT_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+    FT_ISO="$(single_iso)"
   fi
   if [ -f "$FT_ISO" ]; then
     echo "extracting the FULL reactos/ tree from $FT_ISO (~171 MiB, ~1000 files; one-time)..."
@@ -268,6 +338,13 @@ if [ ! -f "$OUT/.fulltree-ok" ]; then
     echo "note: no cached ISO — full \\reactos tree NOT staged (make_image falls back to flat ::NAME files)"
   fi
 fi
+if [ -f "$OUT/.fulltree-ok" ]; then
+  [ -f "$OUT/reactos/system32/drivers/acpi.sys" ] || {
+    echo "ERROR: full ReactOS tree is missing system32/drivers/acpi.sys" >&2
+    exit 1
+  }
+  verify_sha256 "$OUT/reactos/system32/drivers/acpi.sys" "$STOCK_ACPI_SHA256"
+fi
 
 # ★ THE USER-PROFILE TREE — `Profiles/` (77 entries), a TOP-LEVEL sibling of `reactos/` on the ISO.
 #
@@ -283,10 +360,10 @@ fi
 # NOTE: the ISO carries NO `ntuser.dat` anywhere; on a real ReactOS the per-user hive is created by
 # `NtLoadKey` at first logon from `\reactos\system32\config\default`, which we stage separately.
 if [ ! -f "$OUT/.profiles-ok" ]; then
-  PROF_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+  PROF_ISO="$(single_iso)"
   if [ ! -f "$PROF_ISO" ] && [ -f "$OUT/reactos-x64.7z" ]; then
     ( cd "$OUT" && bsdtar -xf reactos-x64.7z )
-    PROF_ISO="$OUT/$(cd "$OUT" && ls *.iso 2>/dev/null | head -1)"
+    PROF_ISO="$(single_iso)"
   fi
   if [ -f "$PROF_ISO" ]; then
     echo "extracting the ISO's user-profile tree (Profiles/) from $PROF_ISO ..."

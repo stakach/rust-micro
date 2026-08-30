@@ -14,5 +14,9 @@ Image creation verifies its recorded SHA-256 and overwrites the stock full-tree 
 ReactOS tree is copied. A missing or mismatched overlay is fatal and never falls back to the stock
 driver.
 
+`manifest.txt` records the complete source, base-media, patch, canonical artifact, build-tuple, and
+build-run identities. `scripts/verify_reactos_acpi_provider.sh` verifies both the patch and the
+artifact before every top-level run and again after the driver is copied into the FAT image.
+
 The provider source and binary remain covered by the ReactOS GPLv2-or-later terms. The complete
 corresponding source is the pinned upstream commit plus the patch in this directory.
