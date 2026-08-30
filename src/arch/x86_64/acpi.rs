@@ -237,6 +237,36 @@ pub struct PcRtcInfo {
     pub century_register: Option<u8>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AcpiRootTableKind {
+    Rsdt,
+    Xsdt,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AcpiRootTableInfo {
+    pub paddr: u64,
+    pub length: u32,
+    pub kind: AcpiRootTableKind,
+}
+
+/// Validate the loader-provided ACPI root table and retain its real physical extent for the initial
+/// root task. BOOTBOOT has already consumed the RSDP and publishes the selected RSDT/XSDT address.
+pub fn root_table_info(sdt_addr: u64) -> Result<AcpiRootTableInfo, AcpiError> {
+    let header = validate_sdt(sdt_addr)?;
+    let signature: [u8; 4] = unsafe { read_unaligned(&raw const header.signature) };
+    let kind = match &signature {
+        b"RSDT" => AcpiRootTableKind::Rsdt,
+        b"XSDT" => AcpiRootTableKind::Xsdt,
+        _ => return Err(AcpiError::BadSignature),
+    };
+    Ok(AcpiRootTableInfo {
+        paddr: sdt_addr,
+        length: unsafe { read_unaligned(&raw const header.length) },
+        kind,
+    })
+}
+
 /// Discover the fixed ACPI PC RTC resource. The FADT explicitly reports when CMOS RTC hardware is
 /// absent; the optional century byte is used only when firmware publishes a non-zero register.
 pub fn find_pc_rtc(sdt_addr: u64) -> Result<PcRtcInfo, AcpiError> {

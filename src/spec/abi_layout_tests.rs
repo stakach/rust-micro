@@ -133,6 +133,11 @@ fn test_runtime_offsets() {
         off(&bi.persistentClockKind as *const _ as *const u8),
         off(&bi.wallClockFlags as *const _ as *const u8) + core::mem::size_of::<u32>(),
     );
+    #[cfg(feature = "extern-rootserver")]
+    assert_eq!(
+        off(&bi.acpiRootTablePaddr as *const _ as *const u8),
+        off(&bi.persistentClockKind as *const _ as *const u8) + 16,
+    );
     arch::log("  ✓ seL4_BootInfo field offsets match libsel4 layout\n");
 }
 

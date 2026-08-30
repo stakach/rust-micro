@@ -50,6 +50,9 @@ pub const CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS: usize = 230;
 pub const BOOT_PERSISTENT_CLOCK_VALID: u16 = 1 << 0;
 pub const BOOT_PERSISTENT_CLOCK_CENTURY: u16 = 1 << 1;
 pub const BOOT_PERSISTENT_CLOCK_PC_CMOS: u16 = 1;
+pub const BOOT_ACPI_ROOT_VALID: u16 = 1 << 0;
+pub const BOOT_ACPI_ROOT_RSDT: u16 = 1;
+pub const BOOT_ACPI_ROOT_XSDT: u16 = 2;
 
 /// Default from `config.cmake` (`KernelNumPriorities`).
 pub const CONFIG_NUM_PRIORITIES: usize = 256;
@@ -353,6 +356,16 @@ pub struct seL4_BootInfo {
     pub persistentClockCenturyRegister: u8,
     #[cfg(feature = "extern-rootserver")]
     pub persistentClockReserved: [u8; 7],
+    /// Loader-selected, checksum-validated ACPI RSDT/XSDT physical extent. BOOTBOOT publishes the
+    /// root table after consuming the firmware RSDP, so this is intentionally not an RSDP field.
+    #[cfg(feature = "extern-rootserver")]
+    pub acpiRootTablePaddr: seL4_Word,
+    #[cfg(feature = "extern-rootserver")]
+    pub acpiRootTableLength: u32,
+    #[cfg(feature = "extern-rootserver")]
+    pub acpiRootTableKind: u16,
+    #[cfg(feature = "extern-rootserver")]
+    pub acpiRootTableFlags: u16,
 }
 
 #[repr(C)]

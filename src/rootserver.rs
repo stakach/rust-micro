@@ -36,7 +36,8 @@ use crate::rootserver_image::rootserver_elf;
 use crate::tcb::{Tcb, ThreadStateType};
 use crate::types::{
     seL4_BootInfo, seL4_SlotPos, seL4_SlotRegion, seL4_UntypedDesc, seL4_Word as Word,
-    BOOT_PERSISTENT_CLOCK_CENTURY, BOOT_PERSISTENT_CLOCK_PC_CMOS, BOOT_PERSISTENT_CLOCK_VALID,
+    BOOT_ACPI_ROOT_RSDT, BOOT_ACPI_ROOT_VALID, BOOT_ACPI_ROOT_XSDT, BOOT_PERSISTENT_CLOCK_CENTURY,
+    BOOT_PERSISTENT_CLOCK_PC_CMOS, BOOT_PERSISTENT_CLOCK_VALID,
     CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS,
 };
 
@@ -192,20 +193,33 @@ impl DeviceUntypedList {
         }
     }
 
-    fn push(&mut self, paddr: u64, size_bits: u8) {
+    fn try_push(&mut self, paddr: u64, size_bits: u8) -> bool {
         if paddr == 0 || size_bits < 12 || self.len >= self.entries.len() {
-            return;
+            return false;
         }
-        if self
-            .entries
-            .iter()
-            .take(self.len)
-            .any(|entry| entry.paddr == paddr)
-        {
-            return;
+        let Some(size) = 1u64.checked_shl(size_bits as u32) else {
+            return false;
+        };
+        let Some(end) = paddr.checked_add(size) else {
+            return false;
+        };
+        if paddr & (size - 1) != 0 {
+            return false;
+        }
+        if self.entries.iter().take(self.len).any(|entry| {
+            let existing_size = 1u64 << entry.size_bits;
+            let existing_end = entry.paddr + existing_size;
+            paddr < existing_end && entry.paddr < end
+        }) {
+            return false;
         }
         self.entries[self.len] = DeviceUntypedSpec { paddr, size_bits };
         self.len += 1;
+        true
+    }
+
+    fn push(&mut self, paddr: u64, size_bits: u8) {
+        let _ = self.try_push(paddr, size_bits);
     }
 
     fn get(&self, index: usize) -> Option<DeviceUntypedSpec> {
@@ -235,6 +249,23 @@ impl DeviceUntypedList {
             }
         }
         result
+    }
+
+    fn covers(&self, paddr: u64, length: u64) -> bool {
+        let Some(end) = paddr.checked_add(length) else {
+            return false;
+        };
+        let mut cursor = paddr;
+        while cursor < end {
+            let Some(entry) = self.entries.iter().take(self.len).find(|entry| {
+                let entry_end = entry.paddr + (1u64 << entry.size_bits);
+                cursor >= entry.paddr && cursor < entry_end
+            }) else {
+                return false;
+            };
+            cursor = core::cmp::min(end, entry.paddr + (1u64 << entry.size_bits));
+        }
+        true
     }
 }
 
@@ -403,6 +434,52 @@ unsafe fn append_pci_mmio_device_untypeds(list: &mut DeviceUntypedList) {
     }
 }
 
+fn append_device_region(list: &mut DeviceUntypedList, start: u64, end: u64) -> bool {
+    const PAGE_SIZE: u64 = 0x1000;
+    if start == 0 || start >= end || start & (PAGE_SIZE - 1) != 0 || end & (PAGE_SIZE - 1) != 0 {
+        return false;
+    }
+    let mut cursor = start;
+    while cursor < end {
+        if list.unique_containing(cursor, PAGE_SIZE).is_some() {
+            cursor += PAGE_SIZE;
+            continue;
+        }
+        let run_end = list
+            .entries
+            .iter()
+            .take(list.len)
+            .filter(|entry| entry.paddr > cursor)
+            .map(|entry| entry.paddr)
+            .min()
+            .map(|next| core::cmp::min(end, next))
+            .unwrap_or(end);
+        let remaining = run_end - cursor;
+        let alignment_bits = cursor.trailing_zeros().min(63) as u8;
+        let remaining_bits = (63 - remaining.leading_zeros()) as u8;
+        let size_bits = core::cmp::max(12, core::cmp::min(alignment_bits, remaining_bits));
+        if !list.try_push(cursor, size_bits) {
+            return false;
+        }
+        cursor += 1u64 << size_bits;
+    }
+    true
+}
+
+#[cfg(feature = "extern-rootserver")]
+fn append_acpi_device_untypeds(list: &mut DeviceUntypedList) -> bool {
+    const MAX_BOOTBOOT_MMAP_ENTRIES: usize = 240;
+    let mut entries = [crate::boot::MemEntry {
+        region: crate::region::PRegion::new(0, 0),
+        kind: crate::boot::MemKind::Used,
+    }; MAX_BOOTBOOT_MMAP_ENTRIES];
+    let count = crate::boot::read_bootboot_mmap(&mut entries);
+    entries[..count]
+        .iter()
+        .filter(|entry| entry.kind == crate::boot::MemKind::Acpi)
+        .all(|entry| append_device_region(list, entry.region.start, entry.region.end))
+}
+
 #[cfg(feature = "extern-rootserver")]
 fn rootserver_device_untypeds() -> DeviceUntypedList {
     let mut list = DeviceUntypedList::new();
@@ -412,6 +489,17 @@ fn rootserver_device_untypeds() -> DeviceUntypedList {
     unsafe {
         append_pci_mmio_device_untypeds(&mut list);
     }
+    assert!(
+        append_acpi_device_untypeds(&mut list),
+        "ACPI reclaim ranges exceed rootserver device-untyped authority"
+    );
+    let acpi_root =
+        crate::arch::x86_64::acpi::root_table_info(crate::bootboot::acpi_table_address())
+            .expect("BOOTBOOT ACPI root table must validate");
+    assert!(
+        list.covers(acpi_root.paddr, acpi_root.length as u64),
+        "ACPI root table must belong to rootserver device-untyped authority"
+    );
     if let Some(framebuffer) = crate::bootboot::framebuffer_info() {
         assert!(
             list.unique_containing(framebuffer.paddr, framebuffer.size as u64)
@@ -1258,6 +1346,9 @@ unsafe fn build_bootinfo(
     #[cfg(feature = "extern-rootserver")]
     let persistent_clock =
         crate::arch::x86_64::acpi::find_pc_rtc(crate::bootboot::acpi_table_address()).ok();
+    #[cfg(feature = "extern-rootserver")]
+    let acpi_root =
+        crate::arch::x86_64::acpi::root_table_info(crate::bootboot::acpi_table_address()).ok();
     seL4_BootInfo {
         extraLen: extra_bi_size,
         nodeID: 0,
@@ -1357,6 +1448,19 @@ unsafe fn build_bootinfo(
             .unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         persistentClockReserved: [0; 7],
+        #[cfg(feature = "extern-rootserver")]
+        acpiRootTablePaddr: acpi_root.map(|root| root.paddr).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        acpiRootTableLength: acpi_root.map(|root| root.length).unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        acpiRootTableKind: acpi_root
+            .map(|root| match root.kind {
+                crate::arch::x86_64::acpi::AcpiRootTableKind::Rsdt => BOOT_ACPI_ROOT_RSDT,
+                crate::arch::x86_64::acpi::AcpiRootTableKind::Xsdt => BOOT_ACPI_ROOT_XSDT,
+            })
+            .unwrap_or(0),
+        #[cfg(feature = "extern-rootserver")]
+        acpiRootTableFlags: acpi_root.map(|_| BOOT_ACPI_ROOT_VALID).unwrap_or(0),
     }
 }
 
@@ -1511,8 +1615,17 @@ pub mod spec {
         assert!(list.unique_containing(0x7fff_f000, 0x2000).is_none());
         assert!(list.unique_containing(u64::MAX - 0x1000, 0x2000).is_none());
 
-        list.push(0x8000_0000 + 0x20_0000, 22);
-        assert!(list.unique_containing(0x8020_0000, 0x10_0000).is_none());
+        assert!(!list.try_push(0x8000_0000 + 0x20_0000, 22));
+        assert!(list.unique_containing(0x8020_0000, 0x10_0000).is_some());
+
+        let mut acpi = DeviceUntypedList::new();
+        assert!(append_device_region(&mut acpi, 0x7ffe_1000, 0x7ffe_a000));
+        assert!(acpi.covers(0x7ffe_1000, 0x9000));
+        assert!(!append_device_region(
+            &mut DeviceUntypedList::new(),
+            0x7ffe_1003,
+            0x7ffe_a000
+        ));
         arch::log("  ✓ device-untyped range authority is unique and bounded\n");
     }
 

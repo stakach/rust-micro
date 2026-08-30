@@ -504,6 +504,9 @@ pub const BOOT_WALL_CLOCK_UTC: u32 = 1 << 1;
 pub const BOOT_PERSISTENT_CLOCK_VALID: u16 = 1 << 0;
 pub const BOOT_PERSISTENT_CLOCK_CENTURY: u16 = 1 << 1;
 pub const BOOT_PERSISTENT_CLOCK_PC_CMOS: u16 = 1;
+pub const BOOT_ACPI_ROOT_VALID: u16 = 1 << 0;
+pub const BOOT_ACPI_ROOT_RSDT: u16 = 1;
+pub const BOOT_ACPI_ROOT_XSDT: u16 = 2;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BootWallClock {
@@ -516,6 +519,19 @@ pub struct BootPcCmosClock {
     pub index_port: u16,
     pub data_port: u16,
     pub century_register: Option<u8>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BootAcpiRootKind {
+    Rsdt,
+    Xsdt,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BootAcpiRootTable {
+    pub paddr: u64,
+    pub length: u32,
+    pub kind: BootAcpiRootKind,
 }
 
 #[repr(C)]
@@ -561,6 +577,10 @@ pub struct BootInfo {
     pub persistent_clock_data_port: u16,
     pub persistent_clock_century_register: u8,
     pub persistent_clock_reserved: [u8; 7],
+    pub acpi_root_table_paddr: u64,
+    pub acpi_root_table_length: u32,
+    pub acpi_root_table_kind: u16,
+    pub acpi_root_table_flags: u16,
 }
 
 impl BootInfo {
@@ -587,6 +607,25 @@ impl BootInfo {
             data_port: self.persistent_clock_data_port,
             century_register: (self.persistent_clock_flags & BOOT_PERSISTENT_CLOCK_CENTURY != 0)
                 .then_some(self.persistent_clock_century_register),
+        })
+    }
+
+    pub fn acpi_root_table(&self) -> Option<BootAcpiRootTable> {
+        if self.acpi_root_table_flags & BOOT_ACPI_ROOT_VALID == 0
+            || self.acpi_root_table_paddr == 0
+            || self.acpi_root_table_length < 36
+        {
+            return None;
+        }
+        let kind = match self.acpi_root_table_kind {
+            BOOT_ACPI_ROOT_RSDT => BootAcpiRootKind::Rsdt,
+            BOOT_ACPI_ROOT_XSDT => BootAcpiRootKind::Xsdt,
+            _ => return None,
+        };
+        Some(BootAcpiRootTable {
+            paddr: self.acpi_root_table_paddr,
+            length: self.acpi_root_table_length,
+            kind,
         })
     }
 }
