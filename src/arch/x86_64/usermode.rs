@@ -22,7 +22,7 @@ use super::paging::{
     install_kernel_page_tables, kernel_virt_to_phys, read_cr3, PTE_PRESENT, PTE_RW, PTE_USER,
 };
 use super::syscall_entry::{enter_user_via_sysret, set_syscall_kernel_rsp, UserContext};
-use crate::cap::{Badge, Cap, EndpointRights, PPtr};
+use crate::cap::{Badge, Cap, EndpointRights, PAddr, PPtr};
 use crate::cte::Cte;
 use crate::kernel::{KernelState, KERNEL};
 use crate::syscalls::Syscall;
@@ -303,7 +303,7 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         let pool_va = (&raw const DEMO_POOL) as u64;
         let pool_pa = kernel_virt_to_phys(pool_va);
         let untyped_cap = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(pool_pa).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(pool_pa),
             block_bits: 14, // 16 KiB
             free_index: 0,
             is_device: false,

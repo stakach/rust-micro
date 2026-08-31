@@ -131,6 +131,48 @@ impl<T> core::fmt::Debug for PPtr<T> {
     }
 }
 
+/// Typed physical address carried by memory capabilities.
+///
+/// Unlike a kernel object pointer, physical address zero is valid (the first page contains the
+/// BIOS Data Area on x86). Keeping this distinct from [`PPtr`] prevents null-pointer niche policy
+/// from changing the address represented by an Untyped or Frame cap.
+#[repr(transparent)]
+pub struct PAddr<T = ()> {
+    addr: u64,
+    _phantom: PhantomData<*const T>,
+}
+
+impl<T> PAddr<T> {
+    pub const fn new(addr: u64) -> Self {
+        Self {
+            addr,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub const fn addr(self) -> u64 {
+        self.addr
+    }
+}
+
+impl<T> Copy for PAddr<T> {}
+impl<T> Clone for PAddr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> PartialEq for PAddr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr
+    }
+}
+impl<T> Eq for PAddr<T> {}
+impl<T> core::fmt::Debug for PAddr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "PAddr({:#x})", self.addr)
+    }
+}
+
 /// 64-bit IPC badge (and notification badge).
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 #[repr(transparent)]
@@ -308,7 +350,7 @@ pub enum ZombieKind {
 pub enum Cap {
     Null,
     Untyped {
-        ptr: PPtr<UntypedStorage>,
+        ptr: PAddr<UntypedStorage>,
         block_bits: u8,
         free_index: u64,
         is_device: bool,
@@ -355,7 +397,7 @@ pub enum Cap {
     /// `mapped` records the user-virtual address the frame is
     /// installed at, or `None` if not currently mapped.
     Frame {
-        ptr: PPtr<FrameStorage>,
+        ptr: PAddr<FrameStorage>,
         size: FrameSize,
         rights: FrameRights,
         mapped: Option<u64>,
@@ -492,7 +534,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
         tag::UNTYPED => {
             let c = UntypedCap { words };
             Cap::Untyped {
-                ptr: PPtr::new(c.capPtr()).unwrap_or(unreachable_ptr::<UntypedStorage>()),
+                ptr: PAddr::new(c.capPtr()),
                 block_bits: c.capBlockSize() as u8,
                 free_index: c.capFreeIndex(),
                 is_device: c.capIsDevice() != 0,
@@ -588,11 +630,8 @@ pub fn from_words(words: [Word; 2]) -> Cap {
         tag::DOMAIN => Cap::Domain,
         tag::FRAME => {
             let c = FrameCap { words };
-            let Some(ptr) = PPtr::<FrameStorage>::new(c.capFBasePtr()) else {
-                return Cap::Null;
-            };
             Cap::Frame {
-                ptr,
+                ptr: PAddr::new(c.capFBasePtr()),
                 size: FrameSize::from_word(c.capFSize()).unwrap_or_default(),
                 rights: FrameRights::from_word(c.capFVMRights()),
                 mapped: {
@@ -985,6 +1024,7 @@ pub mod spec {
         roundtrip_cnode();
         roundtrip_thread();
         roundtrip_irq_handler();
+        roundtrip_zero_untyped();
         roundtrip_arch_passthrough();
         roundtrip_frame();
         roundtrip_paging_structs();
@@ -1103,6 +1143,19 @@ pub mod spec {
         arch::log("  ✓ null cap round-trips\n");
     }
 
+    fn roundtrip_zero_untyped() {
+        let cap = Cap::Untyped {
+            ptr: PAddr::<UntypedStorage>::new(0),
+            block_bits: 12,
+            free_index: 0,
+            is_device: true,
+        };
+        let words = to_words(&cap);
+        assert_eq!(cap_type_of(words), tag::UNTYPED);
+        assert_eq!(from_words(words), cap);
+        arch::log("  ✓ page-zero untyped cap round-trips\n");
+    }
+
     fn roundtrip_endpoint() {
         let ep = PPtr::<EndpointObj>::new(0xFFFF_8000_DEAD_B000).unwrap();
         let cap = Cap::Endpoint {
@@ -1157,7 +1210,7 @@ pub mod spec {
 
     fn roundtrip_frame() {
         let cap = Cap::Frame {
-            ptr: PPtr::<FrameStorage>::new(0x0000_0000_0040_0000).unwrap(),
+            ptr: PAddr::<FrameStorage>::new(0x0000_0000_0040_0000),
             size: FrameSize::Small,
             rights: FrameRights::ReadWrite,
             mapped: Some(0x0000_0080_0000_1000),
@@ -1173,7 +1226,7 @@ pub mod spec {
 
         // Unmapped variant — capFMappedAddress = 0 → mapped: None.
         let cap2 = Cap::Frame {
-            ptr: PPtr::<FrameStorage>::new(0x80_0000).unwrap(),
+            ptr: PAddr::<FrameStorage>::new(0x80_0000),
             size: FrameSize::Large,
             rights: FrameRights::ReadOnly,
             mapped: None,
@@ -1184,6 +1237,17 @@ pub mod spec {
         let words = to_words(&cap2);
         let back = from_words(words);
         assert_eq!(back, cap2);
+
+        let zero = Cap::Frame {
+            ptr: PAddr::<FrameStorage>::new(0),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadOnly,
+            mapped: None,
+            asid: 0,
+            is_device: true,
+            map_type: FrameMapType::None,
+        };
+        assert_eq!(from_words(to_words(&zero)), zero);
         arch::log("  ✓ frame cap round-trips with mapped + unmapped variants\n");
     }
 

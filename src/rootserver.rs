@@ -28,7 +28,9 @@ use crate::arch::x86_64::syscall_entry::{
     enter_user_via_iretq, set_syscall_kernel_rsp, UserContext,
 };
 use crate::arch::x86_64::usermode::map_user_4k_into_pml4;
-use crate::cap::{Cap, FrameRights, FrameSize, FrameStorage, PPtr, Pml4Storage, UntypedStorage};
+use crate::cap::{
+    Cap, FrameRights, FrameSize, FrameStorage, PAddr, PPtr, Pml4Storage, UntypedStorage,
+};
 use crate::cte::Cte;
 use crate::elf::{self, LoadSegment};
 use crate::kernel::{KernelState, KERNEL};
@@ -989,7 +991,7 @@ pub unsafe fn launch_rootserver() -> ! {
         s,
         9,
         &Cap::Frame {
-            ptr: PPtr::<FrameStorage>::new(img.bootinfo_paddr).expect("bi paddr"),
+            ptr: PAddr::<FrameStorage>::new(img.bootinfo_paddr),
             size: FrameSize::Small,
             rights: FrameRights::ReadOnly,
             mapped: Some(img.bootinfo_vaddr),
@@ -1002,7 +1004,7 @@ pub unsafe fn launch_rootserver() -> ! {
         s,
         10,
         &Cap::Frame {
-            ptr: PPtr::<FrameStorage>::new(img.ipc_buffer_paddr).expect("ipc paddr"),
+            ptr: PAddr::<FrameStorage>::new(img.ipc_buffer_paddr),
             size: FrameSize::Small,
             rights: FrameRights::ReadWrite,
             mapped: Some(img.ipc_buffer_vaddr),
@@ -1086,7 +1088,7 @@ pub unsafe fn launch_rootserver() -> ! {
         s,
         untyped_slot,
         &Cap::Untyped {
-            ptr: PPtr::<UntypedStorage>::new(ut_paddr).expect("ut paddr"),
+            ptr: PAddr::<UntypedStorage>::new(ut_paddr),
             block_bits: ut_size_bits,
             free_index: 0,
             is_device: false,
@@ -1106,7 +1108,7 @@ pub unsafe fn launch_rootserver() -> ! {
             s,
             untyped_slot + 1 + i,
             &Cap::Untyped {
-                ptr: PPtr::<UntypedStorage>::new(spec.paddr.max(1)).expect("dev ut paddr"),
+                ptr: PAddr::<UntypedStorage>::new(spec.paddr),
                 block_bits: spec.size_bits,
                 free_index: 0,
                 is_device: true,
@@ -1134,7 +1136,7 @@ pub unsafe fn launch_rootserver() -> ! {
             s,
             user_image_start as usize + i,
             &Cap::Frame {
-                ptr: PPtr::<FrameStorage>::new(pm.paddr).expect("image page paddr"),
+                ptr: PAddr::<FrameStorage>::new(pm.paddr),
                 size: FrameSize::Small,
                 rights,
                 mapped: Some(pm.vaddr),
@@ -1259,6 +1261,7 @@ pub unsafe fn launch_rootserver() -> ! {
     crate::arch::x86_64::lapic::calibrate_timer_with_pit();
     let tsc_frequency_hz = crate::arch::x86_64::lapic::calibrated_tsc_frequency_hz()
         .expect("PIT calibration must publish a nonzero TSC frequency");
+    #[cfg(feature = "extern-rootserver")]
     core::ptr::write_volatile(
         core::ptr::addr_of_mut!((*bi_ptr).tscFrequencyHz),
         tsc_frequency_hz,

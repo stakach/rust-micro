@@ -16,7 +16,7 @@
 
 use crate::cap::{
     Badge, CNodeStorage, Cap, EndpointObj, EndpointRights, NotificationObj, NotificationRights,
-    PPtr, Tcb, UntypedStorage,
+    PAddr, PPtr, Tcb, UntypedStorage,
 };
 use crate::object_type::{size_in_bits, ObjectType, SizeError};
 use crate::region::align_up;
@@ -51,11 +51,7 @@ impl UntypedState {
     }
     /// Encode back into a `Cap::Untyped`.
     pub fn to_cap(&self) -> Cap {
-        // PPtr requires non-zero, but a 0-base untyped is degenerate
-        // and only used in tests. Force a sentinel to keep the type
-        // total. Callers should never construct an Untyped at addr 0
-        // in production.
-        let ptr = PPtr::<UntypedStorage>::new(self.base.max(1)).unwrap();
+        let ptr = PAddr::<UntypedStorage>::new(self.base);
         Cap::Untyped {
             ptr,
             block_bits: self.block_bits as u8,
@@ -208,7 +204,7 @@ fn make_object_cap(
 ) -> Result<Cap, RetypeError> {
     match ty {
         ObjectType::Untyped => {
-            let ptr = PPtr::<UntypedStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            let ptr = PAddr::<UntypedStorage>::new(obj_addr);
             Ok(Cap::Untyped {
                 ptr,
                 block_bits: user_size_bits as u8,
@@ -296,8 +292,7 @@ fn make_object_cap(
                         X86_LARGE_PAGE => FrameSize::Large,
                         _ => unreachable!(),
                     };
-                    let ptr =
-                        PPtr::<FrameStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+                    let ptr = PAddr::<FrameStorage>::new(obj_addr);
                     Ok(Cap::Frame {
                         ptr,
                         size,
@@ -394,6 +389,7 @@ pub mod spec {
         free_index_alignment();
         not_enough_memory();
         device_memory_restrictions();
+        zero_base_device_frame();
         zero_objects_rejected();
         retype_into_paging_structs();
         retype_into_sched_context();
@@ -685,6 +681,33 @@ pub mod spec {
             other => panic!("expected device sub-untyped, got {:?}", other),
         }
         arch::log("  ✓ device memory restricts to Untyped descendants only\n");
+    }
+
+    fn zero_base_device_frame() {
+        use crate::cap::{FrameStorage, PAddr};
+        use crate::object_type::X86_4K;
+
+        let cap = UntypedState::new(0, 12, true).to_cap();
+        let mut state = UntypedState::from_cap(&cap).expect("page-zero untyped state");
+        assert_eq!(state.base, 0);
+        let mut frame = Cap::Null;
+        retype(&mut state, ObjectType::Arch(X86_4K), 0, 1, |cap| {
+            frame = cap
+        })
+        .expect("retype page-zero frame");
+        match frame {
+            Cap::Frame {
+                ptr,
+                size: crate::cap::FrameSize::Small,
+                is_device: true,
+                ..
+            } => {
+                let _: PAddr<FrameStorage> = ptr;
+                assert_eq!(ptr.addr(), 0);
+            }
+            other => panic!("expected page-zero device frame, got {:?}", other),
+        }
+        arch::log("  ✓ page-zero device untyped retypes without address translation\n");
     }
 
     fn zero_objects_rejected() {

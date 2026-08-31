@@ -14,7 +14,7 @@
 //! word of the IPC MessageInfo carries the label in its high bits.
 //! We expose helpers on the generated `InvocationLabel` enum.
 
-use crate::cap::{Cap, PPtr};
+use crate::cap::{Cap, PAddr, PPtr};
 use crate::cspace::lookup_cap;
 use crate::cte::Cte;
 use crate::error::{KException, KResult, SyscallError};
@@ -909,7 +909,7 @@ fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
 
         // Record the IO mapping on the frame cap.
         let new_cap = Cap::Frame {
-            ptr: crate::cap::PPtr::new(frame_paddr).unwrap(),
+            ptr: crate::cap::PAddr::new(frame_paddr),
             size,
             rights: frame_rights,
             mapped: Some(io_address),
@@ -6360,6 +6360,7 @@ pub mod spec {
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
         frame_map_unmap_get_address();
+        zero_device_frame_get_address();
         paging_maps_reject_unassigned_explicit_vspace();
         paging_unmap_requires_exact_physical_identity();
         page_table_invocation_tracks_asid_and_detaches_hardware();
@@ -6399,7 +6400,7 @@ pub mod spec {
         // Slot 5: Untyped (16 KiB) for pool storage.
         unsafe {
             KERNEL.get().cnodes[0].0[5] = Cte::with_cap(&Cap::Untyped {
-                ptr: PPtr::<UntypedStorage>::new(0x0050_0000).unwrap(),
+                ptr: PAddr::<UntypedStorage>::new(0x0050_0000),
                 block_bits: 14,
                 free_index: 0,
                 is_device: false,
@@ -6506,7 +6507,7 @@ pub mod spec {
     fn mdb_records_retype_parent_link() {
         let invoker = setup_invoker(0);
         let ut_cap = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x0080_0000).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(0x0080_0000),
             block_bits: 14,
             free_index: 0,
             is_device: false,
@@ -6544,7 +6545,7 @@ pub mod spec {
     fn mdb_revoke_walks_grandchildren() {
         let invoker = setup_invoker(0);
         let ut_cap = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x0090_0000).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(0x0090_0000),
             block_bits: 14,
             free_index: 0,
             is_device: false,
@@ -6905,7 +6906,7 @@ pub mod spec {
         // Plant an Untyped cap of size 16 KiB at slot 0.
         let untyped_base = 0x0010_0000u64;
         let ut_cap = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(untyped_base).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(untyped_base),
             block_bits: 14,
             free_index: 0,
             is_device: false,
@@ -6992,7 +6993,7 @@ pub mod spec {
         }
         let untyped_base = 0x0090_0000u64;
         let ut_cap = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(untyped_base).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(untyped_base),
             block_bits: 14,
             free_index: 0,
             is_device: false,
@@ -7077,7 +7078,7 @@ pub mod spec {
             };
         }
         let parent_ut = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x00A0_0000).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(0x00A0_0000),
             block_bits: 14,
             free_index: 0,
             is_device: false,
@@ -7085,7 +7086,7 @@ pub mod spec {
         // Plant an UNRELATED Untyped at slot 0x57f — must survive a
         // revoke of slot 0.
         let unrelated_ut = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x00B0_0000).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(0x00B0_0000),
             block_bits: 14,
             free_index: 0,
             is_device: false,
@@ -7176,7 +7177,7 @@ pub mod spec {
         // reclaim. We'll do 500 cycles to force reclaim to actually
         // happen.
         let ut_cap = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(0x00C0_0000).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(0x00C0_0000),
             block_bits: 14,
             free_index: 0,
             is_device: false,
@@ -7342,7 +7343,7 @@ pub mod spec {
         let invoker = setup_invoker(0);
         let untyped_base = 0x0080_0000u64;
         let ut_cap = Cap::Untyped {
-            ptr: PPtr::<crate::cap::UntypedStorage>::new(untyped_base).unwrap(),
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(untyped_base),
             block_bits: 14,
             free_index: 0,
             is_device: false,
@@ -7507,6 +7508,32 @@ pub mod spec {
     }
 
     #[inline(never)]
+    fn zero_device_frame_get_address() {
+        use crate::cap::{FrameRights, FrameSize, FrameStorage};
+
+        let invoker = setup_invoker(0);
+        let frame_cap = Cap::Frame {
+            ptr: PAddr::<FrameStorage>::new(0),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadOnly,
+            mapped: None,
+            asid: 0,
+            is_device: true,
+            map_type: crate::cap::FrameMapType::None,
+        };
+        let args = SyscallArgs {
+            a1: (InvocationLabel::X86PageGetAddress as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(frame_cap, &args, invoker).expect("get page-zero address");
+        unsafe {
+            assert_eq!(KERNEL.get().scheduler.slab.get(invoker).msg_regs[0], 0);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ page-zero device frame GetAddress preserves physical zero\n");
+    }
+
+    #[inline(never)]
     fn frame_map_unmap_get_address() {
         use crate::cap::{FrameRights, FrameSize, FrameStorage};
 
@@ -7517,7 +7544,7 @@ pub mod spec {
         // vaddr in PML4[2] (= same place the user-mode demo uses).
         let paddr = 0x0000_0000_0090_0000u64;
         let frame_cap = Cap::Frame {
-            ptr: PPtr::<FrameStorage>::new(paddr).unwrap(),
+            ptr: PAddr::<FrameStorage>::new(paddr),
             size: FrameSize::Small,
             rights: FrameRights::ReadWrite,
             mapped: None,
@@ -7647,7 +7674,7 @@ pub mod spec {
 
         let invoker = setup_invoker(0);
         let frame_cap = Cap::Frame {
-            ptr: PPtr::<FrameStorage>::new(0x0000_0000_0091_0000).unwrap(),
+            ptr: PAddr::<FrameStorage>::new(0x0000_0000_0091_0000),
             size: FrameSize::Small,
             rights: FrameRights::ReadWrite,
             mapped: None,
@@ -8149,7 +8176,7 @@ pub mod spec {
         // space for one SchedContext).
         unsafe {
             KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&Cap::Untyped {
-                ptr: PPtr::<UntypedStorage>::new(0x0060_0000).unwrap(),
+                ptr: PAddr::<UntypedStorage>::new(0x0060_0000),
                 block_bits: 14,
                 free_index: 0,
                 is_device: false,
@@ -8295,7 +8322,7 @@ pub mod spec {
         // Plant Untyped at slot 0 + retype to SchedContext at slot 7.
         unsafe {
             KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&Cap::Untyped {
-                ptr: PPtr::<UntypedStorage>::new(0x0070_0000).unwrap(),
+                ptr: PAddr::<UntypedStorage>::new(0x0070_0000),
                 block_bits: 14,
                 free_index: 0,
                 is_device: false,
