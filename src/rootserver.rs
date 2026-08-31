@@ -294,6 +294,63 @@ fn rootserver_device_untypeds() -> DeviceUntypedList {
 }
 
 #[cfg(feature = "extern-rootserver")]
+fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryRange]) -> usize {
+    const MAX_BOOTBOOT_MMAP_ENTRIES: usize = 240;
+    const E820_USABLE: u32 = 1;
+    const E820_RESERVED: u32 = 2;
+    const E820_ACPI_RECLAIMABLE: u32 = 3;
+    const E820_EXTENDED_ATTRIBUTE_ENABLED: u32 = 1;
+
+    let mut entries = [crate::boot::MemEntry {
+        region: crate::region::PRegion::new(0, 0),
+        kind: crate::boot::MemKind::Used,
+    }; MAX_BOOTBOOT_MMAP_ENTRIES];
+    let count = crate::boot::read_bootboot_mmap(&mut entries);
+    let mut published = 0usize;
+    for entry in entries[..count].iter().copied() {
+        let length = entry.region.end.saturating_sub(entry.region.start);
+        if length == 0 {
+            continue;
+        }
+        let e820_type = match entry.kind {
+            crate::boot::MemKind::Free => E820_USABLE,
+            crate::boot::MemKind::Acpi => E820_ACPI_RECLAIMABLE,
+            crate::boot::MemKind::Used | crate::boot::MemKind::Mmio => E820_RESERVED,
+        };
+        if let Some(previous) = published
+            .checked_sub(1)
+            .and_then(|index| out.get_mut(index))
+        {
+            if previous.base.checked_add(previous.length) == Some(entry.region.start)
+                && previous.e820Type == e820_type
+                && previous.extendedAttributes == E820_EXTENDED_ATTRIBUTE_ENABLED
+            {
+                previous.length = previous
+                    .length
+                    .checked_add(length)
+                    .expect("BOOTBOOT memory range length overflow");
+                continue;
+            }
+        }
+        let slot = out
+            .get_mut(published)
+            .expect("BOOTBOOT memory map exceeds typed extra-BootInfo capacity");
+        *slot = crate::types::seL4_BootFirmwareMemoryRange {
+            base: entry.region.start,
+            length,
+            e820Type: e820_type,
+            extendedAttributes: E820_EXTENDED_ATTRIBUTE_ENABLED,
+        };
+        published += 1;
+    }
+    assert!(
+        published != 0,
+        "BOOTBOOT supplied no firmware memory ranges"
+    );
+    published
+}
+
+#[cfg(feature = "extern-rootserver")]
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 #[cfg(feature = "extern-rootserver")]
 const PCI_CONFIG_DATA: u16 = 0xCFC;
@@ -1148,10 +1205,10 @@ pub unsafe fn launch_rootserver() -> ! {
     }
     let user_image_end: Word = user_image_start + n_image_pages as Word;
 
-    // Publish the kernel-validated IOAPIC route extents as a private typed chunk before the
-    // standard TSC-frequency chunk. The controller records are firmware ordered and contain no
-    // MMIO authority. Keeping the 20-byte TSC chunk last preserves its standard declared length
-    // while every preceding header remains naturally aligned.
+    // Publish the kernel-validated IOAPIC route extents and the loader's authoritative BOOTBOOT
+    // memory map as private typed chunks before the standard TSC-frequency chunk. Keeping the
+    // 20-byte TSC chunk last preserves its standard declared length while every preceding header
+    // remains naturally aligned.
     const SEL4_BI_HEADER_SIZE: usize = 16; // u64 id + u64 len
     const TSC_FREQ_HEADER_ID: u64 = 5; // SEL4_BOOTINFO_HEADER_X86_TSC_FREQ
     let extra_bi_kvaddr = phys_to_kernel_virt(img.extra_bi_paddr);
@@ -1188,7 +1245,30 @@ pub unsafe fn launch_rootserver() -> ! {
         extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut crate::types::seL4_BootIoApicTopology,
         ioapic_topology,
     );
-    let tsc_chunk = extra_bi_ptr.add(topology_chunk_len);
+    let mut firmware_ranges = [crate::types::seL4_BootFirmwareMemoryRange::default();
+        crate::types::CONFIG_MAX_NUM_BOOTINFO_FIRMWARE_MEMORY_RANGES];
+    let firmware_range_count = boot_firmware_memory_ranges(&mut firmware_ranges);
+    let firmware_payload_len = 8 + firmware_range_count
+        * core::mem::size_of::<crate::types::seL4_BootFirmwareMemoryRange>();
+    let firmware_chunk_len = SEL4_BI_HEADER_SIZE + firmware_payload_len;
+    let firmware_chunk = extra_bi_ptr.add(topology_chunk_len);
+    core::ptr::write_volatile(
+        firmware_chunk as *mut u64,
+        crate::types::SEL4_BOOTINFO_HEADER_NT_FIRMWARE_MEMORY_MAP,
+    );
+    core::ptr::write_volatile(
+        (firmware_chunk as *mut u64).add(1),
+        firmware_chunk_len as u64,
+    );
+    let firmware_payload = firmware_chunk.add(SEL4_BI_HEADER_SIZE);
+    core::ptr::write_volatile(firmware_payload as *mut u16, firmware_range_count as u16);
+    core::ptr::write_bytes(firmware_payload.add(2), 0, 6);
+    core::ptr::copy_nonoverlapping(
+        firmware_ranges.as_ptr() as *const u8,
+        firmware_payload.add(8),
+        firmware_range_count * core::mem::size_of::<crate::types::seL4_BootFirmwareMemoryRange>(),
+    );
+    let tsc_chunk = firmware_chunk.add(firmware_chunk_len);
     core::ptr::write_volatile(tsc_chunk as *mut u64, TSC_FREQ_HEADER_ID);
     core::ptr::write_volatile(
         (tsc_chunk as *mut u64).add(1),
@@ -1196,7 +1276,12 @@ pub unsafe fn launch_rootserver() -> ! {
     );
     let tsc_frequency_payload = tsc_chunk.add(SEL4_BI_HEADER_SIZE) as *mut u32;
     core::ptr::write_volatile(tsc_frequency_payload, 0);
-    let extra_bi_total_len: Word = (topology_chunk_len + SEL4_BI_HEADER_SIZE + 4) as Word;
+    let extra_bi_total_len: Word =
+        (topology_chunk_len + firmware_chunk_len + SEL4_BI_HEADER_SIZE + 4) as Word;
+    assert!(
+        extra_bi_total_len <= 4096,
+        "typed extra BootInfo exceeds its mapped page"
+    );
 
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)

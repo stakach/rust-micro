@@ -37,6 +37,7 @@ const _: () = assert!(size_of::<seL4_UntypedDesc>() == 16);
 const _: () = assert!(size_of::<seL4_BootInfoHeader>() == 16);
 const _: () = assert!(size_of::<seL4_BootIoApicDesc>() == 8);
 const _: () = assert!(size_of::<seL4_BootIoApicTopology>() == 136);
+const _: () = assert!(size_of::<seL4_BootFirmwareMemoryRange>() == 24);
 
 // seL4_IPCBuffer layout, taking the documented field sizes:
 //   tag(8) + msg(120*8=960) + userData(8) + caps(3*8=24)

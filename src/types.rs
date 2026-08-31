@@ -283,6 +283,8 @@ pub struct seL4_IPCBuffer {
 
 pub const CONFIG_MAX_NUM_BOOTINFO_IOAPICS: usize = 16;
 pub const SEL4_BOOTINFO_HEADER_NT_IOAPIC: u64 = u64::from_le_bytes(*b"NTIOAPIC");
+pub const CONFIG_MAX_NUM_BOOTINFO_FIRMWARE_MEMORY_RANGES: usize = 160;
+pub const SEL4_BOOTINFO_HEADER_NT_FIRMWARE_MEMORY_MAP: u64 = u64::from_le_bytes(*b"NTFWMAP1");
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -298,6 +300,18 @@ pub struct seL4_BootIoApicTopology {
     pub count: u16,
     pub reserved: [u8; 6],
     pub controllers: [seL4_BootIoApicDesc; CONFIG_MAX_NUM_BOOTINFO_IOAPICS],
+}
+
+/// One BOOTBOOT memory-map extent projected into the conventional 24-byte E820 record shape.
+/// `extendedAttributes` retains the ACPI 3.0 enabled bit separately; the NT loader projection
+/// combines it with the 32-bit E820 type exactly as FreeLdr's `BIOS_MEMORY_MAP` does.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct seL4_BootFirmwareMemoryRange {
+    pub base: u64,
+    pub length: u64,
+    pub e820Type: u32,
+    pub extendedAttributes: u32,
 }
 
 /// The boot-info frame the kernel hands to the initial thread. The

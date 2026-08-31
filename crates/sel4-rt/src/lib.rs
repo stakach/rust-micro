@@ -509,6 +509,8 @@ pub const BOOT_ACPI_ROOT_RSDT: u16 = 1;
 pub const BOOT_ACPI_ROOT_XSDT: u16 = 2;
 pub const MAX_BOOT_IOAPICS: usize = 16;
 pub const BOOTINFO_HEADER_IOAPIC_TOPOLOGY: u64 = u64::from_le_bytes(*b"NTIOAPIC");
+pub const MAX_BOOT_FIRMWARE_MEMORY_RANGES: usize = 160;
+pub const BOOTINFO_HEADER_FIRMWARE_MEMORY_MAP: u64 = u64::from_le_bytes(*b"NTFWMAP1");
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BootWallClock {
@@ -542,6 +544,15 @@ pub struct BootIoApic {
     pub gsi_base: u32,
     pub redirection_entries: u16,
     pub reserved: u16,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BootFirmwareMemoryRange {
+    pub base: u64,
+    pub length: u64,
+    pub e820_type: u32,
+    pub extended_attributes: u32,
 }
 
 #[repr(C)]
@@ -684,6 +695,39 @@ impl BootInfo {
             }
         }
         Some(controllers)
+    }
+
+    /// Return the firmware-ordered BOOTBOOT memory map published by the kernel. These records are
+    /// information only; physical authority still comes exclusively from BootInfo capabilities.
+    pub fn firmware_memory_map(&self) -> Option<&[BootFirmwareMemoryRange]> {
+        let payload = self.extra_bootinfo_chunk(BOOTINFO_HEADER_FIRMWARE_MEMORY_MAP)?;
+        if payload.len() < 8 || payload[2..8] != [0; 6] {
+            return None;
+        }
+        let count = u16::from_le_bytes(payload[..2].try_into().ok()?) as usize;
+        if count == 0 || count > MAX_BOOT_FIRMWARE_MEMORY_RANGES {
+            return None;
+        }
+        let records_len = count.checked_mul(core::mem::size_of::<BootFirmwareMemoryRange>())?;
+        if payload.len() != 8usize.checked_add(records_len)? {
+            return None;
+        }
+        let records = unsafe {
+            core::slice::from_raw_parts(
+                payload[8..].as_ptr() as *const BootFirmwareMemoryRange,
+                count,
+            )
+        };
+        for record in records {
+            if record.length == 0
+                || record.base.checked_add(record.length).is_none()
+                || !(1..=4).contains(&record.e820_type)
+                || record.extended_attributes & 1 == 0
+            {
+                return None;
+            }
+        }
+        Some(records)
     }
 
     fn extra_bootinfo_chunk(&self, wanted: u64) -> Option<&[u8]> {
