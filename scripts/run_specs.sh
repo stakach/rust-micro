@@ -64,12 +64,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Display vs headless. In graphics mode we (a) select a real display backend,
-# (b) keep a std VGA so OVMF's GOP framebuffer is shown, (c) keep -serial stdio
-# for the log, and (d) DROP the isa-debug-exit device so the kernel's final
-# `out 0x501` exit-write becomes a harmless no-op (the kernel then spins in
-# `loop {}`) — this leaves QEMU alive with the painted desktop on screen until
-# you close the window. Headless mode keeps the original behaviour exactly.
+# Display vs headless. Graphics mode selects a real display backend, keeps std
+# VGA so OVMF's GOP framebuffer is shown, and keeps serial on stdio. Both lanes
+# retain isa-debug-exit: the guest's explicit final verdict must terminate QEMU
+# instead of falling through to the post-verdict spin loop indefinitely.
 DISPLAY_FLAGS=()
 EXIT_DEVICE=(-device isa-debug-exit,iobase=0x501,iosize=0x2)
 case "$GRAPHICS" in
@@ -83,8 +81,7 @@ case "$GRAPHICS" in
       fi
     fi
     DISPLAY_FLAGS=(-display "$DISP" -vga std -no-shutdown)
-    EXIT_DEVICE=()
-    echo "run_specs: graphics mode (display=$DISP) — close the QEMU window to quit" >&2
+    echo "run_specs: graphics mode (display=$DISP) — exits after the guest completion verdict" >&2
     ;;
   *)
     DISPLAY_FLAGS=(-monitor none -nographic)
