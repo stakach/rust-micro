@@ -31,7 +31,6 @@ use crate::arch::x86_64::usermode::map_user_4k_into_pml4;
 use crate::cap::{
     Cap, FrameRights, FrameSize, FrameStorage, PAddr, PPtr, Pml4Storage, UntypedStorage,
 };
-use crate::cte::Cte;
 use crate::elf::{self, LoadSegment};
 use crate::kernel::{KernelState, KERNEL};
 use crate::rootserver_image::rootserver_elf;
@@ -77,6 +76,21 @@ pub unsafe fn install_user_page_region(base_paddr: u64, size: u64) {
     USER_PAGE_REGION.base_paddr = base_paddr;
     USER_PAGE_REGION.size = size;
     USER_PAGE_REGION.used = 0;
+}
+
+#[cfg(feature = "extern-rootserver")]
+static mut ROOTSERVER_CNODE_BACKING: Option<u64> = None;
+
+/// Publish the boot-reserved physical span that backs the external root task's CSpace. This span
+/// is kernel-owned memory and is never exposed through BootInfo as an Untyped.
+#[cfg(feature = "extern-rootserver")]
+pub unsafe fn install_rootserver_cnode_backing(paddr: u64) {
+    assert_eq!(
+        paddr & (ROOTSERVER_CNODE_BYTES - 1),
+        0,
+        "rootserver CNode backing must be naturally aligned"
+    );
+    ROOTSERVER_CNODE_BACKING = Some(paddr);
 }
 
 /// Allocate a 4 KiB page from the user-page region. Returns the
@@ -129,20 +143,12 @@ const ROOTSERVER_STACK_PAGES: u64 = 64;
 ///   index 3 (radix 12 = 4096 slots). Matches the AY-demo convention
 ///   (CNodes 1, 2 went to sender/receiver); cnode_ptr(3) backs
 ///   `Cap::CNode` slot 2 in the rootserver's own CNode.
-/// * extern-rootserver (the NT executive): the executive allocates
-///   caps monotonically into its root CNode and, when demand-paging
-///   large DLLs and mapping shared desktop state, blows well past the
-///   4096-slot big-pool ceiling. Back its root CNode with the XL pool
-///   page (radix 18 = 262144 slots) instead. Mapping-cap pressure above
-///   that belongs in per-client cap banks or dynamic CNode backing, not
-///   a larger kernel-image BSS. The executive never allocates XL CNodes itself (its
-///   spawned processes use CN_RADIX=5 → small pool), so xl[0] is free
-///   to dedicate to the root task. This virtual index stays inside
-///   `cnode_pool_count()` so revoke/delete pool scans still see it.
+/// * extern-rootserver (the NT executive): descriptor zero names a radix-18 CNode whose exact
+///   physical storage is reserved from boot RAM. It carries no fixed CTE array in the kernel ELF.
 #[cfg(not(feature = "extern-rootserver"))]
 pub const ROOTSERVER_CNODE_IDX: usize = 3;
 #[cfg(feature = "extern-rootserver")]
-pub const ROOTSERVER_CNODE_IDX: usize = crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES;
+pub const ROOTSERVER_CNODE_IDX: usize = crate::kernel::DYNAMIC_CNODE_BASE;
 
 /// Radix (log2 of the slot count) of the rootserver's root CNode.
 /// Must match the storage width of the CNode page backing
@@ -152,7 +158,12 @@ pub const ROOTSERVER_CNODE_IDX: usize = crate::kernel::MAX_CNODES + crate::kerne
 #[cfg(not(feature = "extern-rootserver"))]
 pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::CNODE_RADIX;
 #[cfg(feature = "extern-rootserver")]
-pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::XL_CNODE_RADIX;
+pub const ROOTSERVER_CNODE_RADIX: u8 = 18;
+#[cfg(feature = "extern-rootserver")]
+pub const ROOTSERVER_CNODE_SIZE_BITS: u32 =
+    ROOTSERVER_CNODE_RADIX as u32 + crate::object_type::CTE_SIZE_BITS;
+#[cfg(feature = "extern-rootserver")]
+pub const ROOTSERVER_CNODE_BYTES: u64 = 1u64 << ROOTSERVER_CNODE_SIZE_BITS;
 
 /// The always-present architectural device untypeds exposed to the root task, as
 /// `(paddr, size_bits)`.
@@ -894,8 +905,7 @@ pub fn microtest_check_byte(b: u8) -> bool {
 /// the dispatcher's QEMU-exit hook fires once the rootserver prints
 /// `\n`.
 /// Write `cap` into slot `si` of the rootserver's root CNode,
-/// dispatching to whichever pool (big or XL) backs
-/// `ROOTSERVER_CNODE_IDX`. Replaces the old direct
+/// dispatching to either direct-index spec storage or registered boot RAM. Replaces the old direct
 /// `s.cnodes[ROOTSERVER_CNODE_IDX].0[si] = …` writes, which only
 /// worked when the root CNode lived in the big pool.
 #[inline]
@@ -923,9 +933,23 @@ pub unsafe fn launch_rootserver() -> ! {
 
     let s = KERNEL.get();
 
+    #[cfg(feature = "extern-rootserver")]
+    {
+        let backing = ROOTSERVER_CNODE_BACKING.expect("rootserver CNode backing reserved at boot");
+        let slots = crate::arch::x86_64::paging::phys_to_lin(backing) as *mut u8;
+        core::ptr::write_bytes(slots, 0, ROOTSERVER_CNODE_BYTES as usize);
+        let registered = s
+            .alloc_dynamic_cnode(backing, ROOTSERVER_CNODE_RADIX)
+            .expect("rootserver CNode descriptor");
+        assert_eq!(
+            registered, ROOTSERVER_CNODE_IDX,
+            "rootserver must own the first dynamic CNode descriptor"
+        );
+    }
+
     // Build the rootserver's CNode (slot 2 of itself = `seL4_CapInitThreadCNode`).
-    // Phase 42 — the cap's `radix` MUST match the underlying CNode
-    // storage width (`CNODE_RADIX`). When sel4test allocates new
+    // The cap's radix must match the direct-index or registered physical storage. When userspace
+    // allocates new
     // children at high offsets via Untyped::Retype it then addresses
     // them via cptr = node_offset; with radix=6 those high offsets
     // are unreachable through the cap and `lookup_cap` short-circuits
@@ -938,9 +962,7 @@ pub unsafe fn launch_rootserver() -> ! {
         guard_size: 64 - ROOTSERVER_CNODE_RADIX,
         guard: 0,
     };
-    // Wipe the CNode in case prior specs left state. Dispatched via
-    // `cnode_slots_at_mut` so it works whether the root CNode lives in
-    // the big pool (sel4test) or the XL pool (extern-rootserver).
+    // Wipe the direct-index spec CNode or newly registered physical root CNode before planting caps.
     for slot in s
         .cnode_slots_at_mut(ROOTSERVER_CNODE_IDX)
         .expect("rootserver cnode storage")
@@ -948,12 +970,14 @@ pub unsafe fn launch_rootserver() -> ! {
     {
         slot.set_cap(&Cap::Null);
     }
-    // Phase 43 — claim the rootserver's CNode in the in-use bitmap.
+    // Claim the standalone rootserver's direct-index CNode in its in-use bitmap. Dynamic
+    // registration above is the corresponding production ownership transition.
     // Direct init bypasses `alloc_cnode`, which is what stamps in_use,
     // so a later `alloc_cnode` would otherwise see cn3 as free, reuse
     // it for a sub-CSpace allocation, and zero every rootserver cap.
     // DOMAINS0001 hit this after sel4test's per-test allocator
     // exhausted MAX_CNODES and started recycling slots.
+    #[cfg(not(feature = "extern-rootserver"))]
     s.claim_cnode(ROOTSERVER_CNODE_IDX);
 
     // Build the TCB. cspace_root points at the new CNode; the

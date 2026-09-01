@@ -58,19 +58,14 @@ pub const MAX_REPLIES: usize = 1024;
 pub const CNODE_RADIX: u8 = 12;
 pub const CNODE_SLOTS: usize = 1 << CNODE_RADIX;
 
-/// Maximum pre-allocated big CNodes. The built-in sel4test profile keeps the
-/// historical 48 x 4096 x 32 B = 6 MiB pool. The extern NT rootserver spends
-/// the large-capacity CSpace requirement on an out-of-line XL root CNode; big
-/// CNodes remain a scarce kernel-object pool for modest child CapTables such as
-/// image map-cap banks. Large USER/GDI retained mapping-cap sets should use the
-/// XL root CSpace or future dynamic CNode backing, not inflate the boot kernel's
-/// loaded image.
-#[cfg(not(feature = "extern-rootserver"))]
+/// Direct-index CNodes retained by the standalone/spec profile. Production CapTables, including
+/// the root CSpace, use exact physical storage registered in `dynamic_cnodes`.
+#[cfg(any(not(feature = "extern-rootserver"), feature = "spec"))]
 pub const MAX_CNODES: usize = 48;
-#[cfg(feature = "extern-rootserver")]
-pub const MAX_CNODES: usize = 23;
+#[cfg(all(feature = "extern-rootserver", not(feature = "spec")))]
+pub const MAX_CNODES: usize = 0;
 
-/// One pre-allocated CNode: 32 slots × 32 bytes = 1 KiB.
+/// One direct-index CNode: 4096 slots x 32 bytes = 128 KiB.
 #[repr(C, align(32))]
 pub struct CNodePage(pub [Cte; CNODE_SLOTS]);
 
@@ -80,15 +75,13 @@ impl Default for CNodePage {
     }
 }
 
-/// Small CNode pool — radix ≤ 6 (64 slots). Lets CSPACE0001
-/// allocate 64 simultaneous radix-1 CNodes without burning the
-/// 128 KiB-per-slot big pool. 96 entries × 64 slots × 32 bytes
-/// = 192 KiB of static BSS — sized to CSPACE0001's exact 64
-/// demand plus headroom for parallel test churn. Bigger pushes
-/// the kernel image past the 8 MiB virt cap.
+/// Direct-index small CNodes used only by specs that exercise this pool allocator itself.
 pub const SMALL_CNODE_RADIX: u8 = 6;
 pub const SMALL_CNODE_SLOTS: usize = 1 << SMALL_CNODE_RADIX;
+#[cfg(feature = "spec")]
 pub const MAX_SMALL_CNODES: usize = 96;
+#[cfg(not(feature = "spec"))]
+pub const MAX_SMALL_CNODES: usize = 0;
 
 #[repr(C, align(32))]
 pub struct SmallCNodePage(pub [Cte; SMALL_CNODE_SLOTS]);
@@ -99,42 +92,15 @@ impl Default for SmallCNodePage {
     }
 }
 
-/// XL CNode pool — test-process CSpace roots and, in the extern profile, the
-/// NT rootserver. sel4test's TEST_PROCESS_CSPACE_SIZE_BITS is patched to 13
-/// (8,192 slots — SCHED0004 peaks ~6k; the upstream 17 would mean 131k-slot
-/// pages that made every cap-delete pool-scan crawl). The NT rootserver keeps
-/// many live page-map caps for the booting OS frontier, so extern-rootserver
-/// trades big-CNode pool entries for a radix-18 XL page.
-///
-/// This is intentionally one entry. The XL backing store lives in its own
-/// zero-initialized static so it does not turn the whole root CNode into
-/// boot-ELF `.data`. Higher root CSpace capacity must come from dynamic CNode
-/// backing, not a larger kernel-image BSS.
-#[cfg(not(feature = "extern-rootserver"))]
-pub const XL_CNODE_RADIX: u8 = 17;
-#[cfg(feature = "extern-rootserver")]
-pub const XL_CNODE_RADIX: u8 = 18;
-pub const XL_CNODE_SLOTS: usize = 1 << XL_CNODE_RADIX;
-pub const MAX_XL_CNODES: usize = 1;
-const _: () = assert!((XL_CNODE_RADIX as u32) <= crate::cte::MdbId::SLOT_BITS);
 /// Virtual cnode index space:
 ///   [0, MAX_CNODES)                      big (radix 12)
-///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix ≤ 6)
-///   [.., +MAX_XL_CNODES)                 XL (radix 17 or 18)
+///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix <= 6)
 ///   [.., +MAX_DYNAMIC_CNODES)            exact Untyped-backed CNodes
-
-#[repr(C, align(32))]
-pub struct XlCNodePage(pub [Cte; XL_CNODE_SLOTS]);
-
-// Keep the large zeroed XL root storage out of `KernelState`; otherwise raising
-// extern-rootserver CSpace capacity inflates the boot ELF `.data` section.
-static mut XL_CNODES: [XlCNodePage; MAX_XL_CNODES] =
-    [const { XlCNodePage([Cte::null(); XL_CNODE_SLOTS]) }; MAX_XL_CNODES];
 
 /// Compact identities for CNodes whose CTE storage is the physical memory consumed from their
 /// source Untyped. Descriptor capacity is metadata only; CTE capacity comes from RAM at Retype.
 pub const MAX_DYNAMIC_CNODES: usize = 1024;
-pub const DYNAMIC_CNODE_BASE: usize = MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES;
+pub const DYNAMIC_CNODE_BASE: usize = MAX_CNODES + MAX_SMALL_CNODES;
 
 #[derive(Copy, Clone)]
 pub struct DynamicCNodeDescriptor {
@@ -149,24 +115,6 @@ impl DynamicCNodeDescriptor {
         radix: 0,
         in_use: false,
     };
-}
-
-#[inline]
-unsafe fn xl_cnode_slots_at(i: usize) -> Option<&'static [Cte]> {
-    if i >= MAX_XL_CNODES {
-        return None;
-    }
-    let base = core::ptr::addr_of!(XL_CNODES) as *const XlCNodePage;
-    Some(&(&(*base.add(i)).0)[..])
-}
-
-#[inline]
-unsafe fn xl_cnode_slots_at_mut(i: usize) -> Option<&'static mut [Cte]> {
-    if i >= MAX_XL_CNODES {
-        return None;
-    }
-    let base = core::ptr::addr_of_mut!(XL_CNODES) as *mut XlCNodePage;
-    Some(&mut (&mut (*base.add(i)).0)[..])
 }
 
 pub struct KernelState {
@@ -211,7 +159,6 @@ pub struct KernelState {
     pub next_notification: usize,
     pub next_cnode: usize,
     pub next_small_cnode: usize,
-    pub next_xl_cnode: usize,
     pub next_sched_context: usize,
     pub next_reply: usize,
 }
@@ -224,7 +171,6 @@ struct PoolBitmaps {
     pub notifications: [u64; (MAX_NTFNS + 63) / 64],
     pub cnodes: [u64; (MAX_CNODES + 63) / 64],
     pub small_cnodes: [u64; (MAX_SMALL_CNODES + 63) / 64],
-    pub xl_cnodes: [u64; (MAX_XL_CNODES + 63) / 64],
     pub replies: [u64; (MAX_REPLIES + 63) / 64],
 }
 
@@ -233,7 +179,6 @@ static mut POOL_BITMAPS: PoolBitmaps = PoolBitmaps {
     notifications: [0; (MAX_NTFNS + 63) / 64],
     cnodes: [0; (MAX_CNODES + 63) / 64],
     small_cnodes: [0; (MAX_SMALL_CNODES + 63) / 64],
-    xl_cnodes: [0; (MAX_XL_CNODES + 63) / 64],
     replies: [0; (MAX_REPLIES + 63) / 64],
 };
 
@@ -264,7 +209,6 @@ impl KernelState {
             next_notification: 0,
             next_cnode: 4,
             next_small_cnode: 0,
-            next_xl_cnode: 0,
             next_sched_context: 0,
             next_reply: 0,
         }
@@ -437,8 +381,6 @@ impl KernelState {
             self.free_cnode(vi);
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
             self.free_small_cnode(vi);
-        } else if vi < DYNAMIC_CNODE_BASE {
-            self.free_xl_cnode(vi);
         } else {
             self.free_dynamic_cnode(vi);
         }
@@ -454,19 +396,6 @@ impl KernelState {
             self.set_cnode_in_use(i, true);
             if self.next_cnode <= i {
                 self.next_cnode = i + 1;
-            }
-        } else if i >= MAX_CNODES + MAX_SMALL_CNODES
-            && i < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES
-        {
-            // XL pool (e.g. the extern-rootserver executive's root
-            // CNode is backed by an XL page so cptrs can reach far past
-            // the 4096-slot big-pool ceiling). Mark it in-use so
-            // `alloc_xl_cnode` never recycles it out from under the
-            // rootserver.
-            let xi = i - (MAX_CNODES + MAX_SMALL_CNODES);
-            self.set_xl_cnode_in_use(xi, true);
-            if self.next_xl_cnode <= xi {
-                self.next_xl_cnode = xi + 1;
             }
         }
     }
@@ -512,82 +441,18 @@ impl KernelState {
         }
     }
 
-    /// Allocate an XL CNode. Returns the VIRTUAL index past both other pools.
-    pub fn alloc_xl_cnode(&mut self) -> Option<usize> {
-        const BASE: usize = MAX_CNODES + MAX_SMALL_CNODES;
-        for i in 0..self.next_xl_cnode.min(MAX_XL_CNODES) {
-            if !self.xl_cnode_in_use(i) {
-                let Some(slots) = (unsafe { xl_cnode_slots_at_mut(i) }) else {
-                    return None;
-                };
-                for slot in slots.iter_mut() {
-                    slot.set_cap(&Cap::Null);
-                    slot.set_parent(None);
-                }
-                self.set_xl_cnode_in_use(i, true);
-                return Some(BASE + i);
-            }
-        }
-        if self.next_xl_cnode < MAX_XL_CNODES {
-            let i = self.next_xl_cnode;
-            self.next_xl_cnode += 1;
-            let Some(slots) = (unsafe { xl_cnode_slots_at_mut(i) }) else {
-                return None;
-            };
-            for slot in slots.iter_mut() {
-                slot.set_cap(&Cap::Null);
-                slot.set_parent(None);
-            }
-            self.set_xl_cnode_in_use(i, true);
-            return Some(BASE + i);
-        }
-        None
-    }
-
-    pub fn free_xl_cnode(&mut self, virt_idx: usize) {
-        const BASE: usize = MAX_CNODES + MAX_SMALL_CNODES;
-        if virt_idx >= BASE && virt_idx < BASE + MAX_XL_CNODES {
-            let i = virt_idx - BASE;
-            if let Some(slots) = unsafe { xl_cnode_slots_at_mut(i) } {
-                for slot in slots.iter_mut() {
-                    slot.set_cap(&Cap::Null);
-                    slot.set_parent(None);
-                }
-            }
-            self.set_xl_cnode_in_use(i, false);
-        }
-    }
-
-    fn xl_cnode_in_use(&self, i: usize) -> bool {
-        unsafe { (POOL_BITMAPS.xl_cnodes[i / 64] >> (i % 64)) & 1 == 1 }
-    }
-    fn set_xl_cnode_in_use(&self, i: usize, v: bool) {
-        unsafe {
-            let w = &mut POOL_BITMAPS.xl_cnodes[i / 64];
-            if v {
-                *w |= 1 << (i % 64);
-            } else {
-                *w &= !(1 << (i % 64));
-            }
-        }
-    }
-
-    /// Total virtual cnode count = big + small + XL. Used by revoke /
-    /// delete walks that need to scan all pools.
+    /// Total virtual CNode identity count. Used by revoke/delete walks that scan registered pools.
     pub const fn cnode_pool_count() -> usize {
         DYNAMIC_CNODE_BASE + MAX_DYNAMIC_CNODES
     }
 
     /// Backing slot slice for virtual cnode index `vi`.
-    /// Dispatches to `cnodes[vi]` (big), `small_cnodes[vi - MAX_CNODES]` (small), or the
-    /// out-of-line `XL_CNODES` pool.
+    /// Dispatches to direct-index spec storage or exact physical dynamic backing.
     pub fn cnode_slots_at(&self, vi: usize) -> Option<&[Cte]> {
         if vi < MAX_CNODES {
             self.cnodes.get(vi).map(|p| &p.0[..])
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
             self.small_cnodes.get(vi - MAX_CNODES).map(|p| &p.0[..])
-        } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
-            unsafe { xl_cnode_slots_at(vi - MAX_CNODES - MAX_SMALL_CNODES) }
         } else if vi < Self::cnode_pool_count() {
             let descriptor = self.dynamic_cnodes.get(vi - DYNAMIC_CNODE_BASE)?;
             if !descriptor.in_use || descriptor.radix as u32 > crate::cte::MdbId::SLOT_BITS {
@@ -608,8 +473,6 @@ impl KernelState {
             self.small_cnodes
                 .get_mut(vi - MAX_CNODES)
                 .map(|p| &mut p.0[..])
-        } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
-            unsafe { xl_cnode_slots_at_mut(vi - MAX_CNODES - MAX_SMALL_CNODES) }
         } else if vi < Self::cnode_pool_count() {
             let descriptor = self.dynamic_cnodes.get(vi - DYNAMIC_CNODE_BASE)?;
             if !descriptor.in_use || descriptor.radix as u32 > crate::cte::MdbId::SLOT_BITS {
@@ -998,9 +861,6 @@ pub(crate) fn slot_in_pools(addr: usize) -> bool {
     ) || within(
         s.small_cnodes.as_ptr() as *const u8,
         core::mem::size_of_val(&s.small_cnodes),
-    ) || within(
-        core::ptr::addr_of!(XL_CNODES) as *const u8,
-        core::mem::size_of::<[XlCNodePage; MAX_XL_CNODES]>(),
     ) || s.dynamic_cnodes.iter().any(|descriptor| {
         if !descriptor.in_use {
             return false;

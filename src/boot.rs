@@ -443,6 +443,23 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
         }
     }
 
+    #[cfg(feature = "extern-rootserver")]
+    {
+        let cnode_base = carve_chunk(
+            &mut free,
+            crate::rootserver::ROOTSERVER_CNODE_BYTES,
+            crate::rootserver::ROOTSERVER_CNODE_SIZE_BITS,
+        )?;
+        arch::log("boot: reserved root-cnode @0x");
+        log_hex64(cnode_base);
+        arch::log("..");
+        log_hex64(cnode_base + crate::rootserver::ROOTSERVER_CNODE_BYTES);
+        arch::log("\n");
+        unsafe {
+            crate::rootserver::install_rootserver_cnode_backing(cnode_base);
+        }
+    }
+
     // Phase 42 — backing memory for the rootserver's Untyped cap.
     //
     // This remains a single power-of-two, power-of-two-aligned seL4 Untyped. Size it from the live

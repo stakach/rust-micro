@@ -232,6 +232,7 @@ pub static USERMODE_TEST_TRIGGERED: AtomicBool = AtomicBool::new(false);
 pub static IPC_PRINTED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 pub static IPC_DEMO_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(feature = "extern-rootserver"))]
 pub fn launch_two_thread_ipc_demo() -> ! {
     unsafe {
         install_kernel_page_tables();
