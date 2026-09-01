@@ -126,6 +126,30 @@ fn syscall_debug_return_is_transparent(syscall: crate::syscalls::Syscall) -> boo
     )
 }
 
+fn completed_receive_for_invoker(
+    syscall: crate::syscalls::Syscall,
+    next: crate::tcb::TcbId,
+    current: Option<crate::tcb::TcbId>,
+    invoker: Option<crate::tcb::TcbId>,
+    syscall_succeeded: bool,
+) -> bool {
+    use crate::syscalls::Syscall;
+
+    syscall_succeeded
+        && matches!(
+            syscall,
+            Syscall::SysRecv
+                | Syscall::SysNBRecv
+                | Syscall::SysReplyRecv
+                | Syscall::SysNBSendRecv
+                | Syscall::SysNBSendWait
+                | Syscall::SysWait
+                | Syscall::SysNBWait,
+        )
+        && Some(next) == current
+        && Some(next) == invoker
+}
+
 const CR3_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 #[derive(Copy, Clone)]
@@ -1148,23 +1172,16 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             crate::sched_context::complete_yield_if_pending(next);
             let tcb = s.scheduler.slab.get(next);
             let mut new_ctx = tcb.user_context;
-            let was_recv_path = matches!(
-                syscall,
-                Syscall::SysRecv
-                    | Syscall::SysNBRecv
-                    | Syscall::SysReplyRecv
-                    | Syscall::SysNBSendRecv
-                    | Syscall::SysNBSendWait
-                    | Syscall::SysWait
-                    | Syscall::SysNBWait,
-            ) && Some(next) == s.scheduler.current();
-            // The "matches" above guards against the sender side:
-            // when a blocked sender wakes up, we don't want to
-            // overwrite its rdi/rdx with the receiver's view.
-            // Distinguish by checking whether `next` is the same
-            // thread that just issued the syscall.
+            // The helper guards against the sender side and against a composite whose send half
+            // failed before receive: neither may overwrite its registers with stale receive state.
             let invoker = entry_invoker;
-            if was_recv_path && Some(next) == invoker {
+            if completed_receive_for_invoker(
+                syscall,
+                next,
+                s.scheduler.current(),
+                invoker,
+                result.is_ok(),
+            ) {
                 // Pack MessageInfo back into rsi: bits 0..6 length,
                 // bits 7..8 extraCaps (caps transferred into the recv
                 // slots — SERSERV's connect handler asserts on this),
@@ -1391,6 +1408,7 @@ pub mod spec {
         preferred_invoker_budget_failure_falls_back_to_ready_thread();
         tcb_resume_syscall_returns_to_invoker();
         marked_reply_cap_syscall_hands_off_to_caller();
+        failed_composite_send_does_not_enter_receive_fanout();
         dispatcher_signals_unknown_via_max_rax();
         arch::log("SYSCALL MSR tests completed\n");
     }
@@ -2364,6 +2382,25 @@ pub mod spec {
             s.scheduler.reset_queues();
         }
         arch::log("  ✓ marked Reply-cap SysCall dispatch hands off to the caller\n");
+    }
+
+    fn failed_composite_send_does_not_enter_receive_fanout() {
+        let thread = crate::tcb::TcbId(7);
+        assert!(!super::completed_receive_for_invoker(
+            crate::syscalls::Syscall::SysNBSendRecv,
+            thread,
+            Some(thread),
+            Some(thread),
+            false,
+        ));
+        assert!(super::completed_receive_for_invoker(
+            crate::syscalls::Syscall::SysNBSendRecv,
+            thread,
+            Some(thread),
+            Some(thread),
+            true,
+        ));
+        arch::log("  ✓ failed composite send bypasses receive-result fanout\n");
     }
 
     /// Phase 38c-followup — unknown syscalls are still rejected,

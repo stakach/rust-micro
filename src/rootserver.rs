@@ -293,7 +293,6 @@ fn rootserver_device_untypeds() -> DeviceUntypedList {
     list
 }
 
-#[cfg(feature = "extern-rootserver")]
 fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryRange]) -> usize {
     const MAX_BOOTBOOT_MMAP_ENTRIES: usize = 240;
     const E820_USABLE: u32 = 1;
