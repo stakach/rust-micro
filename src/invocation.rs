@@ -4461,16 +4461,7 @@ fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) ->
         }
         let src_id = crate::cte::MdbId::pack(src_cnode_idx as u32, src_res.slot_index as u32);
         let dest_id = crate::cte::MdbId::pack(dest_cnode_idx as u32, dest_res.slot_index as u32);
-        for ci in 0..KernelState::cnode_pool_count() {
-            let slot_count = s.cnode_slots_at(ci).map(|slots| slots.len()).unwrap_or(0);
-            for si in 0..slot_count {
-                if s.cnode_slot(ci, si).and_then(|slot| slot.parent()) == Some(src_id) {
-                    s.cnode_slot_mut(ci, si)
-                        .expect("CNode Move descendant disappeared")
-                        .set_parent(Some(dest_id));
-                }
-            }
-        }
+        reparent_direct_children(s, src_id, Some(dest_id), src_child_count);
         if let Some(slot) = s.cnode_slot_mut(src_cnode_idx, src_res.slot_index) {
             slot.set_cap(&Cap::Null);
             slot.set_parent(None);
@@ -4577,6 +4568,43 @@ unsafe fn cnode_has_only_self_refs(s: &crate::kernel::KernelState, cap: &Cap) ->
     crate::kernel::cap_refcount(cap) as usize == self_refs
 }
 
+#[cfg(feature = "spec")]
+static REPARENT_SCAN_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Rewrite the exact direct MDB edges owned by a CTE whose identity is changing or disappearing.
+/// The per-CTE child count makes the overwhelmingly common leaf case O(1); only a CTE that really
+/// owns descendants needs the registry walk required by the compact parent-only MDB representation.
+unsafe fn reparent_direct_children(
+    s: &mut crate::kernel::KernelState,
+    old_parent: crate::cte::MdbId,
+    new_parent: Option<crate::cte::MdbId>,
+    expected_children: u32,
+) {
+    if expected_children == 0 {
+        return;
+    }
+
+    let mut moved = 0u32;
+    for ci in 0..KernelState::cnode_pool_count() {
+        let slot_count = s.cnode_slots_at(ci).map_or(0, |slots| slots.len());
+        for si in 0..slot_count {
+            #[cfg(feature = "spec")]
+            REPARENT_SCAN_SLOTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if s.cnode_slot(ci, si).and_then(|slot| slot.parent()) != Some(old_parent) {
+                continue;
+            }
+            s.cnode_slot_mut(ci, si)
+                .expect("scanned CNode slot must remain registered under the BKL")
+                .set_parent(new_parent);
+            moved = moved.checked_add(1).expect("MDB child count overflow");
+        }
+    }
+    assert_eq!(
+        moved, expected_children,
+        "MDB child count must equal the registered direct derivation edges"
+    );
+}
+
 /// Splice the direct derivation children of a disappearing CTE to its own parent. seL4's linked MDB
 /// performs this in `emptySlot`; our compact explicit-parent model must do it before a CNode backing
 /// descriptor can be reused, otherwise those children would point into the next object assigned the
@@ -4590,33 +4618,17 @@ unsafe fn splice_cte_out(
         .expect("removed CTE must remain registered while its MDB edge is spliced");
     let new_parent = removed_cte.parent();
     let recorded_children = removed_cte.child_count();
-    let mut moved = 0u32;
-    for ci in 0..KernelState::cnode_pool_count() {
-        let slot_count = s.cnode_slots_at(ci).map_or(0, |slots| slots.len());
-        for si in 0..slot_count {
-            if s.cnode_slot(ci, si).and_then(|slot| slot.parent()) != Some(removed) {
-                continue;
-            }
-            s.cnode_slot_mut(ci, si)
-                .expect("scanned CNode slot must remain registered under the BKL")
-                .set_parent(new_parent);
-            moved = moved.checked_add(1).expect("MDB child count overflow");
-        }
-    }
+    reparent_direct_children(s, removed, new_parent, recorded_children);
     if let Some(parent) = new_parent {
         let parent = s
             .cnode_slot_mut(parent.cnode_idx() as usize, parent.slot() as usize)
             .expect("derived cap parent must remain live while its child is deleted");
         let adopted = parent
             .child_count()
-            .checked_add(moved)
+            .checked_add(recorded_children)
             .expect("MDB child count overflow while splicing a CTE");
         parent.set_child_count(adopted);
     }
-    assert_eq!(
-        moved, recorded_children,
-        "MDB child count must equal the registered direct derivation edges"
-    );
     s.cnode_slot_mut(removed.cnode_idx() as usize, removed.slot() as usize)
         .expect("finalized CNode slot must remain registered until it is cleared")
         .set_child_count(0);
@@ -6269,6 +6281,7 @@ pub mod spec {
         repeated_alloc_free_reclaims_untyped();
         cnode_copy_via_invocation();
         cnode_move_clears_source();
+        cnode_move_reparents_direct_children();
         cnode_delete_splices_derivation_children();
         cnode_alias_delete_preserves_live_object();
         cnode_finalization_drains_deep_nesting();
@@ -7425,6 +7438,7 @@ pub mod spec {
             child_count_inc(parent, 1);
         }
         let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let scan_before = REPARENT_SCAN_SLOTS.load(core::sync::atomic::Ordering::Relaxed);
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeMove as u64) << 12,
             a2: 3, // dest
@@ -7432,6 +7446,11 @@ pub mod spec {
             ..Default::default()
         };
         decode_invocation(cnode_cap, &args, invoker).expect("move ok");
+        assert_eq!(
+            REPARENT_SCAN_SLOTS.load(core::sync::atomic::Ordering::Relaxed),
+            scan_before,
+            "moving a leaf CTE must not scan the CNode registry"
+        );
         unsafe {
             let s = KERNEL.get();
             assert!(s.cnodes[0].0[1].cap().is_null());
@@ -7462,6 +7481,48 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ CNode::Move transfers cap + MDB ownership and zeroes source\n");
+    }
+
+    #[inline(never)]
+    fn cnode_move_reparents_direct_children() {
+        let invoker = setup_invoker(0);
+        let source_id = crate::cte::MdbId::pack(0, 1);
+        let destination_id = crate::cte::MdbId::pack(0, 2);
+        unsafe {
+            let s = KERNEL.get();
+            let endpoint = Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(s.alloc_endpoint().expect("moved endpoint")),
+                badge: Badge(0),
+                rights: EndpointRights::default(),
+            };
+            s.cnodes[0].0[1].set_cap(&endpoint);
+            s.cnodes[0].0[1].set_child_count(1);
+            s.cnodes[0].0[3].set_cap(&endpoint);
+            s.cnodes[0].0[3].set_parent(Some(source_id));
+        }
+
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let mut args = SyscallArgs {
+            a1: (InvocationLabel::CNodeMove as u64) << 12,
+            a2: 2,
+            a3: 1,
+            ..Default::default()
+        };
+        decode_invocation(root, &args, invoker).expect("move cap with direct child");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(s.cnodes[0].0[1].cap().is_null());
+            assert_eq!(s.cnodes[0].0[2].child_count(), 1);
+            assert_eq!(s.cnodes[0].0[3].parent(), Some(destination_id));
+        }
+
+        args.a1 = (InvocationLabel::CNodeDelete as u64) << 12;
+        args.a2 = 3;
+        decode_invocation(root, &args, invoker).expect("delete moved cap child");
+        args.a2 = 2;
+        decode_invocation(root, &args, invoker).expect("delete moved cap");
+        teardown_invoker(invoker);
+        arch::log("  ✓ CNode::Move reparents exact direct descendants\n");
     }
 
     #[inline(never)]
