@@ -312,7 +312,8 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
         // helped. Masking unconditionally makes the storm unreachable by construction: one
         // delivery per Ack, always.
         if let crate::interrupt::IrqSource::IoApic { controller, pin } = source {
-            let _ = super::ioapic::set_route_mask(controller as usize, pin as u32, true);
+            super::ioapic::set_route_mask(controller as usize, pin as u32, true)
+                .expect("a delivered IOAPIC route must remain maskable until userspace Ack");
         }
     }
     super::pic::eoi(irq as u8);

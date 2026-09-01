@@ -3250,19 +3250,28 @@ fn decode_irq_handler(
         let s = KERNEL.get();
         match label {
             InvocationLabel::IRQAckIRQ => {
-                crate::interrupt::ack_irq(&mut s.irqs, irq).map_err(|_| {
+                let source = crate::interrupt::source(&s.irqs, irq).map_err(|_| {
                     KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
                 })?;
-                #[cfg(target_arch = "x86_64")]
-                if let Ok(crate::interrupt::IrqSource::IoApic { controller, pin }) =
-                    crate::interrupt::source(&s.irqs, irq)
+                if s.irqs
+                    .get(irq)
+                    .is_none_or(|entry| entry.state == crate::interrupt::IrqState::Inactive)
                 {
-                    let _ = crate::arch::x86_64::ioapic::set_route_mask(
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )));
+                }
+                #[cfg(target_arch = "x86_64")]
+                if let crate::interrupt::IrqSource::IoApic { controller, pin } = source {
+                    crate::arch::x86_64::ioapic::set_route_mask(
                         controller as usize,
                         pin as u32,
                         false,
-                    );
+                    )
+                    .expect("a live IOAPIC handler must remain rearmable until Ack");
                 }
+                crate::interrupt::ack_irq(&mut s.irqs, irq)
+                    .expect("validated IRQ binding must remain live under the BKL");
                 Ok(())
             }
             InvocationLabel::IRQSetIRQHandler => {
@@ -3312,11 +3321,19 @@ fn decode_irq_handler(
                     if let Ok(crate::interrupt::IrqSource::IoApic { controller, pin }) =
                         crate::interrupt::source(&s.irqs, irq)
                     {
-                        let _ = crate::arch::x86_64::ioapic::set_route_mask(
+                        if crate::arch::x86_64::ioapic::set_route_mask(
                             controller as usize,
                             pin as u32,
                             false,
-                        );
+                        )
+                        .is_err()
+                        {
+                            crate::interrupt::clear_handler(&mut s.irqs, irq)
+                                .expect("new IRQ binding must remain live under the BKL");
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_IllegalOperation,
+                            )));
+                        }
                     }
                 }
                 Ok(())
@@ -3327,11 +3344,16 @@ fn decode_irq_handler(
                     if let Ok(crate::interrupt::IrqSource::IoApic { controller, pin }) =
                         crate::interrupt::source(&s.irqs, irq)
                     {
-                        let _ = crate::arch::x86_64::ioapic::set_route_mask(
+                        crate::arch::x86_64::ioapic::set_route_mask(
                             controller as usize,
                             pin as u32,
                             true,
-                        );
+                        )
+                        .map_err(|_| {
+                            KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_IllegalOperation,
+                            ))
+                        })?;
                     }
                 }
                 crate::interrupt::clear_handler(&mut s.irqs, irq).map_err(|_| {
@@ -4779,11 +4801,12 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
                 let source = crate::interrupt::source(&s.irqs, *irq).unwrap_or_default();
                 #[cfg(target_arch = "x86_64")]
                 if let crate::interrupt::IrqSource::IoApic { controller, pin } = source {
-                    let _ = crate::arch::x86_64::ioapic::set_route_mask(
+                    crate::arch::x86_64::ioapic::set_route_mask(
                         controller as usize,
                         pin as u32,
                         true,
-                    );
+                    )
+                    .expect("live IOAPIC route must remain maskable until handler finalization");
                 }
                 let _ = crate::interrupt::release_handler(&mut s.irqs, *irq);
             }
