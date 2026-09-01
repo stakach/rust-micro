@@ -1969,12 +1969,8 @@ fn decode_asid_pool(
                     }
                     (cnode_idx, slot_idx, slots[slot_idx].cap())
                 };
-                let (ptr, mapped) = match vspace_cap {
-                    Cap::PML4 {
-                        ptr,
-                        mapped,
-                        asid: 0,
-                    } => (ptr, mapped),
+                let ptr = match vspace_cap {
+                    Cap::PML4 { ptr, asid: 0, .. } => ptr,
                     // Already assigned to an ASID — upstream
                     // decodeX86ASIDPoolAssign returns InvalidCapability
                     // (VSPACE0002 assigns the already-mapped
@@ -2027,7 +2023,7 @@ fn decode_asid_pool(
                 if let Some(slot) = s.cnode_slot_mut(slot_cnode_idx, slot_idx) {
                     slot.set_cap(&Cap::PML4 {
                         ptr,
-                        mapped,
+                        mapped: true,
                         asid: assigned,
                     });
                 }
@@ -6605,7 +6601,11 @@ pub mod spec {
         };
         unsafe {
             match KERNEL.get().cnodes[0].0[6].cap() {
-                Cap::PML4 { asid, .. } => {
+                Cap::PML4 {
+                    mapped: true,
+                    asid,
+                    ..
+                } => {
                     assert!(asid != 0, "Assign should set a non-zero ASID, got {asid}");
                     assert!(
                         asid >= pool_base && asid < pool_base + 512,
@@ -6615,6 +6615,20 @@ pub mod spec {
                 other => panic!("expected Cap::PML4, got {:?}", other),
             }
         }
+
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let copy_args = SyscallArgs {
+            a1: (InvocationLabel::CNodeCopy as u64) << 12,
+            a2: 8,
+            a3: 6,
+            ..Default::default()
+        };
+        decode_invocation(root, &copy_args, invoker).expect("derive assigned PML4 cap");
+        assert_eq!(
+            unsafe { KERNEL.get().cnodes[0].0[8].cap() },
+            unsafe { KERNEL.get().cnodes[0].0[6].cap() },
+            "a derived assigned PML4 must preserve its mapping identity"
+        );
         assert_eq!(
             crate::asid::pml4_paddr(assigned_asid),
             0x0050_8000,
@@ -6622,8 +6636,8 @@ pub mod spec {
         );
         assert_eq!(
             crate::asid::pml4_refcount(assigned_asid),
-            1,
-            "one live CSpace PML4 cap should hold one ASID reference"
+            2,
+            "both live CSpace PML4 aliases must hold an ASID reference"
         );
 
         // Re-assigning a PML4 that already has an ASID surfaces
@@ -6643,6 +6657,14 @@ pub mod spec {
 
         unsafe {
             KERNEL.get().cnodes[0].0[6].set_cap(&Cap::Null);
+        }
+        assert_eq!(
+            crate::asid::pml4_refcount(assigned_asid),
+            1,
+            "deleting one PML4 alias must preserve the ASID mapping"
+        );
+        unsafe {
+            KERNEL.get().cnodes[0].0[8].set_cap(&Cap::Null);
         }
         assert_eq!(
             crate::asid::pml4_paddr(assigned_asid),
