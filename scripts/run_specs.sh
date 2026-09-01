@@ -80,7 +80,7 @@ case "$GRAPHICS" in
         DISP=gtk
       fi
     fi
-    DISPLAY_FLAGS=(-display "$DISP" -vga std -no-shutdown)
+    DISPLAY_FLAGS=(-display "$DISP" -vga std)
     echo "run_specs: graphics mode (display=$DISP) — exits after the guest completion verdict" >&2
     ;;
   *)
