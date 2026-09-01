@@ -1213,13 +1213,94 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
 }
 
 fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    if !paging_structure_mapping_valid(&target) {
+    unsafe {
+        if !paging_cap_is_final(KERNEL.get(), &target) {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_RevokeFirst,
+            )));
+        }
+    }
+    if paging_structure_mapping(&target).is_some() {
+        // seL4's explicit paging-structure Unmap clears the table after a best-effort detach.
+        // Deletion finalization deliberately does not clear it: the source Untyped owns reuse.
+        detach_paging_structure(&target);
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let table =
+                crate::arch::x86_64::paging::phys_to_lin(paging_struct_state(&target).0) as *mut u8;
+            core::ptr::write_bytes(table, 0, 4096);
+        }
+    }
+    update_invoked_paging_slot(args, invoker, &target, None, 0)?;
+    Ok(())
+}
+
+fn same_paging_object(a: &Cap, b: &Cap) -> bool {
+    match (a, b) {
+        (Cap::PageTable { ptr: a, .. }, Cap::PageTable { ptr: b, .. }) => a.addr() == b.addr(),
+        (Cap::PageDirectory { ptr: a, .. }, Cap::PageDirectory { ptr: b, .. }) => {
+            a.addr() == b.addr()
+        }
+        (Cap::Pdpt { ptr: a, .. }, Cap::Pdpt { ptr: b, .. }) => a.addr() == b.addr(),
+        _ => false,
+    }
+}
+
+/// seL4 keeps same-object caps adjacent in its MDB, making this query constant-time. rust-micro's
+/// compact parent-only MDB has no sibling link, so mapped paging structures use a bounded registry
+/// walk. This is intentionally limited to explicit unmap and mapped-cap finalization; ordinary cap
+/// deletion remains O(1).
+unsafe fn paging_cap_is_final(s: &crate::kernel::KernelState, cap: &Cap) -> bool {
+    if !matches!(
+        cap,
+        Cap::PageTable { .. } | Cap::PageDirectory { .. } | Cap::Pdpt { .. }
+    ) {
+        return false;
+    }
+    let mut references = 0u32;
+    for ci in 0..KernelState::cnode_pool_count() {
+        let Some(slots) = s.cnode_slots_at(ci) else {
+            continue;
+        };
+        for slot in slots {
+            if same_paging_object(&slot.cap(), cap) {
+                references += 1;
+                if references > 1 {
+                    return false;
+                }
+            }
+        }
+    }
+    references == 1
+}
+
+unsafe fn finalise_cap_mapping(s: &crate::kernel::KernelState, cap: &Cap) {
+    if matches!(
+        cap,
+        Cap::PageTable { .. } | Cap::PageDirectory { .. } | Cap::Pdpt { .. }
+    ) {
+        if paging_structure_mapping(cap).is_some() && paging_cap_is_final(s, cap) {
+            // `unmapPageTable`/`unmapPageDirectory`/`unmapPDPT` are best-effort in seL4. A parent
+            // table or ASID may already be gone; final capability deletion still succeeds.
+            detach_paging_structure(cap);
+        }
+    } else {
+        detach_frame_mapping(cap);
+    }
+}
+
+fn derive_paging_structure(cap: &Cap) -> KResult<()> {
+    if matches!(
+        cap,
+        Cap::PageTable { mapped: None, .. }
+            | Cap::PageDirectory { mapped: None, .. }
+            | Cap::Pdpt { mapped: None, .. }
+            | Cap::PML4 { mapped: false, .. }
+    ) {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         )));
     }
-    detach_paging_structure(&target);
-    update_invoked_paging_slot(args, invoker, &target, None, 0)?;
     Ok(())
 }
 
@@ -1253,23 +1334,6 @@ fn paging_structure_mapping(cap: &Cap) -> Option<(u64, u64, u16, u32)> {
     }
 }
 
-fn paging_structure_mapping_valid(cap: &Cap) -> bool {
-    let is_paging = matches!(
-        cap,
-        Cap::PageTable { .. } | Cap::PageDirectory { .. } | Cap::Pdpt { .. }
-    );
-    let Some((paddr, vaddr, asid, level)) = paging_structure_mapping(cap) else {
-        return !is_paging || paging_struct_state(cap).1.is_none();
-    };
-    let pml4_paddr = pml4_paddr_for_asid(asid);
-    pml4_paddr != 0
-        && unsafe {
-            crate::arch::x86_64::usermode::user_table_matches_in_paddr(
-                pml4_paddr, level, vaddr, paddr,
-            )
-        }
-}
-
 fn detach_paging_structure(cap: &Cap) -> bool {
     let Some((paddr, vaddr, asid, level)) = paging_structure_mapping(cap) else {
         return false;
@@ -1287,7 +1351,7 @@ fn detach_paging_structure(cap: &Cap) -> bool {
     detached
 }
 
-fn detach_cap_mapping(cap: &Cap) {
+fn detach_frame_mapping(cap: &Cap) {
     if let Cap::Frame {
         ptr,
         size,
@@ -1332,8 +1396,6 @@ fn detach_cap_mapping(cap: &Cap) {
                 }
             }
         }
-    } else {
-        detach_paging_structure(cap);
     }
 }
 
@@ -1406,10 +1468,7 @@ unsafe fn cnode_worklist() -> &'static mut CNodeWorkList {
     work
 }
 
-unsafe fn cap_tree_mappings_valid(s: &crate::kernel::KernelState, cap: &Cap) -> bool {
-    if !paging_structure_mapping_valid(cap) {
-        return false;
-    }
+unsafe fn cnode_tree_registered(s: &crate::kernel::KernelState, cap: &Cap) -> bool {
     let Cap::CNode { ptr, .. } = cap else {
         return true;
     };
@@ -1427,9 +1486,6 @@ unsafe fn cap_tree_mappings_valid(s: &crate::kernel::KernelState, cap: &Cap) -> 
             if inner.is_null() {
                 continue;
             }
-            if !paging_structure_mapping_valid(&inner) {
-                return false;
-            }
             if let Cap::CNode { ptr: inner_ptr, .. } = inner {
                 if !work.push(KernelState::cnode_index(inner_ptr)) {
                     return false;
@@ -1446,9 +1502,6 @@ unsafe fn cnode_release_mappings_valid(
     cleared_refs: u32,
     cleared_self_refs: u32,
 ) -> bool {
-    if !paging_structure_mapping_valid(cap) {
-        return false;
-    }
     let Cap::CNode { ptr, .. } = cap else {
         return true;
     };
@@ -1468,7 +1521,7 @@ unsafe fn cnode_release_mappings_valid(
     let Some(remaining_self_refs) = self_refs.checked_sub(cleared_self_refs) else {
         return false;
     };
-    remaining_refs != remaining_self_refs || cap_tree_mappings_valid(s, cap)
+    remaining_refs != remaining_self_refs || cnode_tree_registered(s, cap)
 }
 
 unsafe fn revoke_cnode_clear_counts(
@@ -4043,8 +4096,9 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             }
         }
 
-        // Validate every hardware paging edge before changing any CTE. A
-        // failed exact match must leave the revoke operation atomic.
+        // Validate that every CNode which would become final still has registered backing before
+        // changing any CTE. Paging edges are deliberately not preconditions: seL4 finalizes a
+        // final paging-structure cap with a best-effort unmap even if its parent disappeared first.
         for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
             let slot_count = s.cnode_slots_at(ci).map(|slots| slots.len()).unwrap_or(0);
             for si in 0..slot_count {
@@ -4064,7 +4118,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                             revoke_cnode_clear_counts(s, vi, revoke_epoch, (cnode_idx, src_index));
                         cnode_release_mappings_valid(s, &cap, cleared_refs, cleared_self_refs)
                     }
-                    _ => paging_structure_mapping_valid(&cap),
+                    _ => true,
                 };
                 if !valid {
                     return Err(KException::SyscallError(SyscallError::new(
@@ -4098,7 +4152,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                     .expect("marked revoke slot must remain registered under the BKL")
                     .cap();
                 let parent = splice_cte_out(s, id);
-                detach_cap_mapping(&cap_to_free);
+                finalise_cap_mapping(s, &cap_to_free);
                 // Phase 44 — clear the slot FIRST (the set_cap hook
                 // drops the refcount), then release the object if
                 // that was its last reference. Replaces the
@@ -4235,28 +4289,13 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
                 seL4_Error::seL4_FailedLookup,
             )));
         }
-        // Mirror upstream `Arch_deriveCap` for x86 paging-structure
-        // caps: the derived (copied/minted) cap starts with mapped
-        // state cleared. The original cap retains its mapping; its
-        // copies are independent and must be Map'd before use. Without
-        // this, sel4test's allocman recycles slots, copies frame caps
-        // to new slots, then tries to map them — and the kernel
-        // returns DeleteFirst because the source cap's stale mapped
-        // vaddr propagates through the copy.
+        // `Arch_deriveCap` preserves mapped paging-structure state and rejects derivation of an
+        // unmapped structure. Every mapped alias therefore names the same hardware edge, and only
+        // the final alias may explicitly unmap or detach it during deletion. Frame derivation is
+        // different: its mapping metadata is cleared in the derived cap.
+        derive_paging_structure(&copy)?;
         match &mut copy {
             Cap::Frame { mapped, asid, .. } => {
-                *mapped = None;
-                *asid = 0;
-            }
-            Cap::PageTable { mapped, asid, .. } => {
-                *mapped = None;
-                *asid = 0;
-            }
-            Cap::PageDirectory { mapped, asid, .. } => {
-                *mapped = None;
-                *asid = 0;
-            }
-            Cap::Pdpt { mapped, asid, .. } => {
                 *mapped = None;
                 *asid = 0;
             }
@@ -4831,7 +4870,7 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
                     let spliced_parent =
                         splice_cte_out(s, crate::cte::MdbId::pack(vi as u32, si as u32));
                     assert_eq!(spliced_parent, inner_parent);
-                    detach_cap_mapping(&inner_cap);
+                    finalise_cap_mapping(s, &inner_cap);
                     let slot = s
                         .cnode_slot_mut(vi, si)
                         .expect("queued CNode slot must remain registered until cleared");
@@ -4912,7 +4951,7 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 let vi = KernelState::cnode_index(ptr);
                 cnode_release_mappings_valid(s, &deleted_cap, 1, u32::from(cnode_idx == vi))
             }
-            _ => paging_structure_mapping_valid(&deleted_cap),
+            _ => true,
         };
         if !valid {
             return Err(KException::SyscallError(SyscallError::new(
@@ -4921,7 +4960,7 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         }
 
         let parent_id = splice_cte_out(s, removed_id);
-        detach_cap_mapping(&deleted_cap);
+        finalise_cap_mapping(s, &deleted_cap);
 
         let slot = s
             .cnode_slot_mut(cnode_idx, res.slot_index)
@@ -6905,37 +6944,81 @@ pub mod spec {
                 } if v == vaddr
             ));
 
-            let unmap_args = SyscallArgs {
+            let root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
+            let copy_args = SyscallArgs {
+                a1: (InvocationLabel::CNodeCopy as u64) << 12,
+                a2: 4,
+                a3: 2,
+                ..Default::default()
+            };
+            decode_invocation(root, &copy_args, invoker).expect("copy mapped PT cap");
+            assert_eq!(KERNEL.get().cnodes[0].0[4].cap(), mapped_cap);
+
+            let mut unmap_args = SyscallArgs {
                 a0: 2,
                 a1: (InvocationLabel::X86PageTableUnmap as u64) << 12,
                 ..Default::default()
             };
-            core::ptr::write_volatile(pd.add(pd_i), (pt_paddr + 0x1000) | flags);
             assert!(matches!(
                 decode_invocation(mapped_cap, &unmap_args, invoker),
                 Err(KException::SyscallError(SyscallError {
-                    code: seL4_Error::seL4_IllegalOperation,
+                    code: seL4_Error::seL4_RevokeFirst,
                 }))
             ));
-            assert!(matches!(
-                KERNEL.get().cnodes[0].0[2].cap(),
-                Cap::PageTable {
-                    mapped: Some(v),
-                    asid: ASID,
-                    ..
-                } if v == vaddr
-            ));
-            core::ptr::write_volatile(pd.add(pd_i), pt_paddr | flags);
-            decode_invocation(mapped_cap, &unmap_args, invoker).expect("explicit PT unmap");
+            let delete_args = SyscallArgs {
+                a1: (InvocationLabel::CNodeDelete as u64) << 12,
+                a2: 2,
+                ..Default::default()
+            };
+            decode_invocation(root, &delete_args, invoker).expect("delete non-final PT alias");
+            assert_eq!(
+                core::ptr::read_volatile(pd.add(pd_i)) & 0x000F_FFFF_FFFF_F000,
+                pt_paddr,
+            );
+
+            unmap_args.a0 = 4;
+            decode_invocation(mapped_cap, &unmap_args, invoker).expect("unmap final PT alias");
             assert_eq!(core::ptr::read_volatile(pd.add(pd_i)), 0);
             assert!(matches!(
-                KERNEL.get().cnodes[0].0[2].cap(),
+                KERNEL.get().cnodes[0].0[4].cap(),
                 Cap::PageTable {
                     mapped: None,
                     asid: 0,
                     ..
                 }
             ));
+
+            let mut unmapped_copy_args = copy_args;
+            unmapped_copy_args.a2 = 5;
+            unmapped_copy_args.a3 = 4;
+            assert!(matches!(
+                decode_invocation(root, &unmapped_copy_args, invoker),
+                Err(KException::SyscallError(SyscallError {
+                    code: seL4_Error::seL4_IllegalOperation,
+                }))
+            ));
+
+            let mut remap_args = map_args;
+            remap_args.a0 = 4;
+            let unmapped_cap = KERNEL.get().cnodes[0].0[4].cap();
+            decode_invocation(unmapped_cap, &remap_args, invoker).expect("remap final PT cap");
+            let remapped_cap = KERNEL.get().cnodes[0].0[4].cap();
+            core::ptr::write_volatile(pd.add(pd_i), (pt_paddr + 0x1000) | flags);
+            decode_invocation(remapped_cap, &unmap_args, invoker)
+                .expect("stale parent edge does not block explicit PT unmap");
+            assert_eq!(
+                core::ptr::read_volatile(pd.add(pd_i)) & 0x000F_FFFF_FFFF_F000,
+                pt_paddr + 0x1000,
+            );
+            assert!(matches!(
+                KERNEL.get().cnodes[0].0[4].cap(),
+                Cap::PageTable {
+                    mapped: None,
+                    asid: 0,
+                    ..
+                }
+            ));
+            core::ptr::write_volatile(pd.add(pd_i), 0);
 
             crate::asid::clear_pool(ASID & !0x1ff);
         }
@@ -7620,26 +7703,19 @@ pub mod spec {
         }
 
         args.a2 = 2;
-        assert!(matches!(
-            decode_invocation(root, &args, invoker),
-            Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_IllegalOperation,
-            }))
-        ));
+        decode_invocation(root, &args, invoker)
+            .expect("delete final CNode with detached paging edge");
         unsafe {
             let s = KERNEL.get();
-            assert!(matches!(s.cnodes[0].0[2].cap(), Cap::CNode { .. }));
-            s.cnode_slot_mut(vi, 0)
-                .expect("live alias contents")
-                .set_cap(&Cap::PageTable {
-                    ptr: PPtr::<PageTableStorage>::new(0x00d0_0000).unwrap(),
-                    mapped: None,
-                    asid: 0,
-                });
+            assert!(s.cnodes[0].0[2].cap().is_null());
+            assert!(s
+                .cnode_slot(vi, 0)
+                .expect("finalized CNode storage")
+                .cap()
+                .is_null());
         }
-        decode_invocation(root, &args, invoker).expect("delete final valid CNode alias");
         teardown_invoker(invoker);
-        arch::log("  ✓ non-final CNode alias delete preserves live object contents\n");
+        arch::log("  ✓ final CNode deletion tolerates detached paging edges\n");
     }
 
     #[inline(never)]
