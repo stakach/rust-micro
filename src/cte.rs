@@ -91,7 +91,7 @@ impl Cte {
     // `MdbId::pack(0, 0)` stores as one and remains a valid parent.
 
     pub fn parent(&self) -> Option<MdbId> {
-        let raw = (self.mdb_words[0] & MdbId::MASK as u64) as u32;
+        let raw = self.mdb_words[0] & MdbId::MASK;
         if raw == MdbId::STORED_NONE {
             None
         } else {
@@ -101,39 +101,67 @@ impl Cte {
 
     pub fn set_parent(&mut self, parent: Option<MdbId>) {
         let raw = parent.map_or(MdbId::STORED_NONE, |p| p.0 + 1);
-        self.mdb_words[0] = (self.mdb_words[0] & !(MdbId::MASK as u64)) | (raw as u64);
+        self.mdb_words[0] = (self.mdb_words[0] & !MdbId::MASK) | raw;
+    }
+
+    /// Number of direct descendants whose MDB parent is this CTE. Keeping the count with the
+    /// parent makes CNode Move transfer the complete derivation identity and avoids a kernel-image
+    /// side array sized for every possible CSpace slot.
+    pub const fn child_count(&self) -> u32 {
+        self.mdb_words[1] as u32
+    }
+
+    pub fn set_child_count(&mut self, count: u32) {
+        self.mdb_words[1] = (self.mdb_words[1] & 0xffff_ffff_0000_0000) | count as u64;
+    }
+
+    pub fn increment_child_count(&mut self, by: u32) {
+        self.set_child_count(self.child_count().saturating_add(by));
+    }
+
+    pub fn decrement_child_count(&mut self) -> u32 {
+        let remaining = self.child_count().saturating_sub(1);
+        self.set_child_count(remaining);
+        remaining
+    }
+
+    /// Transient generation used by one BKL-serialized revoke walk. A generation mark avoids a
+    /// second bitmap proportional to total CSpace capacity; it has no meaning after that walk.
+    pub const fn revoke_epoch(&self) -> u32 {
+        (self.mdb_words[1] >> 32) as u32
+    }
+
+    pub fn set_revoke_epoch(&mut self, epoch: u32) {
+        self.mdb_words[1] = (self.mdb_words[1] & 0x0000_0000_ffff_ffff) | ((epoch as u64) << 32);
     }
 }
 
 /// Packed (cnode_idx, slot) handle on a CTE somewhere in
-/// `KernelState`'s big / small / XL CNode pools. 8 bits cnode_idx
-/// (virtual index across all three pools) + 20 bits slot. Extern-rootserver
-/// currently uses a radix-18 XL page; the wider field leaves room for future
-/// dynamically backed CNodes without changing the on-CTE parent encoding.
+/// `KernelState`'s CNode registry. The complete 52-bit identity lives in the
+/// first 64-bit MDB word, leaving the second word for per-CTE ownership state.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
-pub struct MdbId(pub u32);
+pub struct MdbId(pub u64);
 
 impl MdbId {
     pub const SLOT_BITS: u32 = 20;
-    pub const SLOT_MASK: u32 = (1u32 << Self::SLOT_BITS) - 1;
-    pub const CNODE_IDX_BITS: u32 = 8;
-    pub const MASK: u32 = (1u32 << (Self::CNODE_IDX_BITS + Self::SLOT_BITS)) - 1;
-    pub const STORED_NONE: u32 = 0;
+    pub const SLOT_MASK: u64 = (1u64 << Self::SLOT_BITS) - 1;
+    pub const CNODE_IDX_BITS: u32 = 32;
+    pub const MASK: u64 = (1u64 << (Self::CNODE_IDX_BITS + Self::SLOT_BITS)) - 1;
+    pub const STORED_NONE: u64 = 0;
 
     /// Kept as a storage-level alias for older comments/tests that referred to "sentinel"; raw
     /// zero is no-parent, while `MdbId(0)` is a valid encoded parent and stores as one.
-    pub const SENTINEL: u32 = Self::STORED_NONE;
+    pub const SENTINEL: u64 = Self::STORED_NONE;
 
-    /// `cnode_idx`: 0..256 (virtual, across all pools), `slot`:
-    /// 0..1,048,576 (20-bit slot field).
-    pub const fn pack(cnode_idx: u8, slot: u32) -> Self {
-        Self(((cnode_idx as u32) << Self::SLOT_BITS) | (slot & Self::SLOT_MASK))
+    /// `cnode_idx` is a descriptor identity; `slot` supports CNodes through radix 20.
+    pub const fn pack(cnode_idx: u32, slot: u32) -> Self {
+        Self(((cnode_idx as u64) << Self::SLOT_BITS) | ((slot as u64) & Self::SLOT_MASK))
     }
-    pub const fn cnode_idx(self) -> u8 {
-        (self.0 >> Self::SLOT_BITS) as u8
+    pub const fn cnode_idx(self) -> u32 {
+        (self.0 >> Self::SLOT_BITS) as u32
     }
     pub const fn slot(self) -> u32 {
-        self.0 & Self::SLOT_MASK
+        (self.0 & Self::SLOT_MASK) as u32
     }
 }
 

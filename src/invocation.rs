@@ -1662,7 +1662,7 @@ fn decode_asid_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbI
                 if let Some(usl) = untyped_slot {
                     // Phase 30 — record the new pool's MDB parent as
                     // the source Untyped's slot.
-                    let parent_id = crate::cte::MdbId::pack(cnode_idx as u8, usl as u32);
+                    let parent_id = crate::cte::MdbId::pack(cnode_idx as u32, usl as u32);
                     slots[dest_offset].set_parent(Some(parent_id));
                     child_count_inc(parent_id, 1);
                     // Commit the bumped Untyped state back into its slot.
@@ -3413,7 +3413,7 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         // Phase 30 — record each carved child's parent CTE in the
         // MDB. We resolved the source untyped's location above
         // (src_cnode_idx, src_slot_index).
-        let parent_id = crate::cte::MdbId::pack(src_cnode_idx as u8, src_slot_index as u32);
+        let parent_id = crate::cte::MdbId::pack(src_cnode_idx as u32, src_slot_index as u32);
         let result =
             crate::untyped::retype(&mut state, object_type, size_bits, num_objects, |cap| {
                 let cap_to_store = match cap {
@@ -3857,6 +3857,35 @@ fn cnode_cancel_badged_sends(target: Cap, args: &SyscallArgs, _invoker: TcbId) -
     Ok(())
 }
 
+static mut REVOKE_EPOCH: u32 = 0;
+
+unsafe fn begin_revoke_epoch(s: &mut KernelState) -> u32 {
+    let mut epoch = REVOKE_EPOCH.wrapping_add(1);
+    if epoch == 0 {
+        for ci in 0..KernelState::cnode_pool_count() {
+            if let Some(slots) = s.cnode_slots_at_mut(ci) {
+                for slot in slots {
+                    slot.set_revoke_epoch(0);
+                }
+            }
+        }
+        epoch = 1;
+    }
+    REVOKE_EPOCH = epoch;
+    epoch
+}
+
+fn cte_revoke_marked(s: &KernelState, ci: usize, si: usize, epoch: u32) -> bool {
+    s.cnode_slot(ci, si)
+        .is_some_and(|slot| slot.revoke_epoch() == epoch)
+}
+
+fn mark_cte_revoke(s: &mut KernelState, ci: usize, si: usize, epoch: u32) {
+    if let Some(slot) = s.cnode_slot_mut(ci, si) {
+        slot.set_revoke_epoch(epoch);
+    }
+}
+
 fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
     let src_index = args.a2 as usize;
     let cnode_ptr = match target {
@@ -3872,86 +3901,12 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 seL4_Error::seL4_RangeError,
             )));
         }
-        let source_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u32);
+        let source_id = crate::cte::MdbId::pack(cnode_idx as u32, src_index as u32);
 
-        // Tombstone bitmap: bit set means "this CTE has been
-        // revoked-or-is-source". Held in a static (BKL-serialised)
-        // so we don't blow the kernel stack. Split into per-pool
-        // backing arrays sized to each pool's actual capacity —
-        // packing as a single MAX_CNODES * CNODE_SLOTS array would
-        // grow ~3x once the small pool is included.
-        const SLOTS_PER_NODE: usize = crate::kernel::CNODE_SLOTS;
-        const SMALL_SLOTS: usize = crate::kernel::SMALL_CNODE_SLOTS;
-        static mut REVOKED_BIG: [[bool; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES] =
-            [[false; SLOTS_PER_NODE]; crate::kernel::MAX_CNODES];
-        static mut REVOKED_SMALL: [[bool; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES] =
-            [[false; SMALL_SLOTS]; crate::kernel::MAX_SMALL_CNODES];
-        const XL_SLOTS: usize = crate::kernel::XL_CNODE_SLOTS;
-        static mut REVOKED_XL: [[bool; XL_SLOTS]; crate::kernel::MAX_XL_CNODES] =
-            [[false; XL_SLOTS]; crate::kernel::MAX_XL_CNODES];
-        // Reset both pool bitmaps. We touch the statics through raw
-        // pointers below to keep the borrow checker out of the way —
-        // the closures used by the marking + clearing phases need
-        // overlapping reads/writes that &mut won't permit.
-        for row in (&mut *core::ptr::addr_of_mut!(REVOKED_BIG)).iter_mut() {
-            for v in row.iter_mut() {
-                *v = false;
-            }
-        }
-        for row in (&mut *core::ptr::addr_of_mut!(REVOKED_SMALL)).iter_mut() {
-            for v in row.iter_mut() {
-                *v = false;
-            }
-        }
-        for row in (&mut *core::ptr::addr_of_mut!(REVOKED_XL)).iter_mut() {
-            for v in row.iter_mut() {
-                *v = false;
-            }
-        }
-        // Helpers: dispatch on virtual cnode index.
-        let is_revoked = |ci: usize, si: usize| -> bool {
-            if ci < crate::kernel::MAX_CNODES {
-                if si < SLOTS_PER_NODE {
-                    (*core::ptr::addr_of!(REVOKED_BIG))[ci][si]
-                } else {
-                    false
-                }
-            } else if ci < crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES {
-                let small_i = ci - crate::kernel::MAX_CNODES;
-                if si < SMALL_SLOTS {
-                    (*core::ptr::addr_of!(REVOKED_SMALL))[small_i][si]
-                } else {
-                    false
-                }
-            } else if ci < crate::kernel::KernelState::cnode_pool_count() {
-                let xl_i = ci - crate::kernel::MAX_CNODES - crate::kernel::MAX_SMALL_CNODES;
-                if si < XL_SLOTS {
-                    (*core::ptr::addr_of!(REVOKED_XL))[xl_i][si]
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-        let mark_revoked = |ci: usize, si: usize| {
-            if ci < crate::kernel::MAX_CNODES {
-                if si < SLOTS_PER_NODE {
-                    (*core::ptr::addr_of_mut!(REVOKED_BIG))[ci][si] = true;
-                }
-            } else if ci < crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES {
-                let small_i = ci - crate::kernel::MAX_CNODES;
-                if si < SMALL_SLOTS {
-                    (*core::ptr::addr_of_mut!(REVOKED_SMALL))[small_i][si] = true;
-                }
-            } else if ci < crate::kernel::KernelState::cnode_pool_count() {
-                let xl_i = ci - crate::kernel::MAX_CNODES - crate::kernel::MAX_SMALL_CNODES;
-                if si < XL_SLOTS {
-                    (*core::ptr::addr_of_mut!(REVOKED_XL))[xl_i][si] = true;
-                }
-            }
-        };
-        mark_revoked(cnode_idx, src_index);
+        // Mark this walk in each CTE's transient MDB generation. This is BKL-serialized and avoids
+        // a second bitmap proportional to every possible CSpace slot.
+        let revoke_epoch = begin_revoke_epoch(s);
+        mark_cte_revoke(s, cnode_idx, src_index, revoke_epoch);
 
         // Iterate to fixed point: any CTE whose parent is revoked
         // gets revoked too. Capacity-bounded — at most
@@ -3960,23 +3915,17 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         while progress {
             progress = false;
             for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-                let slot_count = if ci < crate::kernel::MAX_CNODES {
-                    s.cnodes[ci].0.len()
-                } else if ci < crate::kernel::MAX_CNODES + crate::kernel::MAX_SMALL_CNODES {
-                    SMALL_SLOTS
-                } else {
-                    XL_SLOTS
-                };
+                let slot_count = s.cnode_slots_at(ci).map(|slots| slots.len()).unwrap_or(0);
                 for si in 0..slot_count {
-                    if is_revoked(ci, si) {
+                    if cte_revoke_marked(s, ci, si, revoke_epoch) {
                         continue;
                     }
                     let parent = s.cnode_slot(ci, si).and_then(|c| c.parent());
                     if let Some(p) = parent {
                         let pi = p.cnode_idx() as usize;
                         let ps = p.slot() as usize;
-                        if is_revoked(pi, ps) {
-                            mark_revoked(ci, si);
+                        if cte_revoke_marked(s, pi, ps, revoke_epoch) {
+                            mark_cte_revoke(s, ci, si, revoke_epoch);
                             progress = true;
                         }
                     }
@@ -3989,7 +3938,9 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
             let slot_count = s.cnode_slots_at(ci).map(|slots| slots.len()).unwrap_or(0);
             for si in 0..slot_count {
-                if !is_revoked(ci, si) || (ci == cnode_idx && si == src_index) {
+                if !cte_revoke_marked(s, ci, si, revoke_epoch)
+                    || (ci == cnode_idx && si == src_index)
+                {
                     continue;
                 }
                 let cap = s
@@ -4011,10 +3962,12 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
             let slot_count = s.cnode_slots_at(ci).map(|sl| sl.len()).unwrap_or(0);
             for si in 0..slot_count {
-                if !is_revoked(ci, si) || (ci == cnode_idx && si == src_index) {
+                if !cte_revoke_marked(s, ci, si, revoke_epoch)
+                    || (ci == cnode_idx && si == src_index)
+                {
                     continue;
                 }
-                let id = crate::cte::MdbId::pack(ci as u8, si as u32);
+                let id = crate::cte::MdbId::pack(ci as u32, si as u32);
                 child_count_reset(id);
                 // Phase 43 — free pool slots so long sel4test
                 // runs don't exhaust the static pools. Only the
@@ -4040,7 +3993,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             }
         }
         // The source itself kept the cap but lost all its descendants.
-        let src_id = crate::cte::MdbId::pack(cnode_idx as u8, src_index as u32);
+        let src_id = crate::cte::MdbId::pack(cnode_idx as u32, src_index as u32);
         child_count_reset(src_id);
 
         // Silence unused: the structural fallback used to live
@@ -4326,8 +4279,10 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
             slot.set_cap(&copy);
             // Phase 30 — the new cap is derived from the source slot;
             // its MDB parent is the source CTE.
-            let src_id = crate::cte::MdbId::pack(src_cnode_idx as u8, src_res.slot_index as u32);
+            let src_id = crate::cte::MdbId::pack(src_cnode_idx as u32, src_res.slot_index as u32);
             slot.set_parent(Some(src_id));
+            slot.set_child_count(0);
+            slot.set_revoke_epoch(0);
             child_count_inc(src_id, 1);
         }
     }
@@ -4395,10 +4350,10 @@ fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) ->
         // Snapshot the complete source ownership state before mutating either slot — both might
         // be in the same CNode, in which case the borrow checker
         // would object to two simultaneous &mut on the same array.
-        let (src_cap, src_parent) = s
+        let (src_cap, src_parent, src_child_count) = s
             .cnode_slot(src_cnode_idx, src_res.slot_index)
-            .map(|c| (c.cap(), c.parent()))
-            .unwrap_or((Cap::Null, None));
+            .map(|c| (c.cap(), c.parent(), c.child_count()))
+            .unwrap_or((Cap::Null, None, 0));
         // Upstream order: dest-not-empty check first (DeleteFirst),
         // then src-empty check (FailedLookup). Matches sel4test's
         // `is_slot_empty` helper in helpers.c.
@@ -4419,10 +4374,26 @@ fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) ->
         if let Some(slot) = s.cnode_slot_mut(dest_cnode_idx, dest_res.slot_index) {
             slot.set_cap(&src_cap);
             slot.set_parent(src_parent);
+            slot.set_child_count(src_child_count);
+            slot.set_revoke_epoch(0);
+        }
+        let src_id = crate::cte::MdbId::pack(src_cnode_idx as u32, src_res.slot_index as u32);
+        let dest_id = crate::cte::MdbId::pack(dest_cnode_idx as u32, dest_res.slot_index as u32);
+        for ci in 0..KernelState::cnode_pool_count() {
+            let slot_count = s.cnode_slots_at(ci).map(|slots| slots.len()).unwrap_or(0);
+            for si in 0..slot_count {
+                if s.cnode_slot(ci, si).and_then(|slot| slot.parent()) == Some(src_id) {
+                    s.cnode_slot_mut(ci, si)
+                        .expect("CNode Move descendant disappeared")
+                        .set_parent(Some(dest_id));
+                }
+            }
         }
         if let Some(slot) = s.cnode_slot_mut(src_cnode_idx, src_res.slot_index) {
             slot.set_cap(&Cap::Null);
             slot.set_parent(None);
+            slot.set_child_count(0);
+            slot.set_revoke_epoch(0);
         }
     }
     Ok(())
@@ -4702,10 +4673,16 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         // Snapshot the cap + parent edge BEFORE clearing — the
         // Untyped reclaim below needs them to know what to give
         // back and to whom.
-        let (deleted_cap, parent_id) = match s.cnode_slot(cnode_idx, res.slot_index) {
-            Some(c) => (c.cap(), c.parent()),
-            None => (Cap::Null, None),
+        let (deleted_cap, parent_id, child_count) = match s.cnode_slot(cnode_idx, res.slot_index) {
+            Some(c) => (c.cap(), c.parent(), c.child_count()),
+            None => (Cap::Null, None, 0),
         };
+
+        if child_count != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_RevokeFirst,
+            )));
+        }
 
         if !cap_tree_mappings_valid(s, &deleted_cap, 0) {
             return Err(KException::SyscallError(SyscallError::new(
@@ -4718,6 +4695,8 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         if let Some(slot) = s.cnode_slot_mut(cnode_idx, res.slot_index) {
             slot.set_cap(&Cap::Null);
             slot.set_parent(None);
+            slot.set_child_count(0);
+            slot.set_revoke_epoch(0);
         }
 
         // Phase 43 — deleting the LAST cap to a TCB triggers thread
@@ -4794,88 +4773,36 @@ fn cap_extent(cap: &Cap) -> (u64, u64) {
     }
 }
 
-/// Phase 43 — per-parent live-child counter, keyed by the parent
-/// cap's slot position across ALL THREE cnode pools (big, small,
-/// XL — the same virtual-index scheme as `free_cnode_virt`).
-/// Maintained on Retype (increment per child emitted) and on
-/// cnode_delete (decrement). When a delete brings the count to 0 we
-/// reset the parent Untyped's `free_index` to 0 — no need for the
-/// O(N) reclaim walk in the common alloc-then-free-all pattern.
-/// Coverage of every pool matters: test-process cspace roots live in
-/// the XL pool, and the untypeds handed to a test process sit in
-/// that root — without counting them, churny tests (helper create/
-/// destroy loops) never reclaim and starve out with NotEnoughMemory.
-const BIG_COUNTS: usize = crate::kernel::MAX_CNODES * crate::kernel::CNODE_SLOTS;
-const SMALL_COUNTS: usize = crate::kernel::MAX_SMALL_CNODES * crate::kernel::SMALL_CNODE_SLOTS;
-const XL_COUNTS: usize = crate::kernel::MAX_XL_CNODES * crate::kernel::XL_CNODE_SLOTS;
-const CHILD_COUNT_LEN: usize = BIG_COUNTS + SMALL_COUNTS + XL_COUNTS;
-static mut CHILD_COUNTS: [u32; CHILD_COUNT_LEN] = [0; CHILD_COUNT_LEN];
-
-#[inline]
-fn child_count_idx(pid: crate::cte::MdbId) -> Option<usize> {
-    use crate::kernel::*;
-    let ci = pid.cnode_idx() as usize;
-    let si = pid.slot() as usize;
-    if ci < MAX_CNODES {
-        (si < CNODE_SLOTS).then(|| ci * CNODE_SLOTS + si)
-    } else if ci < MAX_CNODES + MAX_SMALL_CNODES {
-        (si < SMALL_CNODE_SLOTS).then(|| BIG_COUNTS + (ci - MAX_CNODES) * SMALL_CNODE_SLOTS + si)
-    } else if ci < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
-        (si < XL_CNODE_SLOTS).then(|| {
-            BIG_COUNTS + SMALL_COUNTS + (ci - MAX_CNODES - MAX_SMALL_CNODES) * XL_CNODE_SLOTS + si
-        })
-    } else {
-        None
-    }
-}
-
+/// Per-parent live-child accounting lives in the parent CTE's MDB storage. This follows a CNode
+/// Move with the CTE and scales with memory-backed CNodes without a second kernel-image array.
 pub unsafe fn child_count_inc(pid: crate::cte::MdbId, by: u32) {
-    if let Some(idx) = child_count_idx(pid) {
-        let counts = &mut *core::ptr::addr_of_mut!(CHILD_COUNTS);
-        counts[idx] = counts[idx].saturating_add(by);
+    let s = KERNEL.get();
+    if let Some(parent) = s.cnode_slot_mut(pid.cnode_idx() as usize, pid.slot() as usize) {
+        parent.increment_child_count(by);
     }
 }
 
 unsafe fn child_count_dec(pid: crate::cte::MdbId) -> u32 {
-    if let Some(idx) = child_count_idx(pid) {
-        let counts = &mut *core::ptr::addr_of_mut!(CHILD_COUNTS);
-        if counts[idx] > 0 {
-            counts[idx] -= 1;
+    let s = KERNEL.get();
+    s.cnode_slot_mut(pid.cnode_idx() as usize, pid.slot() as usize)
+        .map(|parent| parent.decrement_child_count())
+        .unwrap_or(u32::MAX)
+}
+
+/// Clear ownership metadata before a CNode descriptor or static page is reused.
+pub unsafe fn child_counts_reset_page(vi: usize) {
+    if let Some(slots) = KERNEL.get().cnode_slots_at_mut(vi) {
+        for slot in slots {
+            slot.set_child_count(0);
+            slot.set_revoke_epoch(0);
         }
-        counts[idx]
-    } else {
-        u32::MAX
     }
 }
 
-/// Zero every child counter keyed by slots of cnode page `vi`.
-/// Called when a cnode page is freed wholesale (`free_cnode_virt`)
-/// so a recycled page starts with clean counters.
-pub unsafe fn child_counts_reset_page(vi: usize) {
-    use crate::kernel::*;
-    let (start, len) = if vi < MAX_CNODES {
-        (vi * CNODE_SLOTS, CNODE_SLOTS)
-    } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
-        (
-            BIG_COUNTS + (vi - MAX_CNODES) * SMALL_CNODE_SLOTS,
-            SMALL_CNODE_SLOTS,
-        )
-    } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
-        (
-            BIG_COUNTS + SMALL_COUNTS + (vi - MAX_CNODES - MAX_SMALL_CNODES) * XL_CNODE_SLOTS,
-            XL_CNODE_SLOTS,
-        )
-    } else {
-        return;
-    };
-    let counts = &mut *core::ptr::addr_of_mut!(CHILD_COUNTS);
-    counts[start..start + len].fill(0);
-}
-
 unsafe fn child_count_reset(pid: crate::cte::MdbId) {
-    if let Some(idx) = child_count_idx(pid) {
-        let counts = &mut *core::ptr::addr_of_mut!(CHILD_COUNTS);
-        counts[idx] = 0;
+    let s = KERNEL.get();
+    if let Some(parent) = s.cnode_slot_mut(pid.cnode_idx() as usize, pid.slot() as usize) {
+        parent.set_child_count(0);
     }
 }
 

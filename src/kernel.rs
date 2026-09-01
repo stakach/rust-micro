@@ -89,9 +89,6 @@ impl Default for CNodePage {
 pub const SMALL_CNODE_RADIX: u8 = 6;
 pub const SMALL_CNODE_SLOTS: usize = 1 << SMALL_CNODE_RADIX;
 pub const MAX_SMALL_CNODES: usize = 96;
-/// `MAX_CNODES + MAX_SMALL_CNODES` must leave room for the XL pool
-/// inside MdbId's 8-bit virtual cnode index field.
-const _: () = assert!(MAX_CNODES + MAX_SMALL_CNODES <= 254);
 
 #[repr(C, align(32))]
 pub struct SmallCNodePage(pub [Cte; SMALL_CNODE_SLOTS]);
@@ -124,7 +121,6 @@ const _: () = assert!((XL_CNODE_RADIX as u32) <= crate::cte::MdbId::SLOT_BITS);
 ///   [0, MAX_CNODES)                      big (radix 12)
 ///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix ≤ 6)
 ///   [.., +MAX_XL_CNODES)                 XL (radix 17 or 18)
-const _: () = assert!(MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES <= 254);
 
 #[repr(C, align(32))]
 pub struct XlCNodePage(pub [Cte; XL_CNODE_SLOTS]);
