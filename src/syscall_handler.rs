@@ -193,10 +193,35 @@ pub fn handle_syscall(
             // NB-send: blocking=false, call=false. A null destination means "no send half" for
             // the bootstrap ReplyRecv shape; a real nonzero bad cap should still report an error.
             if dest_cptr != 0 {
-                handle_send(
+                if let Err(error) = handle_send(
                     &send_args, /* blocking */ false, /* call */ false,
                     /* donate */ true, true,
-                )?;
+                ) {
+                    let label = match &error {
+                        crate::error::KException::SyscallError(
+                            crate::error::SyscallError { code },
+                        ) => *code as u64,
+                        crate::error::KException::LookupFault(_) => {
+                            crate::types::seL4_Error::seL4_FailedLookup as u64
+                        }
+                        _ => 0xFFFF,
+                    };
+                    if let Some(current) = invoker {
+                        let tcb = unsafe {
+                            crate::kernel::KERNEL
+                                .get()
+                                .scheduler
+                                .slab
+                                .get_mut(current)
+                        };
+                        // A composite send failure did not execute the receive half. Reserve an
+                        // impossible receive badge so userspace cannot mistake stale in/out
+                        // registers for a newly received message.
+                        tcb.user_context.rdi = u64::MAX;
+                        tcb.user_context.rsi = label << 12;
+                    }
+                    return Err(error);
+                }
             }
             // The NB-send may have woken a higher-priority receiver,
             // which `possibleSwitchTo` signals by clearing `current`.
@@ -1005,6 +1030,7 @@ pub mod spec {
         debug_putchar_emits_byte();
         unknown_syscall_becomes_fault();
         ipc_syscalls_return_invalid_cap_in_phase5();
+        nbsendrecv_bad_send_marks_receive_as_not_executed();
         sys_yield_succeeds();
         sys_yield_rotates_equal_priority_threads();
         sys_yield_requeues_nonqueued_current_before_choosing_peer();
@@ -1076,6 +1102,41 @@ pub mod spec {
             }
         }
         arch::log("  ✓ IPC syscall handlers route through CSpace lookup\n");
+    }
+
+    fn nbsendrecv_bad_send_marks_receive_as_not_executed() {
+        use crate::kernel::KERNEL;
+
+        let (current, saved_r13, saved_rdi, saved_rsi) = unsafe {
+            let s = KERNEL.get();
+            let current = s.scheduler.current().expect("spec boot thread");
+            let tcb = s.scheduler.slab.get_mut(current);
+            let saved = (
+                current,
+                tcb.user_context.r13,
+                tcb.user_context.rdi,
+                tcb.user_context.rsi,
+            );
+            tcb.user_context.r13 = u64::MAX - 1;
+            saved
+        };
+
+        let mut sink = BufferSink::new();
+        let result = handle_syscall(
+            Syscall::SysNBSendRecv,
+            &SyscallArgs::default(),
+            &mut sink,
+        );
+        assert!(result.is_err());
+        unsafe {
+            let tcb = KERNEL.get().scheduler.slab.get_mut(current);
+            assert_eq!(tcb.user_context.rdi, u64::MAX);
+            assert_ne!(tcb.user_context.rsi >> 12, 0);
+            tcb.user_context.r13 = saved_r13;
+            tcb.user_context.rdi = saved_rdi;
+            tcb.user_context.rsi = saved_rsi;
+        }
+        arch::log("  ✓ NBSendRecv send failure cannot masquerade as a receive\n");
     }
 
     fn sys_yield_succeeds() {

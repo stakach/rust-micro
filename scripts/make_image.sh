@@ -34,6 +34,7 @@ IMAGE=.tmp/disk.img
 KERNEL=target/mykernel-x86/release/mykernel-rust
 ROOTSERVER=.tmp/rootserver.elf
 BOOTBOOT_INITRD_MAX_BYTES=$((16 * 1024 * 1024))
+IMAGE_PROFILE_MARKER=.tmp/image-profile
 
 if [ ! -f "$KERNEL" ]; then
   echo "error: kernel not built at $KERNEL — run scripts/build_kernel.sh first" >&2
@@ -42,6 +43,25 @@ fi
 if [ ! -f "$ROOTSERVER" ]; then
   echo "error: rootserver not staged at $ROOTSERVER — run scripts/build_kernel.sh first" >&2
   exit 1
+fi
+IMAGE_PROFILE=production
+if [ -f .tmp/hive.dat ]; then
+  if [ ! -f "$IMAGE_PROFILE_MARKER" ]; then
+    echo "error: image profile marker missing at $IMAGE_PROFILE_MARKER — rebuild the NT rootserver" >&2
+    exit 1
+  fi
+  IMAGE_PROFILE=$(tr -d '\r\n' < "$IMAGE_PROFILE_MARKER")
+  case "$IMAGE_PROFILE" in
+    production|pending-start) ;;
+    *)
+      echo "error: unsupported staged image profile: $IMAGE_PROFILE" >&2
+      exit 1
+      ;;
+  esac
+  if [ "${NTOS_IMAGE_PROFILE:-production}" != "$IMAGE_PROFILE" ]; then
+    echo "error: staged hive profile '$IMAGE_PROFILE' does not match requested '${NTOS_IMAGE_PROFILE:-production}'" >&2
+    exit 1
+  fi
 fi
 
 find_elf_strip() {
@@ -275,6 +295,9 @@ echo "patched ReactOS ACPI provider added: ::reactos/system32/drivers/acpi.sys"
 for fixture_path in "$FIXTURES"/*.sys; do
   [ -f "$fixture_path" ] || continue
   fx=$(basename "$fixture_path")
+  if [ "$fx" = "PendingStartTest.sys" ] && [ "$IMAGE_PROFILE" != "pending-start" ]; then
+    continue
+  fi
   mcopy -o -i "$IMAGE" "$fixture_path" "::reactos/system32/drivers/$fx"
   echo "driver test fixture added: ::reactos/system32/drivers/$fx"
 done
