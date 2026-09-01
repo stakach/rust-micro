@@ -52,7 +52,7 @@ if [ -f .tmp/hive.dat ]; then
   fi
   IMAGE_PROFILE=$(tr -d '\r\n' < "$IMAGE_PROFILE_MARKER")
   case "$IMAGE_PROFILE" in
-    production|pending-start) ;;
+    production|pending-start|live-device-action) ;;
     *)
       echo "error: unsupported staged image profile: $IMAGE_PROFILE" >&2
       exit 1
