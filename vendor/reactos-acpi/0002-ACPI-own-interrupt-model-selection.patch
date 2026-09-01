@@ -1,0 +1,150 @@
+From 3f99b0643e0a99c3f383f43de5f04c589cd2aff2 Mon Sep 17 00:00:00 2001
+From: Stephen von Takach <steve@place.technology>
+Date: Wed, 2 Sep 2026 16:00:00 +1000
+Subject: [PATCH] ACPI: own interrupt model selection
+
+Select the firmware interrupt routing model during ACPI interpreter
+initialization, before object initialization can run _REG, _STA, or _INI.
+The hosted HAL supplies the model from its validated platform topology.
+
+Do not publish the FDO as started until namespace PDO enumeration succeeds.
+Missing _PIC remains valid per ACPI, but a HAL query failure, invalid model,
+or failure of a present method aborts provider startup.
+---
+ drivers/bus/acpi/busmgr/bus.c      | 50 +++++++++++++++++++++++++++++
+ drivers/bus/acpi/include/acpisys.h |  6 ++++
+ drivers/bus/acpi/pnp.c             | 10 ++++--
+ hal/hal.spec                       |  1 +
+ 4 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/bus/acpi/busmgr/bus.c b/drivers/bus/acpi/busmgr/bus.c
+index ec17fcf6..af58cff3 100644
+--- a/drivers/bus/acpi/busmgr/bus.c
++++ b/drivers/bus/acpi/busmgr/bus.c
+@@ -1636,6 +1636,50 @@ acpi_bus_scan_fixed (
+                              Initialization/Cleanup
+    -------------------------------------------------------------------------- */
+ 
++static ACPI_STATUS
++acpi_bus_set_interrupt_model(void)
++{
++	ACPI_OBJECT		argument;
++	ACPI_OBJECT_LIST	arguments;
++	ACPI_STATUS		status;
++	NTSTATUS		nt_status;
++	ULONG			interrupt_model;
++
++	nt_status = HalAcpiQueryInterruptModel(&interrupt_model);
++	if (!NT_SUCCESS(nt_status)) {
++		DPRINT1("Unable to query the HAL ACPI interrupt model: 0x%08lx\n",
++			nt_status);
++		return AE_ERROR;
++	}
++	if (interrupt_model >= ACPI_IRQ_MODEL_COUNT) {
++		DPRINT1("HAL returned invalid ACPI interrupt model %lu\n",
++			interrupt_model);
++		return AE_BAD_VALUE;
++	}
++
++	RtlZeroMemory(&argument, sizeof(argument));
++	argument.Type = ACPI_TYPE_INTEGER;
++	argument.Integer.Value = interrupt_model;
++	arguments.Count = 1;
++	arguments.Pointer = &argument;
++
++	status = AcpiEvaluateObject(ACPI_ROOT_OBJECT, "_PIC", &arguments, NULL);
++	if (status == AE_NOT_FOUND) {
++		DPRINT("Firmware does not implement _PIC\n");
++		return AE_OK;
++	}
++	if (ACPI_FAILURE(status)) {
++		DPRINT1("Unable to select ACPI interrupt model %lu: %s (0x%08X)\n",
++			interrupt_model,
++			AcpiFormatException(status),
++			status);
++		return status;
++	}
++
++	DPRINT("Selected ACPI interrupt model %lu\n", interrupt_model);
++	return AE_OK;
++}
++
+ int
+ acpi_bus_init (void)
+ {
+@@ -1652,6 +1696,12 @@ acpi_bus_init (void)
+ 		goto error1;
+ 	}
+ 
++	status = acpi_bus_set_interrupt_model();
++	if (ACPI_FAILURE(status)) {
++		DPRINT1("Unable to configure the ACPI interrupt model\n");
++		goto error1;
++	}
++
+ 	/*
+ 	 * ACPI 2.0 requires the EC driver to be loaded and work before
+ 	 * the EC device is found in the namespace. This is accomplished
+diff --git a/drivers/bus/acpi/include/acpisys.h b/drivers/bus/acpi/include/acpisys.h
+index f4923018..632a60a7 100644
+--- a/drivers/bus/acpi/include/acpisys.h
++++ b/drivers/bus/acpi/include/acpisys.h
+@@ -8,6 +8,12 @@ extern UNICODE_STRING ProcessorHardwareIds;
+ extern LPWSTR ProcessorIdString;
+ extern LPWSTR ProcessorNameString;
+ 
++NTHALAPI
++NTSTATUS
++NTAPI
++HalAcpiQueryInterruptModel(
++    _Out_ PULONG InterruptModel);
++
+ #ifndef ACPI_ENUM_CHILDREN_OUTPUT_BUFFER_SIGNATURE
+ #define ACPI_ENUM_CHILDREN_OUTPUT_BUFFER_SIGNATURE 'GieA'
+ #define ACPI_ENUM_CHILDREN_INPUT_BUFFER_SIGNATURE  'HieA'
+diff --git a/drivers/bus/acpi/pnp.c b/drivers/bus/acpi/pnp.c
+index 70b1e8dc..c8a70324 100644
+--- a/drivers/bus/acpi/pnp.c
++++ b/drivers/bus/acpi/pnp.c
+@@ -278,8 +278,6 @@ Bus_StartFdo (
+     powerState.DeviceState = PowerDeviceD0;
+     PoSetPowerState ( FdoData->Common.Self, DevicePowerState, powerState );
+ 
+-    SET_NEW_PNP_STATE(FdoData->Common, Started);
+-
+     AcpiStatus = AcpiInitializeSubsystem();
+     if(ACPI_FAILURE(AcpiStatus)){
+         DPRINT1("Unable to AcpiInitializeSubsystem: %s (0x%08X)\n",
+@@ -318,10 +316,16 @@ Bus_StartFdo (
+         DPRINT1("acpi_init() failed: %s (0x%08X)\n",
+                 AcpiFormatException(AcpiStatus),
+                 AcpiStatus);
+-        AcpiTerminate();
+         return STATUS_UNSUCCESSFUL;
+     }
+ 	status = ACPIEnumerateDevices(FdoData);
++	if (!NT_SUCCESS(status)) {
++		DPRINT1("ACPIEnumerateDevices failed: 0x%08lx\n", status);
++		AcpiTerminate();
++		return status;
++	}
++
++    SET_NEW_PNP_STATE(FdoData->Common, Started);
+ 
+     return status;
+ }
+diff --git a/hal/hal.spec b/hal/hal.spec
+index 2a3285e1..89ec5e6b 100644
+--- a/hal/hal.spec
++++ b/hal/hal.spec
+@@ -10,6 +10,7 @@
+ @ stdcall HalAllocateAdapterChannel(ptr ptr long ptr)
+ @ stdcall HalAllocateCommonBuffer(ptr long ptr long)
+ @ stdcall HalAllocateCrashDumpRegisters(ptr ptr)
++@ stdcall HalAcpiQueryInterruptModel(ptr)
+ @ stdcall HalAssignSlotResources(ptr ptr ptr ptr long long long ptr)
+ @ stdcall -arch=i386,arm HalBeginSystemInterrupt(long long ptr)
+ @ stdcall HalCalibratePerformanceCounter(ptr long long)
+-- 
+2.50.1 (Apple Git-155)
+

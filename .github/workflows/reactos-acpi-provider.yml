@@ -29,7 +29,11 @@ jobs:
 
       - name: Apply provider patch
         shell: bash
-        run: git -C reactos apply --check ../integration/vendor/reactos-acpi/0001-ACPI-enumerate-provider-namespace-PDOs.patch && git -C reactos apply ../integration/vendor/reactos-acpi/0001-ACPI-enumerate-provider-namespace-PDOs.patch
+        run: |
+          git -C reactos apply --check ../integration/vendor/reactos-acpi/0001-ACPI-enumerate-provider-namespace-PDOs.patch
+          git -C reactos apply ../integration/vendor/reactos-acpi/0001-ACPI-enumerate-provider-namespace-PDOs.patch
+          git -C reactos apply --check ../integration/vendor/reactos-acpi/0002-ACPI-own-interrupt-model-selection.patch
+          git -C reactos apply ../integration/vendor/reactos-acpi/0002-ACPI-own-interrupt-model-selection.patch
 
       - name: Install Ninja
         run: choco install -y ninja

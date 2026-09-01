@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="$ROOT/vendor/reactos-acpi/manifest.txt"
 PATCH="$ROOT/vendor/reactos-acpi/0001-ACPI-enumerate-provider-namespace-PDOs.patch"
+PATCH_2="$ROOT/vendor/reactos-acpi/0002-ACPI-own-interrupt-model-selection.patch"
 ARTIFACT="${1:-$ROOT/vendor/reactos-acpi/acpi.sys}"
 
 manifest_value() {
@@ -40,6 +41,7 @@ verify_hash() {
 }
 
 verify_hash "$PATCH" "$(manifest_value provider_patch_sha256)"
+verify_hash "$PATCH_2" "$(manifest_value provider_patch_2_sha256)"
 verify_hash "$ARTIFACT" "$(manifest_value provider_acpi_sys_sha256)"
 
 expected_bytes="$(manifest_value provider_acpi_sys_bytes)"
