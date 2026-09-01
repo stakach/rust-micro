@@ -107,13 +107,19 @@ impl From<SizeError> for RetypeError {
 /// once per child with the constructed cap, in slot order.
 ///
 /// On any error, `untyped`'s state is left untouched.
-pub fn retype(
-    untyped: &mut UntypedState,
+#[derive(Copy, Clone)]
+struct RetypePlan {
+    aligned_offset: u64,
+    new_free_index: u64,
+    per_object: u64,
+}
+
+fn plan_retype(
+    untyped: &UntypedState,
     obj_ty: ObjectType,
     user_size_bits: u32,
     num_objects: u64,
-    mut emit_child: impl FnMut(Cap),
-) -> Result<(), RetypeError> {
+) -> Result<RetypePlan, RetypeError> {
     if num_objects == 0 {
         // seL4 treats this as a successful no-op, but we keep it as
         // a hard reject so callers don't accidentally request zero.
@@ -163,6 +169,42 @@ pub fn retype(
         return Err(RetypeError::NotEnoughMemory);
     }
 
+    // Validate every generated capability address before commit. Several typed pointers are
+    // non-null by construction; discovering an unrepresentable address after clearing memory or
+    // emitting an earlier child would make Retype partially observable.
+    for i in 0..num_objects {
+        let offset_in_untyped = aligned_offset + i * per_object;
+        let object_addr = untyped.base + offset_in_untyped;
+        make_object_cap(obj_ty, user_size_bits, object_addr, untyped.is_device)?;
+    }
+
+    Ok(RetypePlan {
+        aligned_offset,
+        new_free_index,
+        per_object,
+    })
+}
+
+/// Validate the complete Untyped layout without clearing backing memory, allocating kernel object
+/// identities, emitting capabilities, or advancing the source watermark.
+pub fn validate_retype(
+    untyped: &UntypedState,
+    obj_ty: ObjectType,
+    user_size_bits: u32,
+    num_objects: u64,
+) -> Result<(), RetypeError> {
+    plan_retype(untyped, obj_ty, user_size_bits, num_objects).map(|_| ())
+}
+
+pub fn retype(
+    untyped: &mut UntypedState,
+    obj_ty: ObjectType,
+    user_size_bits: u32,
+    num_objects: u64,
+    mut emit_child: impl FnMut(Cap),
+) -> Result<(), RetypeError> {
+    let plan = plan_retype(untyped, obj_ty, user_size_bits, num_objects)?;
+
     // Looks good — build child caps, then commit free_index.
     // Zero non-device retyped memory so paging-structure objects
     // (PT/PD/PDPT/PML4) start with empty entries — otherwise garbage
@@ -172,20 +214,21 @@ pub fn retype(
     // seL4_DeleteFirst. Mirrors upstream seL4's `clearMemory` in
     // src/object/untyped.c.
     if !untyped.is_device {
-        let total_bytes = num_objects * per_object;
+        let total_bytes = num_objects * plan.per_object;
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let lin = crate::arch::x86_64::paging::phys_to_lin(untyped.base + aligned_offset);
+            let lin = crate::arch::x86_64::paging::phys_to_lin(untyped.base + plan.aligned_offset);
             core::ptr::write_bytes(lin as *mut u8, 0, total_bytes as usize);
         }
     }
     for i in 0..num_objects {
-        let offset_in_untyped = aligned_offset + i * per_object;
+        let offset_in_untyped = plan.aligned_offset + i * plan.per_object;
         let object_addr = untyped.base + offset_in_untyped;
-        let cap = make_object_cap(obj_ty, user_size_bits, object_addr, untyped.is_device)?;
+        let cap = make_object_cap(obj_ty, user_size_bits, object_addr, untyped.is_device)
+            .expect("Retype plan must validate every emitted capability address");
         emit_child(cap);
     }
-    untyped.free_index_bytes = new_free_index;
+    untyped.free_index_bytes = plan.new_free_index;
     Ok(())
 }
 

@@ -362,6 +362,30 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
 
+    if upstream {
+        let staged_caps = unsafe {
+            KERNEL
+                .get()
+                .scheduler
+                .slab
+                .get(invoker)
+                .pending_extra_caps_count
+        };
+        if info.length() < 6 || staged_caps == 0 {
+            unsafe {
+                KERNEL
+                    .get()
+                    .scheduler
+                    .slab
+                    .get_mut(invoker)
+                    .pending_extra_caps_count = 0;
+            }
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_TruncatedMessage,
+            )));
+        }
+    }
+
     // Per-size alignment. Small=4 KiB (12-bit), Large=2 MiB (21-bit),
     // Huge=1 GiB (30-bit). FRAMEEXPORTS0001 reserves a 1 GiB-aligned
     // vaddr range so all three sizes share the same base — only the
@@ -3421,22 +3445,6 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         )));
     }
 
-    if object_type == ObjectType::CapTable {
-        if size_bits == 0 || size_bits > crate::cte::MdbId::SLOT_BITS {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_RangeError,
-            )));
-        }
-        let required = usize::try_from(num_objects).map_err(|_| {
-            KException::SyscallError(SyscallError::new(seL4_Error::seL4_NotEnoughMemory))
-        })?;
-        if unsafe { KERNEL.get().available_dynamic_cnodes() } < required {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_NotEnoughMemory,
-            )));
-        }
-    }
-
     // Resolve the destination CNode. When extraCaps[0] is provided
     // (upstream path), walk it with node_depth bits to land on the
     // actual dest CNode. Otherwise fall back to the invoker's
@@ -3499,8 +3507,24 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
             crate::cspace::WORD_BITS,
         )
         .map_err(|_| KException::SyscallError(SyscallError::new(seL4_Error::seL4_FailedLookup)))?;
+        if src_res.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_FailedLookup,
+            )));
+        }
         let src_cnode_idx = KernelState::cnode_index(src_res.slot_ptr);
         let src_slot_index = src_res.slot_index;
+        let invoked_source = s
+            .cnode_slot(src_cnode_idx, src_slot_index)
+            .ok_or_else(|| {
+                KException::SyscallError(SyscallError::new(seL4_Error::seL4_FailedLookup))
+            })?
+            .cap();
+        if invoked_source != target {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
+        }
         // Borrow as raw slice so we don't lock the whole `s` —
         // the surrounding code needs separate access to
         // `s.scheduler` etc. BKL serialises kernel state.
@@ -3523,8 +3547,15 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         // every CNode in our pool is physically 4096 slots.
         // RETYPE0000 in sel4test cares: it sizes the dest CNode at 4
         // and expects offset >= 4 to fail with seL4_RangeError.
-        let logical_capacity = 1usize << dest_radix;
-        let upper = dest_offset + num_objects as usize;
+        let logical_capacity = 1usize.checked_shl(dest_radix as u32).ok_or_else(|| {
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_RangeError))
+        })?;
+        let required = usize::try_from(num_objects).map_err(|_| {
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_RangeError))
+        })?;
+        let upper = dest_offset.checked_add(required).ok_or_else(|| {
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_RangeError))
+        })?;
         if upper > logical_capacity {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_RangeError,
@@ -3543,6 +3574,26 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
             }
         }
 
+        // Validate the complete physical layout before consulting implementation pool capacity.
+        // This preserves ABI/source/destination error precedence and guarantees that the commit
+        // path cannot discover an invalid generated pointer after clearing memory.
+        crate::untyped::validate_retype(&state, object_type, size_bits, num_objects)?;
+
+        let available = match object_type {
+            ObjectType::Tcb => Some(s.scheduler.available_cap_tcbs()),
+            ObjectType::Endpoint => Some(s.available_endpoints()),
+            ObjectType::Notification => Some(s.available_notifications()),
+            ObjectType::CapTable => Some(s.available_dynamic_cnodes()),
+            ObjectType::SchedContext => Some(s.available_sched_contexts()),
+            ObjectType::Reply => Some(s.available_replies()),
+            ObjectType::Untyped | ObjectType::Arch(_) => None,
+        };
+        if available.is_some_and(|count| count < required) {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_NotEnoughMemory,
+            )));
+        }
+
         // Carve children. The closure runs once per child; we
         // place the cap into the destination slot at the matching
         // offset.
@@ -3553,12 +3604,6 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         // Re-encode by admitting a fresh `Tcb::default()` into the
         // slab and storing the TcbId in the cap.
         let mut emit_idx = dest_offset;
-        // We can't borrow `s.scheduler.slab` inside the closure
-        // because `cnode_slots` already holds a mutable borrow of
-        // a sibling field of `*s`. Use a raw pointer to bypass
-        // the aliasing check; the BKL guarantees we're the only
-        // writer.
-        let scheduler_ptr: *mut crate::scheduler::Scheduler = &raw mut s.scheduler;
         // Need a mutable handle on `s` to allocate from the
         // endpoint / notification / cnode pools too. We reborrow
         // via `KERNEL.get()` to avoid the existing `&mut s.cnodes`
@@ -3572,11 +3617,14 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
             crate::untyped::retype(&mut state, object_type, size_bits, num_objects, |cap| {
                 let cap_to_store = match cap {
                     Cap::Thread { .. } => {
-                        let id = (*scheduler_ptr).admit(crate::tcb::Tcb {
-                            state: crate::tcb::ThreadStateType::Inactive,
-                            priority: 0,
-                            ..Default::default()
-                        });
+                        let id = (*s_ptr)
+                            .scheduler
+                            .try_admit_cap(crate::tcb::Tcb {
+                                state: crate::tcb::ThreadStateType::Inactive,
+                                priority: 0,
+                                ..Default::default()
+                            })
+                            .expect("TCB availability preflight must reserve the full fanout");
                         // Phase 43 — scrub any stale kernel
                         // references to this slab slot. The slot may
                         // have been reused after a previous TCB was
@@ -3593,28 +3641,24 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
                             tcb: PPtr::<crate::cap::Tcb>::new(id.0 as u64).expect("nonzero tcb id"),
                         }
                     }
-                    Cap::Endpoint { badge, rights, .. } => match (*s_ptr).alloc_endpoint() {
-                        Some(i) => Cap::Endpoint {
+                    Cap::Endpoint { badge, rights, .. } => {
+                        let i = (*s_ptr)
+                            .alloc_endpoint()
+                            .expect("Endpoint availability preflight must reserve the full fanout");
+                        Cap::Endpoint {
                             ptr: KernelState::endpoint_ptr(i),
                             badge,
                             rights,
-                        },
-                        None => {
-                            crate::arch::log("[retype: endpoint pool exhausted]\n");
-                            Cap::Null
                         }
-                    },
+                    }
                     Cap::Notification { badge, rights, .. } => {
-                        match (*s_ptr).alloc_notification() {
-                            Some(i) => Cap::Notification {
-                                ptr: KernelState::ntfn_ptr(i),
-                                badge,
-                                rights,
-                            },
-                            None => {
-                                crate::arch::log("[retype: ntfn pool exhausted]\n");
-                                Cap::Null
-                            }
+                        let i = (*s_ptr).alloc_notification().expect(
+                            "Notification availability preflight must reserve the full fanout",
+                        );
+                        Cap::Notification {
+                            ptr: KernelState::ntfn_ptr(i),
+                            badge,
+                            rights,
                         }
                     }
                     Cap::CNode {
@@ -3633,26 +3677,24 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
                             guard,
                         }
                     }
-                    Cap::SchedContext { size_bits, .. } => match (*s_ptr).alloc_sched_context() {
-                        Some(i) => Cap::SchedContext {
+                    Cap::SchedContext { size_bits, .. } => {
+                        let i = (*s_ptr).alloc_sched_context().expect(
+                            "SchedContext availability preflight must reserve the full fanout",
+                        );
+                        Cap::SchedContext {
                             ptr: KernelState::sched_context_ptr(i),
                             size_bits,
-                        },
-                        None => {
-                            crate::arch::log("[retype: sc pool exhausted]\n");
-                            Cap::Null
                         }
-                    },
-                    Cap::Reply { can_grant, .. } => match (*s_ptr).alloc_reply() {
-                        Some(i) => Cap::Reply {
+                    }
+                    Cap::Reply { can_grant, .. } => {
+                        let i = (*s_ptr)
+                            .alloc_reply()
+                            .expect("Reply availability preflight must reserve the full fanout");
+                        Cap::Reply {
                             ptr: KernelState::reply_ptr(i),
                             can_grant,
-                        },
-                        None => {
-                            crate::arch::log("[retype: reply pool exhausted]\n");
-                            Cap::Null
                         }
-                    },
+                    }
                     // Phase 33d — when the rootserver retypes a fresh
                     // PML4, copy the live PML4's entries into it so
                     // the new vspace has the kernel half mapped. Any
@@ -3668,49 +3710,6 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
                     }
                     other => other,
                 };
-                // Phase 42 — seL4 zeroes the underlying memory of
-                // every newly-retyped object (other than Untyped, which
-                // doesn't expose its bytes). For paging structs this
-                // is load-bearing: a fresh PD whose bytes look like
-                // valid PTE_PRESENT entries makes the page-table walk
-                // descend into garbage and the leaf Map then returns
-                // DeleteFirst. Frames are zeroed for the usual
-                // security reason.
-                #[cfg(target_arch = "x86_64")]
-                {
-                    use crate::cap::FrameSize;
-                    let zero_range: Option<(u64, u64)> = match cap_to_store {
-                        Cap::PageTable { ptr, .. } => Some((ptr.addr(), 4096)),
-                        Cap::PageDirectory { ptr, .. } => Some((ptr.addr(), 4096)),
-                        Cap::Pdpt { ptr, .. } => Some((ptr.addr(), 4096)),
-                        // Phase 42 — only zero RAM-backed frames.
-                        // Device frames cover MMIO regions or ACPI/BIOS
-                        // tables; zeroing them would either trigger
-                        // side effects or destroy data the user just
-                        // wanted to read.
-                        Cap::Frame {
-                            ptr,
-                            size,
-                            is_device: false,
-                            ..
-                        } => {
-                            let n: u64 = match size {
-                                FrameSize::Small => 4096,
-                                FrameSize::Large => 2 * 1024 * 1024,
-                                FrameSize::Huge => 1024 * 1024 * 1024,
-                            };
-                            Some((ptr.addr(), n))
-                        }
-                        _ => None,
-                    };
-                    if let Some((paddr, len)) = zero_range {
-                        // Reach the page through the kernel-half
-                        // linear map (PML4[256+]) — keeps the
-                        // rootserver's PML4[0] free for user mappings.
-                        let dst = crate::arch::x86_64::paging::phys_to_lin(paddr) as *mut u8;
-                        core::ptr::write_bytes(dst, 0, len as usize);
-                    }
-                }
                 cnode_slots[emit_idx].set_cap(&cap_to_store);
                 cnode_slots[emit_idx].set_parent(Some(parent_id));
                 child_count_inc(parent_id, 1);
@@ -3718,29 +3717,17 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
             });
         result?;
 
-        // Commit the updated UntypedState back into the SOURCE slot.
-        // Phase 42 — re-resolve the source cptr (args.a0) against the
-        // invoker's CSpace to find the exact slot. Walking the CNode
-        // looking for `ptr.addr() == state.base` is broken when the
-        // child untyped is the leftmost descendant of its parent —
-        // both share the same base paddr and the search hits the
-        // parent first, leaving the source slot's free_index stale
-        // and causing the next retype to re-allocate the same memory.
-        let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-        let source_resolved = crate::cspace::resolve_address_bits(
-            s,
-            &invoker_cspace,
-            args.a0,
-            crate::cspace::WORD_BITS,
+        // Commit through the exact source CTE resolved and verified before mutation. A second lookup
+        // could fail or select a same-base ancestor after destination/pool publication.
+        let source_slot = s
+            .cnode_slot_mut(src_cnode_idx, src_slot_index)
+            .expect("validated source CTE must remain registered under the BKL");
+        assert_eq!(
+            source_slot.cap(),
+            target,
+            "invoked Untyped CTE changed during a BKL-serialized Retype"
         );
-        if let Ok(res) = source_resolved {
-            if res.bits_remaining == 0 {
-                let src_idx = KernelState::cnode_index(res.slot_ptr);
-                if let Some(slot) = s.cnode_slot_mut(src_idx, res.slot_index) {
-                    slot.set_cap(&state.to_cap());
-                }
-            }
-        }
+        source_slot.set_cap(&state.to_cap());
     }
     Ok(())
 }
@@ -6277,6 +6264,7 @@ pub mod spec {
         arch::log("Running invocation tests...\n");
         untyped_retype_via_invocation();
         untyped_retype_upstream_abi_far_offset();
+        pooled_retype_capacity_is_atomic();
         revoke_chain_clears_only_descendants();
         repeated_alloc_free_reclaims_untyped();
         cnode_copy_via_invocation();
@@ -6308,6 +6296,193 @@ pub mod spec {
         sched_control_configure_sets_period_budget();
         unsupported_label_returns_illegal();
         arch::log("Invocation tests completed\n");
+    }
+
+    static mut POOL_EXHAUSTION_SCRATCH: [u16; crate::kernel::MAX_DYNAMIC_CNODES] =
+        [0; crate::kernel::MAX_DYNAMIC_CNODES];
+
+    fn pooled_available(object_type: ObjectType) -> usize {
+        unsafe {
+            let s = KERNEL.get();
+            match object_type {
+                ObjectType::Tcb => s.scheduler.available_cap_tcbs(),
+                ObjectType::Endpoint => s.available_endpoints(),
+                ObjectType::Notification => s.available_notifications(),
+                ObjectType::CapTable => s.available_dynamic_cnodes(),
+                ObjectType::SchedContext => s.available_sched_contexts(),
+                ObjectType::Reply => s.available_replies(),
+                _ => unreachable!("non-pooled Retype object"),
+            }
+        }
+    }
+
+    unsafe fn pooled_alloc_one(object_type: ObjectType, ordinal: usize) -> Option<u16> {
+        let s = KERNEL.get();
+        match object_type {
+            ObjectType::Tcb => s
+                .scheduler
+                .try_admit_cap(crate::tcb::Tcb {
+                    state: crate::tcb::ThreadStateType::Inactive,
+                    ..Default::default()
+                })
+                .map(|id| id.0),
+            ObjectType::Endpoint => s.alloc_endpoint().map(|i| i as u16),
+            ObjectType::Notification => s.alloc_notification().map(|i| i as u16),
+            ObjectType::CapTable => {
+                let paddr = 0x1800_0000 + (ordinal as u64) * 64;
+                let backing = crate::arch::x86_64::paging::phys_to_lin(paddr) as *mut u8;
+                core::ptr::write_bytes(backing, 0, 64);
+                s.alloc_dynamic_cnode(paddr, 1)
+                    .map(|i| u16::try_from(i).expect("CNode identity fits scratch"))
+            }
+            ObjectType::SchedContext => s.alloc_sched_context().map(|i| i as u16),
+            ObjectType::Reply => s.alloc_reply().map(|i| i as u16),
+            _ => unreachable!("non-pooled Retype object"),
+        }
+    }
+
+    unsafe fn pooled_free_one(object_type: ObjectType, identity: u16) {
+        let s = KERNEL.get();
+        match object_type {
+            ObjectType::Tcb => s.scheduler.slab.free(TcbId(identity)),
+            ObjectType::Endpoint => s.free_endpoint(identity as usize),
+            ObjectType::Notification => s.free_notification(identity as usize),
+            ObjectType::CapTable => s.free_dynamic_cnode(identity as usize),
+            ObjectType::SchedContext => s.free_sched_context(identity as usize),
+            ObjectType::Reply => s.free_reply(identity as usize),
+            _ => unreachable!("non-pooled Retype object"),
+        }
+    }
+
+    fn assert_pooled_retype_capacity(object_type: ObjectType, size_bits: u32, base: u64) {
+        let invoker = setup_invoker(0);
+        let source = Cap::Untyped {
+            ptr: PAddr::<crate::cap::UntypedStorage>::new(base),
+            block_bits: 16,
+            free_index: 0,
+            is_device: false,
+        };
+        unsafe {
+            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&source);
+        }
+
+        let baseline = pooled_available(object_type);
+        assert!(
+            baseline >= 2,
+            "pooled-object spec needs two free identities"
+        );
+        let scratch = unsafe { &mut *core::ptr::addr_of_mut!(POOL_EXHAUSTION_SCRATCH) };
+        let mut owned = 0usize;
+        while let Some(identity) = unsafe { pooled_alloc_one(object_type, owned) } {
+            scratch[owned] = identity;
+            owned += 1;
+        }
+        assert_eq!(owned, baseline);
+        assert_eq!(pooled_available(object_type), 0);
+
+        let mut args = SyscallArgs {
+            a0: 0,
+            a1: (InvocationLabel::UntypedRetype as u64) << 12,
+            a2: object_type.to_word(),
+            a3: (u64::from(size_bits) << 32) | 1,
+            a4: 4,
+            ..Default::default()
+        };
+        let failed = decode_invocation(source, &args, invoker);
+        assert!(matches!(
+            failed,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_NotEnoughMemory
+            }))
+        ));
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.cnodes[0].0[0].cap(), source);
+            assert_eq!(s.cnodes[0].0[0].child_count(), 0);
+            for slot in 4..6 {
+                assert!(s.cnodes[0].0[slot].cap().is_null());
+                assert_eq!(s.cnodes[0].0[slot].parent(), None);
+                assert_eq!(s.cnodes[0].0[slot].child_count(), 0);
+                assert_eq!(s.cnodes[0].0[slot].revoke_epoch(), 0);
+            }
+        }
+
+        owned -= 1;
+        unsafe { pooled_free_one(object_type, scratch[owned]) };
+        assert_eq!(pooled_available(object_type), 1);
+        args.a3 = (u64::from(size_bits) << 32) | 2;
+        let partial = decode_invocation(source, &args, invoker);
+        assert!(matches!(
+            partial,
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_NotEnoughMemory
+            }))
+        ));
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.cnodes[0].0[0].cap(), source);
+            assert_eq!(s.cnodes[0].0[0].child_count(), 0);
+            assert!(s.cnodes[0].0[4].cap().is_null());
+            assert!(s.cnodes[0].0[5].cap().is_null());
+        }
+        assert_eq!(pooled_available(object_type), 1);
+
+        owned -= 1;
+        unsafe { pooled_free_one(object_type, scratch[owned]) };
+        assert_eq!(pooled_available(object_type), 2);
+        decode_invocation(source, &args, invoker).expect("exact pool capacity Retype");
+        assert_eq!(pooled_available(object_type), 0);
+        unsafe {
+            let s = KERNEL.get();
+            assert!(!s.cnodes[0].0[4].cap().is_null());
+            assert!(!s.cnodes[0].0[5].cap().is_null());
+            assert_eq!(
+                s.cnodes[0].0[4].parent(),
+                Some(crate::cte::MdbId::pack(0, 0))
+            );
+            assert_eq!(
+                s.cnodes[0].0[5].parent(),
+                Some(crate::cte::MdbId::pack(0, 0))
+            );
+            assert_eq!(s.cnodes[0].0[0].child_count(), 2);
+        }
+
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        for slot in 4..6 {
+            let delete = SyscallArgs {
+                a1: (InvocationLabel::CNodeDelete as u64) << 12,
+                a2: slot,
+                ..Default::default()
+            };
+            decode_invocation(root, &delete, invoker).expect("delete exact-fit pooled object");
+        }
+        assert_eq!(pooled_available(object_type), 2);
+
+        for &identity in &scratch[..owned] {
+            unsafe { pooled_free_one(object_type, identity) };
+        }
+        assert_eq!(pooled_available(object_type), baseline);
+        teardown_invoker(invoker);
+    }
+
+    #[inline(never)]
+    fn pooled_retype_capacity_is_atomic() {
+        let cases = [
+            (ObjectType::Tcb, 0, 0x0400_0000),
+            (ObjectType::Endpoint, 0, 0x0401_0000),
+            (ObjectType::Notification, 0, 0x0402_0000),
+            (ObjectType::CapTable, 1, 0x0403_0000),
+            (
+                ObjectType::SchedContext,
+                crate::object_type::MIN_SCHED_CONTEXT_BITS,
+                0x0404_0000,
+            ),
+            (ObjectType::Reply, 0, 0x0405_0000),
+        ];
+        for (object_type, size_bits, base) in cases {
+            assert_pooled_retype_capacity(object_type, size_bits, base);
+        }
+        arch::log("  \u{2713} pooled Untyped::Retype capacity failures are atomic\n");
     }
 
     /// Phase 31 — exercise the ASID path end-to-end:
@@ -7052,6 +7227,7 @@ pub mod spec {
         // Snapshot the sub-Untyped cap.
         let sub_ut = unsafe { KERNEL.get().cnodes[0].0[100].cap() };
         let args = SyscallArgs {
+            a0: 100,
             a1: (InvocationLabel::UntypedRetype as u64) << 12,
             a2: ObjectType::Endpoint.to_word(),
             a3: 1,
@@ -7059,6 +7235,24 @@ pub mod spec {
             ..Default::default()
         };
         decode_invocation(sub_ut, &args, invoker).expect("retype ep");
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(
+                s.cnodes[0].0[200].parent(),
+                Some(crate::cte::MdbId::pack(0, 100))
+            );
+            assert!(matches!(
+                s.cnodes[0].0[0].cap(),
+                Cap::Untyped {
+                    free_index: 256,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                s.cnodes[0].0[100].cap(),
+                Cap::Untyped { free_index: 16, .. }
+            ));
+        }
 
         // Revoke the parent at slot 0.
         let args = SyscallArgs {

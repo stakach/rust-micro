@@ -491,7 +491,24 @@ impl TcbSlab {
     /// Insert a TCB at the next free slot. Returns the assigned id,
     /// or `None` if the slab is full.
     pub fn alloc(&mut self, tcb: Tcb) -> Option<TcbId> {
-        for (i, slot) in self.entries.iter_mut().enumerate() {
+        self.alloc_from(tcb, 0)
+    }
+
+    /// Allocate a TCB identity that can be encoded in a non-null `Cap::Thread` pointer. Slot zero
+    /// represents the bootstrap kernel context and is never a capability-backed object.
+    pub fn alloc_cap_tcb(&mut self, tcb: Tcb) -> Option<TcbId> {
+        self.alloc_from(tcb, 1)
+    }
+
+    pub fn available_cap_slots(&self) -> usize {
+        self.entries[1..]
+            .iter()
+            .filter(|slot| slot.is_none())
+            .count()
+    }
+
+    fn alloc_from(&mut self, tcb: Tcb, first: usize) -> Option<TcbId> {
+        for (i, slot) in self.entries.iter_mut().enumerate().skip(first) {
             if slot.is_none() {
                 *slot = Some(tcb);
                 // Stamp the boot-captured FINIT FPU template so the

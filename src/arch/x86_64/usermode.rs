@@ -281,6 +281,7 @@ pub fn launch_two_thread_ipc_demo() -> ! {
         // (one per thread) each containing the same endpoint cap
         // at slot 1.
         let s = KERNEL.get();
+        s.claim_endpoint(0);
         let ep_ptr = KernelState::endpoint_ptr(0);
         let sender_cnode = KernelState::cnode_ptr(1);
         let receiver_cnode = KernelState::cnode_ptr(2);

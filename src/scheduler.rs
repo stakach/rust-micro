@@ -756,6 +756,23 @@ impl Scheduler {
         id
     }
 
+    /// Fallible admission for TCBs created by Untyped Retype. The separate slab entry point excludes
+    /// bootstrap identity zero, which cannot be represented by the non-null pointer in a Thread cap.
+    pub fn try_admit_cap(&mut self, tcb: Tcb) -> Option<TcbId> {
+        let runnable = tcb.is_runnable();
+        let cpu = tcb.affinity as usize;
+        let dom = tcb.domain as usize;
+        let id = self.slab.alloc_cap_tcb(tcb)?;
+        if runnable {
+            self.nodes[cpu].queues[dom].enqueue(&mut self.slab, id);
+        }
+        Some(id)
+    }
+
+    pub fn available_cap_tcbs(&self) -> usize {
+        self.slab.available_cap_slots()
+    }
+
     /// Mark a thread as runnable and (re-)add it to its affinity
     /// CPU's queue.
     pub fn make_runnable(&mut self, id: TcbId) {

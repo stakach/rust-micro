@@ -148,19 +148,10 @@ pub struct KernelState {
     /// Per-IRQ binding table.
     pub irqs: IrqTable,
 
-    /// Phase 29h — bump-allocator state for the in-kernel
-    /// endpoint / notification / cnode pools. `Untyped::Retype` for
-    /// these object types takes the next free slot and bumps the
-    /// counter; the Untyped's own physical bytes stay reserved but
-    /// the actual kernel object lives here. (Real seL4 stores the
-    /// object in the Untyped's memory; we keep separate pools for
-    /// allocation simplicity.)
-    pub next_endpoint: usize,
-    pub next_notification: usize,
+    /// Direct-index CNode allocation hints retained by the standalone/spec profile. Production
+    /// CapTables are registered from the exact Untyped backing span instead.
     pub next_cnode: usize,
     pub next_small_cnode: usize,
-    pub next_sched_context: usize,
-    pub next_reply: usize,
 }
 
 /// Phase 43 — pool-recycling bitmap. Bit set means slot is in use.
@@ -171,6 +162,7 @@ struct PoolBitmaps {
     pub notifications: [u64; (MAX_NTFNS + 63) / 64],
     pub cnodes: [u64; (MAX_CNODES + 63) / 64],
     pub small_cnodes: [u64; (MAX_SMALL_CNODES + 63) / 64],
+    pub sched_contexts: [u64; (MAX_SCHED_CONTEXTS + 63) / 64],
     pub replies: [u64; (MAX_REPLIES + 63) / 64],
 }
 
@@ -179,6 +171,7 @@ static mut POOL_BITMAPS: PoolBitmaps = PoolBitmaps {
     notifications: [0; (MAX_NTFNS + 63) / 64],
     cnodes: [0; (MAX_CNODES + 63) / 64],
     small_cnodes: [0; (MAX_SMALL_CNODES + 63) / 64],
+    sched_contexts: [0; (MAX_SCHED_CONTEXTS + 63) / 64],
     replies: [0; (MAX_REPLIES + 63) / 64],
 };
 
@@ -201,44 +194,34 @@ impl KernelState {
             sched_contexts: [EMPTY_SC; MAX_SCHED_CONTEXTS],
             replies: [EMPTY_REPLY; MAX_REPLIES],
             irqs: IrqTable::new(),
-            // Reserve indices < these for kernel-internal use
-            // (boot CNode = 0, AY-demo CNodes = 1, 2, rootserver
-            // CNode = 3). Bump allocators start past the reserved
-            // range.
-            next_endpoint: 4,
-            next_notification: 0,
+            // Reserve direct CNodes 0..3 for standalone/spec bootstrap fixtures. Production does
+            // not instantiate this array.
             next_cnode: 4,
             next_small_cnode: 0,
-            next_sched_context: 0,
-            next_reply: 0,
         }
     }
 
-    /// Allocate the next free in-kernel endpoint.
+    /// Allocate an Endpoint identity. Object state is not ownership: an idle live endpoint remains
+    /// unavailable until its last capability releases it.
     pub fn alloc_endpoint(&mut self) -> Option<usize> {
-        if self.next_endpoint < MAX_ENDPOINTS {
-            let i = self.next_endpoint;
-            self.next_endpoint += 1;
-            self.endpoints[i] = Endpoint::new();
-            return Some(i);
-        }
-        // Recycle: an endpoint with no waiters is free for reuse.
         for i in 0..MAX_ENDPOINTS {
-            let ep = &self.endpoints[i];
-            if ep.head.is_none()
-                && ep.tail.is_none()
-                && matches!(ep.state, crate::endpoint::EpState::Idle)
-            {
-                // Need a sentinel to distinguish "freshly idle" from
-                // "in-use but currently idle". We use a side-bitmap.
-                if !self.ep_in_use(i) {
-                    self.endpoints[i] = Endpoint::new();
-                    self.set_ep_in_use(i, true);
-                    return Some(i);
-                }
+            if !self.ep_in_use(i) {
+                self.set_ep_in_use(i, true);
+                self.endpoints[i] = Endpoint::new();
+                return Some(i);
             }
         }
         None
+    }
+
+    pub fn claim_endpoint(&mut self, i: usize) {
+        assert!(i < MAX_ENDPOINTS, "claimed Endpoint identity out of range");
+        assert!(!self.ep_in_use(i), "Endpoint identity already owned");
+        self.set_ep_in_use(i, true);
+    }
+
+    pub fn available_endpoints(&self) -> usize {
+        (0..MAX_ENDPOINTS).filter(|&i| !self.ep_in_use(i)).count()
     }
 
     pub fn free_endpoint(&mut self, i: usize) {
@@ -249,21 +232,18 @@ impl KernelState {
     }
 
     pub fn alloc_notification(&mut self) -> Option<usize> {
-        if self.next_notification < MAX_NTFNS {
-            let i = self.next_notification;
-            self.next_notification += 1;
-            self.notifications[i] = Notification::new();
-            self.set_ntfn_in_use(i, true);
-            return Some(i);
-        }
         for i in 0..MAX_NTFNS {
             if !self.ntfn_in_use(i) {
-                self.notifications[i] = Notification::new();
                 self.set_ntfn_in_use(i, true);
+                self.notifications[i] = Notification::new();
                 return Some(i);
             }
         }
         None
+    }
+
+    pub fn available_notifications(&self) -> usize {
+        (0..MAX_NTFNS).filter(|&i| !self.ntfn_in_use(i)).count()
     }
 
     pub fn free_notification(&mut self, i: usize) {
@@ -547,6 +527,19 @@ impl KernelState {
             }
         }
     }
+    fn sc_in_use(&self, i: usize) -> bool {
+        unsafe { (POOL_BITMAPS.sched_contexts[i / 64] >> (i % 64)) & 1 == 1 }
+    }
+    fn set_sc_in_use(&self, i: usize, v: bool) {
+        unsafe {
+            let w = &mut POOL_BITMAPS.sched_contexts[i / 64];
+            if v {
+                *w |= 1 << (i % 64);
+            } else {
+                *w &= !(1 << (i % 64));
+            }
+        }
+    }
     fn reply_in_use(&self, i: usize) -> bool {
         unsafe { (POOL_BITMAPS.replies[i / 64] >> (i % 64)) & 1 == 1 }
     }
@@ -568,25 +561,23 @@ impl KernelState {
         }
     }
 
-    /// Phase 32c — allocate the next free SchedContext slot.
-    /// Phase 43 — scan from `next_sched_context` then fall back to a
-    /// linear search for a recycled slot (one with `bound_tcb=None`
-    /// AND `count==0`, i.e. never configured or freed). This lets
-    /// long sel4test runs reuse slots cleared by `free_sched_context`.
+    /// Allocate a SchedContext identity. A live, unconfigured SC has empty runtime state but remains
+    /// owned, so only the ownership bitmap may authorize reuse.
     pub fn alloc_sched_context(&mut self) -> Option<usize> {
-        if self.next_sched_context < MAX_SCHED_CONTEXTS {
-            let i = self.next_sched_context;
-            self.next_sched_context += 1;
-            self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
-            return Some(i);
-        }
         for i in 0..MAX_SCHED_CONTEXTS {
-            if self.sched_contexts[i].bound_tcb.is_none() && self.sched_contexts[i].count == 0 {
+            if !self.sc_in_use(i) {
+                self.set_sc_in_use(i, true);
                 self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
                 return Some(i);
             }
         }
         None
+    }
+
+    pub fn available_sched_contexts(&self) -> usize {
+        (0..MAX_SCHED_CONTEXTS)
+            .filter(|&i| !self.sc_in_use(i))
+            .count()
     }
 
     /// Phase 43 — release a SchedContext slot for reuse.
@@ -643,6 +634,7 @@ impl KernelState {
                 }
             }
             self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
+            self.set_sc_in_use(i, false);
         }
     }
 
@@ -657,21 +649,18 @@ impl KernelState {
 
     /// Phase 34e — allocate the next free Reply slot.
     pub fn alloc_reply(&mut self) -> Option<usize> {
-        if self.next_reply < MAX_REPLIES {
-            let i = self.next_reply;
-            self.next_reply += 1;
-            self.replies[i] = crate::reply::Reply::new();
-            self.set_reply_in_use(i, true);
-            return Some(i);
-        }
         for i in 0..MAX_REPLIES {
             if !self.reply_in_use(i) {
-                self.replies[i] = crate::reply::Reply::new();
                 self.set_reply_in_use(i, true);
+                self.replies[i] = crate::reply::Reply::new();
                 return Some(i);
             }
         }
         None
+    }
+
+    pub fn available_replies(&self) -> usize {
+        (0..MAX_REPLIES).filter(|&i| !self.reply_in_use(i)).count()
     }
 
     pub fn reply_ptr(i: usize) -> PPtr<crate::cap::ReplyStorage> {
@@ -956,11 +945,6 @@ pub fn bootstrap_boot_thread() -> TcbId {
                           // test → helpers) silently collapses to 0.
         t.mcp = 255;
         t.state = ThreadStateType::Running;
-        // Placeholder SC so the boot thread is schedulable under the
-        // MCS is_schedulable model (admit enqueues only SC-backed
-        // threads). Spec-only path; the index isn't dereferenced by
-        // the scheduler.
-        t.sc = Some(0);
         let id = s.scheduler.admit(t);
         s.scheduler.set_current(Some(id));
         id
@@ -993,10 +977,62 @@ pub mod spec {
         arch::log("Running KernelState tests...\n");
         bootstrap_registers_boot_thread();
         scheduler_state_persists_across_calls();
+        pooled_object_ownership_is_explicit();
         claim_cnode_pins_directly_initialised_slot();
         small_cnode_pool_alloc_free_dispatch();
         dynamic_cnode_uses_exact_physical_backing();
         arch::log("KernelState tests completed\n");
+    }
+
+    #[inline(never)]
+    fn pooled_object_ownership_is_explicit() {
+        unsafe {
+            let s = KERNEL.get();
+
+            let ep_before = s.available_endpoints();
+            let ep0 = s.alloc_endpoint().expect("first Endpoint identity");
+            let ep1 = s.alloc_endpoint().expect("second Endpoint identity");
+            assert_ne!(ep0, ep1);
+            assert_eq!(s.available_endpoints(), ep_before - 2);
+            s.free_endpoint(ep0);
+            s.free_endpoint(ep1);
+            assert_eq!(s.available_endpoints(), ep_before);
+
+            let ntfn_before = s.available_notifications();
+            let ntfn = s.alloc_notification().expect("Notification identity");
+            assert_eq!(s.available_notifications(), ntfn_before - 1);
+            s.free_notification(ntfn);
+            assert_eq!(s.available_notifications(), ntfn_before);
+
+            let sc_before = s.available_sched_contexts();
+            let sc0 = s.alloc_sched_context().expect("first SC identity");
+            let sc1 = s.alloc_sched_context().expect("second SC identity");
+            assert_ne!(sc0, sc1, "two live unconfigured SCs must not alias");
+            assert_eq!(s.available_sched_contexts(), sc_before - 2);
+            s.free_sched_context(sc0);
+            s.free_sched_context(sc1);
+            assert_eq!(s.available_sched_contexts(), sc_before);
+
+            let reply_before = s.available_replies();
+            let reply = s.alloc_reply().expect("Reply identity");
+            assert_eq!(s.available_replies(), reply_before - 1);
+            s.free_reply(reply);
+            assert_eq!(s.available_replies(), reply_before);
+
+            let tcb_before = s.scheduler.available_cap_tcbs();
+            let tcb = s
+                .scheduler
+                .try_admit_cap(Tcb {
+                    state: ThreadStateType::Inactive,
+                    ..Default::default()
+                })
+                .expect("cap-backed TCB identity");
+            assert_ne!(tcb, TcbId(0));
+            assert_eq!(s.scheduler.available_cap_tcbs(), tcb_before - 1);
+            s.scheduler.slab.free(tcb);
+            assert_eq!(s.scheduler.available_cap_tcbs(), tcb_before);
+        }
+        arch::log("  \u{2713} pooled object ownership and availability are exact\n");
     }
 
     #[inline(never)]
