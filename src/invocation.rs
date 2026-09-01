@@ -1313,33 +1313,171 @@ fn detach_cap_mapping(cap: &Cap) {
     }
 }
 
-unsafe fn cap_tree_mappings_valid(s: &crate::kernel::KernelState, cap: &Cap, depth: u8) -> bool {
+const CNODE_WORK_CAPACITY: usize = KernelState::cnode_pool_count();
+const CNODE_WORK_WORDS: usize = (CNODE_WORK_CAPACITY + 63) / 64;
+const _: () = assert!(CNODE_WORK_CAPACITY <= u16::MAX as usize);
+
+/// Bounded by the complete CNode identity registry rather than by nesting depth.
+struct CNodeWorkList {
+    entries: [u16; CNODE_WORK_CAPACITY],
+    seen: [u64; CNODE_WORK_WORDS],
+    head: usize,
+    tail: usize,
+}
+
+impl CNodeWorkList {
+    const fn new() -> Self {
+        Self {
+            entries: [0; CNODE_WORK_CAPACITY],
+            seen: [0; CNODE_WORK_WORDS],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.seen.fill(0);
+        self.head = 0;
+        self.tail = 0;
+    }
+
+    fn push(&mut self, vi: usize) -> bool {
+        if vi >= CNODE_WORK_CAPACITY {
+            return false;
+        }
+        let bit = 1u64 << (vi % 64);
+        if self.seen[vi / 64] & bit != 0 {
+            return true;
+        }
+        if self.tail == self.entries.len() {
+            return false;
+        }
+        self.seen[vi / 64] |= bit;
+        self.entries[self.tail] = vi as u16;
+        self.tail += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<usize> {
+        if self.head == self.tail {
+            return None;
+        }
+        let vi = self.entries[self.head] as usize;
+        self.head += 1;
+        Some(vi)
+    }
+}
+
+struct CNodeWorkCell(core::cell::UnsafeCell<CNodeWorkList>);
+
+unsafe impl Sync for CNodeWorkCell {}
+
+static CNODE_WORK: CNodeWorkCell = CNodeWorkCell(core::cell::UnsafeCell::new(CNodeWorkList::new()));
+
+/// Invocation and finalization run under the kernel BKL. Reuse one static queue so a traversal over
+/// the complete CNode registry does not consume most of a 4 KiB per-TCB kernel stack.
+unsafe fn cnode_worklist() -> &'static mut CNodeWorkList {
+    let work = &mut *CNODE_WORK.0.get();
+    work.reset();
+    work
+}
+
+unsafe fn cap_tree_mappings_valid(s: &crate::kernel::KernelState, cap: &Cap) -> bool {
     if !paging_structure_mapping_valid(cap) {
         return false;
     }
     let Cap::CNode { ptr, .. } = cap else {
         return true;
     };
-    if depth >= 4 {
+
+    let work = cnode_worklist();
+    if !work.push(KernelState::cnode_index(*ptr)) {
         return false;
     }
-    let vi = KernelState::cnode_index(*ptr);
-    let slot_count = s.cnode_slots_at(vi).map(|slots| slots.len()).unwrap_or(0);
-    for slot_index in 0..slot_count {
-        let inner = s
-            .cnode_slot(vi, slot_index)
-            .map(|cte| cte.cap())
-            .unwrap_or(Cap::Null);
-        if inner.is_null()
-            || matches!(inner, Cap::CNode { ptr: inner_ptr, .. } if inner_ptr.addr() == ptr.addr())
-        {
-            continue;
-        }
-        if !cap_tree_mappings_valid(s, &inner, depth + 1) {
+    while let Some(vi) = work.pop() {
+        let Some(slots) = s.cnode_slots_at(vi) else {
             return false;
+        };
+        for slot in slots {
+            let inner = slot.cap();
+            if inner.is_null() {
+                continue;
+            }
+            if !paging_structure_mapping_valid(&inner) {
+                return false;
+            }
+            if let Cap::CNode { ptr: inner_ptr, .. } = inner {
+                if !work.push(KernelState::cnode_index(inner_ptr)) {
+                    return false;
+                }
+            }
         }
     }
     true
+}
+
+unsafe fn cnode_release_mappings_valid(
+    s: &crate::kernel::KernelState,
+    cap: &Cap,
+    cleared_refs: u32,
+    cleared_self_refs: u32,
+) -> bool {
+    if !paging_structure_mapping_valid(cap) {
+        return false;
+    }
+    let Cap::CNode { ptr, .. } = cap else {
+        return true;
+    };
+    let vi = KernelState::cnode_index(*ptr);
+    let Some(slots) = s.cnode_slots_at(vi) else {
+        return false;
+    };
+    let self_refs = slots
+        .iter()
+        .filter(|slot| {
+            matches!(slot.cap(), Cap::CNode { ptr: inner, .. } if inner.addr() == ptr.addr())
+        })
+        .count() as u32;
+    let Some(remaining_refs) = crate::kernel::cap_refcount(cap).checked_sub(cleared_refs) else {
+        return false;
+    };
+    let Some(remaining_self_refs) = self_refs.checked_sub(cleared_self_refs) else {
+        return false;
+    };
+    remaining_refs != remaining_self_refs || cap_tree_mappings_valid(s, cap)
+}
+
+unsafe fn revoke_cnode_clear_counts(
+    s: &crate::kernel::KernelState,
+    object_vi: usize,
+    revoke_epoch: u32,
+    source: (usize, usize),
+) -> (u32, u32) {
+    let mut refs = 0u32;
+    let mut self_refs = 0u32;
+    for ci in 0..KernelState::cnode_pool_count() {
+        let slot_count = s.cnode_slots_at(ci).map_or(0, |slots| slots.len());
+        for si in 0..slot_count {
+            if (ci, si) == source || !cte_revoke_marked(s, ci, si, revoke_epoch) {
+                continue;
+            }
+            let Some(Cap::CNode { ptr, .. }) = s.cnode_slot(ci, si).map(|slot| slot.cap()) else {
+                continue;
+            };
+            if KernelState::cnode_index(ptr) != object_vi {
+                continue;
+            }
+            refs = refs
+                .checked_add(1)
+                .expect("CNode clear reference count overflow");
+            if ci == object_vi {
+                self_refs = self_refs
+                    .checked_add(1)
+                    .expect("CNode self-reference count overflow");
+            }
+        }
+    }
+    (refs, self_refs)
 }
 
 fn paging_cap_with_mapping(
@@ -3888,8 +4026,6 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 seL4_Error::seL4_RangeError,
             )));
         }
-        let source_id = crate::cte::MdbId::pack(cnode_idx as u32, src_index as u32);
-
         // Mark this walk in each CTE's transient MDB generation. This is BKL-serialized and avoids
         // a second bitmap proportional to every possible CSpace slot.
         let revoke_epoch = begin_revoke_epoch(s);
@@ -3934,7 +4070,16 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                     .cnode_slot(ci, si)
                     .map(|cte| cte.cap())
                     .unwrap_or(Cap::Null);
-                if !cap_tree_mappings_valid(s, &cap, 0) {
+                let valid = match cap {
+                    Cap::CNode { ptr, .. } => {
+                        let vi = KernelState::cnode_index(ptr);
+                        let (cleared_refs, cleared_self_refs) =
+                            revoke_cnode_clear_counts(s, vi, revoke_epoch, (cnode_idx, src_index));
+                        cnode_release_mappings_valid(s, &cap, cleared_refs, cleared_self_refs)
+                    }
+                    _ => paging_structure_mapping_valid(&cap),
+                };
+                if !valid {
                     return Err(KException::SyscallError(SyscallError::new(
                         seL4_Error::seL4_IllegalOperation,
                     )));
@@ -3955,14 +4100,17 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                     continue;
                 }
                 let id = crate::cte::MdbId::pack(ci as u32, si as u32);
-                child_count_reset(id);
                 // Phase 43 — free pool slots so long sel4test
                 // runs don't exhaust the static pools. Only the
                 // FIRST cap (where the object was retyped from
                 // an Untyped) does the free; copies via Mint
                 // would call free again for the same pool slot
                 // which is harmless (free is idempotent).
-                let cap_to_free = s.cnode_slot(ci, si).map(|c| c.cap()).unwrap_or(Cap::Null);
+                let cap_to_free = s
+                    .cnode_slot(ci, si)
+                    .expect("marked revoke slot must remain registered under the BKL")
+                    .cap();
+                let parent = splice_cte_out(s, id);
                 detach_cap_mapping(&cap_to_free);
                 // Phase 44 — clear the slot FIRST (the set_cap hook
                 // drops the refcount), then release the object if
@@ -3972,21 +4120,25 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 // so the object frees exactly when the LAST holder
                 // is cleared — same semantics as the old
                 // is_revoked-excluding sweep.
-                if let Some(slot) = s.cnode_slot_mut(ci, si) {
-                    slot.set_cap(&Cap::Null);
-                    slot.set_parent(None);
-                }
-                maybe_free_object(s, &cap_to_free, 0);
+                let slot = s
+                    .cnode_slot_mut(ci, si)
+                    .expect("marked revoke slot must remain registered until cleared");
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+                slot.set_child_count(0);
+                slot.set_revoke_epoch(0);
+                maybe_free_object(s, &cap_to_free);
+                release_parent_edge(parent);
             }
         }
         // The source itself kept the cap but lost all its descendants.
-        let src_id = crate::cte::MdbId::pack(cnode_idx as u32, src_index as u32);
-        child_count_reset(src_id);
-
-        // Silence unused: the structural fallback used to live
-        // here. Keep `is_derived_from` available for any code that
-        // still wants the structural check (none does today).
-        let _ = source_id;
+        assert_eq!(
+            s.cnode_slot(cnode_idx, src_index)
+                .expect("revoke source must remain registered")
+                .child_count(),
+            0,
+            "revoke must retire or splice every source descendant"
+        );
 
         // Phase 43 — if the source is an Untyped, every derived
         // object has been cleared, so reset the source's free index
@@ -4015,50 +4167,6 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         }
     }
     Ok(())
-}
-
-/// "child is derived from parent" — without an MDB, we approximate
-/// the relationship structurally. Simple but adequate for the
-/// common cases:
-///   * Untyped parent → any cap whose object lives inside the
-///     untyped's physical range
-///   * Endpoint/Notification/CNode/Thread parent → any cap with
-///     the same ptr (Mint and Copy produce children with the same
-///     ptr but possibly different badges/rights)
-fn is_derived_from(child: &Cap, parent: &Cap) -> bool {
-    use Cap::*;
-    match parent {
-        Untyped {
-            ptr, block_bits, ..
-        } => {
-            let base = ptr.addr();
-            let end = base.saturating_add(1u64 << block_bits);
-            let inside = |addr: u64| addr >= base && addr < end;
-            match child {
-                Endpoint { ptr, .. } => inside(ptr.addr()),
-                Notification { ptr, .. } => inside(ptr.addr()),
-                CNode { ptr, .. } => inside(ptr.addr()),
-                Thread { tcb } => inside(tcb.addr()),
-                Untyped { ptr, .. } => inside(ptr.addr()) && ptr.addr() != base,
-                Reply { ptr, .. } => inside(ptr.addr()),
-                Frame { ptr, .. } => inside(ptr.addr()),
-                PageTable { ptr, .. } => inside(ptr.addr()),
-                PageDirectory { ptr, .. } => inside(ptr.addr()),
-                Pdpt { ptr, .. } => inside(ptr.addr()),
-                PML4 { ptr, .. } => inside(ptr.addr()),
-                _ => false,
-            }
-        }
-        Endpoint { ptr: pp, .. } => {
-            matches!(child, Endpoint { ptr: cp, .. } if cp.addr() == pp.addr())
-        }
-        Notification { ptr: pp, .. } => {
-            matches!(child, Notification { ptr: cp, .. } if cp.addr() == pp.addr())
-        }
-        CNode { ptr: pp, .. } => matches!(child, CNode { ptr: cp, .. } if cp.addr() == pp.addr()),
-        Thread { tcb: pp } => matches!(child, Thread { tcb: cp } if cp.addr() == pp.addr()),
-        _ => false,
-    }
 }
 
 fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: bool) -> KResult<()> {
@@ -4465,14 +4573,123 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     s.scheduler.slab.entries[id.0 as usize] = None;
 }
 
-/// Phase 44 — release the tracked object or IRQ vector behind `cap` if the last
-/// reference to it is gone (refcount already reflects the cleared
-/// slot — clear BEFORE calling). CNode pages release their contents
-/// recursively, preserving the per-inner-cap Untyped reclaim the old
-/// sweep-based destroy performed. Self-references inside a CNode
-/// don't pin it: the page is freed when its EXTERNAL refcount hits
-/// zero.
-unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap, depth: u8) {
+unsafe fn cnode_has_only_self_refs(s: &crate::kernel::KernelState, cap: &Cap) -> bool {
+    let Cap::CNode { ptr, .. } = cap else {
+        return false;
+    };
+    let vi = KernelState::cnode_index(*ptr);
+    let Some(slots) = s.cnode_slots_at(vi) else {
+        return false;
+    };
+    let self_refs = slots
+        .iter()
+        .filter(|slot| {
+            matches!(slot.cap(), Cap::CNode { ptr: inner, .. } if inner.addr() == ptr.addr())
+        })
+        .count();
+    crate::kernel::cap_refcount(cap) as usize == self_refs
+}
+
+/// Splice the direct derivation children of a disappearing CTE to its own parent. seL4's linked MDB
+/// performs this in `emptySlot`; our compact explicit-parent model must do it before a CNode backing
+/// descriptor can be reused, otherwise those children would point into the next object assigned the
+/// same descriptor identity.
+unsafe fn splice_cte_out(
+    s: &mut crate::kernel::KernelState,
+    removed: crate::cte::MdbId,
+) -> Option<crate::cte::MdbId> {
+    let removed_cte = s
+        .cnode_slot(removed.cnode_idx() as usize, removed.slot() as usize)
+        .expect("removed CTE must remain registered while its MDB edge is spliced");
+    let new_parent = removed_cte.parent();
+    let recorded_children = removed_cte.child_count();
+    let mut moved = 0u32;
+    for ci in 0..KernelState::cnode_pool_count() {
+        let slot_count = s.cnode_slots_at(ci).map_or(0, |slots| slots.len());
+        for si in 0..slot_count {
+            if s.cnode_slot(ci, si).and_then(|slot| slot.parent()) != Some(removed) {
+                continue;
+            }
+            s.cnode_slot_mut(ci, si)
+                .expect("scanned CNode slot must remain registered under the BKL")
+                .set_parent(new_parent);
+            moved = moved.checked_add(1).expect("MDB child count overflow");
+        }
+    }
+    if let Some(parent) = new_parent {
+        let parent = s
+            .cnode_slot_mut(parent.cnode_idx() as usize, parent.slot() as usize)
+            .expect("derived cap parent must remain live while its child is deleted");
+        let adopted = parent
+            .child_count()
+            .checked_add(moved)
+            .expect("MDB child count overflow while splicing a CTE");
+        parent.set_child_count(adopted);
+    }
+    assert_eq!(
+        moved, recorded_children,
+        "MDB child count must equal the registered direct derivation edges"
+    );
+    s.cnode_slot_mut(removed.cnode_idx() as usize, removed.slot() as usize)
+        .expect("finalized CNode slot must remain registered until it is cleared")
+        .set_child_count(0);
+    new_parent
+}
+
+unsafe fn assert_cnode_release_invariants(s: &crate::kernel::KernelState, vi: usize) {
+    let slots = s
+        .cnode_slots_at(vi)
+        .expect("released CNode must remain registered during validation");
+    for slot in slots {
+        assert!(
+            slot.cap().is_null(),
+            "released CNode must contain only null caps"
+        );
+        assert_eq!(
+            slot.parent(),
+            None,
+            "released CNode slot retains an MDB parent"
+        );
+        assert_eq!(
+            slot.child_count(),
+            0,
+            "released CNode slot retains MDB children"
+        );
+        assert_eq!(
+            slot.revoke_epoch(),
+            0,
+            "released CNode slot retains a revoke mark"
+        );
+    }
+    let released = Cap::CNode {
+        ptr: KernelState::cnode_ptr(vi),
+        radix: slots.len().trailing_zeros() as u8,
+        guard_size: 0,
+        guard: 0,
+    };
+    assert_eq!(
+        crate::kernel::cap_refcount(&released),
+        0,
+        "released CNode descriptor retains a live capability reference"
+    );
+    for ci in 0..KernelState::cnode_pool_count() {
+        let slot_count = s.cnode_slots_at(ci).map_or(0, |inner| inner.len());
+        for si in 0..slot_count {
+            let parent = s.cnode_slot(ci, si).and_then(|slot| slot.parent());
+            assert_ne!(
+                parent.map(|id| id.cnode_idx() as usize),
+                Some(vi),
+                "released CNode descriptor retains an inbound MDB edge"
+            );
+        }
+    }
+}
+
+/// Release the tracked object or IRQ vector behind `cap` if the last reference is gone. The caller
+/// clears its CTE before entering here, so refcounts already exclude that ownership edge. CNode
+/// contents are finalized with a registry-sized iterative worklist: arbitrary valid nesting is
+/// drained completely without recursive kernel-stack growth or a depth-truncation fallback.
+unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
     use crate::kernel::cap_refcount;
     match cap {
         Cap::Thread { tcb } => {
@@ -4569,52 +4786,79 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap, depth
             free_asid_pool_index((*asid_base / 512) as usize);
         }
         Cap::CNode { ptr, .. } => {
-            let vi = KernelState::cnode_index(*ptr);
-            let n = s.cnode_slots_at(vi).map(|sl| sl.len()).unwrap_or(0);
-            // Count self-references (the canonical CSpace-root-in-
-            // slot-N pattern). They keep the refcount above zero but
-            // must not keep the page alive once all EXTERNAL refs
-            // are gone.
-            let mut self_refs = 0usize;
-            for si in 0..n {
-                let c = s.cnode_slot(vi, si).map(|c| c.cap()).unwrap_or(Cap::Null);
-                if matches!(c, Cap::CNode { ptr: ip, .. } if ip.addr() == ptr.addr()) {
-                    self_refs += 1;
-                }
-            }
-            if cap_refcount(cap) as usize != self_refs {
-                return; // external references remain
-            }
-            if depth >= 4 {
-                // Defensive recursion bound — just free the page.
-                s.free_cnode_virt(vi);
+            if !cnode_has_only_self_refs(s, cap) {
                 return;
             }
-            for si in 0..n {
-                let (inner_cap, inner_parent) = match s.cnode_slot(vi, si) {
-                    Some(c) => (c.cap(), c.parent()),
-                    None => continue,
+            let work = cnode_worklist();
+            assert!(
+                work.push(KernelState::cnode_index(*ptr)),
+                "tracked CNode identity must fit finalization worklist"
+            );
+
+            while let Some(vi) = work.pop() {
+                let slots = s
+                    .cnode_slots_at(vi)
+                    .expect("queued CNode must remain registered under the BKL");
+                let n = slots.len();
+                let current_ptr = KernelState::cnode_ptr(vi);
+                let current_cap = Cap::CNode {
+                    ptr: current_ptr,
+                    radix: n.trailing_zeros() as u8,
+                    guard_size: 0,
+                    guard: 0,
                 };
-                if inner_cap.is_null() {
-                    continue;
-                }
-                detach_cap_mapping(&inner_cap);
-                if let Some(slot) = s.cnode_slot_mut(vi, si) {
+                assert!(
+                    cnode_has_only_self_refs(s, &current_cap),
+                    "queued CNode cannot gain an external reference under the BKL"
+                );
+
+                for si in 0..n {
+                    let cte = s
+                        .cnode_slot(vi, si)
+                        .expect("queued CNode slot must remain registered under the BKL");
+                    let (inner_cap, inner_parent, inner_children) =
+                        (cte.cap(), cte.parent(), cte.child_count());
+                    if inner_cap.is_null() {
+                        assert_eq!(
+                            inner_children, 0,
+                            "empty CNode slot cannot own derivation children"
+                        );
+                        assert_eq!(
+                            inner_parent, None,
+                            "empty CNode slot cannot retain an MDB parent"
+                        );
+                        continue;
+                    }
+                    let spliced_parent =
+                        splice_cte_out(s, crate::cte::MdbId::pack(vi as u32, si as u32));
+                    assert_eq!(spliced_parent, inner_parent);
+                    detach_cap_mapping(&inner_cap);
+                    let slot = s
+                        .cnode_slot_mut(vi, si)
+                        .expect("queued CNode slot must remain registered until cleared");
                     slot.set_cap(&Cap::Null);
                     slot.set_parent(None);
+                    slot.set_child_count(0);
+                    slot.set_revoke_epoch(0);
+
+                    match inner_cap {
+                        Cap::CNode { ptr: inner_ptr, .. }
+                            if inner_ptr.addr() == current_ptr.addr() => {}
+                        Cap::CNode { ptr: inner_ptr, .. } => {
+                            if cnode_has_only_self_refs(s, &inner_cap) {
+                                assert!(
+                                    work.push(KernelState::cnode_index(inner_ptr)),
+                                    "tracked CNode identity must fit finalization worklist"
+                                );
+                            }
+                        }
+                        _ => maybe_free_object(s, &inner_cap),
+                    }
+                    release_parent_edge(inner_parent);
                 }
-                // Self-refs were just cleared (refcount handled by
-                // the hook); their object IS this page — skip.
-                if matches!(inner_cap, Cap::CNode { ptr: ip, .. }
-                    if ip.addr() == ptr.addr())
-                {
-                    continue;
-                }
-                maybe_free_object(s, &inner_cap, depth + 1);
-                let (db, ds) = cap_extent(&inner_cap);
-                reclaim_untyped_chain_at_tail(inner_parent, db, ds);
+                assert_cnode_release_invariants(s, vi);
+                s.free_cnode_virt(vi);
             }
-            s.free_cnode_virt(vi);
         }
         _ => {}
     }
@@ -4657,129 +4901,60 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
             crate::arch::log("]\n");
         }
 
-        // Snapshot the cap + parent edge BEFORE clearing — the
-        // Untyped reclaim below needs them to know what to give
-        // back and to whom.
-        let (deleted_cap, parent_id, child_count) = match s.cnode_slot(cnode_idx, res.slot_index) {
-            Some(c) => (c.cap(), c.parent(), c.child_count()),
-            None => (Cap::Null, None, 0),
+        // Keep the cap live while its mappings and MDB edge are validated and spliced.
+        let removed_id = crate::cte::MdbId::pack(cnode_idx as u32, res.slot_index as u32);
+        let deleted_cap = s
+            .cnode_slot(cnode_idx, res.slot_index)
+            .expect("resolved delete slot must remain registered under the BKL")
+            .cap();
+
+        let valid = match deleted_cap {
+            Cap::CNode { ptr, .. } => {
+                let vi = KernelState::cnode_index(ptr);
+                cnode_release_mappings_valid(s, &deleted_cap, 1, u32::from(cnode_idx == vi))
+            }
+            _ => paging_structure_mapping_valid(&deleted_cap),
         };
-
-        if child_count != 0 {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_RevokeFirst,
-            )));
-        }
-
-        if !cap_tree_mappings_valid(s, &deleted_cap, 0) {
+        if !valid {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_IllegalOperation,
             )));
         }
 
+        let parent_id = splice_cte_out(s, removed_id);
         detach_cap_mapping(&deleted_cap);
 
-        if let Some(slot) = s.cnode_slot_mut(cnode_idx, res.slot_index) {
-            slot.set_cap(&Cap::Null);
-            slot.set_parent(None);
-            slot.set_child_count(0);
-            slot.set_revoke_epoch(0);
-        }
+        let slot = s
+            .cnode_slot_mut(cnode_idx, res.slot_index)
+            .expect("resolved delete slot must remain registered until cleared");
+        slot.set_cap(&Cap::Null);
+        slot.set_parent(None);
+        slot.set_child_count(0);
+        slot.set_revoke_epoch(0);
 
-        // Phase 43 — deleting the LAST cap to a TCB triggers thread
-        // destruction in upstream seL4. We approximate: on every
-        // Thread cap delete, suspend the TCB. On every Endpoint /
-        // Notification / SchedContext / Reply / CNode cap delete,
-        // release the pool slot for reuse (so long sel4test runs
-        // don't exhaust pool sizes). But ONLY when no other cap
-        // refers to the same object — Mint/Copy create derivatives
-        // sharing the underlying object. (See
-        // CANCEL_BADGED_SENDS_0001: deleting a derived endpoint cap
-        // with the master still live used to wipe queued senders.)
-        // Match by (discriminator, ptr) so cross-pool index collisions
-        // (TCB id N == endpoint slot N+1 etc.) don't keep the object
-        // pinned spuriously. Any hardware mapping was detached above,
-        // before the CTE and its Untyped ownership edge were cleared.
-        // Phase 44 — refcount-driven release replaces the old
-        // whole-pool same_obj_lives sweep (O(pool) per delete; the
-        // CNode arm nested ANOTHER full sweep per contained slot).
-        // The slot was cleared above, so the refcount already
-        // excludes it: zero means this was the last reference.
-        maybe_free_object(s, &deleted_cap, 0);
+        // The slot is already clear, so the exact object refcount excludes this ownership edge.
+        // Release the object only when no other capability refers to it.
+        maybe_free_object(s, &deleted_cap);
 
-        // Phase 42 — Untyped reclaim. allocman's split allocator
-        // calls CNode_Delete on bisect-ladder children and expects
-        // the parent Untyped's `free_index` to roll back so the
-        // memory becomes allocatable again. We approximate the
-        // upstream MDB-driven cleanup by, on every Untyped delete,
-        // walking up the parent chain and recomputing each parent's
-        // `free_index` as `max(child.base + child.size) -
-        // parent.base` over its surviving children. If no children
-        // remain the parent is reset to fully-free.
-        // Phase 43 — reclaim runs for *any* deleted cap, not just
-        // child Untypeds. The parent's free_index was bumped at
-        // Retype regardless of the resulting child type, so a
-        // deleted Frame/TCB/EP/PT/PD/etc. should release the same
-        // bytes back to the parent. Pass the deleted cap's
-        // (base, size) so reclaim can fast-path the common case
-        // where the deleted child wasn't at the parent's tail.
-        let (deleted_base, deleted_size) = cap_extent(&deleted_cap);
-        reclaim_untyped_chain_at_tail(parent_id, deleted_base, deleted_size);
+        // Retire exactly this derivation edge. An Untyped becomes reusable when its last direct
+        // child disappears; ancestors remain allocated while their child Untyped still exists.
+        release_parent_edge(parent_id);
     }
     Ok(())
-}
-
-/// Compute (base, size) of a cap's underlying object's physical
-/// memory. Used by the reclaim fast-path to decide whether a delete
-/// might shrink the parent's free_index. Returns (0, 0) for caps
-/// whose ptr field encodes a pool index (TCB, Endpoint, Notification,
-/// static CNode, Reply) rather than a real paddr — for those we can't
-/// fast-path and must fall through to the full walk.
-fn cap_extent(cap: &Cap) -> (u64, u64) {
-    match cap {
-        Cap::Untyped {
-            ptr, block_bits, ..
-        } => (ptr.addr(), 1u64 << block_bits),
-        Cap::Frame { ptr, size, .. } => {
-            let n: u64 = match size {
-                crate::cap::FrameSize::Small => 4096,
-                crate::cap::FrameSize::Large => 2 * 1024 * 1024,
-                crate::cap::FrameSize::Huge => 1024 * 1024 * 1024,
-            };
-            (ptr.addr(), n)
-        }
-        Cap::PageTable { ptr, .. } => (ptr.addr(), 4096),
-        Cap::PageDirectory { ptr, .. } => (ptr.addr(), 4096),
-        Cap::Pdpt { ptr, .. } => (ptr.addr(), 4096),
-        Cap::PML4 { ptr, .. } => (ptr.addr(), 4096),
-        Cap::SchedContext { ptr, size_bits, .. } => (ptr.addr(), 1u64 << size_bits),
-        Cap::CNode { ptr, .. } => unsafe {
-            KERNEL
-                .get()
-                .dynamic_cnode_backing(KernelState::cnode_index(*ptr))
-                .unwrap_or((0, 0))
-        },
-        // Pool-indexed caps — ptr.addr() is NOT a paddr, so we can't
-        // compare ranges. Force fall-through to full walk by returning
-        // an extent of (0, 0).
-        _ => (0, 0),
-    }
 }
 
 /// Per-parent live-child accounting lives in the parent CTE's MDB storage. This follows a CNode
 /// Move with the CTE and scales with memory-backed CNodes without a second kernel-image array.
 pub unsafe fn child_count_inc(pid: crate::cte::MdbId, by: u32) {
     let s = KERNEL.get();
-    if let Some(parent) = s.cnode_slot_mut(pid.cnode_idx() as usize, pid.slot() as usize) {
-        parent.increment_child_count(by);
-    }
-}
-
-unsafe fn child_count_dec(pid: crate::cte::MdbId) -> u32 {
-    let s = KERNEL.get();
-    s.cnode_slot_mut(pid.cnode_idx() as usize, pid.slot() as usize)
-        .map(|parent| parent.decrement_child_count())
-        .unwrap_or(u32::MAX)
+    let parent = s
+        .cnode_slot_mut(pid.cnode_idx() as usize, pid.slot() as usize)
+        .expect("MDB parent must resolve while adding a derivation edge");
+    let count = parent
+        .child_count()
+        .checked_add(by)
+        .expect("MDB child count overflow");
+    parent.set_child_count(count);
 }
 
 /// Clear ownership metadata before a CNode descriptor or static page is reused.
@@ -4792,201 +4967,37 @@ pub unsafe fn child_counts_reset_page(vi: usize) {
     }
 }
 
-unsafe fn child_count_reset(pid: crate::cte::MdbId) {
-    let s = KERNEL.get();
-    if let Some(parent) = s.cnode_slot_mut(pid.cnode_idx() as usize, pid.slot() as usize) {
-        parent.set_child_count(0);
-    }
-}
-
-/// Phase 43 — fast-path reclaim. If the deleted child's end_paddr is
-/// strictly less than the parent's effective end (parent.base +
-/// free_index), some other surviving child still extends past it, so
-/// the parent's free_index can't shrink — bail out without the
-/// expensive O(N) walk. Otherwise fall through to the full walk.
-unsafe fn reclaim_untyped_chain_at_tail(
-    start: Option<crate::cte::MdbId>,
-    deleted_base: u64,
-    deleted_size: u64,
-) {
-    // Phase 43 — child-counter only path. Decrement the parent's
-    // counter; if zero we reset free_index and recurse upward (the
-    // parent itself has now disappeared from its parent's view).
-    // For non-zero counts we DO NOT shrink free_index — the next
-    // Retype starts from the high watermark instead of filling holes
-    // left by intermediate deletes. This is less precise than
-    // upstream's per-cap MDB walk but ~free in time, and it matches
-    // the alloc-N/free-N pattern vka uses in practice (free_index
-    // only shrinks once *all* children are gone).
-    if let Some(pid) = start {
-        let remaining = child_count_dec(pid);
-        if remaining == 0 {
-            let s = KERNEL.get();
-            let pcn = pid.cnode_idx() as usize;
-            let psl = pid.slot() as usize;
-            let parent_cap = s.cnode_slot(pcn, psl).map(|c| c.cap());
-            let parent_of_parent = s.cnode_slot(pcn, psl).and_then(|c| c.parent());
-            if let Some(Cap::Untyped {
-                ptr,
-                block_bits,
-                is_device,
-                ..
-            }) = parent_cap
-            {
-                if let Some(slot) = s.cnode_slot_mut(pcn, psl) {
-                    slot.set_cap(&Cap::Untyped {
-                        ptr,
-                        block_bits,
-                        free_index: 0,
-                        is_device,
-                    });
-                }
-                // Walk further up — this level just emptied,
-                // so the parent's-parent might also have its
-                // last child gone now. Recurse with this empty
-                // parent as the deleted-cap.
-                let _ = (deleted_base, deleted_size);
-                reclaim_untyped_chain_at_tail(parent_of_parent, ptr.addr(), 1u64 << block_bits);
-            }
-        }
+/// Remove exactly one live MDB ownership edge. An empty Untyped becomes reusable, but its own
+/// parent remains occupied until this CTE is itself deleted; emptiness never propagates authority
+/// upward through a still-live child cap.
+unsafe fn release_parent_edge(parent_id: Option<crate::cte::MdbId>) {
+    let Some(parent_id) = parent_id else {
         return;
-    }
-
-    // (0, 0) means the deleted cap is pool-indexed (TCB/EP/etc.); we
-    // can't compare paddrs, so fall through to the full walk.
-    if deleted_size != 0 {
-        let s = KERNEL.get();
-        if let Some(pid) = start {
-            let pcn = pid.cnode_idx() as usize;
-            let psl = pid.slot() as usize;
-            if let Some(Cap::Untyped {
-                ptr, free_index, ..
-            }) = s.cnode_slot(pcn, psl).map(|c| c.cap())
-            {
-                let parent_base = ptr.addr();
-                let parent_eff_end = parent_base + free_index;
-                let deleted_end = deleted_base + deleted_size;
-                // Deleted child's tail is below parent's
-                // effective end → some other child still holds
-                // the tail. No shrink possible.
-                if deleted_end < parent_eff_end {
-                    return;
-                }
-            }
-        }
-    }
-    reclaim_untyped_chain(start);
-}
-
-/// Walk up the parent chain starting at `start`. For each parent
-/// CTE that holds an Untyped cap, recompute its `free_index` as the
-/// maximum end-paddr (`base + 2^block_bits`) over its surviving
-/// children, minus its base. If no children remain, the free_index
-/// drops to 0. Stops when a parent has surviving children whose
-/// free_index doesn't change (no further reclaim is possible).
-unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
+    };
     let s = KERNEL.get();
-    let mut cursor = start;
-    while let Some(pid) = cursor {
-        let pcn = pid.cnode_idx() as usize;
-        let psl = pid.slot() as usize;
-        let cap = match s.cnode_slot(pcn, psl) {
-            Some(c) => c.cap(),
-            None => return,
-        };
-        let (parent_base, parent_block_bits, parent_free_index) = match cap {
-            Cap::Untyped {
-                ptr,
-                block_bits,
-                free_index,
-                ..
-            } => (ptr.addr(), block_bits as u32, free_index),
-            _ => return,
-        };
-        let parent_total = 1u64 << parent_block_bits;
-        let parent_end = parent_base + parent_total;
-        // If parent already has free_index = 0, no work to do here
-        // and no reason to walk the parent chain — the chain only
-        // shrinks above us when this level shrank.
-        if parent_free_index == 0 {
-            return;
-        }
-
-        // Find the highest end-paddr among surviving children of pid.
-        // Count ALL child cap types (not just Untyped) — Untyped::Retype
-        // bumps the parent's free_index regardless of the resulting
-        // child type, so frames/TCBs/EPs/etc. all consume the same
-        // parent bytes and need to be tracked here too.
-        let mut max_end: u64 = parent_base; // == "no children" sentinel
-        for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-            let inner_count = s.cnode_slots_at(ci).map(|sl| sl.len()).unwrap_or(0);
-            for si in 0..inner_count {
-                let cte = match s.cnode_slot(ci, si) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                if cte.parent() != Some(pid) {
-                    continue;
-                }
-                let (cbase, csize) = match cte.cap() {
-                    Cap::Untyped {
-                        ptr, block_bits, ..
-                    } => (ptr.addr(), 1u64 << block_bits),
-                    Cap::Frame { ptr, size, .. } => {
-                        let n: u64 = match size {
-                            crate::cap::FrameSize::Small => 4096,
-                            crate::cap::FrameSize::Large => 2 * 1024 * 1024,
-                            crate::cap::FrameSize::Huge => 1024 * 1024 * 1024,
-                        };
-                        (ptr.addr(), n)
-                    }
-                    Cap::PageTable { ptr, .. } => (ptr.addr(), 4096),
-                    Cap::PageDirectory { ptr, .. } => (ptr.addr(), 4096),
-                    Cap::Pdpt { ptr, .. } => (ptr.addr(), 4096),
-                    Cap::PML4 { ptr, .. } => (ptr.addr(), 4096),
-                    Cap::Endpoint { ptr, .. } => (ptr.addr(), 16),
-                    Cap::Notification { ptr, .. } => (ptr.addr(), 32),
-                    Cap::CNode { ptr, .. } => s
-                        .dynamic_cnode_backing(KernelState::cnode_index(ptr))
-                        .unwrap_or((0, 0)),
-                    Cap::Reply { ptr, .. } => (ptr.addr(), 32),
-                    Cap::Thread { tcb } => (tcb.addr(), 4096),
-                    Cap::SchedContext { ptr, size_bits, .. } => (ptr.addr(), 1u64 << size_bits),
-                    _ => continue,
-                };
-                let end = cbase + csize;
-                if end > max_end {
-                    max_end = end;
-                }
-            }
-        }
-        let new_fi = max_end - parent_base;
-        // Read the live cap, write back with updated free_index.
-        if let Some(Cap::Untyped {
+    let parent = s
+        .cnode_slot_mut(parent_id.cnode_idx() as usize, parent_id.slot() as usize)
+        .expect("MDB parent must resolve while removing a derivation edge");
+    let remaining = parent
+        .child_count()
+        .checked_sub(1)
+        .expect("MDB parent child count underflow");
+    parent.set_child_count(remaining);
+    if remaining == 0 {
+        if let Cap::Untyped {
             ptr,
             block_bits,
-            free_index,
             is_device,
-        }) = s.cnode_slot(pcn, psl).map(|c| c.cap())
+            ..
+        } = parent.cap()
         {
-            if new_fi < free_index {
-                let updated = Cap::Untyped {
-                    ptr,
-                    block_bits,
-                    free_index: new_fi,
-                    is_device,
-                };
-                if let Some(slot) = s.cnode_slot_mut(pcn, psl) {
-                    slot.set_cap(&updated);
-                }
-                // Continue up: maybe the parent's parent also has a
-                // tail to reclaim now that this one shrank.
-                cursor = s.cnode_slot(pcn, psl).and_then(|c| c.parent());
-                let _ = parent_end;
-                continue;
-            }
+            parent.set_cap(&Cap::Untyped {
+                ptr,
+                block_bits,
+                free_index: 0,
+                is_device,
+            });
         }
-        return;
     }
 }
 
@@ -6270,6 +6281,10 @@ pub mod spec {
         repeated_alloc_free_reclaims_untyped();
         cnode_copy_via_invocation();
         cnode_move_clears_source();
+        cnode_delete_splices_derivation_children();
+        cnode_alias_delete_preserves_live_object();
+        cnode_finalization_drains_deep_nesting();
+        cnode_finalization_splices_external_derivation();
         cnode_revoke_zaps_descendants();
         mdb_records_retype_parent_link();
         mdb_revoke_walks_grandchildren();
@@ -6804,6 +6819,9 @@ pub mod spec {
             // Wipe the cnode in case earlier specs left state.
             for slot in s.cnodes[cnode_idx].0.iter_mut() {
                 slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+                slot.set_child_count(0);
+                slot.set_revoke_epoch(0);
             }
             s.scheduler.admit(t)
         }
@@ -7250,6 +7268,240 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ CNode::Move transfers cap + MDB ownership and zeroes source\n");
+    }
+
+    #[inline(never)]
+    fn cnode_delete_splices_derivation_children() {
+        let invoker = setup_invoker(0);
+        let parent_id = crate::cte::MdbId::pack(0, 1);
+        let middle_id = crate::cte::MdbId::pack(0, 2);
+        unsafe {
+            let s = KERNEL.get();
+            let parent = Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(s.alloc_endpoint().expect("parent endpoint")),
+                badge: Badge(0),
+                rights: EndpointRights::default(),
+            };
+            let middle = Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(s.alloc_endpoint().expect("middle endpoint")),
+                badge: Badge(0),
+                rights: EndpointRights::default(),
+            };
+            let leaf = Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(s.alloc_endpoint().expect("leaf endpoint")),
+                badge: Badge(0),
+                rights: EndpointRights::default(),
+            };
+            s.cnodes[0].0[1].set_cap(&parent);
+            s.cnodes[0].0[1].set_child_count(1);
+            s.cnodes[0].0[2].set_cap(&middle);
+            s.cnodes[0].0[2].set_parent(Some(parent_id));
+            s.cnodes[0].0[2].set_child_count(1);
+            s.cnodes[0].0[3].set_cap(&leaf);
+            s.cnodes[0].0[3].set_parent(Some(middle_id));
+        }
+
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let mut args = SyscallArgs {
+            a1: (InvocationLabel::CNodeDelete as u64) << 12,
+            a2: 2,
+            ..Default::default()
+        };
+        decode_invocation(cnode_cap, &args, invoker).expect("delete middle derivation cap");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(s.cnodes[0].0[2].cap().is_null());
+            assert_eq!(s.cnodes[0].0[3].parent(), Some(parent_id));
+            assert_eq!(s.cnodes[0].0[1].child_count(), 1);
+        }
+        args.a2 = 3;
+        decode_invocation(cnode_cap, &args, invoker).expect("delete reparented leaf");
+        args.a2 = 1;
+        decode_invocation(cnode_cap, &args, invoker).expect("delete derivation parent");
+        teardown_invoker(invoker);
+        arch::log("  ✓ CNode::Delete splices surviving derivation children\n");
+    }
+
+    #[inline(never)]
+    fn cnode_alias_delete_preserves_live_object() {
+        use crate::cap::PageTableStorage;
+
+        let invoker = setup_invoker(0);
+        let vi = unsafe { KERNEL.get().alloc_small_cnode().expect("alias CNode") };
+        let cnode = Cap::CNode {
+            ptr: KernelState::cnode_ptr(vi),
+            radix: 1,
+            guard_size: 63,
+            guard: 0,
+        };
+        let stale_mapping = Cap::PageTable {
+            ptr: PPtr::<PageTableStorage>::new(0x00d0_0000).unwrap(),
+            mapped: Some(0x0000_0100_2000_0000),
+            asid: 0,
+        };
+        unsafe {
+            let s = KERNEL.get();
+            s.cnodes[0].0[1].set_cap(&cnode);
+            s.cnodes[0].0[2].set_cap(&cnode);
+            s.cnode_slot_mut(vi, 0)
+                .expect("alias CNode slot")
+                .set_cap(&stale_mapping);
+        }
+
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let mut args = SyscallArgs {
+            a1: (InvocationLabel::CNodeDelete as u64) << 12,
+            a2: 1,
+            ..Default::default()
+        };
+        decode_invocation(root, &args, invoker).expect("delete non-final CNode alias");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(matches!(s.cnodes[0].0[2].cap(), Cap::CNode { .. }));
+            assert_eq!(
+                s.cnode_slot(vi, 0).expect("live alias contents").cap(),
+                stale_mapping
+            );
+        }
+
+        args.a2 = 2;
+        assert!(matches!(
+            decode_invocation(root, &args, invoker),
+            Err(KException::SyscallError(SyscallError {
+                code: seL4_Error::seL4_IllegalOperation,
+            }))
+        ));
+        unsafe {
+            let s = KERNEL.get();
+            assert!(matches!(s.cnodes[0].0[2].cap(), Cap::CNode { .. }));
+            s.cnode_slot_mut(vi, 0)
+                .expect("live alias contents")
+                .set_cap(&Cap::PageTable {
+                    ptr: PPtr::<PageTableStorage>::new(0x00d0_0000).unwrap(),
+                    mapped: None,
+                    asid: 0,
+                });
+        }
+        decode_invocation(root, &args, invoker).expect("delete final valid CNode alias");
+        teardown_invoker(invoker);
+        arch::log("  ✓ non-final CNode alias delete preserves live object contents\n");
+    }
+
+    #[inline(never)]
+    fn cnode_finalization_drains_deep_nesting() {
+        const DEPTH: usize = 8;
+        let invoker = setup_invoker(0);
+        let mut nodes = [0usize; DEPTH];
+        unsafe {
+            let s = KERNEL.get();
+            for node in &mut nodes {
+                *node = s.alloc_small_cnode().expect("deep CNode");
+            }
+            for i in 0..DEPTH - 1 {
+                s.cnode_slot_mut(nodes[i], 0)
+                    .expect("deep CNode slot")
+                    .set_cap(&Cap::CNode {
+                        ptr: KernelState::cnode_ptr(nodes[i + 1]),
+                        radix: 1,
+                        guard_size: 63,
+                        guard: 0,
+                    });
+            }
+            s.cnodes[0].0[1].set_cap(&Cap::CNode {
+                ptr: KernelState::cnode_ptr(nodes[0]),
+                radix: 1,
+                guard_size: 63,
+                guard: 0,
+            });
+        }
+
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let args = SyscallArgs {
+            a1: (InvocationLabel::CNodeDelete as u64) << 12,
+            a2: 1,
+            ..Default::default()
+        };
+        decode_invocation(root, &args, invoker).expect("delete deep CNode root");
+        unsafe {
+            let s = KERNEL.get();
+            let mut recycled = [0usize; DEPTH];
+            for node in &mut recycled {
+                *node = s.alloc_small_cnode().expect("recycled deep CNode");
+            }
+            nodes.sort_unstable();
+            recycled.sort_unstable();
+            assert_eq!(
+                recycled, nodes,
+                "every deeply nested CNode must be reclaimed"
+            );
+            for node in recycled {
+                s.free_cnode_virt(node);
+            }
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ CNode finalization drains nesting deeper than four levels\n");
+    }
+
+    #[inline(never)]
+    fn cnode_finalization_splices_external_derivation() {
+        let invoker = setup_invoker(0);
+        let parent_id = crate::cte::MdbId::pack(0, 10);
+        let vi = unsafe { KERNEL.get().alloc_small_cnode().expect("owned CNode") };
+        let source_id = crate::cte::MdbId::pack(vi as u32, 0);
+        unsafe {
+            let s = KERNEL.get();
+            let parent = Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(s.alloc_endpoint().expect("derivation parent")),
+                badge: Badge(0),
+                rights: EndpointRights::default(),
+            };
+            let derived = Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(s.alloc_endpoint().expect("derived endpoint")),
+                badge: Badge(0),
+                rights: EndpointRights::default(),
+            };
+            s.cnodes[0].0[10].set_cap(&parent);
+            s.cnodes[0].0[10].set_child_count(1);
+            let source = s.cnode_slot_mut(vi, 0).expect("owned CNode source slot");
+            source.set_cap(&derived);
+            source.set_parent(Some(parent_id));
+            source.set_child_count(1);
+            s.cnodes[0].0[11].set_cap(&derived);
+            s.cnodes[0].0[11].set_parent(Some(source_id));
+            s.cnodes[0].0[1].set_cap(&Cap::CNode {
+                ptr: KernelState::cnode_ptr(vi),
+                radix: 1,
+                guard_size: 63,
+                guard: 0,
+            });
+        }
+
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let mut args = SyscallArgs {
+            a1: (InvocationLabel::CNodeDelete as u64) << 12,
+            a2: 1,
+            ..Default::default()
+        };
+        decode_invocation(root, &args, invoker).expect("finalize CNode with external derivation");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(matches!(s.cnodes[0].0[11].cap(), Cap::Endpoint { .. }));
+            assert_eq!(s.cnodes[0].0[11].parent(), Some(parent_id));
+            assert_eq!(s.cnodes[0].0[10].child_count(), 1);
+            let reused = s.alloc_small_cnode().expect("reused CNode descriptor");
+            assert_eq!(reused, vi);
+            assert_ne!(
+                s.cnodes[0].0[11].parent(),
+                Some(crate::cte::MdbId::pack(reused as u32, 0))
+            );
+            s.free_cnode_virt(reused);
+        }
+        args.a2 = 11;
+        decode_invocation(root, &args, invoker).expect("delete surviving derived cap");
+        args.a2 = 10;
+        decode_invocation(root, &args, invoker).expect("delete derivation parent");
+        teardown_invoker(invoker);
+        arch::log("  ✓ CNode finalization preserves and reparents external derivations\n");
     }
 
     /// Revoke walks the cap tree and zeroes every derived cap.
