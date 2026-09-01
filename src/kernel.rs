@@ -121,6 +121,7 @@ const _: () = assert!((XL_CNODE_RADIX as u32) <= crate::cte::MdbId::SLOT_BITS);
 ///   [0, MAX_CNODES)                      big (radix 12)
 ///   [MAX_CNODES, +MAX_SMALL_CNODES)      small (radix ≤ 6)
 ///   [.., +MAX_XL_CNODES)                 XL (radix 17 or 18)
+///   [.., +MAX_DYNAMIC_CNODES)            exact Untyped-backed CNodes
 
 #[repr(C, align(32))]
 pub struct XlCNodePage(pub [Cte; XL_CNODE_SLOTS]);
@@ -129,6 +130,26 @@ pub struct XlCNodePage(pub [Cte; XL_CNODE_SLOTS]);
 // extern-rootserver CSpace capacity inflates the boot ELF `.data` section.
 static mut XL_CNODES: [XlCNodePage; MAX_XL_CNODES] =
     [const { XlCNodePage([Cte::null(); XL_CNODE_SLOTS]) }; MAX_XL_CNODES];
+
+/// Compact identities for CNodes whose CTE storage is the physical memory consumed from their
+/// source Untyped. Descriptor capacity is metadata only; CTE capacity comes from RAM at Retype.
+pub const MAX_DYNAMIC_CNODES: usize = 1024;
+pub const DYNAMIC_CNODE_BASE: usize = MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES;
+
+#[derive(Copy, Clone)]
+pub struct DynamicCNodeDescriptor {
+    pub paddr: u64,
+    pub radix: u8,
+    pub in_use: bool,
+}
+
+impl DynamicCNodeDescriptor {
+    pub const EMPTY: Self = Self {
+        paddr: 0,
+        radix: 0,
+        in_use: false,
+    };
+}
 
 #[inline]
 unsafe fn xl_cnode_slots_at(i: usize) -> Option<&'static [Cte]> {
@@ -173,6 +194,9 @@ pub struct KernelState {
     /// exhaust the big pool. Virtual cnode_idx range:
     /// MAX_CNODES..MAX_CNODES+MAX_SMALL_CNODES.
     pub small_cnodes: [SmallCNodePage; MAX_SMALL_CNODES],
+    /// Exact CapTable objects created from Untyped memory. Their CTE arrays live in the carved
+    /// physical spans; the kernel retains only lookup/lifetime metadata here.
+    pub dynamic_cnodes: [DynamicCNodeDescriptor; MAX_DYNAMIC_CNODES],
     /// Per-IRQ binding table.
     pub irqs: IrqTable,
 
@@ -228,6 +252,7 @@ impl KernelState {
             notifications: [EMPTY_NT; MAX_NTFNS],
             cnodes: [EMPTY_CN; MAX_CNODES],
             small_cnodes: [EMPTY_SCN; MAX_SMALL_CNODES],
+            dynamic_cnodes: [DynamicCNodeDescriptor::EMPTY; MAX_DYNAMIC_CNODES],
             sched_contexts: [EMPTY_SC; MAX_SCHED_CONTEXTS],
             replies: [EMPTY_REPLY; MAX_REPLIES],
             irqs: IrqTable::new(),
@@ -341,23 +366,82 @@ impl KernelState {
         }
     }
 
+    pub fn available_dynamic_cnodes(&self) -> usize {
+        self.dynamic_cnodes
+            .iter()
+            .filter(|descriptor| !descriptor.in_use)
+            .count()
+    }
+
+    /// Bind one compact CNode identity to the exact physical CapTable span consumed from Untyped.
+    pub fn alloc_dynamic_cnode(&mut self, paddr: u64, radix: u8) -> Option<usize> {
+        if radix == 0 || radix as u32 > crate::cte::MdbId::SLOT_BITS {
+            return None;
+        }
+        let size = (1u64 << radix).checked_mul(Cte::SIZE_BYTES as u64)?;
+        if paddr & (size - 1) != 0 {
+            return None;
+        }
+        let index = self
+            .dynamic_cnodes
+            .iter()
+            .position(|descriptor| !descriptor.in_use)?;
+        self.dynamic_cnodes[index] = DynamicCNodeDescriptor {
+            paddr,
+            radix,
+            in_use: true,
+        };
+        Some(DYNAMIC_CNODE_BASE + index)
+    }
+
+    pub fn free_dynamic_cnode(&mut self, vi: usize) {
+        let Some(index) = vi.checked_sub(DYNAMIC_CNODE_BASE) else {
+            return;
+        };
+        if index >= MAX_DYNAMIC_CNODES || !self.dynamic_cnodes[index].in_use {
+            return;
+        }
+        if let Some(slots) = self.cnode_slots_at_mut(vi) {
+            for slot in slots {
+                slot.set_cap(&Cap::Null);
+                slot.set_parent(None);
+                slot.set_child_count(0);
+                slot.set_revoke_epoch(0);
+            }
+        }
+        self.dynamic_cnodes[index] = DynamicCNodeDescriptor::EMPTY;
+    }
+
+    pub fn dynamic_cnode_backing(&self, vi: usize) -> Option<(u64, u64)> {
+        let descriptor = self
+            .dynamic_cnodes
+            .get(vi.checked_sub(DYNAMIC_CNODE_BASE)?)?;
+        if !descriptor.in_use {
+            return None;
+        }
+        Some((
+            descriptor.paddr,
+            (1u64 << descriptor.radix) * Cte::SIZE_BYTES as u64,
+        ))
+    }
+
     /// Pool-aware free for a virtual cnode index. Dispatches to
     /// `free_cnode` (big pool) or `free_small_cnode` (small pool)
     /// based on `vi`. Use this from cap-delete paths so callers
     /// don't have to know which pool a `Cap::CNode` lives in.
     pub fn free_cnode_virt(&mut self, vi: usize) {
+        // Metadata is stored in the CTEs themselves and must be cleared while a dynamic descriptor
+        // still resolves its physical backing.
+        unsafe { crate::invocation::child_counts_reset_page(vi) };
         if vi < MAX_CNODES {
             self.free_cnode(vi);
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES {
             self.free_small_cnode(vi);
-        } else {
+        } else if vi < DYNAMIC_CNODE_BASE {
             self.free_xl_cnode(vi);
+        } else {
+            self.free_dynamic_cnode(vi);
         }
-        // The page's slots are gone — zero any per-parent child
-        // counters keyed by them so a recycled page doesn't inherit
-        // stale counts (which would block free_index reclaim for
-        // whatever untyped cap lands on the same slot next).
-        unsafe { crate::invocation::child_counts_reset_page(vi) };
     }
 
     /// Claim a CNode index whose contents were populated by code
@@ -491,7 +575,7 @@ impl KernelState {
     /// Total virtual cnode count = big + small + XL. Used by revoke /
     /// delete walks that need to scan all pools.
     pub const fn cnode_pool_count() -> usize {
-        MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES
+        DYNAMIC_CNODE_BASE + MAX_DYNAMIC_CNODES
     }
 
     /// Backing slot slice for virtual cnode index `vi`.
@@ -504,6 +588,14 @@ impl KernelState {
             self.small_cnodes.get(vi - MAX_CNODES).map(|p| &p.0[..])
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
             unsafe { xl_cnode_slots_at(vi - MAX_CNODES - MAX_SMALL_CNODES) }
+        } else if vi < Self::cnode_pool_count() {
+            let descriptor = self.dynamic_cnodes.get(vi - DYNAMIC_CNODE_BASE)?;
+            if !descriptor.in_use || descriptor.radix as u32 > crate::cte::MdbId::SLOT_BITS {
+                return None;
+            }
+            let len = 1usize << descriptor.radix;
+            let base = crate::arch::x86_64::paging::phys_to_lin(descriptor.paddr) as *const Cte;
+            Some(unsafe { core::slice::from_raw_parts(base, len) })
         } else {
             None
         }
@@ -518,6 +610,14 @@ impl KernelState {
                 .map(|p| &mut p.0[..])
         } else if vi < MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES {
             unsafe { xl_cnode_slots_at_mut(vi - MAX_CNODES - MAX_SMALL_CNODES) }
+        } else if vi < Self::cnode_pool_count() {
+            let descriptor = self.dynamic_cnodes.get(vi - DYNAMIC_CNODE_BASE)?;
+            if !descriptor.in_use || descriptor.radix as u32 > crate::cte::MdbId::SLOT_BITS {
+                return None;
+            }
+            let len = 1usize << descriptor.radix;
+            let base = crate::arch::x86_64::paging::phys_to_lin(descriptor.paddr) as *mut Cte;
+            Some(unsafe { core::slice::from_raw_parts_mut(base, len) })
         } else {
             None
         }
@@ -791,7 +891,7 @@ struct ObjRefCounts {
     ntfns: [u32; MAX_NTFNS],
     scs: [u32; MAX_SCHED_CONTEXTS],
     replies: [u32; MAX_REPLIES],
-    cnodes: [u32; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES],
+    cnodes: [u32; DYNAMIC_CNODE_BASE + MAX_DYNAMIC_CNODES],
     tcbs: [u32; crate::tcb::MAX_TCBS],
     irq_handlers: [u32; crate::interrupt::MAX_IRQ],
 }
@@ -801,7 +901,7 @@ static mut OBJ_REFCOUNTS: ObjRefCounts = ObjRefCounts {
     ntfns: [0; MAX_NTFNS],
     scs: [0; MAX_SCHED_CONTEXTS],
     replies: [0; MAX_REPLIES],
-    cnodes: [0; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES],
+    cnodes: [0; DYNAMIC_CNODE_BASE + MAX_DYNAMIC_CNODES],
     tcbs: [0; crate::tcb::MAX_TCBS],
     irq_handlers: [0; crate::interrupt::MAX_IRQ],
 };
@@ -901,7 +1001,14 @@ pub(crate) fn slot_in_pools(addr: usize) -> bool {
     ) || within(
         core::ptr::addr_of!(XL_CNODES) as *const u8,
         core::mem::size_of::<[XlCNodePage; MAX_XL_CNODES]>(),
-    )
+    ) || s.dynamic_cnodes.iter().any(|descriptor| {
+        if !descriptor.in_use {
+            return false;
+        }
+        let base = crate::arch::x86_64::paging::phys_to_lin(descriptor.paddr) as usize;
+        let len = (1usize << descriptor.radix) * Cte::SIZE_BYTES;
+        addr >= base && addr < base.saturating_add(len)
+    })
 }
 
 /// Rebuild every refcount from the actual pool contents. Run once at
@@ -914,7 +1021,7 @@ pub fn recount_refcounts() {
         (*rc).ntfns = [0; MAX_NTFNS];
         (*rc).scs = [0; MAX_SCHED_CONTEXTS];
         (*rc).replies = [0; MAX_REPLIES];
-        (*rc).cnodes = [0; MAX_CNODES + MAX_SMALL_CNODES + MAX_XL_CNODES];
+        (*rc).cnodes = [0; DYNAMIC_CNODE_BASE + MAX_DYNAMIC_CNODES];
         (*rc).tcbs = [0; crate::tcb::MAX_TCBS];
         (*rc).irq_handlers = [0; crate::interrupt::MAX_IRQ];
         let s = KERNEL.get();
@@ -1016,13 +1123,47 @@ pub mod spec {
     use super::*;
     use crate::arch;
 
+    #[repr(C, align(2048))]
+    struct DynamicSpecCNode([Cte; SMALL_CNODE_SLOTS]);
+
+    static mut DYNAMIC_SPEC_CNODE: DynamicSpecCNode =
+        DynamicSpecCNode([Cte::null(); SMALL_CNODE_SLOTS]);
+
     pub fn test_kernel_state() {
         arch::log("Running KernelState tests...\n");
         bootstrap_registers_boot_thread();
         scheduler_state_persists_across_calls();
         claim_cnode_pins_directly_initialised_slot();
         small_cnode_pool_alloc_free_dispatch();
+        dynamic_cnode_uses_exact_physical_backing();
         arch::log("KernelState tests completed\n");
+    }
+
+    #[inline(never)]
+    fn dynamic_cnode_uses_exact_physical_backing() {
+        unsafe {
+            let s = KERNEL.get();
+            let kva = core::ptr::addr_of_mut!(DYNAMIC_SPEC_CNODE) as u64;
+            let paddr = crate::arch::x86_64::paging::kernel_virt_to_phys(kva);
+            let vi = s
+                .alloc_dynamic_cnode(paddr, SMALL_CNODE_RADIX)
+                .expect("dynamic descriptor");
+            assert!(vi >= DYNAMIC_CNODE_BASE);
+            assert_eq!(s.dynamic_cnode_backing(vi), Some((paddr, 2048)));
+            let slots = s.cnode_slots_at_mut(vi).expect("dynamic slots");
+            assert_eq!(slots.len(), SMALL_CNODE_SLOTS);
+            slots[SMALL_CNODE_SLOTS - 1].set_cap(&Cap::Domain);
+            assert!(matches!(
+                DYNAMIC_SPEC_CNODE.0[SMALL_CNODE_SLOTS - 1].cap(),
+                Cap::Domain
+            ));
+            let wide = crate::cte::MdbId::pack(1000, (1 << 19) + 7);
+            assert_eq!(wide.cnode_idx(), 1000);
+            assert_eq!(wide.slot(), (1 << 19) + 7);
+            s.free_cnode_virt(vi);
+            assert!(s.cnode_slots_at(vi).is_none());
+            arch::log("  \u{2713} dynamic CNode uses exact Untyped-style physical backing\n");
+        }
     }
 
     /// Phase 43 — small CNode pool. `alloc_small_cnode` returns a

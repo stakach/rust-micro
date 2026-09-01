@@ -41,10 +41,9 @@ pub const CTE_SIZE_BITS: u32 = 5;
 /// Smallest CNode (radix 1, two slots).
 pub const MIN_CNODE_SIZE_BITS: u32 = 1;
 
-/// Largest meaningful CNode size — half the address space minus
-/// CTE_SIZE_BITS (a sane upper bound; seL4 enforces this via
-/// CONFIG-driven limit, we use 38 bits for now to avoid overflow).
-pub const MAX_CNODE_SIZE_BITS: u32 = 38;
+/// Largest configured CNode radix. MDB slot identities carry 20 slot bits, so larger CapTables
+/// cannot be represented exactly and are rejected at Retype rather than given partial backing.
+pub const MAX_CNODE_SIZE_BITS: u32 = crate::cte::MdbId::SLOT_BITS;
 
 /// Smallest legal Untyped: 4 bytes (libsel4 enforces ≥ word).
 pub const MIN_UNTYPED_SIZE_BITS: u32 = 4;

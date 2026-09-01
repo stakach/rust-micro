@@ -3283,6 +3283,22 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         )));
     }
 
+    if object_type == ObjectType::CapTable {
+        if size_bits == 0 || size_bits > crate::cte::MdbId::SLOT_BITS {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_RangeError,
+            )));
+        }
+        let required = usize::try_from(num_objects).map_err(|_| {
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_NotEnoughMemory))
+        })?;
+        if unsafe { KERNEL.get().available_dynamic_cnodes() } < required {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_NotEnoughMemory,
+            )));
+        }
+    }
+
     // Resolve the destination CNode. When extraCaps[0] is provided
     // (upstream path), walk it with node_depth bits to land on the
     // actual dest CNode. Otherwise fall back to the invoker's
@@ -3464,48 +3480,19 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
                         }
                     }
                     Cap::CNode {
+                        ptr,
                         radix,
                         guard_size,
                         guard,
-                        ..
                     } => {
-                        // Pick small pool for radix ≤ SMALL_CNODE_RADIX
-                        // (CSPACE0001's 64 radix-1 CNodes etc.). Fall
-                        // back to big pool if small is full or radix
-                        // exceeds the small pool's capacity.
-                        let alloc = if radix <= crate::kernel::SMALL_CNODE_RADIX {
-                            (*s_ptr)
-                                .alloc_small_cnode()
-                                .or_else(|| (*s_ptr).alloc_cnode())
-                        } else if radix > crate::kernel::CNODE_RADIX
-                            && radix <= crate::kernel::XL_CNODE_RADIX
-                        {
-                            // Honest backing for big-radix CSpace
-                            // roots (sel4utils requests radix 17 for
-                            // test processes; SCHED0004 allocates
-                            // past slot 4095 and needs the real
-                            // storage). Falls back to the clamped
-                            // big-pool page if the XL entry is taken.
-                            (*s_ptr).alloc_xl_cnode().or_else(|| (*s_ptr).alloc_cnode())
-                        } else {
-                            // radix <= 12, or bigger than the XL pool
-                            // can honestly back. The big-pool fallback
-                            // stamps the requested radix over 4096-slot
-                            // storage, which only works while callers
-                            // stay below slot 4096.
-                            (*s_ptr).alloc_cnode()
-                        };
-                        match alloc {
-                            Some(vi) => Cap::CNode {
-                                ptr: KernelState::cnode_ptr(vi),
-                                radix,
-                                guard_size,
-                                guard,
-                            },
-                            None => {
-                                crate::arch::log("[retype: cnode pool exhausted]\n");
-                                Cap::Null
-                            }
+                        let vi = (*s_ptr)
+                            .alloc_dynamic_cnode(ptr.addr(), radix)
+                            .expect("CapTable descriptor preflight must reserve exact backing");
+                        Cap::CNode {
+                            ptr: KernelState::cnode_ptr(vi),
+                            radix,
+                            guard_size,
+                            guard,
                         }
                     }
                     Cap::SchedContext { size_bits, .. } => match (*s_ptr).alloc_sched_context() {
@@ -4746,7 +4733,7 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
 /// memory. Used by the reclaim fast-path to decide whether a delete
 /// might shrink the parent's free_index. Returns (0, 0) for caps
 /// whose ptr field encodes a pool index (TCB, Endpoint, Notification,
-/// CNode, Reply) rather than a real paddr — for those we can't
+/// static CNode, Reply) rather than a real paddr — for those we can't
 /// fast-path and must fall through to the full walk.
 fn cap_extent(cap: &Cap) -> (u64, u64) {
     match cap {
@@ -4766,6 +4753,12 @@ fn cap_extent(cap: &Cap) -> (u64, u64) {
         Cap::Pdpt { ptr, .. } => (ptr.addr(), 4096),
         Cap::PML4 { ptr, .. } => (ptr.addr(), 4096),
         Cap::SchedContext { ptr, size_bits, .. } => (ptr.addr(), 1u64 << size_bits),
+        Cap::CNode { ptr, .. } => unsafe {
+            KERNEL
+                .get()
+                .dynamic_cnode_backing(KernelState::cnode_index(*ptr))
+                .unwrap_or((0, 0))
+        },
         // Pool-indexed caps — ptr.addr() is NOT a paddr, so we can't
         // compare ranges. Force fall-through to full walk by returning
         // an extent of (0, 0).
@@ -4953,13 +4946,9 @@ unsafe fn reclaim_untyped_chain(start: Option<crate::cte::MdbId>) {
                     Cap::PML4 { ptr, .. } => (ptr.addr(), 4096),
                     Cap::Endpoint { ptr, .. } => (ptr.addr(), 16),
                     Cap::Notification { ptr, .. } => (ptr.addr(), 32),
-                    Cap::CNode { ptr, radix, .. } => {
-                        // CNode storage = 2^radix * sizeof(Cte) bytes.
-                        // We don't actually know the cte size here; use a
-                        // conservative 32 bytes (matches Cte layout).
-                        let n = (1u64 << radix) * 32;
-                        (ptr.addr(), n)
-                    }
+                    Cap::CNode { ptr, .. } => s
+                        .dynamic_cnode_backing(KernelState::cnode_index(ptr))
+                        .unwrap_or((0, 0)),
                     Cap::Reply { ptr, .. } => (ptr.addr(), 32),
                     Cap::Thread { tcb } => (tcb.addr(), 4096),
                     Cap::SchedContext { ptr, size_bits, .. } => (ptr.addr(), 1u64 << size_bits),
