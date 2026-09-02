@@ -303,9 +303,105 @@ pub fn get_bootstrap_processor_id() -> u16 {
     }
 }
 
-/// Simpleboot does not publish a wall-clock timestamp in the MBI.
+const RTC_SECONDS: u8 = 0x00;
+const RTC_MINUTES: u8 = 0x02;
+const RTC_HOURS: u8 = 0x04;
+const RTC_DAY: u8 = 0x07;
+const RTC_MONTH: u8 = 0x08;
+const RTC_YEAR: u8 = 0x09;
+const RTC_STATUS_A: u8 = 0x0a;
+const RTC_STATUS_B: u8 = 0x0b;
+const RTC_STATUS_D: u8 = 0x0d;
+const RTC_UPDATE_IN_PROGRESS: u8 = 1 << 7;
+const RTC_VALID: u8 = 1 << 7;
+const CMOS_NMI_DISABLE: u8 = 1 << 7;
+const MAX_RTC_UPDATE_POLLS: usize = 128;
+const MAX_RTC_STABLE_READS: usize = 4;
+
+#[inline]
+unsafe fn outb(port: u16, value: u8) {
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") port,
+        in("al") value,
+        options(nomem, nostack, preserves_flags)
+    );
+}
+
+#[inline]
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    core::arch::asm!(
+        "in al, dx",
+        in("dx") port,
+        out("al") value,
+        options(nomem, nostack, preserves_flags)
+    );
+    value
+}
+
+fn cmos_read(index_port: u16, data_port: u16, register: u8) -> u8 {
+    unsafe {
+        outb(index_port, register | CMOS_NMI_DISABLE);
+        inb(data_port)
+    }
+}
+
+fn rtc_update_complete(index_port: u16, data_port: u16) -> bool {
+    for _ in 0..MAX_RTC_UPDATE_POLLS {
+        if cmos_read(index_port, data_port, RTC_STATUS_A) & RTC_UPDATE_IN_PROGRESS == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_rtc_registers(
+    index_port: u16,
+    data_port: u16,
+    century_register: u8,
+) -> bootstrap_clock::PcRtcRegisters {
+    bootstrap_clock::PcRtcRegisters {
+        second: cmos_read(index_port, data_port, RTC_SECONDS),
+        minute: cmos_read(index_port, data_port, RTC_MINUTES),
+        hour: cmos_read(index_port, data_port, RTC_HOURS),
+        day: cmos_read(index_port, data_port, RTC_DAY),
+        month: cmos_read(index_port, data_port, RTC_MONTH),
+        year: cmos_read(index_port, data_port, RTC_YEAR),
+        century: cmos_read(index_port, data_port, century_register),
+    }
+}
+
+/// Simpleboot has no wall-clock MBI tag. Publish a stable snapshot from the ACPI-declared PC RTC;
+/// platforms without a valid RTC and century register remain explicitly unsupported.
 pub fn wall_clock_snapshot() -> Option<bootstrap_clock::WallClockSnapshot> {
-    None
+    let rtc = crate::arch::x86_64::acpi::find_pc_rtc(acpi_table_address()).ok()?;
+    let century_register = rtc.century_register.filter(|register| *register <= 0x7f)?;
+    let snapshot = (|| {
+        if cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_D) & RTC_VALID == 0
+            || !rtc_update_complete(rtc.index_port, rtc.data_port)
+        {
+            return None;
+        }
+        let status_b = cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_B);
+        for _ in 0..MAX_RTC_STABLE_READS {
+            let first = read_rtc_registers(rtc.index_port, rtc.data_port, century_register);
+            if cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_A) & RTC_UPDATE_IN_PROGRESS != 0
+            {
+                if !rtc_update_complete(rtc.index_port, rtc.data_port) {
+                    return None;
+                }
+                continue;
+            }
+            let second = read_rtc_registers(rtc.index_port, rtc.data_port, century_register);
+            if first == second {
+                return bootstrap_clock::decode_pc_rtc_utc(first, status_b).ok();
+            }
+        }
+        None
+    })();
+    unsafe { outb(rtc.index_port, 0) };
+    snapshot
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -350,35 +446,58 @@ pub fn framebuffer_info() -> Option<FramebufferInfo> {
         let width = tag.read_u32(20);
         let height = tag.read_u32(24);
         let bpp = tag.read_u8(28);
+        let framebuffer_type = tag.read_u8(29);
         let red_pos = tag.read_u8(32);
+        let red_size = tag.read_u8(33);
         let green_pos = tag.read_u8(34);
+        let green_size = tag.read_u8(35);
         let blue_pos = tag.read_u8(36);
+        let blue_size = tag.read_u8(37);
         let size = scanline.checked_mul(height)?;
         if paddr == 0 || size == 0 || width == 0 || height == 0 {
             return None;
         }
-        Some(FramebufferInfo {
+        let fb_type = framebuffer_type_from_masks(
+            bpp,
+            framebuffer_type,
+            red_pos,
+            red_size,
+            green_pos,
+            green_size,
+            blue_pos,
+            blue_size,
+        )?;
+        return Some(FramebufferInfo {
             paddr,
             size,
             width,
             height,
             scanline,
-            fb_type: framebuffer_type_from_masks(bpp, red_pos, green_pos, blue_pos),
+            fb_type,
         });
     }
     None
 }
 
 #[cfg(feature = "extern-rootserver")]
-fn framebuffer_type_from_masks(bpp: u8, red_pos: u8, green_pos: u8, blue_pos: u8) -> u8 {
-    if bpp < 24 || green_pos != 8 {
-        return FB_BGRA as u8;
+fn framebuffer_type_from_masks(
+    bpp: u8,
+    framebuffer_type: u8,
+    red_pos: u8,
+    red_size: u8,
+    green_pos: u8,
+    green_size: u8,
+    blue_pos: u8,
+    blue_size: u8,
+) -> Option<u8> {
+    if bpp != 32 || framebuffer_type != 1 || red_size != 8 || green_size != 8 || blue_size != 8 {
+        return None;
     }
-    match (red_pos, blue_pos) {
-        (16, 0) => FB_BGRA as u8,
-        (0, 16) => FB_RGBA as u8,
-        (8, 24) => FB_ARGB as u8,
-        (24, 8) => FB_ABGR as u8,
-        _ => FB_BGRA as u8,
+    match (red_pos, green_pos, blue_pos) {
+        (16, 8, 0) => Some(FB_ARGB as u8),
+        (24, 16, 8) => Some(FB_RGBA as u8),
+        (0, 8, 16) => Some(FB_ABGR as u8),
+        (8, 16, 24) => Some(FB_BGRA as u8),
+        _ => None,
     }
 }

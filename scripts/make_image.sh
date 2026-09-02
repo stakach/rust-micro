@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 missing=()
-for tool in cc curl cp dd find mkdir tar wc; do
+for tool in cc curl cp dd find mkdir mv rm tar wc; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -24,7 +24,7 @@ INITRD_STAGE=.tmp/initrd
 ESP_STAGE=.tmp/simpleboot-esp
 SIMPLEBOOT_SRC_DIR=.tmp/simpleboot-src
 SIMPLEBOOT_BIN=.tmp/simpleboot
-SIMPLEBOOT_REF="${SIMPLEBOOT_REF:-main}"
+SIMPLEBOOT_REF="${SIMPLEBOOT_REF:-f5fa29fe6613dc20b3729e769c68f9435daa15d1}"
 SIMPLEBOOT_RAW_BASE="${SIMPLEBOOT_RAW_BASE:-https://gitlab.com/bztsrc/simpleboot/-/raw/${SIMPLEBOOT_REF}/src}"
 IMAGE_PROFILE_MARKER=.tmp/image-profile
 
@@ -126,8 +126,11 @@ ensure_simpleboot() {
 stage_file() {
   local src="$1"
   local dst="$2"
+  local staged="${dst}.stage.$$"
   mkdir -p "$(dirname "$dst")"
-  cp "$src" "$dst"
+  rm -f "$staged"
+  cp "$src" "$staged"
+  mv -f "$staged" "$dst"
 }
 
 IMAGE_MIB="${IMAGE_MIB:-256}"

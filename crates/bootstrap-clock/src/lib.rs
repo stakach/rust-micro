@@ -17,6 +17,20 @@ pub enum DecodeError {
     InvalidTimezone,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PcRtcRegisters {
+    pub second: u8,
+    pub minute: u8,
+    pub hour: u8,
+    pub day: u8,
+    pub month: u8,
+    pub year: u8,
+    pub century: u8,
+}
+
+const RTC_24_HOUR: u8 = 1 << 1;
+const RTC_BINARY: u8 = 1 << 2;
+
 /// Decode a bootloader UTC `yyyymmddhhiiss` BCD timestamp into a portable Unix epoch.
 ///
 /// Byte seven is the bootloader's daylight indicator and does not alter the UTC timestamp.
@@ -36,6 +50,40 @@ pub fn decode_bcd_utc(
     let minute = decode_bcd(datetime[5])? as u32;
     let second = decode_bcd(datetime[6])? as u32;
 
+    snapshot_from_calendar(year, month, day, hour, minute, second, timezone_minutes)
+}
+
+/// Decode a stable PC RTC snapshot as UTC.
+///
+/// A complete century is required. Guessing it in the boot adapter would make wall-clock authority
+/// depend on the build date or an arbitrary pivot instead of platform state.
+pub fn decode_pc_rtc_utc(
+    registers: PcRtcRegisters,
+    status_b: u8,
+) -> Result<WallClockSnapshot, DecodeError> {
+    let binary = status_b & RTC_BINARY != 0;
+    let second = decode_rtc(registers.second, binary)? as u32;
+    let minute = decode_rtc(registers.minute, binary)? as u32;
+    let hour = decode_rtc_hour(registers.hour, binary, status_b & RTC_24_HOUR != 0)? as u32;
+    let day = decode_rtc(registers.day, binary)? as u32;
+    let month = decode_rtc(registers.month, binary)? as u32;
+    let year = i32::from(decode_rtc(registers.century, binary)?) * 100
+        + i32::from(decode_rtc(registers.year, binary)?);
+    snapshot_from_calendar(year, month, day, hour, minute, second, 0)
+}
+
+fn snapshot_from_calendar(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    timezone_minutes: i16,
+) -> Result<WallClockSnapshot, DecodeError> {
+    if !(-1440..=1440).contains(&timezone_minutes) {
+        return Err(DecodeError::InvalidTimezone);
+    }
     if year == 0
         || !(1..=12).contains(&month)
         || day == 0
@@ -59,6 +107,31 @@ pub fn decode_bcd_utc(
         unix_seconds,
         timezone_minutes: i32::from(timezone_minutes),
         flags: WALL_CLOCK_VALID | WALL_CLOCK_UTC,
+    })
+}
+
+fn decode_rtc(value: u8, binary: bool) -> Result<u8, DecodeError> {
+    if binary {
+        Ok(value)
+    } else {
+        decode_bcd(value)
+    }
+}
+
+fn decode_rtc_hour(raw: u8, binary: bool, twenty_four_hour: bool) -> Result<u8, DecodeError> {
+    if twenty_four_hour {
+        return decode_rtc(raw, binary);
+    }
+    let pm = raw & 0x80 != 0;
+    let hour = decode_rtc(raw & 0x7f, binary)?;
+    if !(1..=12).contains(&hour) {
+        return Err(DecodeError::InvalidDate);
+    }
+    Ok(match (hour, pm) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (_, true) => hour + 12,
+        _ => hour,
     })
 }
 
@@ -154,6 +227,68 @@ mod tests {
         assert_eq!(
             decode_bcd_utc(datetime(2026, 8, 30, 1, 2, 3), 1441),
             Err(DecodeError::InvalidTimezone)
+        );
+    }
+
+    #[test]
+    fn decodes_bcd_pc_rtc_with_acpi_century() {
+        assert_eq!(
+            decode_pc_rtc_utc(
+                PcRtcRegisters {
+                    second: bcd(56),
+                    minute: bcd(34),
+                    hour: bcd(12),
+                    day: bcd(29),
+                    month: bcd(2),
+                    year: bcd(24),
+                    century: bcd(20),
+                },
+                RTC_24_HOUR,
+            ),
+            decode_bcd_utc(datetime(2024, 2, 29, 12, 34, 56), 0)
+        );
+    }
+
+    #[test]
+    fn decodes_binary_twelve_hour_pc_rtc() {
+        let snapshot = decode_pc_rtc_utc(
+            PcRtcRegisters {
+                second: 1,
+                minute: 2,
+                hour: 0x80 | 11,
+                day: 31,
+                month: 12,
+                year: 99,
+                century: 19,
+            },
+            RTC_BINARY,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot,
+            decode_bcd_utc(datetime(1999, 12, 31, 23, 2, 1), 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_pc_rtc_calendar_and_encoding() {
+        let mut registers = PcRtcRegisters {
+            second: bcd(56),
+            minute: bcd(34),
+            hour: bcd(12),
+            day: bcd(29),
+            month: bcd(2),
+            year: bcd(23),
+            century: bcd(20),
+        };
+        assert_eq!(
+            decode_pc_rtc_utc(registers, RTC_24_HOUR),
+            Err(DecodeError::InvalidDate)
+        );
+        registers.century = 0xfa;
+        assert_eq!(
+            decode_pc_rtc_utc(registers, RTC_24_HOUR),
+            Err(DecodeError::InvalidBcd)
         );
     }
 }
