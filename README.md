@@ -106,7 +106,7 @@ and run the kernel and userspace specs with:
 
 ```sh
 ./scripts/check_aarch64.sh
-./vendor/sel4test/build.sh aarch64
+./vendor/sel4test/build.sh aarch64 smp
 ./scripts/run_aarch64_specs.sh
 ```
 
@@ -158,37 +158,46 @@ passed, `255` = panic**. Any trailing arguments are forwarded to QEMU, e.g.:
 ## Running the sel4test conformance suite
 
 This builds the **upstream** sel4test against our kernel ABI and runs its
-`sel4test-driver` as the rootserver. Both commands use four CPUs.
+`sel4test-driver` as the rootserver. The `smp` profile uses four CPUs and one
+domain. The `domains` profile uses one CPU and four domains because upstream
+seL4 does not permit `KernelMaxNumNodes > 1` with `KernelNumDomains > 1`.
 
 ```sh
-# 1. Build the kernel (use `smp` for the multicore/FPU/SC families).
-./scripts/build_kernel.sh smp
+# amd64 SMP: generic + x86 kernel specs, then the four-core userspace suite.
+./vendor/sel4test/build.sh x86_64 smp
+KERNEL_SPECS=1 ./scripts/build_kernel.sh smp extern-rootserver
+QEMU_CPUS=4 ./scripts/run_specs.sh
 
-# 2. Build sel4test-driver (first run fetches pinned SHAs + a Python venv;
-#    CMake + ninja). Emits the ELF and copies it to .tmp/rootserver.elf.
-./vendor/sel4test/build.sh
-
-# 3. Repack the image with the sel4test rootserver, then boot.
+# amd64 domains: generic + x86 kernel specs, then the four-domain suite.
+./vendor/sel4test/build.sh x86_64 domains
+KERNEL_SPECS=1 ./scripts/build_kernel.sh extern-rootserver
 ./scripts/make_image.sh
-./scripts/run_specs.sh
+QEMU_CPUS=1 ./scripts/run_specs.sh
 
-# AArch64: build its four-node driver, then let the run script build and boot
-# the kernel through the AArch64 Simpleboot stage.
-./vendor/sel4test/build.sh aarch64
-./scripts/run_aarch64_specs.sh
+# AArch64 SMP through the same Simpleboot contract.
+./scripts/build_aarch64.sh spec smp
+./vendor/sel4test/build.sh aarch64 smp
+KERNEL_SMP=1 QEMU_CPUS=4 ./scripts/run_aarch64_specs.sh
+
+# AArch64 domains.
+./vendor/sel4test/build.sh aarch64 domains
+KERNEL_SMP=0 QEMU_CPUS=1 ./scripts/run_aarch64_specs.sh
 ```
 
 Notes:
 
-- **Scoping which tests run:** sel4test's `gen_config.h` carries a
-  `CONFIG_TESTPRINTER_REGEX`. Narrow it (e.g. `"^(FPU0002|TRIVIAL)"`) to run a
-  focused subset, then **rebuild** — after editing the regex you must
-  `touch sel4test-driver/src/main.c` and re-run ninja, then verify with
-  `strings <driver> | grep <regex>` (ninja's dep tracking misses the header).
+- **Scoping which tests run:** set `SEL4TEST_REGEX`, for example
+  `SEL4TEST_REGEX='^(FPU0002|TRIVIAL)' ./vendor/sel4test/build.sh aarch64 smp`.
+  The build script updates the generated configuration and rebuilds the driver.
 - **Multicore tests** (MULTICORE\*, FPU0002, SCHED_CONTEXT_0014) require the
-  `smp` kernel **and** sel4test configured with `MAX_NUM_NODES=4`
-  (`cmake -DKernelMaxNumNodes=4 .` in the build dir if a stale `CMakeCache.txt`
-  pins it to 1).
+  `smp` profile. Domain schedule configuration and migration coverage require
+  the `domains` profile.
+- **Remaining disabled tests are configuration exclusions, not unclassified
+  architecture gaps:** `SYSCALL0003`, `CNODEOP0009`, and `SCHED0006` test the
+  legacy non-MCS ABI; `BREAKPOINT_002` and `SCHED0021` are disabled by upstream
+  under simulation; cache-alias tests require hardware cache behaviour that QEMU
+  TCG does not model; EPT and `UNKNOWN_SYSCALL_001` require VT-x; and the SMP or
+  multi-domain families are enabled only in their matching profile.
 - `build_kernel.sh` rewrites `.tmp/disk.img`; don't run it while a QEMU spec run
   is live, and confirm the kernel binary's mtime is newer than your sources
   (a failed `cargo` build can silently leave a stale kernel staged).

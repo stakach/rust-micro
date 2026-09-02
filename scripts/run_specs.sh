@@ -41,6 +41,7 @@ if [ ! -f "$IMAGE" ]; then
   exit 1
 fi
 QEMU_MEMORY="${QEMU_MEMORY:-2048M}"
+QEMU_CPUS="${QEMU_CPUS:-4}"
 
 DEBUG_FLAGS=()
 # GRAPHICS=1 (or the `--display`/`--graphics` flag) boots with a real QEMU
@@ -111,7 +112,7 @@ qemu-system-x86_64 \
   -device e1000,netdev=ntnet0 \
   -device intel-iommu,intremap=off \
   -m "$QEMU_MEMORY" \
-  -smp 4 \
+  -smp "$QEMU_CPUS" \
   -serial stdio \
   -no-reboot \
   ${DISPLAY_FLAGS[@]+"${DISPLAY_FLAGS[@]}"} \

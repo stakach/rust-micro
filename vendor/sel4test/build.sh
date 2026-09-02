@@ -28,25 +28,46 @@ cd "$(dirname "$0")"
 HERE="$PWD"
 
 SEL4TEST_ARCH="${1:-${SEL4TEST_ARCH:-x86_64}}"
+SEL4TEST_PROFILE="${2:-${SEL4TEST_PROFILE:-smp}}"
+SEL4TEST_REGEX="${SEL4TEST_REGEX:-.*}"
 case "$SEL4TEST_ARCH" in
   x86_64|amd64)
     SEL4TEST_ARCH=x86_64
-    BUILD_NAME="${SEL4TEST_BUILD_NAME:-build}"
+    SMP_BUILD_NAME=build
+    DOMAINS_BUILD_NAME=build-domains
     PLATFORM=x86_64
     TRIPLE=x86_64-elf
-    NUM_NODES=4
-    SMP=ON
     ;;
   aarch64|arm64)
     SEL4TEST_ARCH=aarch64
-    BUILD_NAME="${SEL4TEST_BUILD_NAME:-build-aarch64-smp}"
+    SMP_BUILD_NAME=build-aarch64-smp
+    DOMAINS_BUILD_NAME=build-aarch64-domains
     PLATFORM=qemu-arm-virt
     TRIPLE=aarch64-none-elf
-    NUM_NODES=4
-    SMP=ON
     ;;
   *)
     echo "error: architecture must be x86_64/amd64 or aarch64/arm64" >&2
+    exit 2
+    ;;
+esac
+
+case "$SEL4TEST_PROFILE" in
+  smp)
+    BUILD_NAME="${SEL4TEST_BUILD_NAME:-$SMP_BUILD_NAME}"
+    NUM_NODES=4
+    SMP=ON
+    DOMAINS=OFF
+    NUM_DOMAINS=1
+    ;;
+  domains)
+    BUILD_NAME="${SEL4TEST_BUILD_NAME:-$DOMAINS_BUILD_NAME}"
+    NUM_NODES=1
+    SMP=OFF
+    DOMAINS=ON
+    NUM_DOMAINS=4
+    ;;
+  *)
+    echo "error: profile must be smp or domains" >&2
     exit 2
     ;;
 esac
@@ -138,6 +159,21 @@ fetch_pinned https://github.com/seL4/sel4runtime.git        "$SEL4RUNTIME_SHA"  
 fetch_pinned https://github.com/seL4/musllibc.git           "$MUSLLIBC_SHA"           projects/musllibc
 fetch_pinned https://github.com/nanopb/nanopb.git           "$NANOPB_SHA"             tools/nanopb
 
+apply_sel4test_patch() {
+  local patch_file=$1
+  if git -C projects/sel4test apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+    return
+  fi
+  git -C projects/sel4test apply --check "$patch_file"
+  git -C projects/sel4test apply "$patch_file"
+}
+
+# The pinned suite leaves these regressions registered but hard-disabled.
+# Carry the enablement and inter-AS test repair as explicit overlays rather
+# than changing the pinned checkout in an unreproducible way.
+apply_sel4test_patch "$HERE/patches/enable-regression-specs.patch"
+apply_sel4test_patch "$HERE/patches/fix-pagefault1005-inter-as.patch"
+
 # musllibc's CMake assumes the Google Repo tool layout where each
 # repo's `.git` is a *file* (gitdir pointer), not a directory. It
 # does `cp -a <src> build-temp/src/ && rm -f build-temp/src/.git`,
@@ -186,8 +222,13 @@ if [ ! -f CMakeCache.txt ]; then
     -DSIMULATION=ON
     -DMCS=ON
     -DSMP="$SMP"
+    -DNUM_NODES="$NUM_NODES"
+    -DDOMAINS="$DOMAINS"
     -DKernelIsMCS=ON
     -DKernelMaxNumNodes="$NUM_NODES"
+    -DKernelNumDomains="$NUM_DOMAINS"
+    -DKernelNumDomainSchedules=100
+    -DLibSel4TestPrinterRegex="$SEL4TEST_REGEX"
     -DKernelPrinting=ON
     -DKernelDebugBuild=ON
     -DKernelVerificationBuild=OFF
@@ -216,8 +257,6 @@ if [ ! -f CMakeCache.txt ]; then
       -DSel4testHaveTimer=ON
       -DKernelArmExportPCNTUser=ON
       -DKernelArmExportPTMRUser=ON
-      -DKernelNumDomains=1
-      -DKernelNumDomainSchedules=100
       -DHardwareDebugAPI=ON
       -DCMAKE_AR="$RUST_TOOLBIN/llvm-ar"
       -DCMAKE_RANLIB="$HERE/toolchain/llvm-ranlib"
@@ -228,6 +267,18 @@ if [ ! -f CMakeCache.txt ]; then
     )
   fi
   ../init-build.sh "${CONFIGURE_ARGS[@]}"
+else
+  # Keep existing build directories aligned with options added after their
+  # first configure; ninja alone does not update cached feature selections.
+  cmake \
+    -DDOMAINS="$DOMAINS" \
+    -DKernelNumDomains="$NUM_DOMAINS" \
+    -DKernelNumDomainSchedules=100 \
+    -DLibSel4TestPrinterRegex="$SEL4TEST_REGEX" \
+    -DSMP="$SMP" \
+    -DNUM_NODES="$NUM_NODES" \
+    -DKernelMaxNumNodes="$NUM_NODES" \
+    .
 fi
 
 echo ">> building sel4test-driver"

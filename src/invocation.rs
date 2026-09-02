@@ -225,6 +225,8 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         Cap::IrqHandler { irq } => decode_irq_handler(irq, label, args, invoker),
         Cap::Frame { .. } => decode_frame(target, label, args, invoker),
         Cap::PageTable { .. } => decode_page_table(target, label, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        Cap::PML4 { .. } => decode_aarch64_vspace(target, label, args),
         #[cfg(target_arch = "x86_64")]
         Cap::PageDirectory { .. } => decode_page_directory(target, label, args, invoker),
         #[cfg(target_arch = "x86_64")]
@@ -288,10 +290,191 @@ fn decode_frame(
         InvocationLabel::ARMPageUnmap => decode_frame_unmap(target, args, invoker),
         #[cfg(target_arch = "aarch64")]
         InvocationLabel::ARMPageGetAddress => decode_frame_get_address(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageClean_Data
+        | InvocationLabel::ARMPageInvalidate_Data
+        | InvocationLabel::ARMPageCleanInvalidate_Data
+        | InvocationLabel::ARMPageUnify_Instruction => {
+            decode_aarch64_frame_flush(target, label, args)
+        }
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_cache_operation(
+    label: InvocationLabel,
+) -> Option<crate::arch::aarch64::vspace::CacheOperation> {
+    use crate::arch::aarch64::vspace::CacheOperation;
+    match label {
+        InvocationLabel::ARMPageClean_Data | InvocationLabel::ARMVSpaceClean_Data => {
+            Some(CacheOperation::CleanData)
+        }
+        InvocationLabel::ARMPageInvalidate_Data | InvocationLabel::ARMVSpaceInvalidate_Data => {
+            Some(CacheOperation::InvalidateData)
+        }
+        InvocationLabel::ARMPageCleanInvalidate_Data
+        | InvocationLabel::ARMVSpaceCleanInvalidate_Data => {
+            Some(CacheOperation::CleanInvalidateData)
+        }
+        InvocationLabel::ARMPageUnify_Instruction | InvocationLabel::ARMVSpaceUnify_Instruction => {
+            Some(CacheOperation::UnifyInstruction)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decode_aarch64_frame_flush(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+) -> KResult<()> {
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    if info.length() < 2 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_TruncatedMessage,
+        )));
+    }
+    let operation = aarch64_cache_operation(label).unwrap();
+    let (paddr, size_bits, mapped, asid) = match target {
+        Cap::Frame {
+            ptr,
+            size,
+            mapped,
+            asid,
+            ..
+        } => {
+            let size_bits = match size {
+                crate::cap::FrameSize::Small => 12,
+                crate::cap::FrameSize::Large => 21,
+                crate::cap::FrameSize::Huge => 30,
+            };
+            (ptr.addr(), size_bits, mapped, asid)
+        }
+        _ => unreachable!(),
+    };
+    let Some(vaddr) = mapped else {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    };
+    if asid == 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+
+    let start = args.a2;
+    let end = args.a3;
+    let page_size = 1u64 << size_bits;
+    if end <= start || start >= page_size || end > page_size {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
+        )));
+    }
+    let root = pml4_paddr_for_asid(asid);
+    if root == 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_FailedLookup,
+        )));
+    }
+    let mapping = unsafe { crate::arch::aarch64::vspace::lookup_frame(root, vaddr) };
+    let Some(mapping) = mapping else {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    };
+    if mapping.size_bits != size_bits || mapping.paddr != paddr {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+    if operation == crate::arch::aarch64::vspace::CacheOperation::InvalidateData
+        && !mapping.writable
+    {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+
+    unsafe {
+        crate::arch::aarch64::vspace::cache_maintain_vspace(
+            root,
+            asid,
+            vaddr + start,
+            vaddr + end,
+            operation,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decode_aarch64_vspace(target: Cap, label: InvocationLabel, args: &SyscallArgs) -> KResult<()> {
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    if info.length() < 2 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_TruncatedMessage,
+        )));
+    }
+    let Some(operation) = aarch64_cache_operation(label) else {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    };
+    let (root, asid) = match target {
+        Cap::PML4 {
+            ptr,
+            mapped: true,
+            asid,
+        } if asid != 0 => (ptr.addr(), asid),
+        _ => {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )))
+        }
+    };
+    if pml4_paddr_for_asid(asid) != root {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+
+    let start = args.a2;
+    let end = args.a3;
+    if end <= start {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
+        )));
+    }
+    if end > (1u64 << 47) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+    let Some(mapping) = (unsafe { crate::arch::aarch64::vspace::lookup_frame(root, start) }) else {
+        // seL4 deliberately treats maintenance on an unmapped range as a no-op.
+        return Ok(());
+    };
+    if (start >> mapping.size_bits) != ((end - 1) >> mapping.size_bits) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_RangeError,
+        )));
+    }
+    if operation == crate::arch::aarch64::vspace::CacheOperation::InvalidateData
+        && !mapping.writable
+    {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+    unsafe {
+        crate::arch::aarch64::vspace::cache_maintain_vspace(root, asid, start, end, operation);
+    }
+    Ok(())
 }
 
 unsafe fn update_invoked_frame_slot(

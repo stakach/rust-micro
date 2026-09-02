@@ -1,0 +1,231 @@
+diff --git a/apps/sel4test-tests/src/tests/faults.c b/apps/sel4test-tests/src/tests/faults.c
+--- a/apps/sel4test-tests/src/tests/faults.c
++++ b/apps/sel4test-tests/src/tests/faults.c
+@@ -28,6 +28,7 @@ enum {
+ enum {
+     BADGED = seL4_WordBits - 1,
+     RESTART = seL4_WordBits - 2,
++    INTER_AS = seL4_WordBits - 3,
+ };
+ 
+ /* Use a different test virtual address on 32 and 64-bit systems so that we can exercise
+@@ -338,7 +339,7 @@ extern char bad_instruction_restart_address[];
+ static seL4_Word bad_instruction_sp; /* To reset afterwards. */
+ static seL4_Word bad_instruction_cpsr; /* For checking against. */
+ static void __attribute__((noinline))
+-do_bad_instruction(void)
++do_bad_instruction(bool inter_as)
+ {
+     int val = BAD_MAGIC;
+     /* Execute an undefined instruction. */
+@@ -351,8 +352,11 @@ do_bad_instruction(void)
+         "mrs r0, cpsr\n\t"
+         "str r0, [%[cpsr]]\n\t"
+ 
+-        /* Set SP to val. */
++        /* Keep the stack valid when the handler is in another VSpace. */
++        "cmp %[inter_as], #0\n\t"
++        "bne 1f\n\t"
+         "mov sp, %[valptr]\n\t"
++        "1:\n\t"
+ 
+         "bad_instruction_address:\n\t"
+         ".word 0xe7f000f0\n\t" /* Guaranteed to be undefined by ARM. */
+@@ -360,7 +364,8 @@ do_bad_instruction(void)
+         :
+         : [sp] "r"(&bad_instruction_sp),
+         [cpsr] "r"(&bad_instruction_cpsr),
+-        [valptr] "r"(&val)
++        [valptr] "r"(&val),
++        [inter_as] "r"(inter_as)
+         : "r0", "memory"
+     );
+ #elif defined(CONFIG_ARCH_AARCH64)
+@@ -373,8 +378,10 @@ do_bad_instruction(void)
+         "mrs x0, nzcv\n\t"
+         "str x0, [%[cpsr]]\n\t"
+ 
+-        /* Set SP to val. */
++        /* Keep the stack valid when the handler is in another VSpace. */
++        "cbnz %w[inter_as], 1f\n\t"
+         "mov sp, %[valptr]\n\t"
++        "1:\n\t"
+ 
+         "bad_instruction_address:\n\t"
+         ".word 0xe7f000f0\n\t" /* Guaranteed to be undefined by ARM. */
+@@ -382,7 +389,8 @@ do_bad_instruction(void)
+         :
+         : [sp] "r"(&bad_instruction_sp),
+         [cpsr] "r"(&bad_instruction_cpsr),
+-        [valptr] "r"(&val)
++        [valptr] "r"(&val),
++        [inter_as] "r"(inter_as)
+         : "x0", "memory"
+     );
+ #elif defined(CONFIG_ARCH_RISCV)
+@@ -391,8 +399,10 @@ do_bad_instruction(void)
+         "mv  a0, sp\n\t"
+         STORE_S " a0, 0(%[sp])\n\t"
+ 
+-        /* Set SP to val. */
++        /* Keep the stack valid when the handler is in another VSpace. */
++        "bnez %[inter_as], 1f\n\t"
+         "mv sp, %[valptr]\n\t"
++        "1:\n\t"
+ 
+         /* All ones is used as the illegal instruction because it is reasonable
+          * to assume that all current targets support a maximum instruction
+@@ -405,7 +415,8 @@ do_bad_instruction(void)
+         "bad_instruction_restart_address:\n\t"
+         :
+         : [sp] "r"(&bad_instruction_sp),
+-        [valptr] "r"(&val)
++        [valptr] "r"(&val),
++        [inter_as] "r"(inter_as)
+         : "a0", "memory"
+     );
+ #elif defined(CONFIG_ARCH_X86_64)
+@@ -415,14 +426,18 @@ do_bad_instruction(void)
+         "pushf\n\t"
+         "pop    %%rax\n\t"
+         "movq   %%rax, (%[cpsr])\n\t"
++        "test   %[inter_as], %[inter_as]\n\t"
++        "jnz    1f\n\t"
+         "movq   %[valptr], %%rsp\n\t"
++        "1:\n\t"
+         "bad_instruction_address:\n\t"
+         "ud2\n\t"
+         "bad_instruction_restart_address:\n\t"
+         :
+         : [sp] "r"(&bad_instruction_sp),
+         [cpsr] "r"(&bad_instruction_cpsr),
+-        [valptr] "r"(&val)
++        [valptr] "r"(&val),
++        [inter_as] "r"((seL4_Word)inter_as)
+         : "rax", "memory"
+     );
+ #elif defined(CONFIG_ARCH_IA32)
+@@ -435,8 +450,11 @@ do_bad_instruction(void)
+         "pop %%eax\n\t"
+         "mov %%eax, (%[cpsr])\n\t"
+ 
+-        /* Set SP to val. */
++        /* Keep the stack valid when the handler is in another VSpace. */
++        "test %[inter_as], %[inter_as]\n\t"
++        "jnz 1f\n\t"
+         "mov %[valptr], %%esp\n\t"
++        "1:\n\t"
+ 
+         "bad_instruction_address:\n\t"
+         "ud2\n\t"
+@@ -444,13 +462,14 @@ do_bad_instruction(void)
+         :
+         : [sp] "r"(&bad_instruction_sp),
+         [cpsr] "r"(&bad_instruction_cpsr),
+-        [valptr] "r"(&val)
++        [valptr] "r"(&val),
++        [inter_as] "r"(inter_as)
+         : "eax", "memory"
+     );
+ #else
+ #error "Unknown architecture."
+ #endif
+-    test_check(val == GOOD_MAGIC);
++    test_check(val == (inter_as ? BAD_MAGIC : GOOD_MAGIC));
+ }
+ 
+ static void __attribute__((noinline))
+@@ -501,9 +520,10 @@ static int handle_fault(seL4_CPtr fault_ep, seL4_CPtr tcb, seL4_Word expected_fa
+ {
+     seL4_MessageInfo_t tag;
+     seL4_Word sender_badge = 0;
+-    seL4_CPtr reply = flags_and_reply & MASK(RESTART);
++    seL4_CPtr reply = flags_and_reply & MASK(INTER_AS);
+     bool badged = flags_and_reply & BIT(BADGED);
+     bool restart = flags_and_reply & BIT(RESTART);
++    bool inter_as = flags_and_reply & BIT(INTER_AS);
+ 
+     tag = api_recv(fault_ep, &sender_badge, reply);
+ 
+@@ -611,15 +631,21 @@ static int handle_fault(seL4_CPtr fault_ep, seL4_CPtr tcb, seL4_Word expected_fa
+         test_check(seL4_MessageInfo_get_length(tag) == seL4_UserException_Length);
+         test_check(seL4_GetMR(0) == (seL4_Word)bad_instruction_address);
+         int *valptr = (int *)seL4_GetMR(1);
+-        test_check(*valptr == BAD_MAGIC);
++        if (!inter_as) {
++            test_check(*valptr == BAD_MAGIC);
++        }
+ #if defined(CONFIG_ARCH_AARCH32)
+-        test_check(seL4_GetMR(2) == bad_instruction_cpsr);
++        if (!inter_as) {
++            test_check(seL4_GetMR(2) == bad_instruction_cpsr);
++        }
+         test_check(seL4_GetMR(3) == 0);
+         test_check(seL4_GetMR(4) == 0);
+ #elif defined(CONFIG_ARCH_AARCH64)
+         /* We only can access PSTATE.nzcv flags in EL0 in aarch64
+          * so, just make sure ther are preserved ... */
+-        test_check((seL4_GetMR(2) & ~MASK(27)) == bad_instruction_cpsr);
++        if (!inter_as) {
++            test_check((seL4_GetMR(2) & ~MASK(27)) == bad_instruction_cpsr);
++        }
+         /* instruction fault on a 32 bit instruction with ISS = 0 */
+         test_check(seL4_GetMR(3) == 0x02000000);
+         test_check(seL4_GetMR(4) == 0);
+@@ -634,14 +660,18 @@ static int handle_fault(seL4_CPtr fault_ep, seL4_CPtr tcb, seL4_Word expected_fa
+          * checking flags.
+          */
+         seL4_Word mask_out = ~(1 << 16);
+-        test_check(((seL4_GetMR(2) ^ bad_instruction_cpsr) & mask_out) == 0);
++        if (!inter_as) {
++            test_check(((seL4_GetMR(2) ^ bad_instruction_cpsr) & mask_out) == 0);
++        }
+ #else
+ #error "Unknown architecture."
+ #endif
+ 
+-        *valptr = GOOD_MAGIC;
+         seL4_SetMR(0, (seL4_Word)bad_instruction_restart_address);
+-        seL4_SetMR(1, bad_instruction_sp);
++        if (!inter_as) {
++            *valptr = GOOD_MAGIC;
++            seL4_SetMR(1, bad_instruction_sp);
++        }
+ 
+         /* Flag that the thread should be restarted. */
+         if (restart) {
+@@ -662,7 +692,7 @@ static int handle_fault(seL4_CPtr fault_ep, seL4_CPtr tcb, seL4_Word expected_fa
+     return 0;
+ }
+ 
+-static int cause_fault(int fault_type)
++static int cause_fault(int fault_type, int inter_as)
+ {
+     switch (fault_type) {
+     case FAULT_DATA_READ_PAGEFAULT:
+@@ -678,7 +708,7 @@ static int cause_fault(int fault_type)
+         do_bad_syscall();
+         break;
+     case FAULT_BAD_INSTRUCTION:
+-        do_bad_instruction();
++        do_bad_instruction(inter_as);
+         break;
+     }
+ 
+@@ -758,13 +788,14 @@ static int test_fault(env_t env, int fault_type, bool inter_as)
+         for (int restart = 0; restart <= 1; restart++) {
+             seL4_Word flags_and_reply = reply_cptr |
+                                         (badged ? BIT(BADGED) : 0) |
+-                                        (restart ? BIT(RESTART) : 0);
++                                        (restart ? BIT(RESTART) : 0) |
++                                        (inter_as ? BIT(INTER_AS) : 0);
+             for (int prio = 100; prio <= 102; prio++) {
+                 set_helper_priority(env, &faulter_thread, prio);
+                 start_helper(env, &handler_thread, (helper_fn_t) handle_fault,
+                              handler_arg0, handler_arg1, fault_type, flags_and_reply);
+                 start_helper(env, &faulter_thread, (helper_fn_t) cause_fault,
+-                             fault_type, 0, 0, 0);
++                             fault_type, inter_as, 0, 0);
+                 wait_for_helper(&handler_thread);
+ 
+                 if (restart) {

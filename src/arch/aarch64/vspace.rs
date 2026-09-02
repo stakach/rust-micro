@@ -557,6 +557,168 @@ pub unsafe fn frame_paddr(root_paddr: u64, vaddr: u64, size_bits: u32) -> Option
     None
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FrameMapping {
+    pub paddr: u64,
+    pub size_bits: u32,
+    pub writable: bool,
+}
+
+/// Resolve the leaf covering `vaddr`, including block mappings. This mirrors
+/// seL4's `lookupPTSlot` result used to validate cache-maintenance invocations.
+pub unsafe fn lookup_frame(root_paddr: u64, vaddr: u64) -> Option<FrameMapping> {
+    if !canonical(vaddr) || vaddr >= (1u64 << 47) || root_paddr & 0xfff != 0 {
+        return None;
+    }
+
+    let indices = decompose_vaddr(vaddr);
+    let slots = [
+        indices.pgd as usize,
+        indices.pud as usize,
+        indices.pd as usize,
+        indices.pt as usize,
+    ];
+    let levels = [0u8, 1, 2, 3];
+    let bits_left = [39u32, 30, 21, 12];
+    let mut table = table_ptr(root_paddr);
+
+    for index in 0..slots.len() {
+        let entry = ptr::read_volatile(table.add(slots[index]));
+        if entry & DESC_VALID == 0 {
+            return None;
+        }
+
+        let is_leaf = if index == 3 {
+            entry & 0x3 == 0x3
+        } else {
+            index != 0 && entry & 0x3 == 0x1
+        };
+        if is_leaf {
+            return Some(FrameMapping {
+                paddr: descriptor_paddr(entry, levels[index]).ok()?,
+                size_bits: bits_left[index],
+                writable: ((entry >> DESC_AP_SHIFT) & 0x3) == VmRights::UserReadWrite as u64,
+            });
+        }
+        if entry & 0x3 != 0x3 {
+            return None;
+        }
+        table = table_ptr(descriptor_paddr(entry, 0).ok()?);
+    }
+    None
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CacheOperation {
+    CleanData,
+    InvalidateData,
+    CleanInvalidateData,
+    UnifyInstruction,
+}
+
+#[inline]
+fn cache_line_size(ctr_shift: u32) -> u64 {
+    let ctr: u64;
+    unsafe {
+        asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nomem, nostack));
+    }
+    4u64 << ((ctr >> ctr_shift) & 0xf)
+}
+
+#[inline]
+unsafe fn for_each_cache_line(start: u64, end: u64, line_size: u64, mut op: impl FnMut(u64)) {
+    let mut line = start & !(line_size - 1);
+    while line < end {
+        op(line);
+        line += line_size;
+    }
+}
+
+unsafe fn cache_maintain_range(start: u64, end: u64, operation: CacheOperation) {
+    debug_assert!(start < end);
+    let data_line = cache_line_size(16);
+
+    match operation {
+        CacheOperation::CleanData => {
+            for_each_cache_line(start, end, data_line, |line| {
+                asm!("dc cvac, {line}", line = in(reg) line, options(nostack));
+            });
+            asm!("dsb ish", options(nostack));
+        }
+        CacheOperation::InvalidateData => {
+            // Preserve bytes outside a partial boundary line, as seL4's
+            // invalidateCacheRange_RAM does before issuing DC IVAC.
+            if start & (data_line - 1) != 0 {
+                let line = start & !(data_line - 1);
+                asm!("dc cvac, {line}", line = in(reg) line, options(nostack));
+            }
+            if end & (data_line - 1) != 0 {
+                let line = (end - 1) & !(data_line - 1);
+                asm!("dc cvac, {line}", line = in(reg) line, options(nostack));
+            }
+            asm!("dsb ish", options(nostack));
+            for_each_cache_line(start, end, data_line, |line| {
+                asm!("dc ivac, {line}", line = in(reg) line, options(nostack));
+            });
+            asm!("dsb ish", options(nostack));
+        }
+        CacheOperation::CleanInvalidateData => {
+            for_each_cache_line(start, end, data_line, |line| {
+                asm!("dc cvac, {line}", line = in(reg) line, options(nostack));
+            });
+            asm!("dsb ish", options(nostack));
+            for_each_cache_line(start, end, data_line, |line| {
+                asm!("dc civac, {line}", line = in(reg) line, options(nostack));
+            });
+            asm!("dsb ish", options(nostack));
+        }
+        CacheOperation::UnifyInstruction => {
+            for_each_cache_line(start, end, data_line, |line| {
+                asm!("dc cvau, {line}", line = in(reg) line, options(nostack));
+            });
+            asm!("dsb ish", options(nostack));
+            let instruction_line = cache_line_size(0);
+            for_each_cache_line(start, end, instruction_line, |line| {
+                asm!("ic ivau, {line}", line = in(reg) line, options(nostack));
+            });
+            asm!("dsb ish", "isb", options(nostack));
+        }
+    }
+}
+
+/// Perform cache maintenance using addresses in the supplied VSpace. seL4
+/// temporarily installs that root at EL1 for VA-based maintenance and then
+/// restores the interrupted thread's root; doing the same also supports
+/// invocations on a VSpace other than the caller's current one.
+pub unsafe fn cache_maintain_vspace(
+    root_paddr: u64,
+    asid: u16,
+    start: u64,
+    end: u64,
+    operation: CacheOperation,
+) {
+    if start >= end {
+        return;
+    }
+
+    let old_ttbr: u64;
+    asm!("mrs {ttbr}, ttbr0_el1", ttbr = out(reg) old_ttbr, options(nomem, nostack));
+    let target_ttbr = root_paddr | ((asid as u64) << 48);
+    if old_ttbr != target_ttbr {
+        activate_user_vspace(root_paddr, asid);
+    }
+    cache_maintain_range(start, end, operation);
+    if old_ttbr != target_ttbr {
+        asm!(
+            "dsb ish",
+            "msr ttbr0_el1, {ttbr}",
+            "isb",
+            ttbr = in(reg) old_ttbr,
+            options(nostack),
+        );
+    }
+}
+
 pub unsafe fn unmap_page_table(root_paddr: u64, vaddr: u64, child_paddr: u64) -> bool {
     let indices = decompose_vaddr(vaddr);
     let slots = [
@@ -716,6 +878,7 @@ pub mod spec {
         address_indices_round_trip();
         descriptor_encodings_match_sel4();
         live_translation_is_enabled();
+        live_cache_maintenance_matches_sel4();
         live_el0_svc_round_trip();
         arch::log("AArch64 vspace tests completed\n");
     }
@@ -804,5 +967,39 @@ pub mod spec {
         }
         crate::arch::aarch64::exceptions::finish_el0_svc_spec();
         arch::log("  live EL0 SVC register save/restore matches seL4\n");
+    }
+
+    fn live_cache_maintenance_matches_sel4() {
+        map_el0_spec_pages();
+        let root = (&raw const BOOT_L0) as u64;
+        let mapping = unsafe { lookup_frame(root, EL0_SPEC_STACK_VADDR) }
+            .expect("EL0 spec stack should have a leaf mapping");
+        assert_eq!(mapping.paddr, (&raw const EL0_SPEC_STACK) as u64);
+        assert_eq!(mapping.size_bits, PAGE_BITS);
+        assert!(mapping.writable);
+
+        let block = unsafe { lookup_frame(root, 0x4000_1234) }
+            .expect("kernel RAM should retain its live 1 GiB block mapping");
+        assert_eq!(block.paddr, 0x4000_0000);
+        assert_eq!(block.size_bits, HUGE_PAGE_BITS);
+        assert!(!block.writable);
+
+        for operation in [
+            CacheOperation::CleanData,
+            CacheOperation::InvalidateData,
+            CacheOperation::CleanInvalidateData,
+            CacheOperation::UnifyInstruction,
+        ] {
+            unsafe {
+                cache_maintain_vspace(
+                    root,
+                    0,
+                    EL0_SPEC_STACK_VADDR + 1,
+                    EL0_SPEC_STACK_VADDR + 129,
+                    operation,
+                );
+            }
+        }
+        arch::log("  live cache maintenance matches seL4 range semantics\n");
     }
 }

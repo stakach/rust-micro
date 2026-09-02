@@ -9,14 +9,18 @@ if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
   exit 1
 fi
 
-./scripts/build_aarch64.sh spec smp
+FEATURES=(spec)
+if [ "${KERNEL_SMP:-1}" != 0 ]; then
+  FEATURES+=(smp)
+fi
+./scripts/build_aarch64.sh "${FEATURES[@]}"
 ./scripts/make_aarch64_simpleboot.sh
 
 exec qemu-system-aarch64 \
   -machine virt,secure=off,gic-version=2 \
   -cpu cortex-a53 \
   -m "${QEMU_MEMORY:-1024M}" \
-  -smp 4 \
+  -smp "${QEMU_CPUS:-4}" \
   -nographic \
   -semihosting-config enable=on,target=native \
   -kernel .tmp/aarch64-simpleboot/simpleboot-aarch64.img \
