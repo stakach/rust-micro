@@ -24,6 +24,8 @@ disk.img
 /vendor/sel4test/tools/
 /vendor/sel4test/kernel
 /vendor/sel4test/build/
+/vendor/sel4test/build-aarch64*/
+/vendor/sel4test/.toolchain/
 /vendor/sel4test/.venv/
 /vendor/sel4test/.sel4_cache/
 /vendor/sel4test/init-build.sh

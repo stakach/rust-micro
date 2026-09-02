@@ -11,7 +11,7 @@
 # `vendor/sel4test/kernel` via a symlink so we don't fetch the same
 # source twice. After fetching, we run upstream's CMake +
 # ninja-based build pipeline with options that match our kernel:
-# CONFIG_KERNEL_MCS=ON, x86_64, 4-core SMP, debug + printing.
+# CONFIG_KERNEL_MCS=ON, debug + printing, and the requested architecture.
 #
 # The build emits `vendor/sel4test/build/sel4test-driver/sel4test-
 # driver` — the ELF that sel4test-driver runs as the rootserver.
@@ -26,6 +26,30 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 HERE="$PWD"
+
+SEL4TEST_ARCH="${1:-${SEL4TEST_ARCH:-x86_64}}"
+case "$SEL4TEST_ARCH" in
+  x86_64|amd64)
+    SEL4TEST_ARCH=x86_64
+    BUILD_NAME="${SEL4TEST_BUILD_NAME:-build}"
+    PLATFORM=x86_64
+    TRIPLE=x86_64-elf
+    NUM_NODES=4
+    SMP=ON
+    ;;
+  aarch64|arm64)
+    SEL4TEST_ARCH=aarch64
+    BUILD_NAME="${SEL4TEST_BUILD_NAME:-build-aarch64}"
+    PLATFORM=qemu-arm-virt
+    TRIPLE=aarch64-none-elf
+    NUM_NODES=1
+    SMP=OFF
+    ;;
+  *)
+    echo "error: architecture must be x86_64/amd64 or aarch64/arm64" >&2
+    exit 2
+    ;;
+esac
 
 # Pinned SHAs from sel4test-manifest @ master (May 2026 snapshot).
 SEL4_SHA=daa0dfb1470c5ffbf13b3778f93111679574e80c
@@ -66,10 +90,34 @@ if [ ! -x "$VENV/bin/python" ]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install --quiet \
     pyyaml jinja2 ply future six lxml \
-    protobuf
+    protobuf pyfdt jsonschema
+fi
+if ! "$VENV/bin/python" -c 'import pyfdt.pyfdt' 2>/dev/null; then
+  "$VENV/bin/pip" install --quiet pyfdt jsonschema
 fi
 PATH="$VENV/bin:$PATH"
 export PATH
+
+# macOS's ar/ranlib only understand Mach-O. AArch64 userspace objects are
+# ELF, so use rustup's LLVM tools and route Clang's lld lookup to rust-lld.
+if [ "$SEL4TEST_ARCH" = aarch64 ]; then
+  if ! rustup +nightly component list --installed 2>/dev/null | grep -q '^llvm-tools'; then
+    rustup +nightly component add llvm-tools-preview
+  fi
+  RUST_HOST=$(rustc +nightly -vV | sed -n 's/^host: //p')
+  RUST_TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$RUST_HOST/bin"
+  PATH="$HERE/toolchain:$PATH"
+  export PATH
+
+  BUILTINS=$(find "$HERE/../../target/mykernel-aarch64/release/deps" \
+    -name 'libcompiler_builtins-*.rlib' -print 2>/dev/null | head -1)
+  if [ -z "$BUILTINS" ]; then
+    echo "error: AArch64 compiler builtins missing; run scripts/build_aarch64.sh first" >&2
+    exit 1
+  fi
+  mkdir -p "$HERE/.toolchain/lib/aarch64"
+  cp "$BUILTINS" "$HERE/.toolchain/lib/aarch64/libgcc.a"
+fi
 
 # Homebrew installs GNU cpio as keg-only (to avoid shadowing
 # macOS's BSD cpio), so /opt/homebrew/bin/cpio doesn't exist.
@@ -124,39 +172,56 @@ ln -sfn projects/sel4test/easy-settings.cmake easy-settings.cmake
 
 # Configure with CMake + build with ninja. Options match our kernel:
 #   x86_64, MCS scheduler, 4 cores, debug+printing build.
-mkdir -p build
-cd build
+mkdir -p "$BUILD_NAME"
+cd "$BUILD_NAME"
 if [ ! -f CMakeCache.txt ]; then
-  echo ">> configuring sel4test build"
+  echo ">> configuring sel4test build ($SEL4TEST_ARCH)"
   # Use upstream's LLVM toolchain file (kernel/llvm.cmake) so the
   # build picks clang + lld instead of gcc — matches the toolchain
   # we use for vendor/libsel4-build/. TRIPLE selects the target
   # for clang's `-target` flag.
-  ../init-build.sh \
-    -DPLATFORM=x86_64 \
-    -DSIMULATION=ON \
-    -DMCS=ON \
-    -DKernelIsMCS=ON \
-    -DKernelMaxNumNodes=4 \
-    -DKernelPrinting=ON \
-    -DKernelDebugBuild=ON \
-    -DKernelMaxNumBootinfoUntypedCaps=230 \
-    -DKernelSetTLSBaseSelf=ON \
-    -DKernelHugePage=OFF \
-    -DTRIPLE=x86_64-elf \
-    -DCMAKE_TOOLCHAIN_FILE=../kernel/llvm.cmake \
-    -DCMAKE_AR=/opt/homebrew/bin/x86_64-elf-ar \
-    -DCMAKE_RANLIB=/opt/homebrew/bin/x86_64-elf-ranlib \
-    -DCMAKE_NM=/opt/homebrew/bin/x86_64-elf-nm \
-    -DCMAKE_OBJCOPY=/opt/homebrew/bin/x86_64-elf-objcopy \
-    -DCMAKE_STRIP=/opt/homebrew/bin/x86_64-elf-strip
+  CONFIGURE_ARGS=(
+    -DPLATFORM="$PLATFORM"
+    -DKernelSel4Arch="$SEL4TEST_ARCH"
+    -DSIMULATION=ON
+    -DMCS=ON
+    -DSMP="$SMP"
+    -DKernelIsMCS=ON
+    -DKernelMaxNumNodes="$NUM_NODES"
+    -DKernelPrinting=ON
+    -DKernelDebugBuild=ON
+    -DKernelMaxNumBootinfoUntypedCaps=230
+    -DKernelSetTLSBaseSelf=ON
+    -DTRIPLE="$TRIPLE"
+    -DCMAKE_TOOLCHAIN_FILE=../kernel/llvm.cmake
+  )
+  if [ "$SEL4TEST_ARCH" = x86_64 ]; then
+    CONFIGURE_ARGS+=(
+      -DKernelHugePage=OFF
+      -DCMAKE_AR=/opt/homebrew/bin/x86_64-elf-ar
+      -DCMAKE_RANLIB=/opt/homebrew/bin/x86_64-elf-ranlib
+      -DCMAKE_NM=/opt/homebrew/bin/x86_64-elf-nm
+      -DCMAKE_OBJCOPY=/opt/homebrew/bin/x86_64-elf-objcopy
+      -DCMAKE_STRIP=/opt/homebrew/bin/x86_64-elf-strip
+    )
+  else
+    CONFIGURE_ARGS+=(
+      -DCMAKE_AR="$RUST_TOOLBIN/llvm-ar"
+      -DCMAKE_RANLIB="$HERE/toolchain/llvm-ranlib"
+      -DCMAKE_NM="$RUST_TOOLBIN/llvm-nm"
+      -DCMAKE_OBJCOPY="$RUST_TOOLBIN/llvm-objcopy"
+      -DCMAKE_STRIP="$RUST_TOOLBIN/llvm-strip"
+      "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -L$HERE/.toolchain/lib/aarch64"
+    )
+  fi
+  ../init-build.sh "${CONFIGURE_ARGS[@]}"
 fi
 
 echo ">> building sel4test-driver"
 ninja sel4test-driver
 
 # Stage the rootserver ELF where scripts/make_image.sh expects it.
-DRIVER_ELF="$HERE/build/apps/sel4test-driver/sel4test-driver"
+DRIVER_ELF="$HERE/$BUILD_NAME/apps/sel4test-driver/sel4test-driver"
 if [ ! -f "$DRIVER_ELF" ]; then
   echo "error: expected sel4test-driver ELF at $DRIVER_ELF" >&2
   exit 1
