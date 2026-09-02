@@ -132,7 +132,6 @@ mod elf;
 
 // Phase 29c — rootserver loader: parses ROOTSERVER_ELF, allocates
 // user pages, builds a fresh PML4 + user stack.
-#[cfg(target_arch = "x86_64")]
 mod rootserver;
 
 // Phase 10c — IPC fastpath bypassing the slowpath book-keeping for
@@ -317,7 +316,6 @@ fn bsp_main_big_stack() -> ! {
     // spec calls super::load() which allocates from this region,
     // and sel4test-driver's image alone is ~3.9 MiB — too big for
     // a kernel-image BSS pool.
-    #[cfg(target_arch = "x86_64")]
     if let Err(e) = boot::reserve_user_page_region() {
         arch::log("boot: reserve_user_page_region failed: ");
         match e {
@@ -343,7 +341,6 @@ fn bsp_main_big_stack() -> ! {
     // Simpleboot-supplied state — useful as an end-to-end smoke
     // test that the boot code that's been spec'd in synthetic
     // form actually copes with real-hardware data.
-    #[cfg(target_arch = "x86_64")]
     match boot::kernel_init() {
         Ok(_) => arch::log("boot: kernel_init succeeded\n"),
         Err(e) => {
@@ -363,12 +360,11 @@ fn bsp_main_big_stack() -> ! {
     // hand-asm demo as the canonical "kernel actually runs userspace"
     // bootstrap. The dispatcher exits QEMU when the rootserver
     // prints '\n' (closing its banner).
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         crate::rootserver::launch_rootserver();
     }
 
-    #[cfg(any(not(target_arch = "x86_64"), not(feature = "spec")))]
+    #[cfg(not(feature = "spec"))]
     loop {}
 }
 

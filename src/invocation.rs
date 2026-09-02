@@ -545,15 +545,130 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
 }
 
 #[cfg(target_arch = "aarch64")]
-fn decode_frame_map(_target: Cap, _args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
-    Err(KException::SyscallError(SyscallError::new(
-        seL4_Error::seL4_IllegalOperation,
-    )))
+fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    let (frame_ptr, size, is_device, mapped, frame_asid) = match target {
+        Cap::Frame {
+            ptr,
+            size,
+            is_device,
+            mapped,
+            asid,
+            ..
+        } => (ptr, size, is_device, mapped, asid),
+        _ => unreachable!(),
+    };
+    if let Some(previous) = mapped {
+        if previous != args.a2 {
+            Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidArgument,
+            )))?;
+        }
+    }
+    let size_bits = match size {
+        crate::cap::FrameSize::Small => 12,
+        crate::cap::FrameSize::Large => 21,
+        crate::cap::FrameSize::Huge => 30,
+    };
+    if args.a2 & ((1u64 << size_bits) - 1) != 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_AlignmentError,
+        )));
+    }
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let (root, asid) = unsafe {
+        let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+        if info.length() < 3 || info.extra_caps() == 0 || tcb.pending_extra_caps_count == 0 {
+            tcb.pending_extra_caps_count = 0;
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_TruncatedMessage,
+            )));
+        }
+        let cap = tcb.pending_extra_caps[0];
+        tcb.pending_extra_caps_count = 0;
+        match cap {
+            Cap::PML4 {
+                ptr,
+                asid,
+                mapped: true,
+            } if asid != 0 && (frame_asid == 0 || frame_asid == asid) => (ptr.addr(), asid),
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        }
+    };
+    let rights = crate::cap::FrameRights::from_word(args.a3);
+    let writable = matches!(rights, crate::cap::FrameRights::ReadWrite);
+    let attributes = args.a4;
+    let result = unsafe {
+        crate::arch::aarch64::vspace::map_frame(
+            root,
+            args.a2,
+            frame_ptr.addr(),
+            size_bits,
+            writable,
+            attributes & 0b100 == 0,
+            attributes & 1 != 0,
+        )
+    };
+    if let Err(bits_left) = result {
+        if bits_left == 0 && INV_TRACE {
+            let existing =
+                unsafe { crate::arch::aarch64::vspace::frame_paddr(root, args.a2, size_bits) }
+                    .unwrap_or(0);
+            crate::arch::log("[arm map busy va=0x");
+            log_hex_u64(args.a2);
+            crate::arch::log(" root=0x");
+            log_hex_u64(root);
+            crate::arch::log(" want=0x");
+            log_hex_u64(frame_ptr.addr());
+            crate::arch::log(" have=0x");
+            log_hex_u64(existing);
+            crate::arch::log("]\n");
+        }
+        if INV_TRACE {
+            crate::arch::log("[arm.frame va=0x");
+            log_hex_u64(args.a2);
+            crate::arch::log(" missing=");
+            log_dec(bits_left as u64);
+            crate::arch::log("]\n");
+        }
+        if bits_left == 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
+        unsafe {
+            let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+            tcb.msg_regs[2] = bits_left as u64;
+            tcb.ipc_length = 3;
+        }
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_FailedLookup,
+        )));
+    }
+    unsafe {
+        update_invoked_frame_slot(
+            args,
+            invoker,
+            frame_ptr.addr(),
+            Cap::Frame {
+                ptr: frame_ptr,
+                size,
+                rights,
+                mapped: Some(args.a2),
+                asid,
+                is_device,
+                map_type: crate::cap::FrameMapType::VSpace,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Phase 44 — indexed ASID-pool lookup. Returns 0 if the ASID is
 /// unassigned; callers treat that as an idempotent unmap/delete.
-#[cfg(target_arch = "x86_64")]
 fn pml4_paddr_for_asid(asid: u16) -> u64 {
     crate::asid::pml4_paddr(asid)
 }
@@ -620,8 +735,30 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = mapped_vaddr;
-        let _ = size;
+        if let Some(vaddr) = mapped_vaddr {
+            let root = pml4_paddr_for_asid(asid);
+            if root != 0 {
+                let size_bits = match size {
+                    crate::cap::FrameSize::Small => 12,
+                    crate::cap::FrameSize::Large => 21,
+                    crate::cap::FrameSize::Huge => 30,
+                };
+                let removed = unsafe {
+                    crate::arch::aarch64::vspace::unmap_frame(root, vaddr, paddr, size_bits)
+                };
+                if !removed && INV_TRACE {
+                    crate::arch::log("[arm unmap missed va=0x");
+                    log_hex_u64(vaddr);
+                    crate::arch::log(" root=0x");
+                    log_hex_u64(root);
+                    crate::arch::log(" frame=0x");
+                    log_hex_u64(paddr);
+                    crate::arch::log("]\n");
+                }
+            } else if INV_TRACE {
+                crate::arch::log("[arm unmap missing ASID root]\n");
+            }
+        }
     }
 
     // Clear the mapping state in the invoked cap. Falling back to a paddr scan here would have the
@@ -1246,15 +1383,50 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
 }
 
 #[cfg(target_arch = "aarch64")]
-fn map_paging_struct(
-    _target: Cap,
-    _args: &SyscallArgs,
-    _invoker: TcbId,
-    _level: u32,
-) -> KResult<()> {
-    Err(KException::SyscallError(SyscallError::new(
-        seL4_Error::seL4_IllegalOperation,
-    )))
+fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, _level: u32) -> KResult<()> {
+    let (table_paddr, mapped) = paging_struct_state(&target);
+    if mapped.is_some() {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let (root, asid) = unsafe {
+        let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+        if info.length() < 2 || info.extra_caps() == 0 || tcb.pending_extra_caps_count == 0 {
+            tcb.pending_extra_caps_count = 0;
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_TruncatedMessage,
+            )));
+        }
+        let cap = tcb.pending_extra_caps[0];
+        tcb.pending_extra_caps_count = 0;
+        match cap {
+            Cap::PML4 {
+                ptr,
+                asid,
+                mapped: true,
+            } if asid != 0 => (ptr.addr(), asid),
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        }
+    };
+    let map_result =
+        unsafe { crate::arch::aarch64::vspace::map_page_table(root, args.a2, table_paddr) };
+    if INV_TRACE {
+        crate::arch::log("[arm.pt va=0x");
+        log_hex_u64(args.a2);
+        crate::arch::log(" result=");
+        log_dec(map_result.map(|bits| bits as u64).unwrap_or(0));
+        crate::arch::log("]\n");
+    }
+    let bits_left = map_result
+        .map_err(|_| KException::SyscallError(SyscallError::new(seL4_Error::seL4_DeleteFirst)))?;
+    let mapped_vaddr = args.a2 & !((1u64 << bits_left) - 1);
+    update_invoked_paging_slot(args, invoker, &target, Some(mapped_vaddr), asid)
 }
 
 fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
@@ -1269,7 +1441,6 @@ fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResu
         // seL4's explicit paging-structure Unmap clears the table after a best-effort detach.
         // Deletion finalization deliberately does not clear it: the source Untyped owns reuse.
         detach_paging_structure(&target);
-        #[cfg(target_arch = "x86_64")]
         unsafe {
             let table = crate::arch::phys_to_virt(paging_struct_state(&target).0) as *mut u8;
             core::ptr::write_bytes(table, 0, 4096);
@@ -1446,12 +1617,38 @@ fn detach_frame_mapping(cap: &Cap) {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn detach_paging_structure(_cap: &Cap) -> bool {
-    false
+fn detach_paging_structure(cap: &Cap) -> bool {
+    let Some((paddr, vaddr, asid, _)) = paging_structure_mapping(cap) else {
+        return false;
+    };
+    let root = pml4_paddr_for_asid(asid);
+    root != 0 && unsafe { crate::arch::aarch64::vspace::unmap_page_table(root, vaddr, paddr) }
 }
 
 #[cfg(target_arch = "aarch64")]
-fn detach_frame_mapping(_cap: &Cap) {}
+fn detach_frame_mapping(cap: &Cap) {
+    if let Cap::Frame {
+        ptr,
+        size,
+        mapped: Some(vaddr),
+        asid,
+        map_type: crate::cap::FrameMapType::VSpace,
+        ..
+    } = *cap
+    {
+        let root = pml4_paddr_for_asid(asid);
+        let size_bits = match size {
+            crate::cap::FrameSize::Small => 12,
+            crate::cap::FrameSize::Large => 21,
+            crate::cap::FrameSize::Huge => 30,
+        };
+        if root != 0 {
+            unsafe {
+                crate::arch::aarch64::vspace::unmap_frame(root, vaddr, ptr.addr(), size_bits);
+            }
+        }
+    }
+}
 
 const CNODE_WORK_CAPACITY: usize = KernelState::cnode_pool_count();
 const CNODE_WORK_WORDS: usize = (CNODE_WORK_CAPACITY + 63) / 64;
@@ -1714,19 +1911,20 @@ fn decode_pdpt_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult
 // of CR3) is a follow-up.
 // ---------------------------------------------------------------------------
 
-/// x86_64 has `seL4_NumASIDPoolsBits = 3` → 8 ASID pools total.
-/// Pool index 0 is the rootserver's pre-allocated
-/// `InitThreadASIDPool` (asid_base 0); MakePool carves indices
-/// 1..8, so `asid_base = index * 512`. Bounded + recyclable pool
-/// indices keep the per-pool bookkeeping arrays small and stable
-/// across create/free cycles (vs an ever-growing base counter).
+/// Pool index 0 is the rootserver's pre-allocated `InitThreadASIDPool`.
+/// The architectural pool count is 8 on x86_64 and 128 on AArch64.
 const MAX_ASID_POOLS: usize = crate::asid::MAX_ASID_POOLS;
 
 /// Bitmap of in-use pool indices (bit i = index i). Bit 0 (the init
-/// pool) is permanently set. MakePool allocates the lowest clear bit
-/// in 1..8 (→ DeleteFirst when full, VSPACE0004); freeing an AsidPool
-/// cap clears its bit (so the index recycles).
-static ASID_POOL_INUSE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
+/// pool) is permanently set. Freeing an AsidPool cap clears its bit.
+const ASID_POOL_BITMAP_WORDS: usize = MAX_ASID_POOLS.div_ceil(64);
+#[allow(clippy::declare_interior_mutable_const)]
+static ASID_POOL_INUSE: [core::sync::atomic::AtomicU64; ASID_POOL_BITMAP_WORDS] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let mut words = [Z; ASID_POOL_BITMAP_WORDS];
+    words[0] = core::sync::atomic::AtomicU64::new(1);
+    words
+};
 
 /// Per-pool count of ASIDs handed out, indexed by pool index
 /// (`asid_base / 512`, always 0..8). Assign returns `seL4_DeleteFirst`
@@ -1744,17 +1942,23 @@ static ASID_POOL_USED: [core::sync::atomic::AtomicU16; MAX_ASID_POOLS] = {
 /// `None` if all are in use. Resets that pool's used-count.
 fn alloc_asid_pool_index() -> Option<usize> {
     use core::sync::atomic::Ordering;
-    let mut bits = ASID_POOL_INUSE.load(Ordering::Relaxed);
     for idx in 1..MAX_ASID_POOLS {
-        let mask = 1u16 << idx;
+        let word = idx / 64;
+        let mask = 1u64 << (idx % 64);
+        let bits = ASID_POOL_INUSE[word].load(Ordering::Relaxed);
         if bits & mask == 0 {
-            ASID_POOL_INUSE.store(bits | mask, Ordering::Relaxed);
+            ASID_POOL_INUSE[word].store(bits | mask, Ordering::Relaxed);
             ASID_POOL_USED[idx].store(0, Ordering::Relaxed);
             return Some(idx);
         }
-        let _ = &mut bits;
     }
     None
+}
+
+fn asid_pools_full() -> bool {
+    use core::sync::atomic::Ordering;
+    (1..MAX_ASID_POOLS)
+        .all(|idx| ASID_POOL_INUSE[idx / 64].load(Ordering::Relaxed) & (1u64 << (idx % 64)) != 0)
 }
 
 /// Release a pool index (called when its AsidPool cap is deleted).
@@ -1763,8 +1967,10 @@ fn free_asid_pool_index(idx: usize) {
     if idx == 0 || idx >= MAX_ASID_POOLS {
         return;
     }
-    let bits = ASID_POOL_INUSE.load(Ordering::Relaxed);
-    ASID_POOL_INUSE.store(bits & !(1u16 << idx), Ordering::Relaxed);
+    let word = idx / 64;
+    let mask = 1u64 << (idx % 64);
+    let bits = ASID_POOL_INUSE[word].load(Ordering::Relaxed);
+    ASID_POOL_INUSE[word].store(bits & !mask, Ordering::Relaxed);
     ASID_POOL_USED[idx].store(0, Ordering::Relaxed);
     crate::asid::clear_pool((idx * crate::asid::ASIDS_PER_POOL) as u16);
 }
@@ -1774,7 +1980,9 @@ fn free_asid_pool_index(idx: usize) {
 /// runs don't leak into the real test suite's pool accounting.
 pub fn reset_asid_state() {
     use core::sync::atomic::Ordering;
-    ASID_POOL_INUSE.store(1, Ordering::Relaxed);
+    for (index, word) in ASID_POOL_INUSE.iter().enumerate() {
+        word.store(if index == 0 { 1 } else { 0 }, Ordering::Relaxed);
+    }
     for u in ASID_POOL_USED.iter() {
         u.store(0, Ordering::Relaxed);
     }
@@ -1795,7 +2003,6 @@ fn decode_asid_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbI
 }
 
 fn decode_asid_control_make_pool(args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    use core::sync::atomic::Ordering;
     // Two ABI shapes coexist:
     //   * Upstream (libsel4 `seL4_X86_ASIDControl_MakePool`):
     //       extraCaps[0] = Untyped (pool storage)
@@ -1828,13 +2035,10 @@ fn decode_asid_control_make_pool(args: &SyscallArgs, invoker: TcbId) -> KResult<
             (untyped, invoker_cspace, args.a4 as usize, 0u32)
         };
 
-        // Pools are limited (MAX_ASID_POOLS); the 8th MakePool
-        // must fail (VSPACE0004). Check up front so we don't
+        // Pools are architecture-limited. Check up front so we don't
         // consume the untyped on a doomed call; the index is
         // actually claimed below once all validation passes.
-        if (ASID_POOL_INUSE.load(Ordering::Relaxed) & ((1u16 << MAX_ASID_POOLS) - 1))
-            == ((1u16 << MAX_ASID_POOLS) - 1)
-        {
+        if asid_pools_full() {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_DeleteFirst,
             )));
@@ -4125,6 +4329,13 @@ fn cnode_cancel_badged_sends(target: Cap, args: &SyscallArgs, _invoker: TcbId) -
                     cancelled.user_context.rdi = 0;
                     cancelled.blocked_is_call = false;
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let cancelled = (*s_ptr).scheduler.slab.get_mut(t);
+                    let label = seL4_Error::seL4_InvalidCapability as u64;
+                    crate::arch::set_ipc_return(&mut cancelled.user_context, 0, label << 12, &[]);
+                    cancelled.blocked_is_call = false;
+                }
                 (*s_ptr).scheduler.make_runnable(t);
             }
             cur = next;
@@ -6381,22 +6592,40 @@ fn decode_tcb(
             // target TCB so the dispatcher restores it on next entry.
             InvocationLabel::TCBSetTLSBase => {
                 let base = args.a2;
-                let want_gs = args.a3 != 0;
-                if want_gs {
-                    s.scheduler.slab.get_mut(id).cpu_context.gs_base = base;
-                } else {
-                    s.scheduler.slab.get_mut(id).cpu_context.fs_base = base;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    s.scheduler.slab.get_mut(id).user_context.tpidr_el0 = base;
+                    if Some(id) == crate::kernel::current_thread() {
+                        unsafe {
+                            core::arch::asm!(
+                                "msr tpidr_el0, {base}",
+                                base = in(reg) base,
+                                options(nostack),
+                            );
+                        }
+                    }
                 }
                 #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    if Some(id) == crate::kernel::current_thread() {
-                        use crate::arch::x86_64::msr::{wrmsr, IA32_FS_BASE, IA32_KERNEL_GS_BASE};
-                        // The user %gs base is applied via the swapped-out MSR so
-                        // the return-to-user `swapgs` makes it the active %gs.
-                        if want_gs {
-                            wrmsr(IA32_KERNEL_GS_BASE, base);
-                        } else {
-                            wrmsr(IA32_FS_BASE, base);
+                {
+                    let want_gs = args.a3 != 0;
+                    if want_gs {
+                        s.scheduler.slab.get_mut(id).cpu_context.gs_base = base;
+                    } else {
+                        s.scheduler.slab.get_mut(id).cpu_context.fs_base = base;
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        if Some(id) == crate::kernel::current_thread() {
+                            use crate::arch::x86_64::msr::{
+                                wrmsr, IA32_FS_BASE, IA32_KERNEL_GS_BASE,
+                            };
+                            // The user %gs base is applied via the swapped-out MSR so
+                            // the return-to-user `swapgs` makes it the active %gs.
+                            if want_gs {
+                                wrmsr(IA32_KERNEL_GS_BASE, base);
+                            } else {
+                                wrmsr(IA32_FS_BASE, base);
+                            }
                         }
                     }
                 }
@@ -6421,8 +6650,10 @@ fn decode_tcb(
                 Ok(())
             }
             // --- Hardware debug API (CONFIG_HARDWARE_DEBUG_API) ----------
-            #[cfg(target_arch = "x86_64")]
             InvocationLabel::TCBSetBreakpoint => {
+                #[cfg(target_arch = "aarch64")]
+                use crate::arch::aarch64::debug as dbg;
+                #[cfg(target_arch = "x86_64")]
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
                 let vaddr = args.a3;
@@ -6469,6 +6700,10 @@ fn decode_tcb(
                 if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
                     return err(seL4_Error::seL4_RangeError);
                 }
+                #[cfg(target_arch = "aarch64")]
+                if !dbg::valid_id_for_type(bp_num as usize, ty) {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
                 dbg::set_breakpoint(
                     &mut s.scheduler.slab.get_mut(id).debug,
                     bp_num as usize,
@@ -6479,8 +6714,10 @@ fn decode_tcb(
                 );
                 Ok(())
             }
-            #[cfg(target_arch = "x86_64")]
             InvocationLabel::TCBGetBreakpoint => {
+                #[cfg(target_arch = "aarch64")]
+                use crate::arch::aarch64::debug as dbg;
+                #[cfg(target_arch = "x86_64")]
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
                 if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
@@ -6502,8 +6739,10 @@ fn decode_tcb(
                 inv.ipc_length = 5;
                 Ok(())
             }
-            #[cfg(target_arch = "x86_64")]
             InvocationLabel::TCBUnsetBreakpoint => {
+                #[cfg(target_arch = "aarch64")]
+                use crate::arch::aarch64::debug as dbg;
+                #[cfg(target_arch = "x86_64")]
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
                 if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
@@ -6514,8 +6753,10 @@ fn decode_tcb(
                 dbg::unset_breakpoint(&mut s.scheduler.slab.get_mut(id).debug, bp_num as usize);
                 Ok(())
             }
-            #[cfg(target_arch = "x86_64")]
             InvocationLabel::TCBConfigureSingleStepping => {
+                #[cfg(target_arch = "aarch64")]
+                use crate::arch::aarch64::debug as dbg;
+                #[cfg(target_arch = "x86_64")]
                 use crate::arch::x86_64::debug as dbg;
                 let _bp_num = args.a2; // ignored on x86 (TF-based)
                 let n_instr = args.a3;
@@ -6523,16 +6764,19 @@ fn decode_tcb(
                     &mut s.scheduler.slab.get_mut(id).debug,
                     n_instr,
                 );
-                let t = s.scheduler.slab.get_mut(id);
-                if n_instr == 0 {
-                    // Disable: clear TF on the target's saved RFLAGS.
-                    t.user_context.rflags &= !dbg::FLAGS_TF;
-                } else {
-                    // Enable: set TF so the thread single-steps when it
-                    // next runs; force iretq resume so the rflags slot
-                    // (not the sysret r11 path) carries it.
-                    t.user_context.rflags |= dbg::FLAGS_TF;
-                    t.use_iretq_resume = true;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let t = s.scheduler.slab.get_mut(id);
+                    if n_instr == 0 {
+                        // Disable: clear TF on the target's saved RFLAGS.
+                        t.user_context.rflags &= !dbg::FLAGS_TF;
+                    } else {
+                        // Enable: set TF so the thread single-steps when it
+                        // next runs; force iretq resume so the rflags slot
+                        // (not the sysret r11 path) carries it.
+                        t.user_context.rflags |= dbg::FLAGS_TF;
+                        t.use_iretq_resume = true;
+                    }
                 }
                 let inv = s.scheduler.slab.get_mut(invoker);
                 inv.msg_regs[0] = consumed as u64;

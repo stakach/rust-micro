@@ -226,7 +226,363 @@ fn initial_tcr_el1() -> u64 {
     const ORGN0_WBWA: u64 = 1 << 10;
     const SH0_INNER: u64 = 3 << 12;
     const EPD1: u64 = 1 << 23;
-    T0SZ_48_BITS | IRGN0_WBWA | ORGN0_WBWA | SH0_INNER | EPD1 | (physical_address_size() << 32)
+    const ASID16: u64 = 1 << 36;
+    T0SZ_48_BITS
+        | IRGN0_WBWA
+        | ORGN0_WBWA
+        | SH0_INNER
+        | EPD1
+        | ASID16
+        | (physical_address_size() << 32)
+}
+
+unsafe fn table_ptr(paddr: u64) -> *mut u64 {
+    crate::arch::phys_to_virt(paddr) as *mut u64
+}
+
+/// Create a user VSpace root which retains this direct-boot kernel's
+/// privileged mappings. `allocate` must return zeroed, 4 KiB-aligned physical
+/// pages reachable through `arch::phys_to_virt`.
+pub unsafe fn make_user_vspace(mut allocate: impl FnMut() -> u64) -> u64 {
+    let root = allocate();
+    let l1 = allocate();
+    let low_l2 = allocate();
+    assert_eq!(root & 0xfff, 0);
+    assert_eq!(l1 & 0xfff, 0);
+    assert_eq!(low_l2 & 0xfff, 0);
+
+    ptr::write_volatile(table_ptr(root), table_descriptor(l1).unwrap());
+    ptr::write_volatile(table_ptr(l1), table_descriptor(low_l2).unwrap());
+    // The kernel still executes with TTBR0, so retain only the live QEMU
+    // virt devices it accesses after EL0 starts. Leaving the rest of the
+    // low GiB empty is essential: seL4 userspace allocators map ordinary
+    // addresses such as 0x1000_0000 there.
+    for index in [
+        0x0800_0000usize >> LARGE_PAGE_BITS,
+        0x0900_0000usize >> LARGE_PAGE_BITS,
+    ] {
+        ptr::write_volatile(
+            table_ptr(low_l2).add(index),
+            ptr::read_volatile(core::ptr::addr_of!(BOOT_LOW_L2.0[index])),
+        );
+    }
+    ptr::write_volatile(
+        table_ptr(l1).add(1),
+        ptr::read_volatile(core::ptr::addr_of!(BOOT_L1.0[1])),
+    );
+    root
+}
+
+/// Map a seL4 small page into an allocator-backed user VSpace.
+pub unsafe fn map_user_4k(
+    root_paddr: u64,
+    vaddr: u64,
+    paddr: u64,
+    writable: bool,
+    executable: bool,
+    mut allocate: impl FnMut() -> u64,
+) -> Result<(), MapError> {
+    if !canonical(vaddr) || vaddr >= (1u64 << 39) {
+        return Err(MapError::OutOfRange);
+    }
+    if vaddr & 0xfff != 0 || paddr & 0xfff != 0 || root_paddr & 0xfff != 0 {
+        return Err(MapError::Alignment);
+    }
+    let indices = decompose_vaddr(vaddr);
+    let root = table_ptr(root_paddr);
+    let root_entry = ptr::read_volatile(root.add(indices.pgd as usize));
+    if root_entry & 0x3 != 0x3 {
+        return Err(MapError::OutOfRange);
+    }
+    let l1 = table_ptr(descriptor_paddr(root_entry, 0)?);
+
+    let l1_slot = l1.add(indices.pud as usize);
+    let mut l1_entry = ptr::read_volatile(l1_slot);
+    if l1_entry & DESC_VALID == 0 {
+        let child = allocate();
+        if child & 0xfff != 0 {
+            return Err(MapError::Alignment);
+        }
+        l1_entry = table_descriptor(child)?;
+        ptr::write_volatile(l1_slot, l1_entry);
+    }
+    if l1_entry & 0x3 != 0x3 {
+        return Err(MapError::OutOfRange);
+    }
+    // A table descriptor always carries a 4 KiB-aligned address. The
+    // containing level only changes the mask for block descriptors.
+    let l2 = table_ptr(descriptor_paddr(l1_entry, 0)?);
+
+    let l2_slot = l2.add(indices.pd as usize);
+    let mut l2_entry = ptr::read_volatile(l2_slot);
+    if l2_entry & 0x3 != 0x3 {
+        let child = allocate();
+        if child & 0xfff != 0 {
+            return Err(MapError::Alignment);
+        }
+        l2_entry = table_descriptor(child)?;
+        ptr::write_volatile(l2_slot, l2_entry);
+    }
+    let l3 = table_ptr(descriptor_paddr(l2_entry, 0)?);
+    let leaf = l3.add(indices.pt as usize);
+    if ptr::read_volatile(leaf) & DESC_VALID != 0 {
+        return Err(MapError::OutOfRange);
+    }
+    ptr::write_volatile(
+        leaf,
+        page_descriptor(
+            paddr,
+            if writable {
+                VmRights::UserReadWrite
+            } else {
+                VmRights::UserReadOnly
+            },
+            MemoryAttr::Normal,
+            executable,
+        )?,
+    );
+    asm!("dsb ishst", options(nostack));
+    Ok(())
+}
+
+pub fn activate_user_vspace(root_paddr: u64, asid: u16) {
+    let ttbr = root_paddr | ((asid as u64) << 48);
+    unsafe {
+        asm!(
+            "dsb ish",
+            "msr ttbr0_el1, {ttbr}",
+            "isb",
+            ttbr = in(reg) ttbr,
+            options(nostack),
+        );
+    }
+}
+
+unsafe fn flush_vspace() {
+    asm!(
+        "dsb ishst",
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+        options(nostack),
+    );
+}
+
+/// Install a recursive AArch64 PageTable object at the first missing
+/// translation level, as `decodeARMPageTableInvocation` does in seL4.
+/// The returned value is the number of address bits covered by that entry.
+pub unsafe fn map_page_table(
+    root_paddr: u64,
+    vaddr: u64,
+    table_paddr: u64,
+) -> Result<u32, MapError> {
+    if !canonical(vaddr) || vaddr >= (1u64 << 47) {
+        return Err(MapError::OutOfRange);
+    }
+    if root_paddr & 0xfff != 0 || table_paddr & 0xfff != 0 {
+        return Err(MapError::Alignment);
+    }
+
+    let indices = decompose_vaddr(vaddr);
+    let slots = [
+        indices.pgd as usize,
+        indices.pud as usize,
+        indices.pd as usize,
+    ];
+    let bits_left = [39u32, 30, 21];
+    let mut table = table_ptr(root_paddr);
+    for level in 0..slots.len() {
+        let slot = table.add(slots[level]);
+        let entry = ptr::read_volatile(slot);
+        if entry & DESC_VALID == 0 {
+            // This direct-boot kernel currently shares TTBR0 with EL0. When
+            // userspace constructs the low-address walk for a fresh VSpace,
+            // seed only the privileged leaves needed to keep EL1 reachable.
+            // These occupy the same levels that make_user_vspace establishes.
+            if bits_left[level] == 39 && indices.pgd == 0 {
+                ptr::write_volatile(
+                    table_ptr(table_paddr).add(1),
+                    ptr::read_volatile(core::ptr::addr_of!(BOOT_L1.0[1])),
+                );
+            } else if bits_left[level] == 30 && indices.pgd == 0 && indices.pud == 0 {
+                for device_index in [
+                    0x0800_0000usize >> LARGE_PAGE_BITS,
+                    0x0900_0000usize >> LARGE_PAGE_BITS,
+                ] {
+                    ptr::write_volatile(
+                        table_ptr(table_paddr).add(device_index),
+                        ptr::read_volatile(core::ptr::addr_of!(BOOT_LOW_L2.0[device_index])),
+                    );
+                }
+            }
+            ptr::write_volatile(slot, table_descriptor(table_paddr)?);
+            flush_vspace();
+            return Ok(bits_left[level]);
+        }
+        if entry & 0x3 != 0x3 {
+            return Err(MapError::OutOfRange);
+        }
+        table = table_ptr(descriptor_paddr(entry, 0)?);
+    }
+    Err(MapError::OutOfRange)
+}
+
+/// Map a frame after userspace has explicitly supplied every intermediate
+/// PageTable object. `Err(bits_left)` reports the first missing level. Like
+/// seL4's `performPageInvocationMap`, a valid leaf is replaced so remapping a
+/// frame at the same address can update its rights and attributes.
+pub unsafe fn map_frame(
+    root_paddr: u64,
+    vaddr: u64,
+    paddr: u64,
+    size_bits: u32,
+    writable: bool,
+    executable: bool,
+    cacheable: bool,
+) -> Result<(), u32> {
+    if !canonical(vaddr)
+        || vaddr >= (1u64 << 47)
+        || !matches!(size_bits, 12 | 21 | 30)
+        || vaddr & ((1u64 << size_bits) - 1) != 0
+        || paddr & ((1u64 << size_bits) - 1) != 0
+    {
+        return Err(0);
+    }
+
+    let indices = decompose_vaddr(vaddr);
+    let slots = [
+        indices.pgd as usize,
+        indices.pud as usize,
+        indices.pd as usize,
+        indices.pt as usize,
+    ];
+    let levels = [0u8, 1, 2, 3];
+    let bits_left = [39u32, 30, 21, 12];
+    let mut table = table_ptr(root_paddr);
+    for index in 0..slots.len() {
+        let slot = table.add(slots[index]);
+        let entry = ptr::read_volatile(slot);
+        if bits_left[index] == size_bits {
+            let rights = if writable {
+                VmRights::UserReadWrite
+            } else {
+                VmRights::UserReadOnly
+            };
+            let attr = if cacheable {
+                MemoryAttr::Normal
+            } else {
+                MemoryAttr::Device
+            };
+            let descriptor = if size_bits == PAGE_BITS {
+                page_descriptor(paddr, rights, attr, executable).map_err(|_| 0u32)?
+            } else {
+                block_descriptor(paddr, levels[index], rights, attr, executable, false)
+                    .map_err(|_| 0u32)?
+            };
+            ptr::write_volatile(slot, descriptor);
+            flush_vspace();
+            return Ok(());
+        }
+        if entry & DESC_VALID == 0 || entry & 0x3 != 0x3 {
+            return Err(bits_left[index]);
+        }
+        table = table_ptr(descriptor_paddr(entry, 0).map_err(|_| bits_left[index])?);
+    }
+    Err(0)
+}
+
+pub unsafe fn unmap_frame(root_paddr: u64, vaddr: u64, paddr: u64, size_bits: u32) -> bool {
+    if !matches!(size_bits, 12 | 21 | 30) {
+        return false;
+    }
+    let indices = decompose_vaddr(vaddr);
+    let slots = [
+        indices.pgd as usize,
+        indices.pud as usize,
+        indices.pd as usize,
+        indices.pt as usize,
+    ];
+    let levels = [0u8, 1, 2, 3];
+    let bits_left = [39u32, 30, 21, 12];
+    let mut table = table_ptr(root_paddr);
+    for index in 0..slots.len() {
+        let slot = table.add(slots[index]);
+        let entry = ptr::read_volatile(slot);
+        if bits_left[index] == size_bits {
+            if entry & DESC_VALID == 0 || descriptor_paddr(entry, levels[index]).ok() != Some(paddr)
+            {
+                return false;
+            }
+            ptr::write_volatile(slot, 0);
+            flush_vspace();
+            return true;
+        }
+        if entry & 0x3 != 0x3 {
+            return false;
+        }
+        table = table_ptr(match descriptor_paddr(entry, 0) {
+            Ok(address) => address,
+            Err(_) => return false,
+        });
+    }
+    false
+}
+
+pub unsafe fn frame_paddr(root_paddr: u64, vaddr: u64, size_bits: u32) -> Option<u64> {
+    if !matches!(size_bits, 12 | 21 | 30) {
+        return None;
+    }
+    let indices = decompose_vaddr(vaddr);
+    let slots = [
+        indices.pgd as usize,
+        indices.pud as usize,
+        indices.pd as usize,
+        indices.pt as usize,
+    ];
+    let levels = [0u8, 1, 2, 3];
+    let bits_left = [39u32, 30, 21, 12];
+    let mut table = table_ptr(root_paddr);
+    for index in 0..slots.len() {
+        let entry = ptr::read_volatile(table.add(slots[index]));
+        if bits_left[index] == size_bits {
+            return (entry & DESC_VALID != 0)
+                .then(|| descriptor_paddr(entry, levels[index]).ok())
+                .flatten();
+        }
+        if entry & 0x3 != 0x3 {
+            return None;
+        }
+        table = table_ptr(descriptor_paddr(entry, 0).ok()?);
+    }
+    None
+}
+
+pub unsafe fn unmap_page_table(root_paddr: u64, vaddr: u64, child_paddr: u64) -> bool {
+    let indices = decompose_vaddr(vaddr);
+    let slots = [
+        indices.pgd as usize,
+        indices.pud as usize,
+        indices.pd as usize,
+    ];
+    let mut table = table_ptr(root_paddr);
+    for index in slots {
+        let slot = table.add(index);
+        let entry = ptr::read_volatile(slot);
+        if entry & 0x3 != 0x3 {
+            return false;
+        }
+        let address = match descriptor_paddr(entry, 0) {
+            Ok(address) => address,
+            Err(_) => return false,
+        };
+        if address == child_paddr {
+            ptr::write_volatile(slot, 0);
+            flush_vspace();
+            return true;
+        }
+        table = table_ptr(address);
+    }
+    false
 }
 
 /// Install the direct-boot kernel's initial stage-1 tables.

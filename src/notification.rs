@@ -333,7 +333,6 @@ pub fn wait(ntfn: &mut Notification, sched: &mut Scheduler, thread: TcbId) -> Wa
             if let (Some(bsc), Some(tsc)) = (ntfn.bound_sc, thread_sc) {
                 if bsc == tsc {
                     sched.slab.get_mut(thread).sc = None;
-                    #[cfg(target_arch = "x86_64")]
                     unsafe {
                         crate::kernel::KERNEL.get().sched_contexts[bsc as usize].bound_tcb = None;
                     }

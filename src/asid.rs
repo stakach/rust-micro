@@ -7,7 +7,10 @@
 use crate::cap::Cap;
 
 pub const ASIDS_PER_POOL: usize = 1 << 9;
+#[cfg(target_arch = "x86_64")]
 pub const MAX_ASID_POOLS: usize = 1 << 3;
+#[cfg(target_arch = "aarch64")]
+pub const MAX_ASID_POOLS: usize = 1 << 7;
 const MAX_ASIDS: usize = ASIDS_PER_POOL * MAX_ASID_POOLS;
 
 #[allow(clippy::declare_interior_mutable_const)]

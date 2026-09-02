@@ -15,7 +15,7 @@ pub fn init_interrupts() {
 }
 
 #[no_mangle]
-extern "C" fn aarch64_irq_dispatch() {
+extern "C" fn aarch64_irq_dispatch(context: *mut crate::arch::UserContext) {
     let acknowledge = super::gic::acknowledge();
     let irq = acknowledge & 0x3ff;
 
@@ -26,14 +26,62 @@ extern "C" fn aarch64_irq_dispatch() {
     if irq == super::timer::TIMER_IRQ {
         // The architected timer is level-sensitive. Move its compare value
         // before EOI, matching seL4's resetTimer()/isb()/ackInterrupt order.
-        super::timer::disable();
+        let from_user = unsafe { (*context).spsr_el1 & 0xf == 0 };
+        super::timer::program_ticks((super::timer::frequency_hz() / 1_000).max(1));
         TIMER_INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+        if from_user {
+            handle_kernel_tick(context);
+        } else {
+            handle_idle_tick();
+        }
     } else {
         super::gic::mask(irq);
         UNEXPECTED_INTERRUPTS.fetch_add(1, Ordering::SeqCst);
     }
 
     super::gic::end_interrupt(acknowledge);
+}
+
+fn handle_idle_tick() {
+    // `wait_for_runnable` executes WFI at EL1 after releasing the BKL. A
+    // sporadic SC may be the only thing capable of becoming runnable, so an
+    // idle timer IRQ must still advance time and process the release queue.
+    crate::smp::bkl_acquire();
+    unsafe {
+        crate::kernel::KERNEL.get().scheduler.tick();
+    }
+    super::timer::TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::sched_context::mcs_tick(1);
+    crate::smp::bkl_release();
+}
+
+fn handle_kernel_tick(context: *mut crate::arch::UserContext) {
+    crate::smp::bkl_acquire();
+    let interrupted = unsafe {
+        crate::kernel::KERNEL
+            .get()
+            .scheduler
+            .active_user()
+            .or_else(|| crate::kernel::KERNEL.get().scheduler.current())
+    };
+    if let Some(thread) = interrupted {
+        unsafe {
+            let tcb = crate::kernel::KERNEL.get().scheduler.slab.get_mut(thread);
+            tcb.user_context = *context;
+            crate::arch::aarch64::context::save_exception_fpu(context, &mut tcb.aarch64_fpu_state);
+            crate::kernel::KERNEL.get().scheduler.tick();
+        }
+        super::timer::TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        crate::sched_context::mcs_tick(1);
+        crate::arch::aarch64::syscall_entry::dispatch_selected(
+            unsafe { &mut *context },
+            Some(thread),
+            crate::syscalls::Syscall::SysYield,
+            false,
+            false,
+        );
+    }
+    crate::smp::bkl_release();
 }
 
 #[cfg(feature = "spec")]

@@ -211,7 +211,6 @@ pub fn retype(
     // src/object/untyped.c.
     if !untyped.is_device {
         let total_bytes = num_objects * plan.per_object;
-        #[cfg(target_arch = "x86_64")]
         unsafe {
             let lin = crate::arch::phys_to_virt(untyped.base + plan.aligned_offset);
             core::ptr::write_bytes(lin as *mut u8, 0, total_bytes as usize);
@@ -465,6 +464,22 @@ pub mod spec {
     use crate::cspace::{lookup_cap, CSpace};
     use crate::cte::Cte;
 
+    #[repr(C, align(4096))]
+    struct SpecRetypeBacking([u8; 16 * 1024]);
+
+    static mut SPEC_RETYPE_BACKING: SpecRetypeBacking = SpecRetypeBacking([0; 16 * 1024]);
+
+    fn spec_backing_paddr(_fallback: u64) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            _fallback
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            crate::arch::virt_to_phys((&raw const SPEC_RETYPE_BACKING.0) as u64)
+        }
+    }
+
     pub fn test_untyped() {
         arch::log("Running untyped retype tests...\n");
 
@@ -475,6 +490,7 @@ pub mod spec {
         device_memory_restrictions();
         zero_base_device_frame();
         zero_objects_rejected();
+        retype_clears_backing_memory();
         retype_into_paging_structs();
         retype_into_sched_context();
         retype_into_reply();
@@ -486,7 +502,7 @@ pub mod spec {
     /// the resulting cap defaults to `can_grant: true`.
     fn retype_into_reply() {
         use crate::cap::ReplyStorage;
-        let base = 0x0090_0000;
+        let base = spec_backing_paddr(0x0090_0000);
         let mut ut = UntypedState::new(base, 14, false);
 
         let mut produced = Cap::Null;
@@ -509,7 +525,7 @@ pub mod spec {
     /// resulting cap should record that size.
     fn retype_into_sched_context() {
         use crate::cap::SchedContextStorage;
-        let base = 0x0080_0000;
+        let base = spec_backing_paddr(0x0080_0000);
         let mut ut = UntypedState::new(base, 14, false);
 
         let mut produced = Cap::Null;
@@ -622,7 +638,7 @@ pub mod spec {
         };
 
         let mut produced = Cap::Null;
-        let mut small = UntypedState::new(0x0040_0000, 12, false);
+        let mut small = UntypedState::new(spec_backing_paddr(0x0040_0000), 12, false);
         retype(&mut small, ObjectType::Arch(ARM_SMALL_PAGE), 0, 1, |c| {
             produced = c
         })
@@ -635,7 +651,7 @@ pub mod spec {
             }
         ));
 
-        let mut large = UntypedState::new(0x0080_0000, 21, false);
+        let mut large = UntypedState::new(0x0080_0000, 21, true);
         retype(&mut large, ObjectType::Arch(ARM_LARGE_PAGE), 0, 1, |c| {
             produced = c
         })
@@ -648,7 +664,7 @@ pub mod spec {
             }
         ));
 
-        let mut huge = UntypedState::new(0x4000_0000, 30, false);
+        let mut huge = UntypedState::new(0x4000_0000, 30, true);
         retype(&mut huge, ObjectType::Arch(ARM_HUGE_PAGE), 0, 1, |c| {
             produced = c
         })
@@ -661,7 +677,7 @@ pub mod spec {
             }
         ));
 
-        let mut tables = UntypedState::new(0x8000_0000, 13, false);
+        let mut tables = UntypedState::new(spec_backing_paddr(0x8000_0000), 13, false);
         retype(&mut tables, ObjectType::Arch(ARM_VSPACE), 0, 1, |c| {
             produced = c
         })
@@ -693,7 +709,8 @@ pub mod spec {
     fn retype_into_endpoints() {
         // 4 KiB untyped at 0x100_000. Carve out 8 endpoints
         // (16 bytes each = 128 bytes total).
-        let mut ut = UntypedState::new(0x0010_0000, 12, false);
+        let base = spec_backing_paddr(0x0010_0000);
+        let mut ut = UntypedState::new(base, 12, false);
         let mut caps: [Cap; 8] = [Cap::Null; 8];
         let mut idx = 0;
         retype(&mut ut, ObjectType::Endpoint, 0, 8, |cap| {
@@ -706,7 +723,7 @@ pub mod spec {
         for (i, cap) in caps.iter().enumerate() {
             match cap {
                 Cap::Endpoint { ptr, badge, rights } => {
-                    assert_eq!(ptr.addr(), 0x0010_0000 + (i as u64) * 16);
+                    assert_eq!(ptr.addr(), base + (i as u64) * 16);
                     assert_eq!(*badge, Badge(0));
                     // Newly retyped endpoints have all rights.
                     assert!(
@@ -729,7 +746,7 @@ pub mod spec {
         // up a CSpace pointing at a real backing store at the
         // freshly-allocated address, write a cap into one of its
         // slots, look it up.
-        let cnode_base: u64 = 0x0020_0000;
+        let cnode_base = spec_backing_paddr(0x0020_0000);
         let mut ut = UntypedState::new(cnode_base, 12, false);
 
         // Retype 1 CNode of radix 4 (16 slots, 512 bytes total = 9 bits).
@@ -796,7 +813,7 @@ pub mod spec {
         // After carving 1 endpoint (16 bytes) from a fresh 4 KiB
         // untyped, retype a second time for a notification (32 byte
         // alignment): the next-free pointer must round UP to 32.
-        let mut ut = UntypedState::new(0x0030_0000, 12, false);
+        let mut ut = UntypedState::new(spec_backing_paddr(0x0030_0000), 12, false);
         let mut sink = |_| {};
         retype(&mut ut, ObjectType::Endpoint, 0, 1, &mut sink).unwrap();
         assert_eq!(ut.free_index_bytes, 16);
@@ -881,5 +898,25 @@ pub mod spec {
             RetypeError::RangeError,
         );
         arch::log("  ✓ num_objects = 0 rejected as RangeError\n");
+    }
+
+    fn retype_clears_backing_memory() {
+        #[cfg(target_arch = "aarch64")]
+        use crate::object_type::ARM_PAGE_TABLE as PAGE_TABLE_OBJECT;
+        #[cfg(target_arch = "x86_64")]
+        use crate::object_type::X86_PAGE_TABLE as PAGE_TABLE_OBJECT;
+
+        let vaddr = unsafe {
+            let vaddr = (&raw mut SPEC_RETYPE_BACKING.0) as *mut u8;
+            core::ptr::write_bytes(vaddr, 0xa5, 4096);
+            vaddr
+        };
+        let paddr = crate::arch::virt_to_phys(vaddr as u64);
+        let mut ut = UntypedState::new(paddr, 12, false);
+        retype(&mut ut, ObjectType::Arch(PAGE_TABLE_OBJECT), 0, 1, |_| {})
+            .expect("retype page table over reused backing");
+        let bytes = unsafe { core::slice::from_raw_parts(vaddr, 4096) };
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        arch::log("  ✓ retype clears reused non-device backing memory\n");
     }
 }

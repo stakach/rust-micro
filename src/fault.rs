@@ -330,7 +330,6 @@ pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
 /// in-flight fault. Mirrors upstream `handleTimeout`/`validTimeoutHandler`.
 /// The `seL4_Timeout_Data` MR carries the SC's badge so the handler can
 /// identify the overrunning thread.
-#[cfg(target_arch = "x86_64")]
 pub fn deliver_timeout_fault(faulter: TcbId) -> bool {
     unsafe {
         let s = KERNEL.get();
@@ -679,6 +678,45 @@ pub unsafe fn apply_fault_reply(
             if n > 2 {
                 set_resume_flags(t, regs[2]);
             }
+            label == 0
+        }
+        4 => {
+            if t.debug.single_step_enabled {
+                let n = if length >= 1 { regs[0] } else { 1 };
+                crate::arch::aarch64::debug::configure_single_stepping(&mut t.debug, n);
+            }
+            true
+        }
+        5 => {
+            // AArch64 TIMEOUT_REPLY_MESSAGE from the pinned seL4
+            // registerset: FaultIP, SP, SPSR, x0..x8, x16..x18,
+            // x29, x30, x9..x15, x19..x28. seL4 limits the copy to
+            // n_timeoutMessage (34), excluding the two TLS fields in
+            // the public seL4_UserContext structure.
+            if n > 0 {
+                set_resume_ip(t, regs[0]);
+            }
+            if n > 1 {
+                t.user_context.sp_el0 = regs[1];
+            }
+            if n > 2 {
+                set_resume_flags(t, regs[2]);
+            }
+            for public in 3..n.min(12) {
+                t.user_context.x[public - 3] = regs[public];
+            }
+            for (public, register) in [(12, 16), (13, 17), (14, 18), (15, 29), (16, 30)] {
+                if n > public {
+                    t.user_context.x[register] = regs[public];
+                }
+            }
+            for public in 17..n.min(24) {
+                t.user_context.x[public - 8] = regs[public];
+            }
+            for public in 24..n.min(34) {
+                t.user_context.x[public - 5] = regs[public];
+            }
+            // resume = !label.
             label == 0
         }
         _ => true,

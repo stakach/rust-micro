@@ -1,6 +1,9 @@
 //! ARM architected virtual timer used by a non-hypervisor seL4 kernel.
 
+use core::sync::atomic::AtomicU64;
+
 pub const TIMER_IRQ: u32 = 27;
+pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn frequency_hz() -> u32 {
     let value: u64;
@@ -40,6 +43,11 @@ pub fn disable() {
             options(nomem, nostack),
         );
     }
+}
+
+pub fn enable_periodic_kernel_timer() {
+    super::gic::unmask(TIMER_IRQ);
+    program_ticks((frequency_hz() / 1_000).max(1));
 }
 
 #[cfg(feature = "spec")]

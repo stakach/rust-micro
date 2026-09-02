@@ -305,7 +305,6 @@ fn layout_at(base: u64, layout: &RootserverLayout) -> RootserverMem {
 // and converts each entry into a `MemEntry`.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "x86_64")]
 pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> usize {
     const EFI_MEMORY_MAPPED_IO: u32 = 11;
     const EFI_MEMORY_MAPPED_IO_PORT_SPACE: u32 = 12;
@@ -338,7 +337,6 @@ pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> usize {
     count
 }
 
-#[cfg(target_arch = "x86_64")]
 fn reserve_simpleboot_allocations(free: &mut RegionList) -> Result<(), BootError> {
     if let Some((start, end)) = crate::simpleboot::mbi_region() {
         reserve_page_range(free, start, end)?;
@@ -363,10 +361,11 @@ fn reserve_simpleboot_allocations(free: &mut RegionList) -> Result<(), BootError
         return Err(e);
     }
 
-    reserve_live_page_tables(free)
+    #[cfg(target_arch = "x86_64")]
+    reserve_live_page_tables(free)?;
+    Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
 fn reserve_page_range(free: &mut RegionList, start: u64, end: u64) -> Result<(), BootError> {
     if end <= start {
         return Ok(());
@@ -418,7 +417,6 @@ fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
 // installer.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "x86_64")]
 pub fn kernel_init() -> Result<RootserverMem, BootError> {
     use crate::arch;
 
@@ -469,7 +467,6 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
 /// Cap::Untyped. sel4test's vka allocator carves TCBs / CNodes /
 /// frames / page tables out of this; sized large enough to run the
 /// full sel4test suite (~64 MiB).
-#[cfg(target_arch = "x86_64")]
 pub fn reserve_user_page_region() -> Result<(), BootError> {
     use crate::arch;
 
@@ -630,7 +627,6 @@ fn carve_chunk(free: &mut RegionList, size: u64, align_bits: u32) -> Result<u64,
     Err(BootError::NoSuitableRegion)
 }
 
-#[cfg(target_arch = "x86_64")]
 fn log_count(n: usize) {
     let mut buf = [b'0'; 4];
     let mut v = n;
@@ -649,7 +645,6 @@ fn log_count(n: usize) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn log_hex64(v: u64) {
     let mut buf = [b'0'; 16];
     for i in 0..16 {

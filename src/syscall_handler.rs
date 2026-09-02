@@ -57,7 +57,6 @@ pub trait DebugSink {
 /// `cap_*_cap` enum values from `structures_64.bf` so libsel4sync
 /// (and other libs) can identify caps by type. Tag values mirror
 /// `crate::cap::tag` — keep in sync.
-#[cfg(target_arch = "x86_64")]
 fn debug_cap_type_tag(cap: &crate::cap::Cap) -> u64 {
     use crate::cap::{tag, Cap};
     match cap {
@@ -129,7 +128,6 @@ pub fn handle_syscall(
             // invoker before the reply and restore it afterwards so
             // handle_recv sees the right TCB. The actual reschedule
             // happens at the dispatcher tail once handle_recv is done.
-            #[cfg(target_arch = "x86_64")]
             let saved_current = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
             handle_reply(args)?;
             unsafe {
@@ -140,7 +138,6 @@ pub fn handle_syscall(
                     }
                 }
             }
-            #[cfg(target_arch = "x86_64")]
             unsafe {
                 let s = crate::kernel::KERNEL.get();
                 if s.scheduler.current().is_none() {
@@ -231,7 +228,6 @@ pub fn handle_syscall(
             // receiver, so restore the invoker (same workaround as
             // SysReplyRecv). The real reschedule happens at the
             // dispatcher tail once handle_recv is done.
-            #[cfg(target_arch = "x86_64")]
             unsafe {
                 let s = crate::kernel::KERNEL.get();
                 if s.scheduler.current().is_none() {
@@ -278,7 +274,6 @@ pub fn handle_syscall(
             if dest_cptr != 0 {
                 handle_send(&send_args, false, false, /* donate */ true, true)?;
             }
-            #[cfg(target_arch = "x86_64")]
             unsafe {
                 let s = crate::kernel::KERNEL.get();
                 if s.scheduler.current().is_none() {
@@ -324,7 +319,6 @@ pub fn handle_syscall(
             // looking it up in the invoker's CSpace and returning a
             // type tag; null slots return 0 so libsel4allocman's
             // `vka_cspace_free` debug check sees them as free.
-            #[cfg(target_arch = "x86_64")]
             unsafe {
                 use crate::kernel::KERNEL;
                 if let Some(cur) = KERNEL.get().scheduler.current() {
@@ -334,7 +328,14 @@ pub fn handle_syscall(
                         Err(_) => 0,
                     };
                     let t = KERNEL.get().scheduler.slab.get_mut(cur);
-                    t.user_context.rdi = tag;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        t.user_context.rdi = tag;
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        t.user_context.x[0] = tag;
+                    }
                 }
             }
             Ok(())
@@ -356,6 +357,23 @@ pub fn handle_syscall(
                 if let Some(cur) = crate::kernel::current_thread() {
                     let s = crate::kernel::KERNEL.get();
                     s.scheduler.slab.get_mut(cur).cpu_context.fs_base = args.a0;
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!(
+                    "msr tpidr_el0, {base}",
+                    base = in(reg) args.a0,
+                    options(nostack),
+                );
+                if let Some(cur) = crate::kernel::current_thread() {
+                    crate::kernel::KERNEL
+                        .get()
+                        .scheduler
+                        .slab
+                        .get_mut(cur)
+                        .user_context
+                        .tpidr_el0 = args.a0;
                 }
             }
             Ok(())
@@ -492,7 +510,6 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             me.msg_regs[3] = args.a5;
             me.reply_to = None; // consume the reply slot
             if length > 4 && me.ipc_buffer_paddr != 0 {
-                #[cfg(target_arch = "x86_64")]
                 unsafe {
                     let buf = (crate::arch::phys_to_virt(me.ipc_buffer_paddr) as *const u64)
                         .wrapping_add(1);

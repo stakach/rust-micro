@@ -58,7 +58,6 @@ pub fn test_main() {
     crate::boot::spec::test_boot();
     crate::initrd::spec::test_initrd();
     crate::elf::spec::test_elf();
-    #[cfg(target_arch = "x86_64")]
     crate::rootserver::spec::test_rootserver();
     integration_tests::test_integration();
 
@@ -72,7 +71,5 @@ pub fn test_main() {
     crate::vcpu::spec::test_vcpu();
 
     arch::log("All specs passed!\n");
-    #[cfg(target_arch = "aarch64")]
-    arch::qemu_exit(0);
-    // x86 returns to `main` so its live rootserver boot path is exercised.
+    // Return to `main` so the live rootserver boot path is exercised.
 }

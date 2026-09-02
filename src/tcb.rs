@@ -105,11 +105,11 @@ pub const MAX_PRIORITY: u8 = (NUM_PRIORITIES - 1) as u8;
 /// to receiver's at handoff time so we don't need 120 words on
 /// every TCB. See `endpoint::transfer_long_msg`.
 ///
-/// 20 (was 8) so kernel-synthesized fault messages fit entirely in
-/// the staging area: x86_64 `seL4_UnknownSyscall_Msg` is 19 words
-/// (RAX..R15, FaultIP, SP, FLAGS, Syscall) and a faulter has no
-/// sender-side IPC buffer copy to long-copy from.
-pub const SCRATCH_MSG_LEN: usize = 20;
+/// 34 (was 20) so architecture fault replies fit entirely in the
+/// staging area. AArch64's `TIMEOUT_REPLY_MESSAGE` contains 34
+/// registers and must be available while the kernel restores a
+/// checkpointed passive server.
+pub const SCRATCH_MSG_LEN: usize = 34;
 
 /// Per-TCB kernel stack size. seL4 uses 4 KiB; we match that.
 pub const KERNEL_STACK_BYTES: usize = 4096;
@@ -166,6 +166,26 @@ impl FxArea {
         b[24] = 0x80; // MXCSR low  \ = 0x1F80
         b[25] = 0x1F; // MXCSR high /
         FxArea(b)
+    };
+}
+
+/// AArch64 SIMD/FP state stored beside each TCB. The exception frame uses the
+/// same FPCR/FPSR followed by Q0..Q31 layout, so switches are bounded copies.
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug)]
+pub struct Aarch64FpuState {
+    pub fpcr: u64,
+    pub fpsr: u64,
+    pub q: [u128; 32],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Aarch64FpuState {
+    pub const ZERO: Self = Self {
+        fpcr: 0,
+        fpsr: 0,
+        q: [0; 32],
     };
 }
 
@@ -384,6 +404,8 @@ pub struct Tcb {
     /// `fxrstor`d on switch-to. Initialised to a valid FINIT image.
     #[cfg(feature = "smp")]
     pub fpu_state: FxArea,
+    #[cfg(target_arch = "aarch64")]
+    pub aarch64_fpu_state: Aarch64FpuState,
 }
 
 impl Default for Tcb {
@@ -438,6 +460,8 @@ impl Default for Tcb {
             hosted_syscalls: false,
             #[cfg(feature = "smp")]
             fpu_state: FxArea::FINIT,
+            #[cfg(target_arch = "aarch64")]
+            aarch64_fpu_state: Aarch64FpuState::ZERO,
         }
     }
 }

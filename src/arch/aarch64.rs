@@ -1,4 +1,5 @@
 pub mod serial;
+pub mod syscall_entry;
 
 #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
 pub mod qemu;

@@ -349,10 +349,7 @@ pub fn mcs_tick(delta_ticks: Ticks) {
                 // instead of postponing — the handler decides what to
                 // do (e.g. reset the thread). Otherwise park on the
                 // release queue until the next refill matures.
-                #[cfg(target_arch = "x86_64")]
                 let delivered = crate::fault::deliver_timeout_fault(cur);
-                #[cfg(not(target_arch = "x86_64"))]
-                let delivered = false;
                 if !delivered {
                     s.scheduler
                         .block(cur, crate::tcb::ThreadStateType::BlockedOnBudget);
@@ -362,7 +359,6 @@ pub fn mcs_tick(delta_ticks: Ticks) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn dispatch_budget_check(tcb_id: TcbId) -> bool {
     unsafe {
         let s = crate::kernel::KERNEL.get();
@@ -577,9 +573,9 @@ pub fn current_time() -> Ticks {
         return crate::arch::x86_64::pit::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed)
             as Ticks;
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        0
+        crate::arch::aarch64::timer::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed) as Ticks
     }
 }
 
