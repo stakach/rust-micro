@@ -95,15 +95,14 @@ pub mod spec {
 
     pub fn test_initrd() {
         arch::log("Running initrd tests...\n");
-        #[cfg(target_arch = "x86_64")]
-        finds_rootserver_in_live_initrd();
-        #[cfg(target_arch = "x86_64")]
-        rejects_missing_file();
+        if crate::simpleboot::first_module().is_some() {
+            finds_rootserver_in_live_initrd();
+            rejects_missing_file();
+        }
         synthetic_archive_round_trip();
         arch::log("initrd tests completed\n");
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn finds_rootserver_in_live_initrd() {
         let initrd = slice();
@@ -122,7 +121,6 @@ pub mod spec {
         arch::log("  ✓ initrd carries boot/rootserver as an ELF\n");
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn rejects_missing_file() {
         let initrd = slice();

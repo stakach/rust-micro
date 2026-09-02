@@ -16,7 +16,19 @@ fn test_fdt_handoff() {
     assert_ne!(fdt, 0, "QEMU must pass a live FDT to the Image entry");
     let magic = unsafe { core::ptr::read_volatile(fdt as *const u32) };
     assert_eq!(u32::from_be(magic), 0xd00d_feed);
-    crate::arch::log("AArch64 FDT handoff validated\n");
+    let image = test_fdt_handoff as *const () as u64;
+    let mut memory_ranges = 0usize;
+    let mut image_is_in_ram = false;
+    crate::simpleboot::for_each_mmap_entry(|entry| {
+        memory_ranges += 1;
+        image_is_in_ram |=
+            image >= entry.base_addr && image < entry.base_addr.saturating_add(entry.length);
+    });
+    assert_ne!(memory_ranges, 0, "FDT must describe at least one RAM range");
+    assert!(image_is_in_ram, "FDT RAM must contain the kernel image");
+    let fdt_region = crate::simpleboot::mbi_region().expect("FDT region must be bounded");
+    assert!(fdt_region.1 > fdt_region.0);
+    crate::arch::log("AArch64 FDT memory handoff validated\n");
 }
 
 #[cfg(feature = "spec")]
