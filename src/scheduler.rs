@@ -596,15 +596,12 @@ impl Scheduler {
         if was_enqueued && self.slab.get(id).is_schedulable() {
             self.nodes[new_core].queues[dom].enqueue(&mut self.slab, id);
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            let my = crate::arch::get_cpu_id() as usize;
-            if was_current && old != my {
-                crate::smp::kick_cpu(old as u32);
-            }
-            if new_core != my && self.nodes[new_core].current.is_none() {
-                crate::smp::kick_cpu(new_core as u32);
-            }
+        let my = crate::arch::get_cpu_id() as usize;
+        if was_current && old != my {
+            crate::smp::kick_cpu(old as u32);
+        }
+        if new_core != my && self.nodes[new_core].current.is_none() {
+            crate::smp::kick_cpu(new_core as u32);
         }
     }
 
@@ -780,6 +777,7 @@ impl Scheduler {
         let cpu = self.slab.get(id).affinity as usize;
         let dom = self.slab.get(id).domain as usize;
         let prio = self.slab.get(id).priority;
+        let my_cpu = crate::arch::get_cpu_id() as usize;
         self.slab.get_mut(id).state = ThreadStateType::Running;
         // Passive threads (no SC) become runnable so they can pair in
         // IPC, but are NOT enqueued and cannot preempt — they run only
@@ -799,12 +797,8 @@ impl Scheduler {
             // sel4test deadlocks the moment a per-CPU timer
             // notification wakes a thread on AP1 while AP1 is
             // sleeping.
-            #[cfg(target_arch = "x86_64")]
-            {
-                let my_cpu = crate::arch::get_cpu_id() as usize;
-                if cpu != my_cpu && self.nodes[cpu].current.is_none() {
-                    crate::smp::kick_cpu(cpu as u32);
-                }
+            if cpu != my_cpu && self.nodes[cpu].current.is_none() {
+                crate::smp::kick_cpu(cpu as u32);
             }
         }
         // Phase 43 — possibleSwitchTo: if the woken thread is higher
@@ -822,12 +816,8 @@ impl Scheduler {
                     let cur_prio = self.slab.get(cur).priority;
                     if prio > cur_prio {
                         self.nodes[cpu].current = None;
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            let my_cpu = crate::arch::get_cpu_id() as usize;
-                            if cpu != my_cpu {
-                                crate::smp::kick_cpu(cpu as u32);
-                            }
+                        if cpu != my_cpu {
+                            crate::smp::kick_cpu(cpu as u32);
                         }
                     }
                 }
@@ -838,12 +828,9 @@ impl Scheduler {
     /// Force `cpu` to re-run its scheduling decision. Caller holds the BKL.
     pub fn request_reschedule_on(&mut self, cpu: usize) {
         self.nodes[cpu].current = None;
-        #[cfg(target_arch = "x86_64")]
-        {
-            let my_cpu = crate::arch::get_cpu_id() as usize;
-            if cpu != my_cpu {
-                crate::smp::kick_cpu(cpu as u32);
-            }
+        let my_cpu = crate::arch::get_cpu_id() as usize;
+        if cpu != my_cpu {
+            crate::smp::kick_cpu(cpu as u32);
         }
     }
 
@@ -859,15 +846,15 @@ impl Scheduler {
         let dom = self.slab.get(id).domain as usize;
         let prio = self.slab.get(id).priority;
         self.nodes[cpu].queues[dom].enqueue_front(&mut self.slab, id);
+        let my_cpu = crate::arch::get_cpu_id() as usize;
+        if cpu != my_cpu && self.nodes[cpu].current.is_none() {
+            crate::smp::kick_cpu(cpu as u32);
+        }
         if let Some(cur) = self.nodes[cpu].current {
             if cur != id && prio > self.slab.get(cur).priority {
                 self.nodes[cpu].current = None;
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let my_cpu = crate::arch::get_cpu_id() as usize;
-                    if cpu != my_cpu {
-                        crate::smp::kick_cpu(cpu as u32);
-                    }
+                if cpu != my_cpu {
+                    crate::smp::kick_cpu(cpu as u32);
                 }
             }
         }

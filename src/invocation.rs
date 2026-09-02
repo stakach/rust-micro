@@ -225,7 +225,11 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         Cap::IrqHandler { irq } => decode_irq_handler(irq, label, args, invoker),
         Cap::Frame { .. } => decode_frame(target, label, args, invoker),
         Cap::PageTable { .. } => decode_page_table(target, label, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        Cap::PML4 { .. } => decode_aarch64_vspace(target, label, args),
+        #[cfg(target_arch = "x86_64")]
         Cap::PageDirectory { .. } => decode_page_directory(target, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::Pdpt { .. } => decode_pdpt(target, label, args, invoker),
         Cap::AsidControl => decode_asid_control(label, args, invoker),
         Cap::AsidPool { .. } => decode_asid_pool(target, label, args, invoker),
@@ -233,14 +237,18 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         Cap::SchedControl { core } => decode_sched_control(core, label, args, invoker),
         Cap::Reply { .. } => decode_reply(target, args, invoker),
         Cap::Domain => decode_domain(label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::IOPort {
             first_port,
             last_port,
         } => decode_io_port(first_port, last_port, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::IOPortControl => decode_io_port_control(label, args, invoker),
         // Phase 44 — VT-d. IoPageTable caps take Map/Unmap; IoSpace
         // caps have no invocations of their own.
+        #[cfg(target_arch = "x86_64")]
         Cap::IoPageTable { .. } => decode_x86_iopt(target, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::IoSpace { .. } => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
@@ -268,14 +276,205 @@ fn decode_frame(
     invoker: TcbId,
 ) -> KResult<()> {
     match label {
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageMap => decode_frame_map(target, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageUnmap => decode_frame_unmap(target, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageMapIO => decode_x86_iomap(target, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageGetAddress => decode_frame_get_address(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageMap => decode_frame_map(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageUnmap => decode_frame_unmap(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageGetAddress => decode_frame_get_address(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageClean_Data
+        | InvocationLabel::ARMPageInvalidate_Data
+        | InvocationLabel::ARMPageCleanInvalidate_Data
+        | InvocationLabel::ARMPageUnify_Instruction => {
+            decode_aarch64_frame_flush(target, label, args)
+        }
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn aarch64_cache_operation(
+    label: InvocationLabel,
+) -> Option<crate::arch::aarch64::vspace::CacheOperation> {
+    use crate::arch::aarch64::vspace::CacheOperation;
+    match label {
+        InvocationLabel::ARMPageClean_Data | InvocationLabel::ARMVSpaceClean_Data => {
+            Some(CacheOperation::CleanData)
+        }
+        InvocationLabel::ARMPageInvalidate_Data | InvocationLabel::ARMVSpaceInvalidate_Data => {
+            Some(CacheOperation::InvalidateData)
+        }
+        InvocationLabel::ARMPageCleanInvalidate_Data
+        | InvocationLabel::ARMVSpaceCleanInvalidate_Data => {
+            Some(CacheOperation::CleanInvalidateData)
+        }
+        InvocationLabel::ARMPageUnify_Instruction | InvocationLabel::ARMVSpaceUnify_Instruction => {
+            Some(CacheOperation::UnifyInstruction)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decode_aarch64_frame_flush(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+) -> KResult<()> {
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    if info.length() < 2 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_TruncatedMessage,
+        )));
+    }
+    let operation = aarch64_cache_operation(label).unwrap();
+    let (paddr, size_bits, mapped, asid) = match target {
+        Cap::Frame {
+            ptr,
+            size,
+            mapped,
+            asid,
+            ..
+        } => {
+            let size_bits = match size {
+                crate::cap::FrameSize::Small => 12,
+                crate::cap::FrameSize::Large => 21,
+                crate::cap::FrameSize::Huge => 30,
+            };
+            (ptr.addr(), size_bits, mapped, asid)
+        }
+        _ => unreachable!(),
+    };
+    let Some(vaddr) = mapped else {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    };
+    if asid == 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+
+    let start = args.a2;
+    let end = args.a3;
+    let page_size = 1u64 << size_bits;
+    if end <= start || start >= page_size || end > page_size {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
+        )));
+    }
+    let root = pml4_paddr_for_asid(asid);
+    if root == 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_FailedLookup,
+        )));
+    }
+    let mapping = unsafe { crate::arch::aarch64::vspace::lookup_frame(root, vaddr) };
+    let Some(mapping) = mapping else {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    };
+    if mapping.size_bits != size_bits || mapping.paddr != paddr {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+    if operation == crate::arch::aarch64::vspace::CacheOperation::InvalidateData
+        && !mapping.writable
+    {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+
+    unsafe {
+        crate::arch::aarch64::vspace::cache_maintain_vspace(
+            root,
+            asid,
+            vaddr + start,
+            vaddr + end,
+            operation,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decode_aarch64_vspace(target: Cap, label: InvocationLabel, args: &SyscallArgs) -> KResult<()> {
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    if info.length() < 2 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_TruncatedMessage,
+        )));
+    }
+    let Some(operation) = aarch64_cache_operation(label) else {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    };
+    let (root, asid) = match target {
+        Cap::PML4 {
+            ptr,
+            mapped: true,
+            asid,
+        } if asid != 0 => (ptr.addr(), asid),
+        _ => {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )))
+        }
+    };
+    if pml4_paddr_for_asid(asid) != root {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+
+    let start = args.a2;
+    let end = args.a3;
+    if end <= start {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
+        )));
+    }
+    if end > (1u64 << 47) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+    let Some(mapping) = (unsafe { crate::arch::aarch64::vspace::lookup_frame(root, start) }) else {
+        // seL4 deliberately treats maintenance on an unmapped range as a no-op.
+        return Ok(());
+    };
+    if (start >> mapping.size_bits) != ((end - 1) >> mapping.size_bits) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_RangeError,
+        )));
+    }
+    if operation == crate::arch::aarch64::vspace::CacheOperation::InvalidateData
+        && !mapping.writable
+    {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+    unsafe {
+        crate::arch::aarch64::vspace::cache_maintain_vspace(root, asid, start, end, operation);
+    }
+    Ok(())
 }
 
 unsafe fn update_invoked_frame_slot(
@@ -323,6 +522,7 @@ unsafe fn update_invoked_frame_slot(
 /// a4 = vspace cap_ptr (0 = current CR3 — backward-compatible
 /// default; non-zero = invoker-owned PML4 cap to map the frame
 /// into, used by the Phase 33d multi-vspace path).
+#[cfg(target_arch = "x86_64")]
 fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     use crate::arch::x86_64::usermode;
     let (frame_ptr, paddr, size, _device, current_mapped) = match target {
@@ -527,9 +727,131 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     Ok(())
 }
 
+#[cfg(target_arch = "aarch64")]
+fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    let (frame_ptr, size, is_device, mapped, frame_asid) = match target {
+        Cap::Frame {
+            ptr,
+            size,
+            is_device,
+            mapped,
+            asid,
+            ..
+        } => (ptr, size, is_device, mapped, asid),
+        _ => unreachable!(),
+    };
+    if let Some(previous) = mapped {
+        if previous != args.a2 {
+            Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidArgument,
+            )))?;
+        }
+    }
+    let size_bits = match size {
+        crate::cap::FrameSize::Small => 12,
+        crate::cap::FrameSize::Large => 21,
+        crate::cap::FrameSize::Huge => 30,
+    };
+    if args.a2 & ((1u64 << size_bits) - 1) != 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_AlignmentError,
+        )));
+    }
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let (root, asid) = unsafe {
+        let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+        if info.length() < 3 || info.extra_caps() == 0 || tcb.pending_extra_caps_count == 0 {
+            tcb.pending_extra_caps_count = 0;
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_TruncatedMessage,
+            )));
+        }
+        let cap = tcb.pending_extra_caps[0];
+        tcb.pending_extra_caps_count = 0;
+        match cap {
+            Cap::PML4 {
+                ptr,
+                asid,
+                mapped: true,
+            } if asid != 0 && (frame_asid == 0 || frame_asid == asid) => (ptr.addr(), asid),
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        }
+    };
+    let rights = crate::cap::FrameRights::from_word(args.a3);
+    let writable = matches!(rights, crate::cap::FrameRights::ReadWrite);
+    let attributes = args.a4;
+    let result = unsafe {
+        crate::arch::aarch64::vspace::map_frame(
+            root,
+            args.a2,
+            frame_ptr.addr(),
+            size_bits,
+            writable,
+            attributes & 0b100 == 0,
+            attributes & 1 != 0,
+        )
+    };
+    if let Err(bits_left) = result {
+        if bits_left == 0 && INV_TRACE {
+            let existing =
+                unsafe { crate::arch::aarch64::vspace::frame_paddr(root, args.a2, size_bits) }
+                    .unwrap_or(0);
+            crate::arch::log("[arm map busy va=0x");
+            log_hex_u64(args.a2);
+            crate::arch::log(" root=0x");
+            log_hex_u64(root);
+            crate::arch::log(" want=0x");
+            log_hex_u64(frame_ptr.addr());
+            crate::arch::log(" have=0x");
+            log_hex_u64(existing);
+            crate::arch::log("]\n");
+        }
+        if INV_TRACE {
+            crate::arch::log("[arm.frame va=0x");
+            log_hex_u64(args.a2);
+            crate::arch::log(" missing=");
+            log_dec(bits_left as u64);
+            crate::arch::log("]\n");
+        }
+        if bits_left == 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
+        unsafe {
+            let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+            tcb.msg_regs[2] = bits_left as u64;
+            tcb.ipc_length = 3;
+        }
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_FailedLookup,
+        )));
+    }
+    unsafe {
+        update_invoked_frame_slot(
+            args,
+            invoker,
+            frame_ptr.addr(),
+            Cap::Frame {
+                ptr: frame_ptr,
+                size,
+                rights,
+                mapped: Some(args.a2),
+                asid,
+                is_device,
+                map_type: crate::cap::FrameMapType::VSpace,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Phase 44 — indexed ASID-pool lookup. Returns 0 if the ASID is
 /// unassigned; callers treat that as an idempotent unmap/delete.
-#[cfg(target_arch = "x86_64")]
 fn pml4_paddr_for_asid(asid: u16) -> u64 {
     crate::asid::pml4_paddr(asid)
 }
@@ -596,8 +918,30 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = mapped_vaddr;
-        let _ = size;
+        if let Some(vaddr) = mapped_vaddr {
+            let root = pml4_paddr_for_asid(asid);
+            if root != 0 {
+                let size_bits = match size {
+                    crate::cap::FrameSize::Small => 12,
+                    crate::cap::FrameSize::Large => 21,
+                    crate::cap::FrameSize::Huge => 30,
+                };
+                let removed = unsafe {
+                    crate::arch::aarch64::vspace::unmap_frame(root, vaddr, paddr, size_bits)
+                };
+                if !removed && INV_TRACE {
+                    crate::arch::log("[arm unmap missed va=0x");
+                    log_hex_u64(vaddr);
+                    crate::arch::log(" root=0x");
+                    log_hex_u64(root);
+                    crate::arch::log(" frame=0x");
+                    log_hex_u64(paddr);
+                    crate::arch::log("]\n");
+                }
+            } else if INV_TRACE {
+                crate::arch::log("[arm unmap missing ASID root]\n");
+            }
+        }
     }
 
     // Clear the mapping state in the invoked cap. Falling back to a paddr scan here would have the
@@ -1035,14 +1379,21 @@ fn decode_page_table(
     invoker: TcbId,
 ) -> KResult<()> {
     match label {
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageTableMap => decode_pt_map(target, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageTableUnmap => decode_pt_unmap(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageTableMap => decode_pt_map(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageTableUnmap => decode_pt_unmap(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn decode_page_directory(
     target: Cap,
     label: InvocationLabel,
@@ -1058,6 +1409,7 @@ fn decode_page_directory(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn decode_pdpt(
     target: Cap,
     label: InvocationLabel,
@@ -1080,6 +1432,7 @@ fn decode_pdpt(
 /// ABI: a2 = vaddr, a3 = vspace cap_ptr (0 = current CR3 —
 /// backward-compatible default; non-zero = invoker-owned PML4 cap
 /// added by Phase 33d for multi-vspace setup).
+#[cfg(target_arch = "x86_64")]
 fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32) -> KResult<()> {
     use crate::arch::x86_64::usermode;
     let (paddr, current_mapped) = paging_struct_state(&target);
@@ -1212,6 +1565,53 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
     Ok(())
 }
 
+#[cfg(target_arch = "aarch64")]
+fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, _level: u32) -> KResult<()> {
+    let (table_paddr, mapped) = paging_struct_state(&target);
+    if mapped.is_some() {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let (root, asid) = unsafe {
+        let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+        if info.length() < 2 || info.extra_caps() == 0 || tcb.pending_extra_caps_count == 0 {
+            tcb.pending_extra_caps_count = 0;
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_TruncatedMessage,
+            )));
+        }
+        let cap = tcb.pending_extra_caps[0];
+        tcb.pending_extra_caps_count = 0;
+        match cap {
+            Cap::PML4 {
+                ptr,
+                asid,
+                mapped: true,
+            } if asid != 0 => (ptr.addr(), asid),
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        }
+    };
+    let map_result =
+        unsafe { crate::arch::aarch64::vspace::map_page_table(root, args.a2, table_paddr) };
+    if INV_TRACE {
+        crate::arch::log("[arm.pt va=0x");
+        log_hex_u64(args.a2);
+        crate::arch::log(" result=");
+        log_dec(map_result.map(|bits| bits as u64).unwrap_or(0));
+        crate::arch::log("]\n");
+    }
+    let bits_left = map_result
+        .map_err(|_| KException::SyscallError(SyscallError::new(seL4_Error::seL4_DeleteFirst)))?;
+    let mapped_vaddr = args.a2 & !((1u64 << bits_left) - 1);
+    update_invoked_paging_slot(args, invoker, &target, Some(mapped_vaddr), asid)
+}
+
 fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     unsafe {
         if !paging_cap_is_final(KERNEL.get(), &target) {
@@ -1224,10 +1624,8 @@ fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResu
         // seL4's explicit paging-structure Unmap clears the table after a best-effort detach.
         // Deletion finalization deliberately does not clear it: the source Untyped owns reuse.
         detach_paging_structure(&target);
-        #[cfg(target_arch = "x86_64")]
         unsafe {
-            let table =
-                crate::arch::x86_64::paging::phys_to_lin(paging_struct_state(&target).0) as *mut u8;
+            let table = crate::arch::phys_to_virt(paging_struct_state(&target).0) as *mut u8;
             core::ptr::write_bytes(table, 0, 4096);
         }
     }
@@ -1334,6 +1732,7 @@ fn paging_structure_mapping(cap: &Cap) -> Option<(u64, u64, u16, u32)> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn detach_paging_structure(cap: &Cap) -> bool {
     let Some((paddr, vaddr, asid, level)) = paging_structure_mapping(cap) else {
         return false;
@@ -1351,6 +1750,7 @@ fn detach_paging_structure(cap: &Cap) -> bool {
     detached
 }
 
+#[cfg(target_arch = "x86_64")]
 fn detach_frame_mapping(cap: &Cap) {
     if let Cap::Frame {
         ptr,
@@ -1394,6 +1794,40 @@ fn detach_frame_mapping(cap: &Cap) {
                         crate::smp::shootdown_tlb(vaddr);
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn detach_paging_structure(cap: &Cap) -> bool {
+    let Some((paddr, vaddr, asid, _)) = paging_structure_mapping(cap) else {
+        return false;
+    };
+    let root = pml4_paddr_for_asid(asid);
+    root != 0 && unsafe { crate::arch::aarch64::vspace::unmap_page_table(root, vaddr, paddr) }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn detach_frame_mapping(cap: &Cap) {
+    if let Cap::Frame {
+        ptr,
+        size,
+        mapped: Some(vaddr),
+        asid,
+        map_type: crate::cap::FrameMapType::VSpace,
+        ..
+    } = *cap
+    {
+        let root = pml4_paddr_for_asid(asid);
+        let size_bits = match size {
+            crate::cap::FrameSize::Small => 12,
+            crate::cap::FrameSize::Large => 21,
+            crate::cap::FrameSize::Huge => 30,
+        };
+        if root != 0 {
+            unsafe {
+                crate::arch::aarch64::vspace::unmap_frame(root, vaddr, ptr.addr(), size_bits);
             }
         }
     }
@@ -1660,19 +2094,20 @@ fn decode_pdpt_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult
 // of CR3) is a follow-up.
 // ---------------------------------------------------------------------------
 
-/// x86_64 has `seL4_NumASIDPoolsBits = 3` → 8 ASID pools total.
-/// Pool index 0 is the rootserver's pre-allocated
-/// `InitThreadASIDPool` (asid_base 0); MakePool carves indices
-/// 1..8, so `asid_base = index * 512`. Bounded + recyclable pool
-/// indices keep the per-pool bookkeeping arrays small and stable
-/// across create/free cycles (vs an ever-growing base counter).
+/// Pool index 0 is the rootserver's pre-allocated `InitThreadASIDPool`.
+/// The architectural pool count is 8 on x86_64 and 128 on AArch64.
 const MAX_ASID_POOLS: usize = crate::asid::MAX_ASID_POOLS;
 
 /// Bitmap of in-use pool indices (bit i = index i). Bit 0 (the init
-/// pool) is permanently set. MakePool allocates the lowest clear bit
-/// in 1..8 (→ DeleteFirst when full, VSPACE0004); freeing an AsidPool
-/// cap clears its bit (so the index recycles).
-static ASID_POOL_INUSE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
+/// pool) is permanently set. Freeing an AsidPool cap clears its bit.
+const ASID_POOL_BITMAP_WORDS: usize = MAX_ASID_POOLS.div_ceil(64);
+#[allow(clippy::declare_interior_mutable_const)]
+static ASID_POOL_INUSE: [core::sync::atomic::AtomicU64; ASID_POOL_BITMAP_WORDS] = {
+    const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let mut words = [Z; ASID_POOL_BITMAP_WORDS];
+    words[0] = core::sync::atomic::AtomicU64::new(1);
+    words
+};
 
 /// Per-pool count of ASIDs handed out, indexed by pool index
 /// (`asid_base / 512`, always 0..8). Assign returns `seL4_DeleteFirst`
@@ -1690,17 +2125,23 @@ static ASID_POOL_USED: [core::sync::atomic::AtomicU16; MAX_ASID_POOLS] = {
 /// `None` if all are in use. Resets that pool's used-count.
 fn alloc_asid_pool_index() -> Option<usize> {
     use core::sync::atomic::Ordering;
-    let mut bits = ASID_POOL_INUSE.load(Ordering::Relaxed);
     for idx in 1..MAX_ASID_POOLS {
-        let mask = 1u16 << idx;
+        let word = idx / 64;
+        let mask = 1u64 << (idx % 64);
+        let bits = ASID_POOL_INUSE[word].load(Ordering::Relaxed);
         if bits & mask == 0 {
-            ASID_POOL_INUSE.store(bits | mask, Ordering::Relaxed);
+            ASID_POOL_INUSE[word].store(bits | mask, Ordering::Relaxed);
             ASID_POOL_USED[idx].store(0, Ordering::Relaxed);
             return Some(idx);
         }
-        let _ = &mut bits;
     }
     None
+}
+
+fn asid_pools_full() -> bool {
+    use core::sync::atomic::Ordering;
+    (1..MAX_ASID_POOLS)
+        .all(|idx| ASID_POOL_INUSE[idx / 64].load(Ordering::Relaxed) & (1u64 << (idx % 64)) != 0)
 }
 
 /// Release a pool index (called when its AsidPool cap is deleted).
@@ -1709,8 +2150,10 @@ fn free_asid_pool_index(idx: usize) {
     if idx == 0 || idx >= MAX_ASID_POOLS {
         return;
     }
-    let bits = ASID_POOL_INUSE.load(Ordering::Relaxed);
-    ASID_POOL_INUSE.store(bits & !(1u16 << idx), Ordering::Relaxed);
+    let word = idx / 64;
+    let mask = 1u64 << (idx % 64);
+    let bits = ASID_POOL_INUSE[word].load(Ordering::Relaxed);
+    ASID_POOL_INUSE[word].store(bits & !mask, Ordering::Relaxed);
     ASID_POOL_USED[idx].store(0, Ordering::Relaxed);
     crate::asid::clear_pool((idx * crate::asid::ASIDS_PER_POOL) as u16);
 }
@@ -1720,7 +2163,9 @@ fn free_asid_pool_index(idx: usize) {
 /// runs don't leak into the real test suite's pool accounting.
 pub fn reset_asid_state() {
     use core::sync::atomic::Ordering;
-    ASID_POOL_INUSE.store(1, Ordering::Relaxed);
+    for (index, word) in ASID_POOL_INUSE.iter().enumerate() {
+        word.store(if index == 0 { 1 } else { 0 }, Ordering::Relaxed);
+    }
     for u in ASID_POOL_USED.iter() {
         u.store(0, Ordering::Relaxed);
     }
@@ -1729,168 +2174,163 @@ pub fn reset_asid_state() {
 }
 
 fn decode_asid_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    use core::sync::atomic::Ordering;
     match label {
-        InvocationLabel::X86ASIDControlMakePool => {
-            // Two ABI shapes coexist:
-            //   * Upstream (libsel4 `seL4_X86_ASIDControl_MakePool`):
-            //       extraCaps[0] = Untyped (pool storage)
-            //       extraCaps[1] = dest CNode (root)
-            //       mr0 (a2)     = dest slot index
-            //       mr1 (a3)     = depth
-            //   * Legacy (kernel spec): a2 = Untyped cap_ptr,
-            //       a3 = dest CNode cptr (ignored → invoker CSpace),
-            //       a4 = dest slot index.
-            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-            let upstream = info.extra_caps() >= 2;
-
-            unsafe {
-                let s = KERNEL.get();
-                let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-
-                let (untyped, dest_cnode_cap, dest_index, depth) = if upstream {
-                    let inv = s.scheduler.slab.get(invoker);
-                    if inv.pending_extra_caps_count < 2 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                    let untyped = inv.pending_extra_caps[0];
-                    let root = inv.pending_extra_caps[1];
-                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
-                    (untyped, root, args.a2 as usize, args.a3 as u32)
-                } else {
-                    let untyped = crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?;
-                    (untyped, invoker_cspace, args.a4 as usize, 0u32)
-                };
-
-                // Pools are limited (MAX_ASID_POOLS); the 8th MakePool
-                // must fail (VSPACE0004). Check up front so we don't
-                // consume the untyped on a doomed call; the index is
-                // actually claimed below once all validation passes.
-                if (ASID_POOL_INUSE.load(Ordering::Relaxed) & ((1u16 << MAX_ASID_POOLS) - 1))
-                    == ((1u16 << MAX_ASID_POOLS) - 1)
-                {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst,
-                    )));
-                }
-
-                let mut state = match crate::untyped::UntypedState::from_cap(&untyped) {
-                    Some(s) => s,
-                    None => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-
-                // Resolve the dest slot within the dest CNode cap at
-                // `depth` (upstream) or directly (legacy depth==0).
-                let cnode_ptr = match dest_cnode_cap {
-                    Cap::CNode { ptr, .. } => ptr,
-                    _ => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-                let (cnode_idx, dest_offset) = if upstream && depth != 0 {
-                    let res = crate::cspace::resolve_address_bits(
-                        s,
-                        &dest_cnode_cap,
-                        dest_index as u64,
-                        depth,
-                    )?;
-                    if res.bits_remaining != 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_FailedLookup,
-                        )));
-                    }
-                    (KernelState::cnode_index(res.slot_ptr), res.slot_index)
-                } else {
-                    (KernelState::cnode_index(cnode_ptr), dest_index)
-                };
-
-                let slots = match s.cnode_slots_at_mut(cnode_idx) {
-                    Some(s) => s,
-                    None => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-                if dest_offset >= slots.len() || !slots[dest_offset].cap().is_null() {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst,
-                    )));
-                }
-
-                // Carve 4 KiB out of the Untyped for the pool storage.
-                // Manual carve (mirrors what `retype()` does for one
-                // child of size 2^12 = 4 KiB).
-                let aligned = (state.free_index_bytes + 0xFFF) & !0xFFF;
-                let block_total = 1u64 << state.block_bits;
-                if aligned + 0x1000 > block_total {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_NotEnoughMemory,
-                    )));
-                }
-                let pool_paddr = state.base + aligned;
-                state.free_index_bytes = aligned + 0x1000;
-                // Claim a bounded pool index (validation has passed).
-                // `alloc_asid_pool_index` also zeroes this pool's
-                // per-pool ASID-used counter so Assign can enforce the
-                // 512-ASID limit (VSPACE0005). asid_base = index * 512.
-                let pool_index = match alloc_asid_pool_index() {
-                    Some(i) => i,
-                    None => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_DeleteFirst,
-                        )))
-                    }
-                };
-                let asid_base = (pool_index as u16) * 512;
-
-                let pool_cap = Cap::AsidPool {
-                    ptr: PPtr::<crate::cap::AsidPoolStorage>::new(pool_paddr).ok_or_else(|| {
-                        KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidArgument,
-                        ))
-                    })?,
-                    asid_base,
-                };
-                slots[dest_offset].set_cap(&pool_cap);
-                // Locate the source Untyped's slot in this CNode (the
-                // upstream extraCap resolves into the rootserver's flat
-                // cspace, same CNode as the dest). Used for the MDB
-                // parent link and to commit the bumped free_index.
-                let mut untyped_slot = None;
-                for (i, slot) in slots.iter().enumerate() {
-                    if let Cap::Untyped { ptr, .. } = slot.cap() {
-                        if ptr.addr() == state.base {
-                            untyped_slot = Some(i);
-                            break;
-                        }
-                    }
-                }
-                if let Some(usl) = untyped_slot {
-                    // Phase 30 — record the new pool's MDB parent as
-                    // the source Untyped's slot.
-                    let parent_id = crate::cte::MdbId::pack(cnode_idx as u32, usl as u32);
-                    slots[dest_offset].set_parent(Some(parent_id));
-                    child_count_inc(parent_id, 1);
-                    // Commit the bumped Untyped state back into its slot.
-                    slots[usl].set_cap(&state.to_cap());
-                }
-                let _ = pool_index; // index claimed above
-            }
-            Ok(())
-        }
+        #[cfg(target_arch = "x86_64")]
+        InvocationLabel::X86ASIDControlMakePool => decode_asid_control_make_pool(args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMASIDControlMakePool => decode_asid_control_make_pool(args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
+}
+
+fn decode_asid_control_make_pool(args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    // Two ABI shapes coexist:
+    //   * Upstream (libsel4 `seL4_X86_ASIDControl_MakePool`):
+    //       extraCaps[0] = Untyped (pool storage)
+    //       extraCaps[1] = dest CNode (root)
+    //       mr0 (a2)     = dest slot index
+    //       mr1 (a3)     = depth
+    //   * Legacy (kernel spec): a2 = Untyped cap_ptr,
+    //       a3 = dest CNode cptr (ignored → invoker CSpace),
+    //       a4 = dest slot index.
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() >= 2;
+
+    unsafe {
+        let s = KERNEL.get();
+        let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+
+        let (untyped, dest_cnode_cap, dest_index, depth) = if upstream {
+            let inv = s.scheduler.slab.get(invoker);
+            if inv.pending_extra_caps_count < 2 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )));
+            }
+            let untyped = inv.pending_extra_caps[0];
+            let root = inv.pending_extra_caps[1];
+            s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+            (untyped, root, args.a2 as usize, args.a3 as u32)
+        } else {
+            let untyped = crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?;
+            (untyped, invoker_cspace, args.a4 as usize, 0u32)
+        };
+
+        // Pools are architecture-limited. Check up front so we don't
+        // consume the untyped on a doomed call; the index is
+        // actually claimed below once all validation passes.
+        if asid_pools_full() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
+
+        let mut state = match crate::untyped::UntypedState::from_cap(&untyped) {
+            Some(s) => s,
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        };
+
+        // Resolve the dest slot within the dest CNode cap at
+        // `depth` (upstream) or directly (legacy depth==0).
+        let cnode_ptr = match dest_cnode_cap {
+            Cap::CNode { ptr, .. } => ptr,
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        };
+        let (cnode_idx, dest_offset) = if upstream && depth != 0 {
+            let res =
+                crate::cspace::resolve_address_bits(s, &dest_cnode_cap, dest_index as u64, depth)?;
+            if res.bits_remaining != 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_FailedLookup,
+                )));
+            }
+            (KernelState::cnode_index(res.slot_ptr), res.slot_index)
+        } else {
+            (KernelState::cnode_index(cnode_ptr), dest_index)
+        };
+
+        let slots = match s.cnode_slots_at_mut(cnode_idx) {
+            Some(s) => s,
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        };
+        if dest_offset >= slots.len() || !slots[dest_offset].cap().is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
+
+        // Carve 4 KiB out of the Untyped for the pool storage.
+        // Manual carve (mirrors what `retype()` does for one
+        // child of size 2^12 = 4 KiB).
+        let aligned = (state.free_index_bytes + 0xFFF) & !0xFFF;
+        let block_total = 1u64 << state.block_bits;
+        if aligned + 0x1000 > block_total {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_NotEnoughMemory,
+            )));
+        }
+        let pool_paddr = state.base + aligned;
+        state.free_index_bytes = aligned + 0x1000;
+        // Claim a bounded pool index (validation has passed).
+        // `alloc_asid_pool_index` also zeroes this pool's
+        // per-pool ASID-used counter so Assign can enforce the
+        // 512-ASID limit (VSPACE0005). asid_base = index * 512.
+        let pool_index = match alloc_asid_pool_index() {
+            Some(i) => i,
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_DeleteFirst,
+                )))
+            }
+        };
+        let asid_base = (pool_index as u16) * 512;
+
+        let pool_cap = Cap::AsidPool {
+            ptr: PPtr::<crate::cap::AsidPoolStorage>::new(pool_paddr).ok_or_else(|| {
+                KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidArgument))
+            })?,
+            asid_base,
+        };
+        slots[dest_offset].set_cap(&pool_cap);
+        // Locate the source Untyped's slot in this CNode (the
+        // upstream extraCap resolves into the rootserver's flat
+        // cspace, same CNode as the dest). Used for the MDB
+        // parent link and to commit the bumped free_index.
+        let mut untyped_slot = None;
+        for (i, slot) in slots.iter().enumerate() {
+            if let Cap::Untyped { ptr, .. } = slot.cap() {
+                if ptr.addr() == state.base {
+                    untyped_slot = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(usl) = untyped_slot {
+            // Phase 30 — record the new pool's MDB parent as
+            // the source Untyped's slot.
+            let parent_id = crate::cte::MdbId::pack(cnode_idx as u32, usl as u32);
+            slots[dest_offset].set_parent(Some(parent_id));
+            child_count_inc(parent_id, 1);
+            // Commit the bumped Untyped state back into its slot.
+            slots[usl].set_cap(&state.to_cap());
+        }
+        let _ = pool_index; // index claimed above
+    }
+    Ok(())
 }
 
 fn decode_asid_pool(
@@ -1899,140 +2339,153 @@ fn decode_asid_pool(
     args: &SyscallArgs,
     invoker: TcbId,
 ) -> KResult<()> {
-    use core::sync::atomic::Ordering;
     let (asid_base, pool_paddr) = match target {
         Cap::AsidPool { asid_base, ptr } => (asid_base, ptr.addr()),
         _ => unreachable!(),
     };
     match label {
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86ASIDPoolAssign => {
-            // Two ABI shapes coexist:
-            //   * Upstream (libsel4 stub `seL4_X86_ASIDPool_Assign`):
-            //     vspace cap passed as `extraCaps[0]`. Tag carries
-            //     `extra_caps=1`. The cptr the sender used appears
-            //     in the IPC buffer at `caps_or_badges_offset[0]`.
-            //   * Legacy (internal specs): vspace cap_ptr in `a2`.
-            //     No extra caps.
-            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-            let upstream = info.extra_caps() > 0;
-            unsafe {
-                let s = KERNEL.get();
-                let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let (slot_cnode_idx, slot_idx, vspace_cap) = if upstream {
-                    let inv_tcb = s.scheduler.slab.get(invoker);
-                    if inv_tcb.pending_extra_caps_count == 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                    let cap = inv_tcb.pending_extra_caps[0];
-                    let buf_paddr = inv_tcb.ipc_buffer_paddr;
-                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
-                    if buf_paddr == 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                    let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr) as *const u64;
-                    let cptr =
-                        core::ptr::read_volatile(buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET));
-                    let res = crate::cspace::resolve_address_bits(s, &invoker_cspace, cptr, 64)?;
-                    if res.bits_remaining != 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_FailedLookup,
-                        )));
-                    }
-                    (KernelState::cnode_index(res.slot_ptr), res.slot_index, cap)
-                } else {
-                    let cnode_ptr = match invoker_cspace {
-                        Cap::CNode { ptr, .. } => ptr,
-                        _ => {
-                            return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_InvalidCapability,
-                            )))
-                        }
-                    };
-                    let cnode_idx = KernelState::cnode_index(cnode_ptr);
-                    let slot_idx = args.a2 as usize;
-                    let slots = match s.cnode_slots_at(cnode_idx) {
-                        Some(s) => s,
-                        None => {
-                            return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_InvalidCapability,
-                            )))
-                        }
-                    };
-                    if slot_idx >= slots.len() {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_RangeError,
-                        )));
-                    }
-                    (cnode_idx, slot_idx, slots[slot_idx].cap())
-                };
-                let ptr = match vspace_cap {
-                    Cap::PML4 { ptr, asid: 0, .. } => ptr,
-                    // Already assigned to an ASID — upstream
-                    // decodeX86ASIDPoolAssign returns InvalidCapability
-                    // (VSPACE0002 assigns the already-mapped
-                    // page_directory and expects exactly that).
-                    Cap::PML4 { .. } => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                    _ => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-                // Allocate the next ASID in this pool.
-                //   * MakePool'd pools (asid_base != 0): use a per-pool
-                //     used-counter in the storage page so the pool
-                //     enforces its 512-ASID limit (VSPACE0005 assigns
-                //     512 then expects DeleteFirst). These pools don't
-                //     unassign mid-test, so a counter (not a bitmap)
-                //     is sufficient.
-                //   * Init pool (asid_base == 0): the rootserver pool
-                //     that every inter-AS test process draws from —
-                //     keep the existing global wrapping offset (never
-                //     exhausts), so its many assign/teardown cycles
-                //     across the suite stay unaffected.
-                let _ = pool_paddr;
-                let assigned = if asid_base != 0 {
-                    let idx = (asid_base / 512) as usize;
-                    let used = ASID_POOL_USED
-                        .get(idx)
-                        .map(|u| u.load(Ordering::Relaxed))
-                        .unwrap_or(0);
-                    if used >= 512 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_DeleteFirst,
-                        )));
-                    }
-                    if let Some(u) = ASID_POOL_USED.get(idx) {
-                        u.store(used + 1, Ordering::Relaxed);
-                    }
-                    asid_base.saturating_add(used)
-                } else {
-                    asid_base.saturating_add(
-                        (NEXT_ASID_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-                            & 0x1FF) as u16,
-                    )
-                };
-                if let Some(slot) = s.cnode_slot_mut(slot_cnode_idx, slot_idx) {
-                    slot.set_cap(&Cap::PML4 {
-                        ptr,
-                        mapped: true,
-                        asid: assigned,
-                    });
-                }
-                Ok(())
-            }
+            decode_asid_pool_assign(asid_base, pool_paddr, args, invoker)
+        }
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMASIDPoolAssign => {
+            decode_asid_pool_assign(asid_base, pool_paddr, args, invoker)
         }
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
+    }
+}
+
+fn decode_asid_pool_assign(
+    asid_base: u16,
+    pool_paddr: u64,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    use core::sync::atomic::Ordering;
+    // Two ABI shapes coexist:
+    //   * Upstream (libsel4 stub `seL4_X86_ASIDPool_Assign`):
+    //     vspace cap passed as `extraCaps[0]`. Tag carries
+    //     `extra_caps=1`. The cptr the sender used appears
+    //     in the IPC buffer at `caps_or_badges_offset[0]`.
+    //   * Legacy (internal specs): vspace cap_ptr in `a2`.
+    //     No extra caps.
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() > 0;
+    unsafe {
+        let s = KERNEL.get();
+        let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+        let (slot_cnode_idx, slot_idx, vspace_cap) = if upstream {
+            let inv_tcb = s.scheduler.slab.get(invoker);
+            if inv_tcb.pending_extra_caps_count == 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )));
+            }
+            let cap = inv_tcb.pending_extra_caps[0];
+            let buf_paddr = inv_tcb.ipc_buffer_paddr;
+            s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+            if buf_paddr == 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )));
+            }
+            let buf = crate::arch::phys_to_virt(buf_paddr) as *const u64;
+            let cptr = core::ptr::read_volatile(buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET));
+            let res = crate::cspace::resolve_address_bits(s, &invoker_cspace, cptr, 64)?;
+            if res.bits_remaining != 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_FailedLookup,
+                )));
+            }
+            (KernelState::cnode_index(res.slot_ptr), res.slot_index, cap)
+        } else {
+            let cnode_ptr = match invoker_cspace {
+                Cap::CNode { ptr, .. } => ptr,
+                _ => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
+            };
+            let cnode_idx = KernelState::cnode_index(cnode_ptr);
+            let slot_idx = args.a2 as usize;
+            let slots = match s.cnode_slots_at(cnode_idx) {
+                Some(s) => s,
+                None => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
+            };
+            if slot_idx >= slots.len() {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_RangeError,
+                )));
+            }
+            (cnode_idx, slot_idx, slots[slot_idx].cap())
+        };
+        let ptr = match vspace_cap {
+            Cap::PML4 { ptr, asid: 0, .. } => ptr,
+            // Already assigned to an ASID — upstream
+            // decodeX86ASIDPoolAssign returns InvalidCapability
+            // (VSPACE0002 assigns the already-mapped
+            // page_directory and expects exactly that).
+            Cap::PML4 { .. } => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        };
+        // Allocate the next ASID in this pool.
+        //   * MakePool'd pools (asid_base != 0): use a per-pool
+        //     used-counter in the storage page so the pool
+        //     enforces its 512-ASID limit (VSPACE0005 assigns
+        //     512 then expects DeleteFirst). These pools don't
+        //     unassign mid-test, so a counter (not a bitmap)
+        //     is sufficient.
+        //   * Init pool (asid_base == 0): the rootserver pool
+        //     that every inter-AS test process draws from —
+        //     keep the existing global wrapping offset (never
+        //     exhausts), so its many assign/teardown cycles
+        //     across the suite stay unaffected.
+        let _ = pool_paddr;
+        let assigned = if asid_base != 0 {
+            let idx = (asid_base / 512) as usize;
+            let used = ASID_POOL_USED
+                .get(idx)
+                .map(|u| u.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if used >= 512 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_DeleteFirst,
+                )));
+            }
+            if let Some(u) = ASID_POOL_USED.get(idx) {
+                u.store(used + 1, Ordering::Relaxed);
+            }
+            asid_base.saturating_add(used)
+        } else {
+            asid_base.saturating_add(
+                (NEXT_ASID_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) & 0x1FF)
+                    as u16,
+            )
+        };
+        if let Some(slot) = s.cnode_slot_mut(slot_cnode_idx, slot_idx) {
+            slot.set_cap(&Cap::PML4 {
+                ptr,
+                mapped: true,
+                asid: assigned,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2050,15 +2503,8 @@ static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 pub(crate) const REPLY_HANDOFF_MAGIC: Word = 0x4e54_4f53_5245_5431;
 
 fn reply_handoff_requested(s: &KernelState, invoker: TcbId) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        s.scheduler.slab.get(invoker).user_context.r13 == REPLY_HANDOFF_MAGIC
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (s, invoker);
-        false
-    }
+    crate::arch::composite_send_destination(&s.scheduler.slab.get(invoker).user_context, false)
+        == REPLY_HANDOFF_MAGIC
 }
 
 fn handoff_marked_reply_to_caller(
@@ -2157,9 +2603,8 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             let me = s.scheduler.slab.get_mut(invoker);
             let length = me.ipc_length as usize;
             if length > 4 && me.ipc_buffer_paddr != 0 {
-                let buf = (crate::arch::x86_64::paging::phys_to_lin(me.ipc_buffer_paddr)
-                    as *const u64)
-                    .wrapping_add(1);
+                let buf =
+                    (crate::arch::phys_to_virt(me.ipc_buffer_paddr) as *const u64).wrapping_add(1);
                 let max = length.min(me.msg_regs.len());
                 for i in 4..max {
                     me.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -2412,7 +2857,7 @@ fn decode_sched_context(
             unsafe {
                 let s = KERNEL.get();
                 if let Some(tcb_id) = s.sched_contexts[sc_id as usize].bound_tcb {
-                    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                    #[cfg(feature = "smp")]
                     crate::smp::remote_tcb_stall(tcb_id);
                     // Remove from the ready queue / surrender the CPU
                     // before clearing the SC so a runnable thread that
@@ -2465,7 +2910,7 @@ fn decode_sched_context(
                                 seL4_Error::seL4_IllegalOperation,
                             )));
                         }
-                        #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                        #[cfg(feature = "smp")]
                         crate::smp::remote_tcb_stall(tcb_id);
                         s.scheduler.on_sc_lost(tcb_id);
                         s.scheduler.slab.get_mut(tcb_id).sc = None;
@@ -2584,6 +3029,20 @@ fn decode_sched_context(
                     s.sched_contexts[sc_id as usize].yield_from = Some(invoker);
                     s.scheduler.slab.get_mut(invoker).yield_to = Some(sc_id);
                     let cpu = s.scheduler.slab.get(invoker).affinity as usize;
+                    let invoker_domain = s.scheduler.slab.get(invoker).domain as usize;
+                    let target_cpu = s.scheduler.slab.get(target_id).affinity as usize;
+                    let target_domain = s.scheduler.slab.get(target_id).domain as usize;
+                    // seL4 dequeues both parties, then SCHED_ENQUEUEs the
+                    // yielder followed by the target. SCHED_ENQUEUE inserts
+                    // at the head, making the target the next runnable TCB.
+                    s.scheduler.nodes[target_cpu].queues[target_domain]
+                        .dequeue(&mut s.scheduler.slab, target_id);
+                    s.scheduler.nodes[cpu].queues[invoker_domain]
+                        .dequeue(&mut s.scheduler.slab, invoker);
+                    s.scheduler.nodes[cpu].queues[invoker_domain]
+                        .enqueue_front(&mut s.scheduler.slab, invoker);
+                    s.scheduler.nodes[target_cpu].queues[target_domain]
+                        .enqueue_front(&mut s.scheduler.slab, target_id);
                     if s.scheduler.nodes[cpu].current == Some(invoker) {
                         s.scheduler.nodes[cpu].current = None;
                     }
@@ -2760,7 +3219,6 @@ fn decode_sched_control(
                     // bound thread is currently running on another core,
                     // stall that core off it before moving it, so it can't
                     // run on two cores at once (MULTICORE0002/0003).
-                    #[cfg(target_arch = "x86_64")]
                     crate::smp::remote_tcb_stall(tcb);
                     s.scheduler.migrate_tcb(tcb, sched_control_core);
                 }
@@ -2782,26 +3240,56 @@ fn decode_sched_control(
 fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     match label {
         InvocationLabel::IRQIssueIRQHandler => {
-            // a2 = IRQ number, a3 = dest slot index
+            // Upstream ABI: a2 = IRQ, a3 = destination CPtr, a4 = depth,
+            // extraCaps[0] = destination CNode. Legacy kernel specs omit the
+            // extra cap and address a slot in the invoker's root CNode.
             if args.a2 >= crate::interrupt::MAX_IRQ as u64 {
                 return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_RangeError,
                 )));
             }
             let irq = args.a2 as u16;
-            let dest_index = args.a3 as usize;
             unsafe {
                 let s = KERNEL.get();
-                let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-                let cnode_ptr = match cspace_root {
-                    Cap::CNode { ptr, .. } => ptr,
-                    _ => {
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                let (cnode_idx, dest_index) = if info.extra_caps() > 0 {
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    if info.length() < 3 || inv_tcb.pending_extra_caps_count == 0 {
+                        inv_tcb.pending_extra_caps_count = 0;
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_TruncatedMessage,
+                        )));
+                    }
+                    let root = inv_tcb.pending_extra_caps[0];
+                    inv_tcb.pending_extra_caps_count = 0;
+                    if !matches!(root, Cap::CNode { .. }) {
                         return Err(KException::SyscallError(SyscallError::new(
                             seL4_Error::seL4_InvalidCapability,
-                        )))
+                        )));
                     }
+                    let resolved =
+                        crate::cspace::resolve_address_bits(s, &root, args.a3, args.a4 as u32)?;
+                    if resolved.bits_remaining != 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_FailedLookup,
+                        )));
+                    }
+                    (
+                        KernelState::cnode_index(resolved.slot_ptr),
+                        resolved.slot_index,
+                    )
+                } else {
+                    let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+                    let cnode_ptr = match cspace_root {
+                        Cap::CNode { ptr, .. } => ptr,
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
+                    };
+                    (KernelState::cnode_index(cnode_ptr), args.a3 as usize)
                 };
-                let cnode_idx = KernelState::cnode_index(cnode_ptr);
                 let slots = match s.cnode_slots_at(cnode_idx) {
                     Some(s) => s,
                     None => {
@@ -2833,13 +3321,52 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
                 .map_err(|_| {
                     KException::SyscallError(SyscallError::new(seL4_Error::seL4_RevokeFirst))
                 })?;
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::gic::mask(u32::from(irq));
                 s.cnode_slot_mut(cnode_idx, dest_index)
                     .expect("validated IRQ destination slot")
                     .set_cap(&Cap::IrqHandler { irq });
             }
             Ok(())
         }
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMIRQIssueIRQHandlerTrigger => {
+            if args.a3 > 1 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidArgument,
+                )));
+            }
+            let translated = SyscallArgs {
+                a0: args.a0,
+                a1: args.a1,
+                a2: args.a2,
+                a3: args.a4,
+                a4: args.a5,
+                a5: 0,
+            };
+            decode_irq_control(InvocationLabel::IRQIssueIRQHandler, &translated, invoker)
+        }
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMIRQIssueIRQHandlerTriggerCore => {
+            let target = unsafe { KERNEL.get().scheduler.slab.get(invoker).msg_regs[4] };
+            if args.a3 > 1 || target != 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidArgument,
+                )));
+            }
+            let translated = SyscallArgs {
+                a0: args.a0,
+                a1: args.a1,
+                a2: args.a2,
+                a3: args.a4,
+                a4: args.a5,
+                a5: 0,
+            };
+            decode_irq_control(InvocationLabel::IRQIssueIRQHandler, &translated, invoker)
+        }
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86IRQIssueIRQHandlerIOAPIC => issue_x86_ioapic_irq_handler(args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86IRQIssueIRQHandlerMSI => {
             // MSI needs an interrupt-remapping/configuration implementation. Never mint a handler
             // for hardware the kernel has not actually programmed.
@@ -2855,6 +3382,7 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
 
 /// Resolve an IOAPIC request against the immutable boot catalog, then program the exact
 /// controller-local pin before publishing the handler capability.
+#[cfg(target_arch = "x86_64")]
 fn issue_x86_ioapic_irq_handler(_args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
@@ -3030,6 +3558,7 @@ unsafe fn io_out16(_p: u16, _v: u16) {}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn io_out32(_p: u16, _v: u32) {}
 
+#[cfg(target_arch = "x86_64")]
 fn decode_io_port(
     first_port: u16,
     last_port: u16,
@@ -3120,7 +3649,7 @@ fn decode_domain(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> 
                     Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
                     _ => return err(seL4_Error::seL4_InvalidArgument),
                 };
-                #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                #[cfg(feature = "smp")]
                 crate::smp::remote_tcb_stall(tcb_id);
                 // setDomain: re-queues the thread under the new domain.
                 s.scheduler.set_domain(tcb_id, domain as u8);
@@ -3185,6 +3714,7 @@ fn decode_domain(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> 
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn decode_io_port_control(
     label: InvocationLabel,
     args: &SyscallArgs,
@@ -3285,6 +3815,10 @@ fn decode_irq_handler(
                     )
                     .expect("a live IOAPIC handler must remain rearmable until Ack");
                 }
+                #[cfg(target_arch = "aarch64")]
+                if source == crate::interrupt::IrqSource::Generic {
+                    crate::arch::aarch64::gic::unmask(u32::from(irq));
+                }
                 crate::interrupt::ack_irq(&mut s.irqs, irq)
                     .expect("validated IRQ binding must remain live under the BKL");
                 Ok(())
@@ -3354,6 +3888,8 @@ fn decode_irq_handler(
                 Ok(())
             }
             InvocationLabel::IRQClearIRQHandler => {
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::gic::mask(u32::from(irq));
                 #[cfg(target_arch = "x86_64")]
                 {
                     if let Ok(crate::interrupt::IrqSource::IoApic { controller, pin }) =
@@ -4062,6 +4598,13 @@ fn cnode_cancel_badged_sends(target: Cap, args: &SyscallArgs, _invoker: TcbId) -
                     cancelled.user_context.rdi = 0;
                     cancelled.blocked_is_call = false;
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let cancelled = (*s_ptr).scheduler.slab.get_mut(t);
+                    let label = seL4_Error::seL4_InvalidCapability as u64;
+                    crate::arch::set_ipc_return(&mut cancelled.user_context, 0, label << 12, &[]);
+                    cancelled.blocked_is_call = false;
+                }
                 (*s_ptr).scheduler.make_runnable(t);
             }
             cur = next;
@@ -4608,7 +5151,7 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     // make that core switch off it before we free the slab entry —
     // otherwise the remote core keeps executing a freed TCB
     // (MULTICORE0005 remote-delete).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(feature = "smp")]
     crate::smp::remote_tcb_stall(id);
     crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
     // YieldTo bookkeeping (SCHED0018 delete phases):
@@ -4685,6 +5228,17 @@ unsafe fn reparent_direct_children(
                 .set_parent(new_parent);
             moved = moved.checked_add(1).expect("MDB child count overflow");
         }
+    }
+    if moved != expected_children {
+        crate::arch::log("MDB reparent mismatch: moved=");
+        log_dec(moved as u64);
+        crate::arch::log(" expected=");
+        log_dec(expected_children as u64);
+        crate::arch::log(" parent_cnode=");
+        log_dec(old_parent.cnode_idx() as u64);
+        crate::arch::log(" parent_slot=");
+        log_dec(old_parent.slot() as u64);
+        crate::arch::log("\n");
     }
     assert_eq!(
         moved, expected_children,
@@ -4821,6 +5375,10 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
         Cap::IrqHandler { irq } => {
             if cap_refcount(cap) == 0 {
                 let source = crate::interrupt::source(&s.irqs, *irq).unwrap_or_default();
+                #[cfg(target_arch = "aarch64")]
+                if source == crate::interrupt::IrqSource::Generic {
+                    crate::arch::aarch64::gic::mask(u32::from(*irq));
+                }
                 #[cfg(target_arch = "x86_64")]
                 if let crate::interrupt::IrqSource::IoApic { controller, pin } = source {
                     crate::arch::x86_64::ioapic::set_route_mask(
@@ -5159,7 +5717,6 @@ fn debug_tcb_fault_slot(s: &KernelState, cspace_idx: Word) -> [Word; 6] {
     [cspace_idx, kind, detail, ep_state, ep_head, ep_tail]
 }
 
-#[cfg(target_arch = "x86_64")]
 fn write_invocation_words(invoker_tcb: &mut crate::tcb::Tcb, ipc_paddr: Word, words: &[Word]) {
     let in_regs = words.len().min(invoker_tcb.msg_regs.len());
     for (i, word) in words.iter().copied().enumerate().take(in_regs) {
@@ -5167,7 +5724,7 @@ fn write_invocation_words(invoker_tcb: &mut crate::tcb::Tcb, ipc_paddr: Word, wo
     }
     invoker_tcb.ipc_length = words.len() as u32;
     if words.len() > invoker_tcb.msg_regs.len() && ipc_paddr != 0 {
-        let buf = (crate::arch::x86_64::paging::phys_to_lin(ipc_paddr) as *mut u64).wrapping_add(1);
+        let buf = (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
         for (i, word) in words
             .iter()
             .copied()
@@ -5179,19 +5736,12 @@ fn write_invocation_words(invoker_tcb: &mut crate::tcb::Tcb, ipc_paddr: Word, wo
             }
         }
     }
-    if !words.is_empty() {
-        invoker_tcb.user_context.r10 = words[0];
-    }
-    if words.len() > 1 {
-        invoker_tcb.user_context.r8 = words[1];
-    }
-    if words.len() > 2 {
-        invoker_tcb.user_context.r9 = words[2];
-    }
-    if words.len() > 3 {
-        invoker_tcb.user_context.r15 = words[3];
-    }
-    invoker_tcb.user_context.rsi = (words.len() as u64) & 0x7F;
+    crate::arch::set_ipc_return(
+        &mut invoker_tcb.user_context,
+        0,
+        (words.len() as u64) & 0x7f,
+        &words[..words.len().min(4)],
+    );
 }
 
 fn decode_tcb(
@@ -5222,7 +5772,7 @@ fn decode_tcb(
                 // seL4 `remoteTCBStall`: if the thread is running on a
                 // remote core, stall that core off it before suspending
                 // so the counter freezes immediately (MULTICORE0001).
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(feature = "smp")]
                 crate::smp::remote_tcb_stall(id);
                 crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
                 // Upstream suspend() also completes an outstanding
@@ -5325,12 +5875,9 @@ fn decode_tcb(
                     queue_top_priority,
                     direct_handoff,
                 ];
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
-                    let inv = s.scheduler.slab.get_mut(invoker);
-                    write_invocation_words(inv, ipc_paddr, &words);
-                }
+                let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                let inv = s.scheduler.slab.get_mut(invoker);
+                write_invocation_words(inv, ipc_paddr, &words);
                 Ok(())
             }
             // `seL4_TCB_Configure` — one-shot TCB setup. Two ABI
@@ -5574,10 +6121,9 @@ fn decode_tcb(
                             if msg_idx < inv.msg_regs.len() {
                                 regs[i] = inv.msg_regs[msg_idx];
                             } else if inv.ipc_buffer_paddr != 0 {
-                                let buf =
-                                    (crate::arch::x86_64::paging::phys_to_lin(inv.ipc_buffer_paddr)
-                                        as *const u64)
-                                        .wrapping_add(1);
+                                let buf = (crate::arch::phys_to_virt(inv.ipc_buffer_paddr)
+                                    as *const u64)
+                                    .wrapping_add(1);
                                 regs[i] = core::ptr::read_volatile(buf.add(msg_idx));
                             }
                         }
@@ -5709,6 +6255,79 @@ fn decode_tcb(
                         }
                     }
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                    if info.length() == 0 {
+                        let t = s.scheduler.slab.get_mut(id);
+                        t.user_context.fault_ip = args.a2;
+                        t.user_context.elr_el1 = args.a2;
+                        t.user_context.sp_el0 = args.a3;
+                        t.user_context.x[0] = args.a4;
+                        t.user_context.spsr_el1 = 1 << 6;
+                    } else {
+                        let resume = args.a2 & 1 != 0;
+                        let count = (args.a3 as usize).min(36);
+                        let inv = s.scheduler.slab.get(invoker);
+                        let mut regs = [0u64; 36];
+                        if count > 0 {
+                            regs[0] = args.a4;
+                        }
+                        if count > 1 {
+                            regs[1] = args.a5;
+                        }
+                        for i in 2..count {
+                            let msg_idx = i + 2;
+                            if msg_idx < inv.msg_regs.len() {
+                                regs[i] = inv.msg_regs[msg_idx];
+                            } else if inv.ipc_buffer_paddr != 0 {
+                                let buf = (crate::arch::phys_to_virt(inv.ipc_buffer_paddr)
+                                    as *const u64)
+                                    .wrapping_add(1);
+                                regs[i] = core::ptr::read_volatile(buf.add(msg_idx));
+                            }
+                        }
+
+                        let t = s.scheduler.slab.get_mut(id);
+                        if count > 0 {
+                            t.user_context.fault_ip = regs[0];
+                            t.user_context.elr_el1 = regs[0];
+                        }
+                        if count > 1 {
+                            t.user_context.sp_el0 = regs[1];
+                        }
+                        if count > 2 {
+                            t.user_context.spsr_el1 = (regs[2] & 0xf000_0000) | (1 << 6);
+                        }
+                        for public in 3..count.min(12) {
+                            t.user_context.x[public - 3] = regs[public];
+                        }
+                        for (public, register) in [(12, 16), (13, 17), (14, 18), (15, 29), (16, 30)]
+                        {
+                            if count > public {
+                                t.user_context.x[register] = regs[public];
+                            }
+                        }
+                        for public in 17..count.min(24) {
+                            t.user_context.x[public - 8] = regs[public];
+                        }
+                        for public in 24..count.min(34) {
+                            t.user_context.x[public - 5] = regs[public];
+                        }
+                        if count > 34 {
+                            t.user_context.tpidr_el0 = regs[34];
+                        }
+                        if count > 35 {
+                            t.user_context.tpidrro_el0 = regs[35];
+                        }
+                        if resume {
+                            crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
+                            cancel_reply_wait_for_caller(s, id);
+                            s.scheduler.slab.get_mut(id).pending_fault = 0;
+                            s.scheduler.make_runnable(id);
+                        }
+                    }
+                }
                 Ok(())
             }
             InvocationLabel::TCBReadRegisters => {
@@ -5792,9 +6411,8 @@ fn decode_tcb(
                         // invoker's IPC buffer so userspace's
                         // libsel4 stub can read the whole array.
                         if count > inv.msg_regs.len() && ipc_paddr != 0 {
-                            let buf = (crate::arch::x86_64::paging::phys_to_lin(ipc_paddr)
-                                as *mut u64)
-                                .wrapping_add(1);
+                            let buf =
+                                (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
                             for i in inv.msg_regs.len()..count {
                                 core::ptr::write_volatile(buf.add(i), regs[i]);
                             }
@@ -5827,6 +6445,32 @@ fn decode_tcb(
                         inv.user_context.rsi = mi;
                     }
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                    let t = s.scheduler.slab.get(id);
+                    let mut regs = [0u64; 36];
+                    regs[0] = t.user_context.fault_ip;
+                    regs[1] = t.user_context.sp_el0;
+                    regs[2] = t.user_context.spsr_el1;
+                    regs[3..12].copy_from_slice(&t.user_context.x[0..9]);
+                    for (public, register) in [(12, 16), (13, 17), (14, 18), (15, 29), (16, 30)] {
+                        regs[public] = t.user_context.x[register];
+                    }
+                    regs[17..24].copy_from_slice(&t.user_context.x[9..16]);
+                    regs[24..34].copy_from_slice(&t.user_context.x[19..29]);
+                    regs[34] = t.user_context.tpidr_el0;
+                    regs[35] = t.user_context.tpidrro_el0;
+
+                    let count = if info.length() == 0 {
+                        3
+                    } else {
+                        (args.a3 as usize).min(regs.len())
+                    };
+                    let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                    let inv = s.scheduler.slab.get_mut(invoker);
+                    write_invocation_words(inv, ipc_paddr, &regs[..count]);
+                }
                 Ok(())
             }
             InvocationLabel::TCBSetSpace => {
@@ -5856,8 +6500,7 @@ fn decode_tcb(
                     let fault_cptr = if count > 0 && ipc_paddr != 0 {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            let buf =
-                                crate::arch::x86_64::paging::phys_to_lin(ipc_paddr) as *const u64;
+                            let buf = crate::arch::phys_to_virt(ipc_paddr) as *const u64;
                             core::ptr::read_volatile(
                                 buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET),
                             )
@@ -6222,22 +6865,40 @@ fn decode_tcb(
             // target TCB so the dispatcher restores it on next entry.
             InvocationLabel::TCBSetTLSBase => {
                 let base = args.a2;
-                let want_gs = args.a3 != 0;
-                if want_gs {
-                    s.scheduler.slab.get_mut(id).cpu_context.gs_base = base;
-                } else {
-                    s.scheduler.slab.get_mut(id).cpu_context.fs_base = base;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    s.scheduler.slab.get_mut(id).user_context.tpidr_el0 = base;
+                    if Some(id) == crate::kernel::current_thread() {
+                        unsafe {
+                            core::arch::asm!(
+                                "msr tpidr_el0, {base}",
+                                base = in(reg) base,
+                                options(nostack),
+                            );
+                        }
+                    }
                 }
                 #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    if Some(id) == crate::kernel::current_thread() {
-                        use crate::arch::x86_64::msr::{wrmsr, IA32_FS_BASE, IA32_KERNEL_GS_BASE};
-                        // The user %gs base is applied via the swapped-out MSR so
-                        // the return-to-user `swapgs` makes it the active %gs.
-                        if want_gs {
-                            wrmsr(IA32_KERNEL_GS_BASE, base);
-                        } else {
-                            wrmsr(IA32_FS_BASE, base);
+                {
+                    let want_gs = args.a3 != 0;
+                    if want_gs {
+                        s.scheduler.slab.get_mut(id).cpu_context.gs_base = base;
+                    } else {
+                        s.scheduler.slab.get_mut(id).cpu_context.fs_base = base;
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        if Some(id) == crate::kernel::current_thread() {
+                            use crate::arch::x86_64::msr::{
+                                wrmsr, IA32_FS_BASE, IA32_KERNEL_GS_BASE,
+                            };
+                            // The user %gs base is applied via the swapped-out MSR so
+                            // the return-to-user `swapgs` makes it the active %gs.
+                            if want_gs {
+                                wrmsr(IA32_KERNEL_GS_BASE, base);
+                            } else {
+                                wrmsr(IA32_FS_BASE, base);
+                            }
                         }
                     }
                 }
@@ -6263,6 +6924,9 @@ fn decode_tcb(
             }
             // --- Hardware debug API (CONFIG_HARDWARE_DEBUG_API) ----------
             InvocationLabel::TCBSetBreakpoint => {
+                #[cfg(target_arch = "aarch64")]
+                use crate::arch::aarch64::debug as dbg;
+                #[cfg(target_arch = "x86_64")]
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
                 let vaddr = args.a3;
@@ -6275,8 +6939,7 @@ fn decode_tcb(
                     if paddr == 0 {
                         0
                     } else {
-                        let buf = (crate::arch::x86_64::paging::phys_to_lin(paddr) as *const u64)
-                            .wrapping_add(1);
+                        let buf = (crate::arch::phys_to_virt(paddr) as *const u64).wrapping_add(1);
                         core::ptr::read_volatile(buf.add(4))
                     }
                 };
@@ -6310,6 +6973,10 @@ fn decode_tcb(
                 if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
                     return err(seL4_Error::seL4_RangeError);
                 }
+                #[cfg(target_arch = "aarch64")]
+                if !dbg::valid_id_for_type(bp_num as usize, ty) {
+                    return err(seL4_Error::seL4_InvalidArgument);
+                }
                 dbg::set_breakpoint(
                     &mut s.scheduler.slab.get_mut(id).debug,
                     bp_num as usize,
@@ -6321,6 +6988,9 @@ fn decode_tcb(
                 Ok(())
             }
             InvocationLabel::TCBGetBreakpoint => {
+                #[cfg(target_arch = "aarch64")]
+                use crate::arch::aarch64::debug as dbg;
+                #[cfg(target_arch = "x86_64")]
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
                 if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
@@ -6343,6 +7013,9 @@ fn decode_tcb(
                 Ok(())
             }
             InvocationLabel::TCBUnsetBreakpoint => {
+                #[cfg(target_arch = "aarch64")]
+                use crate::arch::aarch64::debug as dbg;
+                #[cfg(target_arch = "x86_64")]
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
                 if bp_num >= dbg::SEL4_NUM_HW_BREAKPOINTS as u64 {
@@ -6354,6 +7027,9 @@ fn decode_tcb(
                 Ok(())
             }
             InvocationLabel::TCBConfigureSingleStepping => {
+                #[cfg(target_arch = "aarch64")]
+                use crate::arch::aarch64::debug as dbg;
+                #[cfg(target_arch = "x86_64")]
                 use crate::arch::x86_64::debug as dbg;
                 let _bp_num = args.a2; // ignored on x86 (TF-based)
                 let n_instr = args.a3;
@@ -6361,16 +7037,19 @@ fn decode_tcb(
                     &mut s.scheduler.slab.get_mut(id).debug,
                     n_instr,
                 );
-                let t = s.scheduler.slab.get_mut(id);
-                if n_instr == 0 {
-                    // Disable: clear TF on the target's saved RFLAGS.
-                    t.user_context.rflags &= !dbg::FLAGS_TF;
-                } else {
-                    // Enable: set TF so the thread single-steps when it
-                    // next runs; force iretq resume so the rflags slot
-                    // (not the sysret r11 path) carries it.
-                    t.user_context.rflags |= dbg::FLAGS_TF;
-                    t.use_iretq_resume = true;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let t = s.scheduler.slab.get_mut(id);
+                    if n_instr == 0 {
+                        // Disable: clear TF on the target's saved RFLAGS.
+                        t.user_context.rflags &= !dbg::FLAGS_TF;
+                    } else {
+                        // Enable: set TF so the thread single-steps when it
+                        // next runs; force iretq resume so the rflags slot
+                        // (not the sysret r11 path) carries it.
+                        t.user_context.rflags |= dbg::FLAGS_TF;
+                        t.use_iretq_resume = true;
+                    }
                 }
                 let inv = s.scheduler.slab.get_mut(invoker);
                 inv.msg_regs[0] = consumed as u64;
@@ -6413,13 +7092,16 @@ pub mod spec {
         mdb_revoke_walks_grandchildren();
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
-        frame_map_unmap_get_address();
-        frame_map_accepts_upstream_libsel4_abi();
         zero_device_frame_get_address();
-        paging_maps_reject_unassigned_explicit_vspace();
-        paging_unmap_requires_exact_physical_identity();
-        page_table_invocation_tracks_asid_and_detaches_hardware();
-        page_table_map_updates_invoked_slot_not_first_alias();
+        #[cfg(target_arch = "x86_64")]
+        {
+            frame_map_unmap_get_address();
+            frame_map_accepts_upstream_libsel4_abi();
+            paging_maps_reject_unassigned_explicit_vspace();
+            paging_unmap_requires_exact_physical_identity();
+            page_table_invocation_tracks_asid_and_detaches_hardware();
+            page_table_map_updates_invoked_slot_not_first_alias();
+        }
         tcb_write_read_registers();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
@@ -6437,6 +7119,14 @@ pub mod spec {
 
     static mut POOL_EXHAUSTION_SCRATCH: [u16; crate::kernel::MAX_DYNAMIC_CNODES] =
         [0; crate::kernel::MAX_DYNAMIC_CNODES];
+
+    #[inline]
+    fn spec_ram_paddr(paddr: u64) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        return paddr;
+        #[cfg(target_arch = "aarch64")]
+        return paddr + 0x4000_0000;
+    }
 
     fn pooled_available(object_type: ObjectType) -> usize {
         unsafe {
@@ -6466,8 +7156,8 @@ pub mod spec {
             ObjectType::Endpoint => s.alloc_endpoint().map(|i| i as u16),
             ObjectType::Notification => s.alloc_notification().map(|i| i as u16),
             ObjectType::CapTable => {
-                let paddr = 0x1800_0000 + (ordinal as u64) * 64;
-                let backing = crate::arch::x86_64::paging::phys_to_lin(paddr) as *mut u8;
+                let paddr = spec_ram_paddr(0x1800_0000 + (ordinal as u64) * 64);
+                let backing = crate::arch::phys_to_virt(paddr) as *mut u8;
                 core::ptr::write_bytes(backing, 0, 64);
                 s.alloc_dynamic_cnode(paddr, 1)
                     .map(|i| u16::try_from(i).expect("CNode identity fits scratch"))
@@ -6493,6 +7183,7 @@ pub mod spec {
 
     fn assert_pooled_retype_capacity(object_type: ObjectType, size_bits: u32, base: u64) {
         let invoker = setup_invoker(0);
+        let base = spec_ram_paddr(base);
         let source = Cap::Untyped {
             ptr: PAddr::<crate::cap::UntypedStorage>::new(base),
             block_bits: 16,
@@ -6660,8 +7351,12 @@ pub mod spec {
         }
 
         // AsidControl::MakePool — pool lands in slot 7.
+        #[cfg(target_arch = "x86_64")]
+        let make_pool_label = InvocationLabel::X86ASIDControlMakePool;
+        #[cfg(target_arch = "aarch64")]
+        let make_pool_label = InvocationLabel::ARMASIDControlMakePool;
         let args = SyscallArgs {
-            a1: (InvocationLabel::X86ASIDControlMakePool as u64) << 12,
+            a1: (make_pool_label as u64) << 12,
             a2: 5, // Untyped cap_ptr
             a3: 0, // dest_cnode (ignored — we use invoker's CSpace)
             a4: 7, // dest slot
@@ -6676,8 +7371,12 @@ pub mod spec {
         let _: PPtr<AsidPoolStorage> = pool_ptr; // type assertion
 
         // AsidPool::Assign — give the PML4 in slot 6 an ASID.
+        #[cfg(target_arch = "x86_64")]
+        let assign_label = InvocationLabel::X86ASIDPoolAssign;
+        #[cfg(target_arch = "aarch64")]
+        let assign_label = InvocationLabel::ARMASIDPoolAssign;
         let args = SyscallArgs {
-            a1: (InvocationLabel::X86ASIDPoolAssign as u64) << 12,
+            a1: (assign_label as u64) << 12,
             a2: 6, // vspace cap_ptr
             ..Default::default()
         };
@@ -6877,6 +7576,7 @@ pub mod spec {
         arch::log("  ✓ Revoke walks derivation graph transitively (MDB)\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn paging_unmap_requires_exact_physical_identity() {
         #[repr(C, align(4096))]
@@ -6980,6 +7680,7 @@ pub mod spec {
         arch::log("  ✓ paging unmap requires exact physical identity at every level\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn page_table_invocation_tracks_asid_and_detaches_hardware() {
         #[repr(C, align(4096))]
@@ -7138,6 +7839,7 @@ pub mod spec {
     /// Page-structure map must update the cap slot the caller invoked, not the first sibling cap
     /// with the same object paddr. The NT rootserver keeps copied aliases and a large root CSpace; a
     /// full-CNode scan both mutates the wrong sibling and becomes a boot-time cliff.
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn page_table_map_updates_invoked_slot_not_first_alias() {
         use crate::cap::PageTableStorage;
@@ -8129,8 +8831,12 @@ pub mod spec {
             is_device: true,
             map_type: crate::cap::FrameMapType::None,
         };
+        #[cfg(target_arch = "x86_64")]
+        let get_address_label = InvocationLabel::X86PageGetAddress;
+        #[cfg(target_arch = "aarch64")]
+        let get_address_label = InvocationLabel::ARMPageGetAddress;
         let args = SyscallArgs {
-            a1: (InvocationLabel::X86PageGetAddress as u64) << 12,
+            a1: (get_address_label as u64) << 12,
             ..Default::default()
         };
         decode_invocation(frame_cap, &args, invoker).expect("get page-zero address");
@@ -8141,6 +8847,7 @@ pub mod spec {
         arch::log("  ✓ page-zero device frame GetAddress preserves physical zero\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn frame_map_unmap_get_address() {
         use crate::cap::{FrameRights, FrameSize, FrameStorage};
@@ -8274,6 +8981,7 @@ pub mod spec {
         arch::log("  ✓ Frame::Map / Unmap / GetAddress round-trip\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn frame_map_accepts_upstream_libsel4_abi() {
         use crate::cap::{FrameRights, FrameSize, FrameStorage, Pml4Storage};
@@ -8342,6 +9050,7 @@ pub mod spec {
     }
 
     /// Explicit frame maps need a real ASID so later unmap/delete can find the same VSpace.
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn paging_maps_reject_unassigned_explicit_vspace() {
         use crate::cap::{FrameRights, FrameSize, FrameStorage, PageTableStorage, Pml4Storage};

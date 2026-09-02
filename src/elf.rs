@@ -35,7 +35,10 @@ const EV_CURRENT: u8 = 1;
 
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
+#[cfg(target_arch = "x86_64")]
 const EM_X86_64: u16 = 62;
+#[cfg(target_arch = "aarch64")]
+const EM_AARCH64: u16 = 183;
 
 const PT_LOAD: u32 = 1;
 
@@ -124,7 +127,7 @@ pub enum ElfError {
     NotElf64,
     NotLittleEndian,
     BadVersion,
-    NotX86_64,
+    WrongMachine,
     NotExecutable,
     BadPhdrSize,
 }
@@ -159,8 +162,12 @@ pub fn parse(bytes: &[u8]) -> Result<Image<'_>, ElfError> {
     }
 
     let e_machine = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_machine)) };
-    if e_machine != EM_X86_64 {
-        return Err(ElfError::NotX86_64);
+    #[cfg(target_arch = "x86_64")]
+    let expected_machine = EM_X86_64;
+    #[cfg(target_arch = "aarch64")]
+    let expected_machine = EM_AARCH64;
+    if e_machine != expected_machine {
+        return Err(ElfError::WrongMachine);
     }
     let e_type = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*h_ptr).e_type)) };
     if e_type != ET_EXEC && e_type != ET_DYN {
@@ -253,7 +260,9 @@ pub mod spec {
     pub fn test_elf() {
         arch::log("Running ELF parser tests...\n");
         rejects_bogus_inputs();
+        #[cfg(target_arch = "x86_64")]
         parses_embedded_rootserver();
+        #[cfg(target_arch = "x86_64")]
         rootserver_segments_have_known_shape();
         arch::log("ELF parser tests completed\n");
     }
@@ -282,6 +291,7 @@ pub mod spec {
         arch::log("  ✓ ELF parser rejects bogus inputs\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn parses_embedded_rootserver() {
         let img = parse(crate::rootserver_image::rootserver_elf()).expect("rootserver ELF parses");
@@ -299,6 +309,7 @@ pub mod spec {
         arch::log("  ✓ embedded rootserver ELF parses + entry in user space\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn rootserver_segments_have_known_shape() {
         let img = parse(crate::rootserver_image::rootserver_elf()).unwrap();

@@ -11,7 +11,7 @@
 # `vendor/sel4test/kernel` via a symlink so we don't fetch the same
 # source twice. After fetching, we run upstream's CMake +
 # ninja-based build pipeline with options that match our kernel:
-# CONFIG_KERNEL_MCS=ON, x86_64, 4-core SMP, debug + printing.
+# CONFIG_KERNEL_MCS=ON, debug + printing, and the requested architecture.
 #
 # The build emits `vendor/sel4test/build/sel4test-driver/sel4test-
 # driver` — the ELF that sel4test-driver runs as the rootserver.
@@ -26,6 +26,51 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 HERE="$PWD"
+
+SEL4TEST_ARCH="${1:-${SEL4TEST_ARCH:-x86_64}}"
+SEL4TEST_PROFILE="${2:-${SEL4TEST_PROFILE:-smp}}"
+SEL4TEST_REGEX="${SEL4TEST_REGEX:-.*}"
+case "$SEL4TEST_ARCH" in
+  x86_64|amd64)
+    SEL4TEST_ARCH=x86_64
+    SMP_BUILD_NAME=build
+    DOMAINS_BUILD_NAME=build-domains
+    PLATFORM=x86_64
+    TRIPLE=x86_64-elf
+    ;;
+  aarch64|arm64)
+    SEL4TEST_ARCH=aarch64
+    SMP_BUILD_NAME=build-aarch64-smp
+    DOMAINS_BUILD_NAME=build-aarch64-domains
+    PLATFORM=qemu-arm-virt
+    TRIPLE=aarch64-none-elf
+    ;;
+  *)
+    echo "error: architecture must be x86_64/amd64 or aarch64/arm64" >&2
+    exit 2
+    ;;
+esac
+
+case "$SEL4TEST_PROFILE" in
+  smp)
+    BUILD_NAME="${SEL4TEST_BUILD_NAME:-$SMP_BUILD_NAME}"
+    NUM_NODES=4
+    SMP=ON
+    DOMAINS=OFF
+    NUM_DOMAINS=1
+    ;;
+  domains)
+    BUILD_NAME="${SEL4TEST_BUILD_NAME:-$DOMAINS_BUILD_NAME}"
+    NUM_NODES=1
+    SMP=OFF
+    DOMAINS=ON
+    NUM_DOMAINS=4
+    ;;
+  *)
+    echo "error: profile must be smp or domains" >&2
+    exit 2
+    ;;
+esac
 
 # Pinned SHAs from sel4test-manifest @ master (May 2026 snapshot).
 SEL4_SHA=daa0dfb1470c5ffbf13b3778f93111679574e80c
@@ -66,10 +111,34 @@ if [ ! -x "$VENV/bin/python" ]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install --quiet \
     pyyaml jinja2 ply future six lxml \
-    protobuf
+    protobuf pyfdt jsonschema
+fi
+if ! "$VENV/bin/python" -c 'import pyfdt.pyfdt' 2>/dev/null; then
+  "$VENV/bin/pip" install --quiet pyfdt jsonschema
 fi
 PATH="$VENV/bin:$PATH"
 export PATH
+
+# macOS's ar/ranlib only understand Mach-O. AArch64 userspace objects are
+# ELF, so use rustup's LLVM tools and route Clang's lld lookup to rust-lld.
+if [ "$SEL4TEST_ARCH" = aarch64 ]; then
+  if ! rustup +nightly component list --installed 2>/dev/null | grep -q '^llvm-tools'; then
+    rustup +nightly component add llvm-tools-preview
+  fi
+  RUST_HOST=$(rustc +nightly -vV | sed -n 's/^host: //p')
+  RUST_TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$RUST_HOST/bin"
+  PATH="$HERE/toolchain:$PATH"
+  export PATH
+
+  BUILTINS=$(find "$HERE/../../target/mykernel-aarch64/release/deps" \
+    -name 'libcompiler_builtins-*.rlib' -print 2>/dev/null | head -1)
+  if [ -z "$BUILTINS" ]; then
+    echo "error: AArch64 compiler builtins missing; run scripts/build_aarch64.sh first" >&2
+    exit 1
+  fi
+  mkdir -p "$HERE/.toolchain/lib/aarch64"
+  cp "$BUILTINS" "$HERE/.toolchain/lib/aarch64/libgcc.a"
+fi
 
 # Homebrew installs GNU cpio as keg-only (to avoid shadowing
 # macOS's BSD cpio), so /opt/homebrew/bin/cpio doesn't exist.
@@ -89,6 +158,21 @@ fetch_pinned https://github.com/seL4/sel4_projects_libs.git "$SEL4_PROJECTS_LIBS
 fetch_pinned https://github.com/seL4/sel4runtime.git        "$SEL4RUNTIME_SHA"        projects/sel4runtime
 fetch_pinned https://github.com/seL4/musllibc.git           "$MUSLLIBC_SHA"           projects/musllibc
 fetch_pinned https://github.com/nanopb/nanopb.git           "$NANOPB_SHA"             tools/nanopb
+
+apply_sel4test_patch() {
+  local patch_file=$1
+  if git -C projects/sel4test apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+    return
+  fi
+  git -C projects/sel4test apply --check "$patch_file"
+  git -C projects/sel4test apply "$patch_file"
+}
+
+# The pinned suite leaves these regressions registered but hard-disabled.
+# Carry the enablement and inter-AS test repair as explicit overlays rather
+# than changing the pinned checkout in an unreproducible way.
+apply_sel4test_patch "$HERE/patches/enable-regression-specs.patch"
+apply_sel4test_patch "$HERE/patches/fix-pagefault1005-inter-as.patch"
 
 # musllibc's CMake assumes the Google Repo tool layout where each
 # repo's `.git` is a *file* (gitdir pointer), not a directory. It
@@ -124,39 +208,84 @@ ln -sfn projects/sel4test/easy-settings.cmake easy-settings.cmake
 
 # Configure with CMake + build with ninja. Options match our kernel:
 #   x86_64, MCS scheduler, 4 cores, debug+printing build.
-mkdir -p build
-cd build
+mkdir -p "$BUILD_NAME"
+cd "$BUILD_NAME"
 if [ ! -f CMakeCache.txt ]; then
-  echo ">> configuring sel4test build"
+  echo ">> configuring sel4test build ($SEL4TEST_ARCH)"
   # Use upstream's LLVM toolchain file (kernel/llvm.cmake) so the
   # build picks clang + lld instead of gcc — matches the toolchain
   # we use for vendor/libsel4-build/. TRIPLE selects the target
   # for clang's `-target` flag.
-  ../init-build.sh \
-    -DPLATFORM=x86_64 \
-    -DSIMULATION=ON \
-    -DMCS=ON \
-    -DKernelIsMCS=ON \
-    -DKernelMaxNumNodes=4 \
-    -DKernelPrinting=ON \
-    -DKernelDebugBuild=ON \
-    -DKernelMaxNumBootinfoUntypedCaps=230 \
-    -DKernelSetTLSBaseSelf=ON \
-    -DKernelHugePage=OFF \
-    -DTRIPLE=x86_64-elf \
-    -DCMAKE_TOOLCHAIN_FILE=../kernel/llvm.cmake \
-    -DCMAKE_AR=/opt/homebrew/bin/x86_64-elf-ar \
-    -DCMAKE_RANLIB=/opt/homebrew/bin/x86_64-elf-ranlib \
-    -DCMAKE_NM=/opt/homebrew/bin/x86_64-elf-nm \
-    -DCMAKE_OBJCOPY=/opt/homebrew/bin/x86_64-elf-objcopy \
-    -DCMAKE_STRIP=/opt/homebrew/bin/x86_64-elf-strip
+  CONFIGURE_ARGS=(
+    -DPLATFORM="$PLATFORM"
+    -DKernelSel4Arch="$SEL4TEST_ARCH"
+    -DSIMULATION=ON
+    -DMCS=ON
+    -DSMP="$SMP"
+    -DNUM_NODES="$NUM_NODES"
+    -DDOMAINS="$DOMAINS"
+    -DKernelIsMCS=ON
+    -DKernelMaxNumNodes="$NUM_NODES"
+    -DKernelNumDomains="$NUM_DOMAINS"
+    -DKernelNumDomainSchedules=100
+    -DLibSel4TestPrinterRegex="$SEL4TEST_REGEX"
+    -DKernelPrinting=ON
+    -DKernelDebugBuild=ON
+    -DKernelVerificationBuild=OFF
+    -DKernelBinaryVerificationBuild=OFF
+    -DKernelMaxNumBootinfoUntypedCaps=230
+    -DKernelSetTLSBaseSelf=ON
+    -DTRIPLE="$TRIPLE"
+    -DCMAKE_TOOLCHAIN_FILE=../kernel/llvm.cmake
+  )
+  if [ "$SEL4TEST_ARCH" = x86_64 ]; then
+    CONFIGURE_ARGS+=(
+      -DKernelHugePage=OFF
+      -DCMAKE_AR=/opt/homebrew/bin/x86_64-elf-ar
+      -DCMAKE_RANLIB=/opt/homebrew/bin/x86_64-elf-ranlib
+      -DCMAKE_NM=/opt/homebrew/bin/x86_64-elf-nm
+      -DCMAKE_OBJCOPY=/opt/homebrew/bin/x86_64-elf-objcopy
+      -DCMAKE_STRIP=/opt/homebrew/bin/x86_64-elf-strip
+    )
+  else
+    CONFIGURE_ARGS+=(
+      -DSel4testAllowSettingsOverride=ON
+      -DSIMULATION=OFF
+      -DSel4testSimulation=ON
+      -DSel4testHaveCache=OFF
+      -DLibPlatSupportHaveTimer=ON
+      -DSel4testHaveTimer=ON
+      -DKernelArmExportPCNTUser=ON
+      -DKernelArmExportPTMRUser=ON
+      -DHardwareDebugAPI=ON
+      -DCMAKE_AR="$RUST_TOOLBIN/llvm-ar"
+      -DCMAKE_RANLIB="$HERE/toolchain/llvm-ranlib"
+      -DCMAKE_NM="$RUST_TOOLBIN/llvm-nm"
+      -DCMAKE_OBJCOPY="$RUST_TOOLBIN/llvm-objcopy"
+      -DCMAKE_STRIP="$RUST_TOOLBIN/llvm-strip"
+      "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=$HERE/toolchain/ld.lld -L$HERE/.toolchain/lib/aarch64"
+    )
+  fi
+  ../init-build.sh "${CONFIGURE_ARGS[@]}"
+else
+  # Keep existing build directories aligned with options added after their
+  # first configure; ninja alone does not update cached feature selections.
+  cmake \
+    -DDOMAINS="$DOMAINS" \
+    -DKernelNumDomains="$NUM_DOMAINS" \
+    -DKernelNumDomainSchedules=100 \
+    -DLibSel4TestPrinterRegex="$SEL4TEST_REGEX" \
+    -DSMP="$SMP" \
+    -DNUM_NODES="$NUM_NODES" \
+    -DKernelMaxNumNodes="$NUM_NODES" \
+    .
 fi
 
 echo ">> building sel4test-driver"
 ninja sel4test-driver
 
 # Stage the rootserver ELF where scripts/make_image.sh expects it.
-DRIVER_ELF="$HERE/build/apps/sel4test-driver/sel4test-driver"
+DRIVER_ELF="$HERE/$BUILD_NAME/apps/sel4test-driver/sel4test-driver"
 if [ ! -f "$DRIVER_ELF" ]; then
   echo "error: expected sel4test-driver ELF at $DRIVER_ELF" >&2
   exit 1

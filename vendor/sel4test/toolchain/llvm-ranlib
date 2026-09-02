@@ -1,0 +1,5 @@
+#!/bin/sh
+# The rustup llvm-tools component ships llvm-ar but not the llvm-ranlib alias.
+sysroot=$(rustc +nightly --print sysroot) || exit $?
+host=$(rustc +nightly -vV | sed -n 's/^host: //p') || exit $?
+exec "$sysroot/lib/rustlib/$host/bin/llvm-ar" s "$@"

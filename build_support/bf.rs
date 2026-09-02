@@ -38,14 +38,15 @@ use std::fmt::Write as _;
 pub const WORD_SIZE: u64 = 64;
 pub const CANONICAL_SIZE: u64 = 48;
 
-pub fn default_config() -> HashMap<String, bool> {
+pub fn config_for_arch(arch: &str) -> HashMap<String, bool> {
     // Phase 32 — we run kernel-MCS only. seL4-MCS is the modern
     // path (sporadic-server scheduling, MCS-shaped reply caps,
     // per-TCB SchedContext binding); nothing in this kernel
     // depends on the non-MCS layout.
-    [
+    let mut config: HashMap<String, bool> = [
         ("CONFIG_KERNEL_MCS", true),
         ("ENABLE_SMP_SUPPORT", true),
+        ("CONFIG_ENABLE_SMP_SUPPORT", true),
         ("CONFIG_HARDWARE_DEBUG_API", false),
         ("CONFIG_SET_TLS_BASE_SELF", false),
         // Phase 44 — VT-d IOMMU. Enables the io_space_cap (tag 15)
@@ -53,10 +54,21 @@ pub fn default_config() -> HashMap<String, bool> {
         // structures_x86_64.bf so `IoSpaceCap` / `IoPageTableCap`
         // generate for the IOPT invocation path.
         ("CONFIG_IOMMU", true),
+        ("CONFIG_ARM_HYPERVISOR_SUPPORT", false),
+        ("CONFIG_ARM_SMMU", false),
+        ("CONFIG_ALLOW_SMC_CALLS", false),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
-    .collect()
+    .collect();
+    if arch == "aarch64" {
+        config.insert("CONFIG_IOMMU".to_string(), false);
+    }
+    config
+}
+
+pub fn default_config() -> HashMap<String, bool> {
+    config_for_arch("x86_64")
 }
 
 // ---------------------------------------------------------------------------
@@ -87,14 +99,22 @@ pub fn preprocess(src: &str, cfg: &HashMap<String, bool>) -> String {
             emit_stack.push(parent_emit && cond);
             continue;
         }
-        if trimmed == "#else" {
+        if let Some(rest) = trimmed.strip_prefix("#ifndef") {
+            let ident = rest.trim();
+            let cond = !*cfg.get(ident).unwrap_or(&false);
+            cond_stack.push(cond);
+            let parent_emit = *emit_stack.last().unwrap();
+            emit_stack.push(parent_emit && cond);
+            continue;
+        }
+        if trimmed.starts_with("#else") {
             let cond = cond_stack.last().copied().unwrap_or(true);
             emit_stack.pop();
             let parent_emit = *emit_stack.last().unwrap();
             emit_stack.push(parent_emit && !cond);
             continue;
         }
-        if trimmed == "#endif" {
+        if trimmed.starts_with("#endif") {
             emit_stack.pop();
             cond_stack.pop();
             continue;
@@ -553,6 +573,22 @@ impl Parser {
     fn parse_tagged_union(&mut self) -> Result<TaggedUnionDecl, String> {
         let name = self.expect_ident()?;
         let tagname = self.expect_ident()?;
+        // Multi-tag unions (for example AArch64 PTEs) name each tag
+        // field after the discriminator: `pte_type(hw, sw)`. The
+        // renderer does not emit union helpers, but the parser must
+        // still consume the complete upstream grammar.
+        if matches!(self.peek(), Some(Tok::LParen)) {
+            self.bump();
+            loop {
+                let _ = self.expect_ident()?;
+                if matches!(self.peek(), Some(Tok::Comma)) {
+                    self.bump();
+                    continue;
+                }
+                self.expect(&Tok::RParen)?;
+                break;
+            }
+        }
         self.expect(&Tok::LBrace)?;
         let mut tags = Vec::new();
         while !matches!(self.peek(), Some(Tok::RBrace)) {
@@ -562,6 +598,17 @@ impl Parser {
             let block = self.expect_ident()?;
             let value = match self.bump() {
                 Some(Tok::Number(n)) => n,
+                Some(Tok::LParen) => {
+                    let first = match self.bump() {
+                        Some(Tok::Number(n)) => n,
+                        other => return Err(format!("expected first tag number, got {:?}", other)),
+                    };
+                    while !matches!(self.peek(), Some(Tok::RParen)) {
+                        self.bump();
+                    }
+                    self.expect(&Tok::RParen)?;
+                    first
+                }
                 other => return Err(format!("expected tag number, got {:?}", other)),
             };
             tags.push(TaggedTag { block, value });
@@ -896,7 +943,11 @@ fn type_name(bf_name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn generate(src: &str) -> Result<String, String> {
-    let cfg = default_config();
+    generate_for_arch(src, "x86_64")
+}
+
+pub fn generate_for_arch(src: &str, arch: &str) -> Result<String, String> {
+    let cfg = config_for_arch(arch);
     let preprocessed = preprocess(src, &cfg);
     let module = parse(&preprocessed)?;
     let blocks = lower(&module)?;
@@ -975,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn ifdef_kernel_mcs_picks_else_branch() {
+    fn ifdef_kernel_mcs_picks_enabled_branch() {
         let src = "#ifdef CONFIG_KERNEL_MCS\n\
                    block reply_cap_mcs {\n\
                        field a 64\n\
@@ -991,7 +1042,16 @@ mod tests {
                    #endif\n";
         let m = parse(&preprocess(src, &default_config())).unwrap();
         assert_eq!(m.blocks.len(), 1);
-        assert_eq!(m.blocks[0].name, "reply_cap_classic");
+        assert_eq!(m.blocks[0].name, "reply_cap_mcs");
+    }
+
+    #[test]
+    fn ifndef_smp_omits_uniprocessor_cap() {
+        let src = "#ifndef CONFIG_ENABLE_SMP_SUPPORT\n\
+                   block sgi_signal_cap { field capType 5 padding 59 }\n\
+                   #endif /* CONFIG_ENABLE_SMP_SUPPORT */\n";
+        let m = parse(&preprocess(src, &config_for_arch("aarch64"))).unwrap();
+        assert!(m.blocks.is_empty());
     }
 
     #[test]

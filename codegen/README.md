@@ -13,6 +13,10 @@ with `./refresh.sh` and commit the diff.
 | `object-api.xml` | `libsel4/include/interfaces/object-api.xml` |
 | `object-api-arch.xml` | `libsel4/arch_include/x86/interfaces/object-api-arch.xml` |
 | `object-api-sel4-arch.xml` | `libsel4/sel4_arch_include/x86_64/interfaces/object-api-sel4-arch.xml` |
+| `structures_aarch64.bf` | `include/arch/arm/arch/64/mode/object/structures.bf` |
+| `object-api-arm.xml` | `libsel4/arch_include/arm/interfaces/object-api-arch.xml` |
+| `object-api-aarch64.xml` | `libsel4/sel4_arch_include/aarch64/interfaces/object-api-sel4-arch.xml` |
+| `object-api-rust-micro.xml` | Project-owned invocation extensions, appended after the upstream architecture labels |
 
 Pinned upstream revision:
 

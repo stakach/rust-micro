@@ -1,0 +1,6 @@
+#!/bin/sh
+# Clang's `-fuse-ld=lld` searches PATH for this name. rust-lld is the
+# cross-platform LLD shipped with the nightly Rust toolchain.
+sysroot=$(rustc +nightly --print sysroot) || exit $?
+host=$(rustc +nightly -vV | sed -n 's/^host: //p') || exit $?
+exec "$sysroot/lib/rustlib/$host/bin/rust-lld" -flavor ld.lld "$@"

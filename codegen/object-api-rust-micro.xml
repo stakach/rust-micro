@@ -1,0 +1,33 @@
+<!-- rust-micro extensions. Kept separate so pinned seL4 snapshots remain exact. -->
+<interface name="seL4_TCB_HostedSyscalls" manual_name="TCB Hosted Syscalls">
+    <method id="TCBSetHostedSyscalls" name="SetHostedSyscalls" manual_name="Set Hosted Syscalls" manual_label="tcb_sethostedsyscalls">
+        <brief>Route every syscall this thread issues to its fault handler.</brief>
+        <description>
+            Puts the target TCB into hosted-syscall mode: from then on each syscall the thread
+            executes is delivered as a seL4_Fault_UnknownSyscall to its fault handler instead of
+            being dispatched as a native seL4 syscall. Used by hosted Windows processes.
+        </description>
+    </method>
+    <method id="TCBReadDebugState" name="ReadDebugState" manual_name="Read Debug State" manual_label="tcb_readdebugstate">
+        <brief>Read compact scheduler and IPC state for a target TCB.</brief>
+        <description>
+            Returns bounded kernel scheduler and IPC fields for the target TCB, plus the bound TCB
+            of an optional Reply cap. This diagnostic extension does not affect scheduling policy.
+        </description>
+        <param dir="in" name="reply" type="seL4_CPtr" description="Optional Reply cap to inspect; 0 skips reply-object state."/>
+        <param dir="out" name="state" type="seL4_Word" description="ThreadStateType discriminant."/>
+        <param dir="out" name="schedulable" type="seL4_Word" description="1 when runnable with a bound scheduling context."/>
+        <param dir="out" name="enqueued" type="seL4_Word" description="1 when linked into a ready queue."/>
+        <param dir="out" name="priority" type="seL4_Word" description="Thread priority."/>
+    </method>
+    <method id="SchedContextReadRuntime" name="ReadRuntime" manual_name="Read Runtime" manual_label="schedcontext_readruntime">
+        <brief>Read cumulative bound and donated execution time for a scheduling context.</brief>
+        <description>
+            The bound counter measures execution by the scheduling context's bound TCB. The donated
+            counter measures execution by another TCB while carrying this scheduling context through
+            IPC donation. Both counters are monotonic for the scheduling context's lifetime.
+        </description>
+        <param dir="out" name="bound" type="seL4_Time" description="Cumulative execution by the bound TCB."/>
+        <param dir="out" name="donated" type="seL4_Time" description="Cumulative execution while donated to another TCB."/>
+    </method>
+</interface>

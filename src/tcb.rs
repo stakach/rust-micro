@@ -105,11 +105,11 @@ pub const MAX_PRIORITY: u8 = (NUM_PRIORITIES - 1) as u8;
 /// to receiver's at handoff time so we don't need 120 words on
 /// every TCB. See `endpoint::transfer_long_msg`.
 ///
-/// 20 (was 8) so kernel-synthesized fault messages fit entirely in
-/// the staging area: x86_64 `seL4_UnknownSyscall_Msg` is 19 words
-/// (RAX..R15, FaultIP, SP, FLAGS, Syscall) and a faulter has no
-/// sender-side IPC buffer copy to long-copy from.
-pub const SCRATCH_MSG_LEN: usize = 20;
+/// 34 (was 20) so architecture fault replies fit entirely in the
+/// staging area. AArch64's `TIMEOUT_REPLY_MESSAGE` contains 34
+/// registers and must be available while the kernel restores a
+/// checkpointed passive server.
+pub const SCRATCH_MSG_LEN: usize = 34;
 
 /// Per-TCB kernel stack size. seL4 uses 4 KiB; we match that.
 pub const KERNEL_STACK_BYTES: usize = 4096;
@@ -166,6 +166,26 @@ impl FxArea {
         b[24] = 0x80; // MXCSR low  \ = 0x1F80
         b[25] = 0x1F; // MXCSR high /
         FxArea(b)
+    };
+}
+
+/// AArch64 SIMD/FP state stored beside each TCB. The exception frame uses the
+/// same FPCR/FPSR followed by Q0..Q31 layout, so switches are bounded copies.
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug)]
+pub struct Aarch64FpuState {
+    pub fpcr: u64,
+    pub fpsr: u64,
+    pub q: [u128; 32],
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Aarch64FpuState {
+    pub const ZERO: Self = Self {
+        fpcr: 0,
+        fpsr: 0,
+        q: [0; 32],
     };
 }
 
@@ -227,8 +247,7 @@ pub struct Tcb {
     /// SYSCALL_SAVE area into here on entry and back out before
     /// sysretq, so each thread's user state survives across
     /// schedule() calls.
-    #[cfg(target_arch = "x86_64")]
-    pub user_context: crate::arch::x86_64::syscall_entry::UserContext,
+    pub user_context: crate::arch::UserContext,
     /// Phase 15b — non-MCS reply tracking. When this thread is on
     /// the receive side of a Call, `reply_to` holds the TCB of the
     /// caller that's waiting for SysReply. seL4 calls this
@@ -355,7 +374,7 @@ pub struct Tcb {
     pub timeout_endpoint_cap: crate::cap::Cap,
     /// Per-thread hardware-debug state (CONFIG_HARDWARE_DEBUG_API).
     /// Mirrors seL4's `user_breakpoint_state_t`.
-    pub debug: crate::arch::x86_64::debug::DebugState,
+    pub debug: crate::arch::DebugState,
     /// Fault-type of the in-flight fault this thread is blocked on
     /// (0 = none; otherwise a `seL4_Fault_*` discriminant: 2 =
     /// UnknownSyscall, 3 = UserException, 6 = VMFault). Replying to
@@ -385,6 +404,8 @@ pub struct Tcb {
     /// `fxrstor`d on switch-to. Initialised to a valid FINIT image.
     #[cfg(feature = "smp")]
     pub fpu_state: FxArea,
+    #[cfg(target_arch = "aarch64")]
+    pub aarch64_fpu_state: Aarch64FpuState,
 }
 
 impl Default for Tcb {
@@ -413,8 +434,7 @@ impl Default for Tcb {
                 gs_base: 0,
             },
             cspace_root: crate::cap::Cap::Null,
-            #[cfg(target_arch = "x86_64")]
-            user_context: crate::arch::x86_64::syscall_entry::UserContext::new_zero(),
+            user_context: crate::arch::UserContext::new_zero(),
             reply_to: None,
             vspace_root: crate::cap::Cap::Null,
             bound_notification: None,
@@ -435,11 +455,13 @@ impl Default for Tcb {
             donated_sc: None,
             fault_handler_cap: crate::cap::Cap::Null,
             timeout_endpoint_cap: crate::cap::Cap::Null,
-            debug: crate::arch::x86_64::debug::DebugState::new(),
+            debug: crate::arch::DebugState::new(),
             pending_fault: 0,
             hosted_syscalls: false,
             #[cfg(feature = "smp")]
             fpu_state: FxArea::FINIT,
+            #[cfg(target_arch = "aarch64")]
+            aarch64_fpu_state: Aarch64FpuState::ZERO,
         }
     }
 }
@@ -516,7 +538,7 @@ impl TcbSlab {
                 // (SMP FPU save/restore). The `Default` is already a
                 // valid FINIT image; this just adopts the canonical
                 // boot-captured one for fidelity.
-                #[cfg(feature = "smp")]
+                #[cfg(all(feature = "smp", target_arch = "x86_64"))]
                 crate::arch::x86_64::fpu_ctx::stamp_template(&mut slot.as_mut().unwrap().fpu_state);
                 return Some(TcbId(i as u16));
             }

@@ -217,11 +217,13 @@ fn test_invocation_decoding() {
         InvocationLabel::from_u64(1),
         Some(InvocationLabel::UntypedRetype)
     );
-    // Last common label, then first arch-specific tag (X86PDPTMap).
-    // We don't hard-code numbers other than the anchor points, since
-    // adding methods upstream would shift them — but we do confirm
-    // the X86 range exists.
-    let some_x86 = InvocationLabel::from_u64(InvocationLabel::X86PDPTMap as u64);
-    assert_eq!(some_x86, Some(InvocationLabel::X86PDPTMap));
+    #[cfg(target_arch = "x86_64")]
+    let arch_label = InvocationLabel::X86PDPTMap;
+    #[cfg(target_arch = "aarch64")]
+    let arch_label = InvocationLabel::ARMVSpaceClean_Data;
+    assert_eq!(
+        InvocationLabel::from_u64(arch_label as u64),
+        Some(arch_label)
+    );
     arch::log("  ✓ InvocationLabel::from_u64 decodes per generator output\n");
 }

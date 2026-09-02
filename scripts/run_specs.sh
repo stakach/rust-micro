@@ -41,6 +41,7 @@ if [ ! -f "$IMAGE" ]; then
   exit 1
 fi
 QEMU_MEMORY="${QEMU_MEMORY:-2048M}"
+QEMU_CPUS="${QEMU_CPUS:-4}"
 
 DEBUG_FLAGS=()
 # GRAPHICS=1 (or the `--display`/`--graphics` flag) boots with a real QEMU
@@ -100,7 +101,8 @@ esac
 # need. Under q35 the boot disk lands on AHCI/SATA and OVMF won't
 # auto-boot it from a bare `-drive`, so we attach it explicitly with
 # `bootindex=0`. intremap=off: we only do DMA remapping, not IRQ remap.
-exec qemu-system-x86_64 \
+qemu_status=0
+qemu-system-x86_64 \
   -machine q35 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
   -drive format=raw,file="$IMAGE",if=none,id=bootdisk \
@@ -110,10 +112,17 @@ exec qemu-system-x86_64 \
   -device e1000,netdev=ntnet0 \
   -device intel-iommu,intremap=off \
   -m "$QEMU_MEMORY" \
-  -smp 4 \
+  -smp "$QEMU_CPUS" \
   -serial stdio \
   -no-reboot \
   ${DISPLAY_FLAGS[@]+"${DISPLAY_FLAGS[@]}"} \
   ${EXIT_DEVICE[@]+"${EXIT_DEVICE[@]}"} \
   ${DEBUG_FLAGS[@]+"${DEBUG_FLAGS[@]}"} \
-  "$@"
+  "$@" || qemu_status=$?
+
+# isa-debug-exit reserves odd host statuses: a guest value of zero becomes
+# status 1. Translate that successful completion to the conventional shell 0.
+if [ "$qemu_status" -eq 1 ]; then
+  exit 0
+fi
+exit "$qemu_status"

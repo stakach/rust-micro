@@ -1,0 +1,26 @@
+diff --git a/apps/sel4test-tests/src/tests/faults.c b/apps/sel4test-tests/src/tests/faults.c
+--- a/apps/sel4test-tests/src/tests/faults.c
++++ b/apps/sel4test-tests/src/tests/faults.c
+@@ -837,7 +837,7 @@ static int test_bad_instruction_interas(env_t env)
+ {
+     return test_fault(env, FAULT_BAD_INSTRUCTION, true);
+ }
+-DEFINE_TEST(PAGEFAULT1005, "Test undefined instruction (inter-AS)", test_bad_instruction_interas, false)
++DEFINE_TEST(PAGEFAULT1005, "Test undefined instruction (inter-AS)", test_bad_instruction_interas, true)
+ 
+ static void
+ timeout_fault_0001_fn(void)
+diff --git a/apps/sel4test-tests/src/tests/ipc.c b/apps/sel4test-tests/src/tests/ipc.c
+--- a/apps/sel4test-tests/src/tests/ipc.c
++++ b/apps/sel4test-tests/src/tests/ipc.c
+@@ -1356,8 +1356,6 @@ static int test_sched_donation_cross_core(env_t env)
+ 
+     return sel4test_get_result();
+ }
+-/* This test currently fails.
+-   See https://github.com/seL4/seL4/issues/941 and https://github.com/seL4/seL4/pull/986 */
+-DEFINE_TEST(IPC0028, "Cross core sched donation", test_sched_donation_cross_core, false);
+-/*            config_set(CONFIG_KERNEL_MCS) &&(CONFIG_MAX_NUM_NODES > 1)); */
++DEFINE_TEST(IPC0028, "Cross core sched donation", test_sched_donation_cross_core,
++            config_set(CONFIG_KERNEL_MCS) && (CONFIG_MAX_NUM_NODES > 1));
+ #endif /* CONFIG_KERNEL_MCS */

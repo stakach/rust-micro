@@ -20,9 +20,11 @@ use crate::interrupt::{handle_interrupt, set_notification, IrqTable};
 use crate::notification::{wait, Notification, WaitOutcome};
 use crate::object_type::ObjectType;
 use crate::scheduler::Scheduler;
+#[cfg(target_arch = "x86_64")]
 use crate::structures::arch::Pte;
 use crate::tcb::{Tcb, TcbId, ThreadStateType};
 use crate::untyped::{retype, UntypedState};
+#[cfg(target_arch = "x86_64")]
 use crate::vspace::{decompose_vaddr, frame_map_4k, CacheAttr, VmRights, ENTRIES_PER_TABLE};
 
 pub fn test_integration() {
@@ -31,6 +33,7 @@ pub fn test_integration() {
     two_thread_endpoint_pingpong();
     irq_drives_thread_unblock();
     badge_identifies_sender();
+    #[cfg(target_arch = "x86_64")]
     untyped_to_frame_map();
     arch::log("Integration tests completed\n");
 }
@@ -219,6 +222,7 @@ fn badge_identifies_sender() {
 // page-aligned addresses.
 // ---------------------------------------------------------------------------
 
+#[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn untyped_to_frame_map() {
     // Page table = one page = 4 KiB = block_bits 12.

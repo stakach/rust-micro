@@ -34,14 +34,7 @@ static MBI_ADDR: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn phys_ptr(paddr: u64) -> *const u8 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let base = crate::arch::x86_64::paging::LINEAR_MAP_BASE;
-        if base != 0 {
-            return crate::arch::x86_64::paging::phys_to_lin(paddr) as *const u8;
-        }
-    }
-    paddr as *const u8
+    crate::arch::phys_to_virt(paddr) as *const u8
 }
 
 #[inline]
@@ -303,22 +296,37 @@ pub fn get_bootstrap_processor_id() -> u16 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 const RTC_SECONDS: u8 = 0x00;
+#[cfg(target_arch = "x86_64")]
 const RTC_MINUTES: u8 = 0x02;
+#[cfg(target_arch = "x86_64")]
 const RTC_HOURS: u8 = 0x04;
+#[cfg(target_arch = "x86_64")]
 const RTC_DAY: u8 = 0x07;
+#[cfg(target_arch = "x86_64")]
 const RTC_MONTH: u8 = 0x08;
+#[cfg(target_arch = "x86_64")]
 const RTC_YEAR: u8 = 0x09;
+#[cfg(target_arch = "x86_64")]
 const RTC_STATUS_A: u8 = 0x0a;
+#[cfg(target_arch = "x86_64")]
 const RTC_STATUS_B: u8 = 0x0b;
+#[cfg(target_arch = "x86_64")]
 const RTC_STATUS_D: u8 = 0x0d;
+#[cfg(target_arch = "x86_64")]
 const RTC_UPDATE_IN_PROGRESS: u8 = 1 << 7;
+#[cfg(target_arch = "x86_64")]
 const RTC_VALID: u8 = 1 << 7;
+#[cfg(target_arch = "x86_64")]
 const CMOS_NMI_DISABLE: u8 = 1 << 7;
+#[cfg(target_arch = "x86_64")]
 const MAX_RTC_UPDATE_POLLS: usize = 128;
+#[cfg(target_arch = "x86_64")]
 const MAX_RTC_STABLE_READS: usize = 4;
 
 #[inline]
+#[cfg(target_arch = "x86_64")]
 unsafe fn outb(port: u16, value: u8) {
     core::arch::asm!(
         "out dx, al",
@@ -329,6 +337,7 @@ unsafe fn outb(port: u16, value: u8) {
 }
 
 #[inline]
+#[cfg(target_arch = "x86_64")]
 unsafe fn inb(port: u16) -> u8 {
     let value: u8;
     core::arch::asm!(
@@ -340,6 +349,7 @@ unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+#[cfg(target_arch = "x86_64")]
 fn cmos_read(index_port: u16, data_port: u16, register: u8) -> u8 {
     unsafe {
         outb(index_port, register | CMOS_NMI_DISABLE);
@@ -347,6 +357,7 @@ fn cmos_read(index_port: u16, data_port: u16, register: u8) -> u8 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn rtc_update_complete(index_port: u16, data_port: u16) -> bool {
     for _ in 0..MAX_RTC_UPDATE_POLLS {
         if cmos_read(index_port, data_port, RTC_STATUS_A) & RTC_UPDATE_IN_PROGRESS == 0 {
@@ -356,6 +367,7 @@ fn rtc_update_complete(index_port: u16, data_port: u16) -> bool {
     false
 }
 
+#[cfg(target_arch = "x86_64")]
 fn read_rtc_registers(
     index_port: u16,
     data_port: u16,
@@ -375,33 +387,41 @@ fn read_rtc_registers(
 /// Simpleboot has no wall-clock MBI tag. Publish a stable snapshot from the ACPI-declared PC RTC;
 /// platforms without a valid RTC and century register remain explicitly unsupported.
 pub fn wall_clock_snapshot() -> Option<bootstrap_clock::WallClockSnapshot> {
-    let rtc = crate::arch::x86_64::acpi::find_pc_rtc(acpi_table_address()).ok()?;
-    let century_register = rtc.century_register.filter(|register| *register <= 0x7f)?;
-    let snapshot = (|| {
-        if cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_D) & RTC_VALID == 0
-            || !rtc_update_complete(rtc.index_port, rtc.data_port)
-        {
-            return None;
-        }
-        let status_b = cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_B);
-        for _ in 0..MAX_RTC_STABLE_READS {
-            let first = read_rtc_registers(rtc.index_port, rtc.data_port, century_register);
-            if cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_A) & RTC_UPDATE_IN_PROGRESS != 0
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return None;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rtc = crate::arch::x86_64::acpi::find_pc_rtc(acpi_table_address()).ok()?;
+        let century_register = rtc.century_register.filter(|register| *register <= 0x7f)?;
+        let snapshot = (|| {
+            if cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_D) & RTC_VALID == 0
+                || !rtc_update_complete(rtc.index_port, rtc.data_port)
             {
-                if !rtc_update_complete(rtc.index_port, rtc.data_port) {
-                    return None;
+                return None;
+            }
+            let status_b = cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_B);
+            for _ in 0..MAX_RTC_STABLE_READS {
+                let first = read_rtc_registers(rtc.index_port, rtc.data_port, century_register);
+                if cmos_read(rtc.index_port, rtc.data_port, RTC_STATUS_A) & RTC_UPDATE_IN_PROGRESS
+                    != 0
+                {
+                    if !rtc_update_complete(rtc.index_port, rtc.data_port) {
+                        return None;
+                    }
+                    continue;
                 }
-                continue;
+                let second = read_rtc_registers(rtc.index_port, rtc.data_port, century_register);
+                if first == second {
+                    return bootstrap_clock::decode_pc_rtc_utc(first, status_b).ok();
+                }
             }
-            let second = read_rtc_registers(rtc.index_port, rtc.data_port, century_register);
-            if first == second {
-                return bootstrap_clock::decode_pc_rtc_utc(first, status_b).ok();
-            }
-        }
-        None
-    })();
-    unsafe { outb(rtc.index_port, 0) };
-    snapshot
+            None
+        })();
+        unsafe { outb(rtc.index_port, 0) };
+        snapshot
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -2,6 +2,21 @@
 #![no_std]
 #![no_main]
 
+#[cfg(all(feature = "arch-x86_64", feature = "arch-aarch64"))]
+compile_error!("select exactly one architecture feature");
+#[cfg(not(any(feature = "arch-x86_64", feature = "arch-aarch64")))]
+compile_error!("select an architecture feature");
+#[cfg(all(target_arch = "x86_64", not(feature = "arch-x86_64")))]
+compile_error!("x86_64 targets require the `arch-x86_64` feature");
+#[cfg(all(target_arch = "aarch64", not(feature = "arch-aarch64")))]
+compile_error!("aarch64 targets require the `arch-aarch64` feature");
+#[cfg(all(feature = "arch-x86_64", not(target_arch = "x86_64")))]
+compile_error!("the `arch-x86_64` feature requires an x86_64 target");
+#[cfg(all(feature = "arch-aarch64", not(target_arch = "aarch64")))]
+compile_error!("the `arch-aarch64` feature requires an aarch64 target");
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("supported kernel targets are x86_64 and aarch64");
+
 #[allow(dead_code)]
 mod simpleboot;
 
@@ -117,7 +132,6 @@ mod elf;
 
 // Phase 29c — rootserver loader: parses ROOTSERVER_ELF, allocates
 // user pages, builds a fresh PML4 + user stack.
-#[cfg(target_arch = "x86_64")]
 mod rootserver;
 
 // Phase 10c — IPC fastpath bypassing the slowpath book-keeping for
@@ -140,29 +154,101 @@ mod spec;
 /********************************************
  * Entry point, called by Simpleboot Loader *
  ********************************************/
-// NOTE: this code runs on all cores in parallel
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    r#"
+    .section .text.boot,"ax"
+    .global _arm64_image_start
+_arm64_image_start:
+    b _start
+    nop
+    .quad 0x00200000
+    .quad __kernel_end - _arm64_image_start
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .word 0x644d5241
+    .word 0
+"#
+);
+
+// NOTE: Simpleboot enters this path on all configured x86 cores.
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 extern "C" fn _start(magic: u64, mbi_addr: u64) -> ! {
     simpleboot::init(magic, mbi_addr);
+    kernel_entry()
+}
 
+/// Simpleboot enters every AArch64 CPU with its magic in X0 and the shared
+/// Multiboot Information address in X1. Move off the loader's temporary stack
+/// before calling Rust, using MPIDR affinity level 0 as the dense QEMU CPU id.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+#[no_mangle]
+extern "C" fn _start(_magic: u64, _mbi_addr: u64) -> ! {
+    core::arch::naked_asm!(
+        "mrs x9, mpidr_el1",
+        "and x9, x9, #0xff",
+        "cmp x9, {max_cpus}",
+        "b.hs 2f",
+        "adrp x10, {stacks}",
+        "add x10, x10, :lo12:{stacks}",
+        "add x9, x9, #1",
+        "lsl x9, x9, {stack_shift}",
+        "add sp, x10, x9",
+        // Match seL4's non-hypervisor `disableFpuEL0`: EL1 may use
+        // FP/SIMD while EL0 remains trapped for lazy context switching.
+        "mrs x3, cpacr_el1",
+        "orr x3, x3, #0x100000",
+        "msr cpacr_el1, x3",
+        "isb",
+        "b {entry}",
+        "2:",
+        "wfe",
+        "b 2b",
+        stacks = sym AARCH64_BOOT_STACKS,
+        stack_shift = const 22,
+        max_cpus = const smp::MAX_CPUS,
+        entry = sym aarch64_start,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+extern "C" fn aarch64_start(magic: u64, mbi_addr: u64) -> ! {
+    simpleboot::init(magic, mbi_addr);
+    kernel_entry()
+}
+
+fn kernel_entry() -> ! {
     // Only initialize on the bootstrap processor
-    // Check if current APIC ID matches the Simpleboot BSP ID
-    let current_apic_id = arch::get_cpu_id();
+    // Check if the current architectural CPU ID matches Simpleboot's BSP ID.
+    let current_cpu_id = arch::get_cpu_id();
     let simpleboot_bsp_id = simpleboot::get_bootstrap_processor_id() as arch::CpuId;
 
-    if current_apic_id == simpleboot_bsp_id {
+    if current_cpu_id == simpleboot_bsp_id {
         bsp_main();
     } else {
-        ap_main(current_apic_id);
+        ap_main(current_cpu_id);
     }
 }
 
 /// Bootloader stacks are intentionally small. The BSP hops onto this
 /// BSS-allocated stack first thing so kernel specs can build larger
 /// test fixtures without depending on loader stack policy.
+#[cfg(target_arch = "x86_64")]
 #[repr(C, align(16))]
-struct BspStack([u8; 1024 * 1024]);
-static mut BSP_BIG_STACK: BspStack = BspStack([0; 1024 * 1024]);
+struct BspStack([u8; 4 * 1024 * 1024]);
+#[cfg(target_arch = "x86_64")]
+static mut BSP_BIG_STACK: BspStack = BspStack([0; 4 * 1024 * 1024]);
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C, align(4_194_304))]
+struct Aarch64BootStack([u8; 4 * 1024 * 1024]);
+#[cfg(target_arch = "aarch64")]
+static mut AARCH64_BOOT_STACKS: [Aarch64BootStack; smp::MAX_CPUS] =
+    [const { Aarch64BootStack([0; 4 * 1024 * 1024]) }; smp::MAX_CPUS];
 
 #[cfg(target_arch = "x86_64")]
 #[repr(C, align(16))]
@@ -227,6 +313,9 @@ fn bsp_main_big_stack() -> ! {
         crate::arch::x86_64::lapic::init_lapic();
     }
 
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::vspace::install_kernel_vspace();
+
     arch::log("Kernel initialization complete on BSP\n");
 
     // Release APs — the shared GDT and IDT are now populated, so
@@ -245,7 +334,6 @@ fn bsp_main_big_stack() -> ! {
     // spec calls super::load() which allocates from this region,
     // and sel4test-driver's image alone is ~3.9 MiB — too big for
     // a kernel-image BSS pool.
-    #[cfg(target_arch = "x86_64")]
     if let Err(e) = boot::reserve_user_page_region() {
         arch::log("boot: reserve_user_page_region failed: ");
         match e {
@@ -271,7 +359,6 @@ fn bsp_main_big_stack() -> ! {
     // Simpleboot-supplied state — useful as an end-to-end smoke
     // test that the boot code that's been spec'd in synthetic
     // form actually copes with real-hardware data.
-    #[cfg(target_arch = "x86_64")]
     match boot::kernel_init() {
         Ok(_) => arch::log("boot: kernel_init succeeded\n"),
         Err(e) => {
@@ -291,12 +378,11 @@ fn bsp_main_big_stack() -> ! {
     // hand-asm demo as the canonical "kernel actually runs userspace"
     // bootstrap. The dispatcher exits QEMU when the rootserver
     // prints '\n' (closing its banner).
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         crate::rootserver::launch_rootserver();
     }
 
-    #[cfg(any(not(target_arch = "x86_64"), not(feature = "spec")))]
+    #[cfg(not(feature = "spec"))]
     loop {}
 }
 
@@ -348,6 +434,13 @@ fn ap_main_big_stack(apic_id: arch::CpuId) -> ! {
     // SVR + TPR writes are per-CPU.
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::lapic::init_lapic();
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::vspace::install_kernel_vspace_for_ap();
+        crate::arch::aarch64::exceptions::init_exceptions();
+        unsafe { crate::arch::aarch64::gic::init_cpu_interface() };
+    }
 
     // Each AP needs its own FPU/CR4 set up to match the BSP, or migrated
     // threads run with a different FPU config across cores (FPU0002).
@@ -522,6 +615,45 @@ fn ap_scheduler_loop() -> ! {
             }
         }
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            let my_cpu = arch::get_cpu_id();
+            let next = unsafe {
+                let state = crate::kernel::KERNEL.get();
+                state
+                    .scheduler
+                    .current_for_cpu(my_cpu)
+                    .or_else(|| state.scheduler.choose_thread())
+            };
+            if let Some(tcb_id) = next {
+                let dispatchable = unsafe {
+                    let tcb = crate::kernel::KERNEL.get().scheduler.slab.get(tcb_id);
+                    tcb.cpu_context.cr3 != 0
+                        || matches!(tcb.vspace_root, crate::cap::Cap::PML4 { mapped: true, .. })
+                };
+                if dispatchable {
+                    let context = unsafe {
+                        let state = crate::kernel::KERNEL.get();
+                        state.scheduler.set_current(Some(tcb_id));
+                        state.scheduler.set_active_user(Some(tcb_id));
+                        crate::sched_context::complete_yield_if_pending(tcb_id);
+                        let tcb = state.scheduler.slab.get_mut(tcb_id);
+                        crate::arch::aarch64::debug::restore_user_debug_context(
+                            &tcb.debug,
+                            &mut tcb.user_context,
+                        );
+                        crate::arch::aarch64::context::set_user_fpu_access(tcb.flags & 1 != 0);
+                        crate::arch::aarch64::context::restore_fpu_hardware(&tcb.aarch64_fpu_state);
+                        &tcb.user_context as *const crate::arch::UserContext
+                    };
+                    crate::arch::aarch64::syscall_entry::activate_thread_vspace(tcb_id);
+                    crate::arch::aarch64::timer::ensure_periodic_kernel_timer();
+                    smp::bkl_release();
+                    unsafe { crate::arch::aarch64::context::enter_user(context) }
+                }
+            }
+        }
+
         // SMP: this AP is about to idle — flush its live FPU state back
         // to the owner TCB so a thread migrated off this idle core (which
         // `remote_tcb_stall` won't stall/flush) restores fresh state.
@@ -541,6 +673,8 @@ fn ap_scheduler_loop() -> ! {
         // IDT and triple-faults (MULTICORE0003 cross-AS teardown).
         #[cfg(all(target_arch = "x86_64", feature = "smp"))]
         crate::arch::x86_64::paging::park_on_kernel_root();
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::vspace::park_on_kernel_root();
         // Mark went-idle so the next dispatch flushes a possibly-stale
         // TLB (this AP misses shootdowns while idle).
         smp::mark_went_idle();
@@ -551,8 +685,18 @@ fn ap_scheduler_loop() -> ! {
         // the top, so an IRQ can't re-enter bkl_acquire while we hold it
         // (the BKL re-entrancy / silent-hang class fixed in the BSP idle
         // loops — syscall_entry.rs / exceptions.rs).
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!("sti", "hlt", "cli", options(nostack, preserves_flags),);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!(
+                "msr daifclr, #2",
+                "wfi",
+                "msr daifset, #2",
+                options(nostack, nomem),
+            );
         }
     }
 }

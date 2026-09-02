@@ -19,15 +19,13 @@
 //! Phase 29c stops at "ready to dispatch" — actually wiring the
 //! rootserver as the boot thread lands in 29e.
 
-#![cfg(target_arch = "x86_64")]
-
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::paging::{install_kernel_page_tables, make_user_pml4};
-use crate::arch::x86_64::syscall_entry::{
-    enter_user_via_iretq, set_syscall_kernel_rsp, UserContext,
-};
-use crate::arch::x86_64::usermode::map_user_4k_into_pml4;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::syscall_entry::{enter_user_via_iretq, set_syscall_kernel_rsp};
+use crate::arch::UserContext;
 use crate::cap::{
     Cap, FrameRights, FrameSize, FrameStorage, PAddr, PPtr, Pml4Storage, UntypedStorage,
 };
@@ -108,7 +106,7 @@ unsafe fn alloc_page() -> u64 {
     let paddr = (*region).base_paddr + used;
     (*region).used = used + 4096;
     // Zero the page through the kernel-half linear map.
-    let p = crate::arch::x86_64::paging::phys_to_lin(paddr) as *mut u8;
+    let p = crate::arch::phys_to_virt(paddr) as *mut u8;
     for i in 0..4096 {
         core::ptr::write_volatile(p.add(i), 0);
     }
@@ -175,6 +173,7 @@ pub const ROOTSERVER_CNODE_BYTES: u64 = 1u64 << ROOTSERVER_CNODE_SIZE_BITS;
 ///   * 0x00000000 (4 KiB): BIOS Data Area, including the ACPICA EBDA pointer at 0x40e.
 ///   * 0x00080000 (512 KiB): upper conventional/BIOS memory, including the RSDP scan window.
 ///   * 0xFEC00000 / 0xFED00000 / 0xFEE00000 (4 KiB each): IOAPIC / HPET / LAPIC MMIO.
+#[cfg(target_arch = "x86_64")]
 pub const DEVICE_UTS: &[(u64, u8)] = &[
     (0x00000000, 12),
     (0x00080000, 19),
@@ -182,6 +181,9 @@ pub const DEVICE_UTS: &[(u64, u8)] = &[
     (0xFED00000, 12),
     (0xFEE00000, 12),
 ];
+
+#[cfg(target_arch = "aarch64")]
+pub const DEVICE_UTS: &[(u64, u8)] = &[(0, 30)];
 
 #[derive(Copy, Clone)]
 struct DeviceUntypedSpec {
@@ -721,6 +723,33 @@ pub enum LoadError {
     },
 }
 
+unsafe fn make_rootserver_vspace() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        make_user_pml4()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::vspace::make_user_vspace(|| alloc_page())
+    }
+}
+
+unsafe fn map_user_4k_into_pml4(
+    root: u64,
+    vaddr: u64,
+    paddr: u64,
+    writable: bool,
+    no_execute: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::usermode::map_user_4k_into_pml4(root, vaddr, paddr, writable, no_execute);
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::vspace::map_user_4k(root, vaddr, paddr, writable, !no_execute, || {
+        alloc_page()
+    })
+    .expect("rootserver user mapping");
+}
+
 // ---------------------------------------------------------------------------
 // Loader entry.
 //
@@ -731,7 +760,7 @@ pub enum LoadError {
 
 pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     let img = elf::parse(rootserver_elf()).map_err(LoadError::Elf)?;
-    let pml4 = make_user_pml4();
+    let pml4 = make_rootserver_vspace();
 
     // The linker may emit several PT_LOAD segments that share a
     // single 4 KiB page (e.g. read-only data + .text both starting
@@ -954,6 +983,7 @@ unsafe fn rs_set(s: &mut KernelState, si: usize, cap: &Cap) {
 }
 
 pub unsafe fn launch_rootserver() -> ! {
+    #[cfg(target_arch = "x86_64")]
     install_kernel_page_tables();
 
     let img = load().expect("rootserver loads");
@@ -972,7 +1002,7 @@ pub unsafe fn launch_rootserver() -> ! {
     #[cfg(feature = "extern-rootserver")]
     {
         let backing = ROOTSERVER_CNODE_BACKING.expect("rootserver CNode backing reserved at boot");
-        let slots = crate::arch::x86_64::paging::phys_to_lin(backing) as *mut u8;
+        let slots = crate::arch::phys_to_virt(backing) as *mut u8;
         core::ptr::write_bytes(slots, 0, ROOTSERVER_CNODE_BYTES as usize);
         let registered = s
             .alloc_dynamic_cnode(backing, ROOTSERVER_CNODE_RADIX)
@@ -1028,11 +1058,11 @@ pub unsafe fn launch_rootserver() -> ! {
     t.mcp = 255;
     t.state = ThreadStateType::Running;
     t.affinity = 0;
-    t.user_context = UserContext::for_entry(
-        img.entry,
-        img.stack_top - 8,
-        /* rdi (arg0) */ img.bootinfo_vaddr,
-    );
+    #[cfg(target_arch = "x86_64")]
+    let initial_sp = img.stack_top - 8;
+    #[cfg(target_arch = "aarch64")]
+    let initial_sp = img.stack_top;
+    t.user_context = UserContext::for_entry(img.entry, initial_sp, img.bootinfo_vaddr);
     t.cpu_context.cr3 = img.pml4_paddr;
     // Phase 34c — register the rootserver's IPC buffer with the
     // kernel so long-message IPC can read/write it via paddr.
@@ -1134,7 +1164,10 @@ pub unsafe fn launch_rootserver() -> ! {
     // Phase 37a — pre-allocated InitThreadASIDPool at canonical
     // slot 6. asid_base = 0 (rootserver gets the first 512 ASIDs).
     let asid_pool_va = (&raw const ROOTSERVER_ASID_POOL) as u64;
+    #[cfg(target_arch = "x86_64")]
     let asid_pool_pa = crate::arch::x86_64::paging::kernel_virt_to_phys(asid_pool_va);
+    #[cfg(target_arch = "aarch64")]
+    let asid_pool_pa = asid_pool_va;
     rs_set(
         s,
         6,
@@ -1148,6 +1181,7 @@ pub unsafe fn launch_rootserver() -> ! {
     // calls `seL4_X86_IOPortControl_Issue` here when it falls back
     // to PIT (which it does whenever ACPI/HPET discovery fails),
     // so without this cap the timer driver silently bails.
+    #[cfg(target_arch = "x86_64")]
     rs_set(s, 7, &Cap::IOPortControl);
     // Phase 43 — slot 11 is the canonical seL4_CapDomain. sel4test's
     // DOMAINS0001-3 invoke DomainSet_Set on it; the kernel's decode_
@@ -1266,79 +1300,86 @@ pub unsafe fn launch_rootserver() -> ! {
     // memory map as private typed chunks before the standard TSC-frequency chunk. Keeping the
     // 20-byte TSC chunk last preserves its standard declared length while every preceding header
     // remains naturally aligned.
-    const SEL4_BI_HEADER_SIZE: usize = 16; // u64 id + u64 len
-    const TSC_FREQ_HEADER_ID: u64 = 5; // SEL4_BOOTINFO_HEADER_X86_TSC_FREQ
-    let extra_bi_kvaddr = phys_to_kernel_virt(img.extra_bi_paddr);
-    let extra_bi_ptr = extra_bi_kvaddr as *mut u8;
-    let ioapic_count = crate::arch::x86_64::ioapic::controller_count();
-    assert!(ioapic_count <= crate::types::CONFIG_MAX_NUM_BOOTINFO_IOAPICS);
-    let mut ioapic_topology = crate::types::seL4_BootIoApicTopology {
-        count: ioapic_count as u16,
-        reserved: [0; 6],
-        controllers: [crate::types::seL4_BootIoApicDesc::default();
-            crate::types::CONFIG_MAX_NUM_BOOTINFO_IOAPICS],
-    };
-    for (ordinal, description) in ioapic_topology.controllers[..ioapic_count]
-        .iter_mut()
-        .enumerate()
-    {
-        let (gsi_base, redirection_entries) =
-            crate::arch::x86_64::ioapic::controller_route_extent(ordinal)
-                .expect("published IOAPIC catalog entry must remain valid");
-        *description = crate::types::seL4_BootIoApicDesc {
-            gsiBase: gsi_base,
-            redirectionEntries: redirection_entries,
-            reserved: 0,
+    #[cfg(target_arch = "x86_64")]
+    let (extra_bi_total_len, tsc_frequency_payload) = {
+        const SEL4_BI_HEADER_SIZE: usize = 16; // u64 id + u64 len
+        const TSC_FREQ_HEADER_ID: u64 = 5; // SEL4_BOOTINFO_HEADER_X86_TSC_FREQ
+        let extra_bi_kvaddr = phys_to_kernel_virt(img.extra_bi_paddr);
+        let extra_bi_ptr = extra_bi_kvaddr as *mut u8;
+        let ioapic_count = crate::arch::x86_64::ioapic::controller_count();
+        assert!(ioapic_count <= crate::types::CONFIG_MAX_NUM_BOOTINFO_IOAPICS);
+        let mut ioapic_topology = crate::types::seL4_BootIoApicTopology {
+            count: ioapic_count as u16,
+            reserved: [0; 6],
+            controllers: [crate::types::seL4_BootIoApicDesc::default();
+                crate::types::CONFIG_MAX_NUM_BOOTINFO_IOAPICS],
         };
-    }
-    let topology_chunk_len =
-        SEL4_BI_HEADER_SIZE + core::mem::size_of::<crate::types::seL4_BootIoApicTopology>();
-    core::ptr::write_volatile(
-        extra_bi_ptr as *mut u64,
-        crate::types::SEL4_BOOTINFO_HEADER_NT_IOAPIC,
-    );
-    core::ptr::write_volatile((extra_bi_ptr as *mut u64).add(1), topology_chunk_len as u64);
-    core::ptr::write(
-        extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut crate::types::seL4_BootIoApicTopology,
-        ioapic_topology,
-    );
-    let mut firmware_ranges = [crate::types::seL4_BootFirmwareMemoryRange::default();
-        crate::types::CONFIG_MAX_NUM_BOOTINFO_FIRMWARE_MEMORY_RANGES];
-    let firmware_range_count = boot_firmware_memory_ranges(&mut firmware_ranges);
-    let firmware_payload_len = 8 + firmware_range_count
-        * core::mem::size_of::<crate::types::seL4_BootFirmwareMemoryRange>();
-    let firmware_chunk_len = SEL4_BI_HEADER_SIZE + firmware_payload_len;
-    let firmware_chunk = extra_bi_ptr.add(topology_chunk_len);
-    core::ptr::write_volatile(
-        firmware_chunk as *mut u64,
-        crate::types::SEL4_BOOTINFO_HEADER_NT_FIRMWARE_MEMORY_MAP,
-    );
-    core::ptr::write_volatile(
-        (firmware_chunk as *mut u64).add(1),
-        firmware_chunk_len as u64,
-    );
-    let firmware_payload = firmware_chunk.add(SEL4_BI_HEADER_SIZE);
-    core::ptr::write_volatile(firmware_payload as *mut u16, firmware_range_count as u16);
-    core::ptr::write_bytes(firmware_payload.add(2), 0, 6);
-    core::ptr::copy_nonoverlapping(
-        firmware_ranges.as_ptr() as *const u8,
-        firmware_payload.add(8),
-        firmware_range_count * core::mem::size_of::<crate::types::seL4_BootFirmwareMemoryRange>(),
-    );
-    let tsc_chunk = firmware_chunk.add(firmware_chunk_len);
-    core::ptr::write_volatile(tsc_chunk as *mut u64, TSC_FREQ_HEADER_ID);
-    core::ptr::write_volatile(
-        (tsc_chunk as *mut u64).add(1),
-        (SEL4_BI_HEADER_SIZE + 4) as u64,
-    );
-    let tsc_frequency_payload = tsc_chunk.add(SEL4_BI_HEADER_SIZE) as *mut u32;
-    core::ptr::write_volatile(tsc_frequency_payload, 0);
-    let extra_bi_total_len: Word =
-        (topology_chunk_len + firmware_chunk_len + SEL4_BI_HEADER_SIZE + 4) as Word;
-    assert!(
-        extra_bi_total_len <= 4096,
-        "typed extra BootInfo exceeds its mapped page"
-    );
+        for (ordinal, description) in ioapic_topology.controllers[..ioapic_count]
+            .iter_mut()
+            .enumerate()
+        {
+            let (gsi_base, redirection_entries) =
+                crate::arch::x86_64::ioapic::controller_route_extent(ordinal)
+                    .expect("published IOAPIC catalog entry must remain valid");
+            *description = crate::types::seL4_BootIoApicDesc {
+                gsiBase: gsi_base,
+                redirectionEntries: redirection_entries,
+                reserved: 0,
+            };
+        }
+        let topology_chunk_len =
+            SEL4_BI_HEADER_SIZE + core::mem::size_of::<crate::types::seL4_BootIoApicTopology>();
+        core::ptr::write_volatile(
+            extra_bi_ptr as *mut u64,
+            crate::types::SEL4_BOOTINFO_HEADER_NT_IOAPIC,
+        );
+        core::ptr::write_volatile((extra_bi_ptr as *mut u64).add(1), topology_chunk_len as u64);
+        core::ptr::write(
+            extra_bi_ptr.add(SEL4_BI_HEADER_SIZE) as *mut crate::types::seL4_BootIoApicTopology,
+            ioapic_topology,
+        );
+        let mut firmware_ranges = [crate::types::seL4_BootFirmwareMemoryRange::default();
+            crate::types::CONFIG_MAX_NUM_BOOTINFO_FIRMWARE_MEMORY_RANGES];
+        let firmware_range_count = boot_firmware_memory_ranges(&mut firmware_ranges);
+        let firmware_payload_len = 8 + firmware_range_count
+            * core::mem::size_of::<crate::types::seL4_BootFirmwareMemoryRange>();
+        let firmware_chunk_len = SEL4_BI_HEADER_SIZE + firmware_payload_len;
+        let firmware_chunk = extra_bi_ptr.add(topology_chunk_len);
+        core::ptr::write_volatile(
+            firmware_chunk as *mut u64,
+            crate::types::SEL4_BOOTINFO_HEADER_NT_FIRMWARE_MEMORY_MAP,
+        );
+        core::ptr::write_volatile(
+            (firmware_chunk as *mut u64).add(1),
+            firmware_chunk_len as u64,
+        );
+        let firmware_payload = firmware_chunk.add(SEL4_BI_HEADER_SIZE);
+        core::ptr::write_volatile(firmware_payload as *mut u16, firmware_range_count as u16);
+        core::ptr::write_bytes(firmware_payload.add(2), 0, 6);
+        core::ptr::copy_nonoverlapping(
+            firmware_ranges.as_ptr() as *const u8,
+            firmware_payload.add(8),
+            firmware_range_count
+                * core::mem::size_of::<crate::types::seL4_BootFirmwareMemoryRange>(),
+        );
+        let tsc_chunk = firmware_chunk.add(firmware_chunk_len);
+        core::ptr::write_volatile(tsc_chunk as *mut u64, TSC_FREQ_HEADER_ID);
+        core::ptr::write_volatile(
+            (tsc_chunk as *mut u64).add(1),
+            (SEL4_BI_HEADER_SIZE + 4) as u64,
+        );
+        let tsc_frequency_payload = tsc_chunk.add(SEL4_BI_HEADER_SIZE) as *mut u32;
+        core::ptr::write_volatile(tsc_frequency_payload, 0);
+        let extra_bi_total_len: Word =
+            (topology_chunk_len + firmware_chunk_len + SEL4_BI_HEADER_SIZE + 4) as Word;
+        assert!(
+            extra_bi_total_len <= 4096,
+            "typed extra BootInfo exceeds its mapped page"
+        );
+        (extra_bi_total_len, tsc_frequency_payload)
+    };
+    #[cfg(target_arch = "aarch64")]
+    let extra_bi_total_len: Word = 0;
 
     // Build + write the BootInfo struct into its page. We address
     // it via its kernel-virt mapping (still Simpleboot-identity-mapped)
@@ -1364,13 +1405,16 @@ pub unsafe fn launch_rootserver() -> ! {
     s.scheduler.set_current(Some(id));
 
     // Pin SYSCALL kernel rsp for BSP.
-    let rsp: u64;
-    core::arch::asm!(
-        "mov {}, rsp",
-        out(reg) rsp,
-        options(nomem, nostack, preserves_flags),
-    );
-    set_syscall_kernel_rsp(rsp);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rsp: u64;
+        core::arch::asm!(
+            "mov {}, rsp",
+            out(reg) rsp,
+            options(nomem, nostack, preserves_flags),
+        );
+        set_syscall_kernel_rsp(rsp);
+    }
 
     // Arm the dispatcher's exit hook.
     #[cfg(not(feature = "extern-rootserver"))]
@@ -1400,48 +1444,51 @@ pub unsafe fn launch_rootserver() -> ! {
     // notification. The kernel only installs the handler and
     // unmasks the line (after specs — the PIT spec's mask_all()
     // would otherwise leave IRQ 0 dead).
-    crate::arch::x86_64::pic::init_pic();
-    crate::arch::x86_64::lapic::calibrate_timer_with_pit();
-    let tsc_frequency_hz = crate::arch::x86_64::lapic::calibrated_tsc_frequency_hz()
-        .expect("PIT calibration must publish a nonzero TSC frequency");
-    #[cfg(feature = "extern-rootserver")]
-    core::ptr::write_volatile(
-        core::ptr::addr_of_mut!((*bi_ptr).tscFrequencyHz),
-        tsc_frequency_hz,
-    );
-    let tsc_frequency_mhz = tsc_frequency_hz
-        .saturating_add(500_000)
-        .checked_div(1_000_000)
-        .and_then(|frequency| u32::try_from(frequency).ok())
-        .expect("calibrated TSC frequency must fit the seL4 MHz boot-info payload");
-    core::ptr::write_volatile(tsc_frequency_payload, tsc_frequency_mhz);
-    crate::arch::x86_64::lapic::enable_periodic_kernel_timer();
-    crate::arch::x86_64::pit::install_irq_handler();
-
-    // Swap CR3 to the rootserver's PML4 (kernel half preserved).
-    core::arch::asm!(
-        "mov cr3, {}",
-        in(reg) img.pml4_paddr,
-        options(nostack, preserves_flags),
-    );
-
-    // SMP: establish the rootserver as this core's FPU owner so its
-    // x87/SSE state is tracked from first entry (otherwise a later
-    // switch wouldn't save it).
-    #[cfg(feature = "smp")]
-    crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, id);
-
-    let launch_fs_base = s.scheduler.slab.get(id).cpu_context.fs_base;
-    let launch_gs_base = s.scheduler.slab.get(id).cpu_context.gs_base;
-    unsafe {
-        crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, launch_fs_base);
-        crate::arch::x86_64::msr::wrmsr(
-            crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
-            launch_gs_base,
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::pic::init_pic();
+        crate::arch::x86_64::lapic::calibrate_timer_with_pit();
+        let tsc_frequency_hz = crate::arch::x86_64::lapic::calibrated_tsc_frequency_hz()
+            .expect("PIT calibration must publish a nonzero TSC frequency");
+        #[cfg(feature = "extern-rootserver")]
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*bi_ptr).tscFrequencyHz),
+            tsc_frequency_hz,
         );
+        let tsc_frequency_mhz = tsc_frequency_hz
+            .saturating_add(500_000)
+            .checked_div(1_000_000)
+            .and_then(|frequency| u32::try_from(frequency).ok())
+            .expect("calibrated TSC frequency must fit the seL4 MHz boot-info payload");
+        core::ptr::write_volatile(tsc_frequency_payload, tsc_frequency_mhz);
+        crate::arch::x86_64::lapic::enable_periodic_kernel_timer();
+        crate::arch::x86_64::pit::install_irq_handler();
+
+        // Swap CR3 to the rootserver's PML4 (kernel half preserved).
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) img.pml4_paddr,
+            options(nostack, preserves_flags),
+        );
+
+        // SMP: establish the rootserver as this core's FPU owner so its
+        // x87/SSE state is tracked from first entry (otherwise a later
+        // switch wouldn't save it).
+        #[cfg(feature = "smp")]
+        crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, id);
+
+        let launch_fs_base = s.scheduler.slab.get(id).cpu_context.fs_base;
+        let launch_gs_base = s.scheduler.slab.get(id).cpu_context.gs_base;
+        unsafe {
+            crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, launch_fs_base);
+            crate::arch::x86_64::msr::wrmsr(
+                crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
+                launch_gs_base,
+            );
+        }
     }
 
-    #[cfg(feature = "extern-rootserver")]
+    #[cfg(all(feature = "extern-rootserver", target_arch = "x86_64"))]
     {
         let ctx = s.scheduler.slab.get(id).user_context;
         crate::arch::log("[rootserver-enter] tcb=");
@@ -1455,14 +1502,26 @@ pub unsafe fn launch_rootserver() -> ! {
         crate::arch::log(" rdi=0x");
         log_rootserver_hex(ctx.rdi);
         crate::arch::log(" fs=0x");
-        log_rootserver_hex(launch_fs_base);
+        log_rootserver_hex(s.scheduler.slab.get(id).cpu_context.fs_base);
         crate::arch::log(" gs-shadow=0x");
-        log_rootserver_hex(launch_gs_base);
+        log_rootserver_hex(s.scheduler.slab.get(id).cpu_context.gs_base);
         crate::arch::log("\n");
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let tcb = s.scheduler.slab.get_mut(id);
+        crate::arch::aarch64::debug::restore_user_debug_context(&tcb.debug, &mut tcb.user_context);
     }
     let ctx = &s.scheduler.slab.get(id).user_context as *const UserContext;
     s.scheduler.set_active_user(Some(id));
+    #[cfg(target_arch = "x86_64")]
     enter_user_via_iretq(ctx);
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::vspace::activate_user_vspace(img.pml4_paddr, ROOTSERVER_ASID);
+        crate::arch::aarch64::timer::enable_periodic_kernel_timer();
+        crate::arch::aarch64::context::enter_user(ctx);
+    }
 }
 
 /// Convert a physical address to its kernel-virt counterpart. The
@@ -1474,7 +1533,7 @@ unsafe fn phys_to_kernel_virt(paddr: u64) -> u64 {
     // Phase 42 — single regime: every paddr (alloc_page output,
     // kernel-image-pool output, etc.) is reachable through the
     // kernel-half linear map.
-    crate::arch::x86_64::paging::phys_to_lin(paddr)
+    crate::arch::phys_to_virt(paddr)
 }
 
 unsafe fn build_bootinfo(
@@ -1721,7 +1780,7 @@ unsafe fn load_segment(
                 phys
             }
         };
-        let kva = crate::arch::x86_64::paging::phys_to_lin(phys_addr);
+        let kva = crate::arch::phys_to_virt(phys_addr);
 
         // Copy the slice of this segment that lies in this page:
         // [max(seg.vaddr, page_vaddr) .. min(seg.vaddr + filesize, page_vaddr + 4096)).

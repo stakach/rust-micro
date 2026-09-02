@@ -349,10 +349,7 @@ pub fn mcs_tick(delta_ticks: Ticks) {
                 // instead of postponing — the handler decides what to
                 // do (e.g. reset the thread). Otherwise park on the
                 // release queue until the next refill matures.
-                #[cfg(target_arch = "x86_64")]
                 let delivered = crate::fault::deliver_timeout_fault(cur);
-                #[cfg(not(target_arch = "x86_64"))]
-                let delivered = false;
                 if !delivered {
                     s.scheduler
                         .block(cur, crate::tcb::ThreadStateType::BlockedOnBudget);
@@ -362,7 +359,6 @@ pub fn mcs_tick(delta_ticks: Ticks) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn dispatch_budget_check(tcb_id: TcbId) -> bool {
     unsafe {
         let s = crate::kernel::KERNEL.get();
@@ -487,15 +483,10 @@ pub fn complete_yield_to(s: &mut crate::kernel::KernelState, yielder: TcbId, sc_
         let _ = t;
         let t = s.scheduler.slab.get_mut(yielder);
         t.yield_to = None;
-        // Syscall return: msginfo label 0 / length 1 in rsi, badge 0
-        // in rdi, mr0 = consumed in r10 (seL4_CallWithMRs register
-        // convention).
-        #[cfg(target_arch = "x86_64")]
-        {
-            t.user_context.rsi = 1;
-            t.user_context.rdi = 0;
-            t.user_context.r10 = consumed_us;
-        }
+        // Syscall return: success label / length 1 and MR0 = consumed.
+        // The shared helper selects x86 r10 or AArch64 X2 according to
+        // libsel4's seL4_CallWithMRs register convention.
+        crate::arch::set_ipc_return(&mut t.user_context, 0, 1, &[consumed_us]);
         t.msg_regs[0] = consumed_us;
         t.ipc_length = 1;
         t.ipc_label = 0;
@@ -577,9 +568,9 @@ pub fn current_time() -> Ticks {
         return crate::arch::x86_64::pit::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed)
             as Ticks;
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        0
+        crate::arch::aarch64::timer::TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed) as Ticks
     }
 }
 

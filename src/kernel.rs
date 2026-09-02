@@ -439,7 +439,7 @@ impl KernelState {
                 return None;
             }
             let len = 1usize << descriptor.radix;
-            let base = crate::arch::x86_64::paging::phys_to_lin(descriptor.paddr) as *const Cte;
+            let base = crate::arch::phys_to_virt(descriptor.paddr) as *const Cte;
             Some(unsafe { core::slice::from_raw_parts(base, len) })
         } else {
             None
@@ -459,7 +459,7 @@ impl KernelState {
                 return None;
             }
             let len = 1usize << descriptor.radix;
-            let base = crate::arch::x86_64::paging::phys_to_lin(descriptor.paddr) as *mut Cte;
+            let base = crate::arch::phys_to_virt(descriptor.paddr) as *mut Cte;
             Some(unsafe { core::slice::from_raw_parts_mut(base, len) })
         } else {
             None
@@ -604,7 +604,7 @@ impl KernelState {
                     // fault. seL4 does the same `remoteTCBStall` before
                     // unbinding an SC. No-op unless the thread is live on a
                     // different core; gated to the smp build.
-                    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                    #[cfg(feature = "smp")]
                     crate::smp::remote_tcb_stall(tcb_id);
                     // Remove from the ready queue / surrender the CPU
                     // before clearing the SC so a runnable thread that
@@ -854,7 +854,7 @@ pub(crate) fn slot_in_pools(addr: usize) -> bool {
         if !descriptor.in_use {
             return false;
         }
-        let base = crate::arch::x86_64::paging::phys_to_lin(descriptor.paddr) as usize;
+        let base = crate::arch::phys_to_virt(descriptor.paddr) as usize;
         let len = (1usize << descriptor.radix) * Cte::SIZE_BYTES;
         addr >= base && addr < base.saturating_add(len)
     })
@@ -1040,7 +1040,7 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             let kva = core::ptr::addr_of_mut!(DYNAMIC_SPEC_CNODE) as u64;
-            let paddr = crate::arch::x86_64::paging::kernel_virt_to_phys(kva);
+            let paddr = crate::arch::virt_to_phys(kva);
             let vi = s
                 .alloc_dynamic_cnode(paddr, SMALL_CNODE_RADIX)
                 .expect("dynamic descriptor");

@@ -715,8 +715,7 @@ pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: Tc
     // registers (rdx/r10/r8/r9 below) and don't need the buffer.
     let recv_buf_paddr = r.ipc_buffer_paddr;
     if length > 4 && recv_buf_paddr != 0 {
-        let buf =
-            (crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr) as *mut u64).wrapping_add(1); // skip tag word
+        let buf = (crate::arch::phys_to_virt(recv_buf_paddr) as *mut u64).wrapping_add(1); // skip tag word
         let staged_max = (length as usize).min(regs.len());
         for i in 4..staged_max {
             unsafe {
@@ -731,8 +730,7 @@ pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: Tc
         // were allocated as user Frames whose phys range is in our
         // mapped low-mem region.
         if length as usize > regs.len() && snd_buf_paddr != 0 {
-            let snd_buf = (crate::arch::x86_64::paging::phys_to_lin(snd_buf_paddr) as *const u64)
-                .wrapping_add(1);
+            let snd_buf = (crate::arch::phys_to_virt(snd_buf_paddr) as *const u64).wrapping_add(1);
             for i in regs.len()..(length as usize).min(crate::types::seL4_MsgMaxLength) {
                 let w = unsafe { core::ptr::read_volatile(snd_buf.add(i)) };
                 unsafe {
@@ -748,22 +746,11 @@ pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: Tc
     // SysRecv, which doesn't cover the "receiver-blocked-first,
     // sender-arrives-later" path. We do it here so the receiver's
     // saved user_context has the right values whenever it next runs.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mi = (label << 12) | (length as Word & 0x7F);
-        // Phase 38c-followup — rax is preserved across SYSCALL.
-        // Upstream seL4 signals success/error via the IPC label in
-        // msginfo and faults via the parent's fault EP, not via a
-        // rax sentinel.
-        r.user_context.rsi = mi;
-        r.user_context.rdi = badge;
-        // Upstream seL4 x86_64 IPC return ABI: msg_regs[0..3] map to
-        // r10/r8/r9/r15 (matches `x64_sys_recv` in libsel4).
-        r.user_context.r10 = r.msg_regs[0];
-        r.user_context.r8 = r.msg_regs[1];
-        r.user_context.r9 = r.msg_regs[2];
-        r.user_context.r15 = r.msg_regs[3];
-    }
+    let mi = (label << 12) | (length as Word & 0x7F);
+    // Upstream signals success/error through MessageInfo and faults through
+    // the configured fault endpoint, not a separate integer result.
+    let msg_regs = r.msg_regs;
+    crate::arch::set_ipc_return(&mut r.user_context, badge, mi, &msg_regs[..4]);
 }
 
 /// Phase 34d — copy any caps the sender staged on
@@ -791,7 +778,7 @@ pub fn transfer_extra_caps(
 
     // Read receive descriptor from receiver's IPC buffer.
     let (recv_cnode_cptr, recv_index, recv_depth) = unsafe {
-        let buf = crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr) as *const u64;
+        let buf = crate::arch::phys_to_virt(recv_buf_paddr) as *const u64;
         (
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET)),
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET)),
@@ -885,12 +872,12 @@ pub fn transfer_extra_caps(
         // count (bits 7..8) in now — covers the receiver-blocked-first
         // path, where the dispatcher's recv-return tail doesn't re-pack
         // rsi (next != invoker).
-        #[cfg(target_arch = "x86_64")]
-        {
-            let r = s.scheduler.slab.get_mut(receiver);
-            r.user_context.rsi =
-                (r.user_context.rsi & !(0x3 << 7)) | (((placed as u64) & 0x3) << 7);
-        }
+        let r = s.scheduler.slab.get_mut(receiver);
+        let info = (crate::arch::ipc_message_info(&r.user_context) & !(0x3 << 7))
+            | (((placed as u64) & 0x3) << 7);
+        let badge = crate::arch::ipc_badge(&r.user_context);
+        let msg_regs = r.msg_regs;
+        crate::arch::set_ipc_return(&mut r.user_context, badge, info, &msg_regs[..4]);
     }
     sched.slab.get_mut(sender).pending_extra_caps_count = 0;
 }
@@ -964,9 +951,9 @@ pub mod spec {
             // paddr so the ipc-path's `phys_to_lin` round-trips back
             // to the same kernel-virt address via the linear map.
             s.scheduler.slab.get_mut(sender).ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut SENDER_BUF) as u64);
+                crate::arch::virt_to_phys((&raw mut SENDER_BUF) as u64);
             s.scheduler.slab.get_mut(receiver).ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut RECEIVER_BUF) as u64);
+                crate::arch::virt_to_phys((&raw mut RECEIVER_BUF) as u64);
         }
 
         // Receiver names slot 5 of its own CSpace as the receive
@@ -1056,9 +1043,9 @@ pub mod spec {
         let receiver = sched.admit(runnable(50));
         unsafe {
             sched.slab.get_mut(sender).ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut SENDER_BUF) as u64);
+                crate::arch::virt_to_phys((&raw mut SENDER_BUF) as u64);
             sched.slab.get_mut(receiver).ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut RECEIVER_BUF) as u64);
+                crate::arch::virt_to_phys((&raw mut RECEIVER_BUF) as u64);
         }
 
         // Stage an 8-word message. Words 0..3 in msg_regs (the

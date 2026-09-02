@@ -9,6 +9,16 @@ pub fn test_main() {
     arch::log("Starting kernel specs...\n");
 
     arch_tests::test_architecture();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::exceptions::spec::test_exceptions();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::gic::spec::test_gic();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::timer::spec::test_timer();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::interrupts::spec::test_interrupts();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::vspace::spec::test_vspace();
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::gdt::spec::test_gdt();
     #[cfg(target_arch = "x86_64")]
@@ -43,11 +53,11 @@ pub fn test_main() {
     crate::endpoint::spec::test_endpoint();
     crate::notification::spec::test_notification();
     crate::interrupt::spec::test_interrupt();
+    #[cfg(target_arch = "x86_64")]
     crate::vspace::spec::test_vspace();
     crate::boot::spec::test_boot();
     crate::initrd::spec::test_initrd();
     crate::elf::spec::test_elf();
-    #[cfg(target_arch = "x86_64")]
     crate::rootserver::spec::test_rootserver();
     integration_tests::test_integration();
 
@@ -61,7 +71,5 @@ pub fn test_main() {
     crate::vcpu::spec::test_vcpu();
 
     arch::log("All specs passed!\n");
-    // Don't `qemu_exit` here — control returns to `main` so the
-    // real-hardware boot path (Phase 12d's `boot::kernel_init`)
-    // gets exercised before we leave QEMU.
+    // Return to `main` so the live rootserver boot path is exercised.
 }
