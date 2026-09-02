@@ -170,6 +170,47 @@ pub const fn descriptor_paddr(descriptor: u64, level: u8) -> Result<u64, MapErro
 static mut BOOT_L0: PageTable = PageTable::zeroed();
 static mut BOOT_L1: PageTable = PageTable::zeroed();
 static mut BOOT_LOW_L2: PageTable = PageTable::zeroed();
+static mut EL0_SPEC_L2: PageTable = PageTable::zeroed();
+static mut EL0_SPEC_L3: PageTable = PageTable::zeroed();
+static mut EL0_SPEC_STACK: PageTable = PageTable::zeroed();
+
+const EL0_SPEC_CODE_VADDR: u64 = 0x8000_0000;
+const EL0_SPEC_STACK_VADDR: u64 = EL0_SPEC_CODE_VADDR + 0x1000;
+
+core::arch::global_asm!(
+    r#"
+    .section .text.aarch64_el0_spec,"ax"
+    .balign 4096
+    .global aarch64_el0_spec_start
+aarch64_el0_spec_start:
+    mov x0, #'U'
+    mov x7, #-12
+    svc #0
+    mov x0, #'Z'
+    svc #1
+1:
+    b 1b
+    .balign 4096
+
+    .section .text.aarch64_el0_entry,"ax"
+    .global aarch64_enter_el0_spec
+aarch64_enter_el0_spec:
+    msr sp_el0, x1
+    msr elr_el1, x0
+    mov x9, #0x40
+    msr spsr_el1, x9
+    isb
+    eret
+    .global aarch64_el0_spec_resume
+aarch64_el0_spec_resume:
+    ret
+"#
+);
+
+extern "C" {
+    static aarch64_el0_spec_start: u8;
+    fn aarch64_enter_el0_spec(entry: u64, stack: u64);
+}
 
 fn physical_address_size() -> u64 {
     let mmfr0: u64;
@@ -253,6 +294,46 @@ pub fn install_kernel_vspace() {
 }
 
 #[cfg(feature = "spec")]
+fn map_el0_spec_pages() {
+    unsafe {
+        ptr::write_bytes((&raw mut EL0_SPEC_L2) as *mut u8, 0, size_of::<PageTable>());
+        ptr::write_bytes((&raw mut EL0_SPEC_L3) as *mut u8, 0, size_of::<PageTable>());
+        ptr::write_bytes(
+            (&raw mut EL0_SPEC_STACK) as *mut u8,
+            0,
+            size_of::<PageTable>(),
+        );
+
+        let indices = decompose_vaddr(EL0_SPEC_CODE_VADDR);
+        BOOT_L1.0[indices.pud as usize] =
+            table_descriptor((&raw const EL0_SPEC_L2) as u64).unwrap();
+        EL0_SPEC_L2.0[indices.pd as usize] =
+            table_descriptor((&raw const EL0_SPEC_L3) as u64).unwrap();
+        EL0_SPEC_L3.0[indices.pt as usize] = page_descriptor(
+            core::ptr::addr_of!(aarch64_el0_spec_start) as u64,
+            VmRights::UserReadWrite,
+            MemoryAttr::Normal,
+            true,
+        )
+        .unwrap();
+        EL0_SPEC_L3.0[indices.pt as usize + 1] = page_descriptor(
+            (&raw const EL0_SPEC_STACK) as u64,
+            VmRights::UserReadWrite,
+            MemoryAttr::Normal,
+            false,
+        )
+        .unwrap();
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
+    }
+}
+
+#[cfg(feature = "spec")]
 pub mod spec {
     use super::*;
     use crate::arch;
@@ -262,6 +343,7 @@ pub mod spec {
         address_indices_round_trip();
         descriptor_encodings_match_sel4();
         live_translation_is_enabled();
+        live_el0_svc_round_trip();
         arch::log("AArch64 vspace tests completed\n");
     }
 
@@ -339,5 +421,15 @@ pub mod spec {
             address,
             "identity translation returned the wrong physical address"
         );
+    }
+
+    fn live_el0_svc_round_trip() {
+        map_el0_spec_pages();
+        crate::arch::aarch64::exceptions::begin_el0_svc_spec();
+        unsafe {
+            aarch64_enter_el0_spec(EL0_SPEC_CODE_VADDR, EL0_SPEC_STACK_VADDR + 0x1000);
+        }
+        crate::arch::aarch64::exceptions::finish_el0_svc_spec();
+        arch::log("  live EL0 SVC register save/restore matches seL4\n");
     }
 }

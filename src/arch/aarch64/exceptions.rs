@@ -1,9 +1,10 @@
 //! AArch64 EL1 exception-vector installation.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 static EXPECTED_BRK: AtomicBool = AtomicBool::new(false);
 static LAST_ESR: AtomicU64 = AtomicU64::new(0);
+static EL0_SPEC_STATE: AtomicU8 = AtomicU8::new(0);
 
 core::arch::global_asm!(
     r#"
@@ -48,7 +49,7 @@ aarch64_vector_table:
     b aarch64_invalid_entry
 
     .macro save_aarch64_context
-    sub sp, sp, #784
+    sub sp, sp, #832
     stp x0,  x1,  [sp, #0]
     stp x2,  x3,  [sp, #16]
     stp x4,  x5,  [sp, #32]
@@ -65,47 +66,64 @@ aarch64_vector_table:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    mrs x0, sp_el0
+    mrs x1, elr_el1
+    stp x0, x1, [sp, #248]
+    mrs x0, spsr_el1
+    str x0, [sp, #264]
+    str x1, [sp, #272]
+    mrs x0, tpidr_el0
+    mrs x1, tpidrro_el0
+    stp x0, x1, [sp, #280]
     mrs x0, fpcr
     mrs x1, fpsr
-    stp x0, x1, [sp, #256]
-    stp q0,  q1,  [sp, #272]
-    stp q2,  q3,  [sp, #304]
-    stp q4,  q5,  [sp, #336]
-    stp q6,  q7,  [sp, #368]
-    stp q8,  q9,  [sp, #400]
-    stp q10, q11, [sp, #432]
-    stp q12, q13, [sp, #464]
-    stp q14, q15, [sp, #496]
-    stp q16, q17, [sp, #528]
-    stp q18, q19, [sp, #560]
-    stp q20, q21, [sp, #592]
-    stp q22, q23, [sp, #624]
-    stp q24, q25, [sp, #656]
-    stp q26, q27, [sp, #688]
-    stp q28, q29, [sp, #720]
-    stp q30, q31, [sp, #752]
+    stp x0, x1, [sp, #304]
+    stp q0,  q1,  [sp, #320]
+    stp q2,  q3,  [sp, #352]
+    stp q4,  q5,  [sp, #384]
+    stp q6,  q7,  [sp, #416]
+    stp q8,  q9,  [sp, #448]
+    stp q10, q11, [sp, #480]
+    stp q12, q13, [sp, #512]
+    stp q14, q15, [sp, #544]
+    stp q16, q17, [sp, #576]
+    stp q18, q19, [sp, #608]
+    stp q20, q21, [sp, #640]
+    stp q22, q23, [sp, #672]
+    stp q24, q25, [sp, #704]
+    stp q26, q27, [sp, #736]
+    stp q28, q29, [sp, #768]
+    stp q30, q31, [sp, #800]
     .endm
 
     .macro restore_aarch64_context
-    ldp q0,  q1,  [sp, #272]
-    ldp q2,  q3,  [sp, #304]
-    ldp q4,  q5,  [sp, #336]
-    ldp q6,  q7,  [sp, #368]
-    ldp q8,  q9,  [sp, #400]
-    ldp q10, q11, [sp, #432]
-    ldp q12, q13, [sp, #464]
-    ldp q14, q15, [sp, #496]
-    ldp q16, q17, [sp, #528]
-    ldp q18, q19, [sp, #560]
-    ldp q20, q21, [sp, #592]
-    ldp q22, q23, [sp, #624]
-    ldp q24, q25, [sp, #656]
-    ldp q26, q27, [sp, #688]
-    ldp q28, q29, [sp, #720]
-    ldp q30, q31, [sp, #752]
-    ldp x0, x1, [sp, #256]
+    ldp q0,  q1,  [sp, #320]
+    ldp q2,  q3,  [sp, #352]
+    ldp q4,  q5,  [sp, #384]
+    ldp q6,  q7,  [sp, #416]
+    ldp q8,  q9,  [sp, #448]
+    ldp q10, q11, [sp, #480]
+    ldp q12, q13, [sp, #512]
+    ldp q14, q15, [sp, #544]
+    ldp q16, q17, [sp, #576]
+    ldp q18, q19, [sp, #608]
+    ldp q20, q21, [sp, #640]
+    ldp q22, q23, [sp, #672]
+    ldp q24, q25, [sp, #704]
+    ldp q26, q27, [sp, #736]
+    ldp q28, q29, [sp, #768]
+    ldp q30, q31, [sp, #800]
+    ldp x0, x1, [sp, #304]
     msr fpcr, x0
     msr fpsr, x1
+    ldp x0, x1, [sp, #248]
+    msr sp_el0, x0
+    msr elr_el1, x1
+    ldr x0, [sp, #264]
+    msr spsr_el1, x0
+    ldp x0, x1, [sp, #280]
+    msr tpidr_el0, x0
+    msr tpidrro_el0, x1
     ldr x30, [sp, #240]
     ldp x28, x29, [sp, #224]
     ldp x26, x27, [sp, #208]
@@ -122,23 +140,26 @@ aarch64_vector_table:
     ldp x4,  x5,  [sp, #32]
     ldp x2,  x3,  [sp, #16]
     ldp x0,  x1,  [sp, #0]
-    add sp, sp, #784
+    add sp, sp, #832
     .endm
 
 aarch64_sync_entry:
     save_aarch64_context
+    mov x0, sp
     bl aarch64_sync_dispatch
     restore_aarch64_context
     eret
 
 aarch64_irq_entry:
     save_aarch64_context
+    mov x0, sp
     bl aarch64_irq_dispatch
     restore_aarch64_context
     eret
 
 aarch64_invalid_entry:
     save_aarch64_context
+    mov x0, sp
     bl aarch64_invalid_dispatch
 1:
     wfi
@@ -164,29 +185,49 @@ pub fn init_exceptions() {
 }
 
 #[no_mangle]
-extern "C" fn aarch64_sync_dispatch() {
+extern "C" fn aarch64_sync_dispatch(context: *mut crate::arch::UserContext) {
     let esr: u64;
     unsafe {
         core::arch::asm!("mrs {esr}, esr_el1", esr = out(reg) esr, options(nomem, nostack));
     }
     LAST_ESR.store(esr, Ordering::SeqCst);
 
+    if (esr >> 26) == 0x15 {
+        handle_el0_spec_svc(esr, context);
+        return;
+    }
+
     // EC=0x3c is BRK from AArch64. Only the architecture spec arms this
     // recovery path; arbitrary kernel synchronous exceptions remain fatal.
     if EXPECTED_BRK.swap(false, Ordering::SeqCst) && (esr >> 26) == 0x3c {
-        unsafe {
-            core::arch::asm!(
-                "mrs x9, elr_el1",
-                "add x9, x9, #4",
-                "msr elr_el1, x9",
-                out("x9") _,
-                options(nomem, nostack),
-            );
-        }
+        unsafe { (*context).elr_el1 += 4 };
         return;
     }
 
     fatal_exception("Unexpected AArch64 synchronous exception\n")
+}
+
+fn handle_el0_spec_svc(esr: u64, context: *mut crate::arch::UserContext) {
+    let immediate = (esr & 0xffff) as u16;
+    let state = EL0_SPEC_STATE.load(Ordering::SeqCst);
+    let context = unsafe { &mut *context };
+    match (state, immediate) {
+        (1, 0) => {
+            assert_eq!(context.x[0], b'U' as u64);
+            assert_eq!(context.x[7] as i64, -12);
+            EL0_SPEC_STATE.store(2, Ordering::SeqCst);
+        }
+        (2, 1) => {
+            assert_eq!(context.x[0], b'Z' as u64);
+            extern "C" {
+                static aarch64_el0_spec_resume: u8;
+            }
+            context.elr_el1 = core::ptr::addr_of!(aarch64_el0_spec_resume) as u64;
+            context.spsr_el1 = 0x3c5;
+            EL0_SPEC_STATE.store(3, Ordering::SeqCst);
+        }
+        _ => fatal_exception("Unexpected AArch64 EL0 SVC\n"),
+    }
 }
 
 #[no_mangle]
@@ -202,6 +243,16 @@ fn fatal_exception(message: &str) -> ! {
     loop {
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
     }
+}
+
+#[cfg(feature = "spec")]
+pub fn begin_el0_svc_spec() {
+    assert_eq!(EL0_SPEC_STATE.swap(1, Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "spec")]
+pub fn finish_el0_svc_spec() {
+    assert_eq!(EL0_SPEC_STATE.swap(0, Ordering::SeqCst), 3);
 }
 
 #[cfg(feature = "spec")]
