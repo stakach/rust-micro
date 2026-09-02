@@ -7,7 +7,9 @@ pub mod context;
 pub mod cpu;
 pub mod debug;
 pub mod exceptions;
+pub mod gic;
 pub mod interrupts;
+pub mod timer;
 
 pub use context::UserContext;
 pub use cpu::{get_cpu_id, halt_cpu};

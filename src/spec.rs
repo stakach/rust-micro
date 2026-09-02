@@ -9,6 +9,14 @@ pub fn test_main() {
     arch::log("Starting kernel specs...\n");
 
     arch_tests::test_architecture();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::exceptions::spec::test_exceptions();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::gic::spec::test_gic();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::timer::spec::test_timer();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::interrupts::spec::test_interrupts();
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::gdt::spec::test_gdt();
     #[cfg(target_arch = "x86_64")]
@@ -64,7 +72,5 @@ pub fn test_main() {
     arch::log("All specs passed!\n");
     #[cfg(target_arch = "aarch64")]
     arch::qemu_exit(0);
-    // Don't `qemu_exit` here — control returns to `main` so the
-    // real-hardware boot path (Phase 12d's `boot::kernel_init`)
-    // gets exercised before we leave QEMU.
+    // x86 returns to `main` so its live rootserver boot path is exercised.
 }
