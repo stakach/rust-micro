@@ -296,6 +296,9 @@ fn bsp_main_big_stack() -> ! {
         crate::arch::x86_64::lapic::init_lapic();
     }
 
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::vspace::install_kernel_vspace();
+
     arch::log("Kernel initialization complete on BSP\n");
 
     // Release APs — the shared GDT and IDT are now populated, so

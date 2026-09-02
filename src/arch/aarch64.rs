@@ -10,6 +10,7 @@ pub mod exceptions;
 pub mod gic;
 pub mod interrupts;
 pub mod timer;
+pub mod vspace;
 
 pub use context::UserContext;
 pub use cpu::{get_cpu_id, halt_cpu};

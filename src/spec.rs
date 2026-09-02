@@ -17,6 +17,8 @@ pub fn test_main() {
     crate::arch::aarch64::timer::spec::test_timer();
     #[cfg(target_arch = "aarch64")]
     crate::arch::aarch64::interrupts::spec::test_interrupts();
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::vspace::spec::test_vspace();
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::gdt::spec::test_gdt();
     #[cfg(target_arch = "x86_64")]
