@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 static TIMER_INTERRUPTS: AtomicU32 = AtomicU32::new(0);
 static UNEXPECTED_INTERRUPTS: AtomicU32 = AtomicU32::new(0);
+pub const IPI_IRQ: u32 = 1;
 
 pub fn init_interrupts() {
     // Keep PSTATE.I set here. `init_exceptions` installs VBAR_EL1 later,
@@ -23,7 +24,9 @@ extern "C" fn aarch64_irq_dispatch(context: *mut crate::arch::UserContext) {
         return;
     }
 
-    if irq == super::timer::TIMER_IRQ {
+    if irq == IPI_IRQ {
+        handle_ipi(context, acknowledge);
+    } else if irq == super::timer::TIMER_IRQ {
         // The architected timer is level-sensitive. Move its compare value
         // before EOI, matching seL4's resetTimer()/isb()/ackInterrupt order.
         // A domain switch can then wait for another timer interrupt, so the
@@ -42,6 +45,105 @@ extern "C" fn aarch64_irq_dispatch(context: *mut crate::arch::UserContext) {
         handle_userspace_irq(context, irq, acknowledge);
         return;
     }
+}
+
+fn invalidate_local_tlb() {
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
+    }
+}
+
+fn handle_ipi(context: *mut crate::arch::UserContext, acknowledge: u32) {
+    use crate::smp::IpiKind;
+
+    crate::smp::bkl_acquire();
+    let context = unsafe { &mut *context };
+    let from_user = context.spsr_el1 & 0xf == 0;
+    let me = crate::arch::get_cpu_id();
+    let interrupted = unsafe {
+        let scheduler = &crate::kernel::KERNEL.get().scheduler;
+        if from_user {
+            scheduler
+                .active_user_for_cpu(me)
+                .or_else(|| scheduler.current_for_cpu(me))
+        } else {
+            scheduler.current_for_cpu(me)
+        }
+    };
+
+    let mut want_reschedule = false;
+    crate::smp::handle_ipis(crate::smp::nodes_mut(), me, |_from, kind| match kind {
+        IpiKind::Reschedule => want_reschedule = true,
+        IpiKind::InvalidateTlb { .. } | IpiKind::InvalidateVspace { .. } => invalidate_local_tlb(),
+        IpiKind::Stop => loop {
+            unsafe { core::arch::asm!("wfi", options(nostack, nomem)) };
+        },
+    });
+    crate::smp::IPI_HANDLED_COUNT.fetch_add(1, Ordering::SeqCst);
+
+    if from_user {
+        if let Some(thread) = interrupted {
+            unsafe {
+                let tcb = crate::kernel::KERNEL.get().scheduler.slab.get_mut(thread);
+                tcb.user_context = *context;
+                crate::arch::aarch64::context::save_exception_fpu(
+                    context,
+                    &mut tcb.aarch64_fpu_state,
+                );
+            }
+        }
+    }
+
+    if crate::smp::STALL_REQUESTED[me as usize].load(Ordering::Acquire) {
+        unsafe {
+            let scheduler = &mut crate::kernel::KERNEL.get().scheduler;
+            scheduler.set_current(None);
+            scheduler.set_active_user(None);
+        }
+        crate::arch::aarch64::vspace::park_on_kernel_root();
+        super::gic::end_interrupt(acknowledge);
+        crate::smp::STALL_ACK[me as usize].store(true, Ordering::Release);
+        crate::smp::bkl_release();
+        while crate::smp::STALL_REQUESTED[me as usize].load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        crate::smp::bkl_acquire();
+        crate::arch::aarch64::syscall_entry::dispatch_selected(
+            context,
+            interrupted,
+            crate::syscalls::Syscall::SysYield,
+            false,
+            false,
+        );
+        crate::smp::bkl_release();
+        return;
+    }
+
+    super::gic::end_interrupt(acknowledge);
+    if want_reschedule {
+        if from_user {
+            crate::arch::aarch64::syscall_entry::dispatch_selected(
+                context,
+                interrupted,
+                crate::syscalls::Syscall::SysYield,
+                false,
+                false,
+            );
+        } else {
+            unsafe {
+                let scheduler = &mut crate::kernel::KERNEL.get().scheduler;
+                let next = scheduler.choose_thread();
+                scheduler.set_current(next);
+            }
+        }
+    }
+    crate::smp::bkl_release();
 }
 
 fn handle_userspace_irq(context: *mut crate::arch::UserContext, irq: u32, acknowledge: u32) {

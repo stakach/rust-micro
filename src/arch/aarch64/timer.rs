@@ -1,10 +1,21 @@
 //! ARM architected virtual timer used by a non-hypervisor seL4 kernel.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const TIMER_IRQ: u32 = 27;
 pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
-static LAST_ACCOUNTED_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LAST_ACCOUNTED_COUNTER: [AtomicU64; crate::smp::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static TIMER_ENABLED: [AtomicBool; crate::smp::MAX_CPUS] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
 pub fn frequency_hz() -> u32 {
     let value: u64;
@@ -69,9 +80,18 @@ pub fn enable_el0_physical_timer() {
 }
 
 pub fn enable_periodic_kernel_timer() {
-    LAST_ACCOUNTED_COUNTER.store(counter(), Ordering::Relaxed);
+    let cpu = crate::arch::get_cpu_id() as usize;
+    LAST_ACCOUNTED_COUNTER[cpu].store(counter(), Ordering::Relaxed);
     super::gic::unmask(TIMER_IRQ);
     program_ticks((frequency_hz() / 1_000).max(1));
+    TIMER_ENABLED[cpu].store(true, Ordering::Release);
+}
+
+pub fn ensure_periodic_kernel_timer() {
+    let cpu = crate::arch::get_cpu_id() as usize;
+    if !TIMER_ENABLED[cpu].load(Ordering::Acquire) {
+        enable_periodic_kernel_timer();
+    }
 }
 
 fn elapsed_whole_ticks(now: u64, last: u64, per_tick: u64) -> (u64, u64) {
@@ -85,16 +105,17 @@ fn elapsed_whole_ticks(now: u64, last: u64, per_tick: u64) -> (u64, u64) {
 /// the fractional counter remainder so repeated late interrupts charge wall
 /// time instead of fire count, as seL4's MCS timestamp accounting does.
 pub fn elapsed_kernel_ticks() -> u64 {
+    let cpu = crate::arch::get_cpu_id() as usize;
     let now = counter();
     let per_ms = u64::from((frequency_hz() / 1_000).max(1));
-    let last = LAST_ACCOUNTED_COUNTER.load(Ordering::Relaxed);
+    let last = LAST_ACCOUNTED_COUNTER[cpu].load(Ordering::Relaxed);
     if last == 0 {
-        LAST_ACCOUNTED_COUNTER.store(now, Ordering::Relaxed);
+        LAST_ACCOUNTED_COUNTER[cpu].store(now, Ordering::Relaxed);
         return 1;
     }
     let (elapsed, next) = elapsed_whole_ticks(now, last, per_ms);
     if elapsed != 0 {
-        LAST_ACCOUNTED_COUNTER.store(next, Ordering::Relaxed);
+        LAST_ACCOUNTED_COUNTER[cpu].store(next, Ordering::Relaxed);
     }
     elapsed
 }

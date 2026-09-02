@@ -984,7 +984,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             arch::log("[microtest sentinel matched -- exiting QEMU]\n");
             crate::arch::qemu_exit(0);
         }
-        #[cfg(feature = "extern-rootserver")]
+        #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
         if let Some(success) = crate::rootserver::sel4test_check_byte(b) {
             if success {
                 crate::arch::qemu_exit(0);

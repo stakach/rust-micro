@@ -1502,9 +1502,9 @@ pub unsafe fn launch_rootserver() -> ! {
         crate::arch::log(" rdi=0x");
         log_rootserver_hex(ctx.rdi);
         crate::arch::log(" fs=0x");
-        log_rootserver_hex(launch_fs_base);
+        log_rootserver_hex(s.scheduler.slab.get(id).cpu_context.fs_base);
         crate::arch::log(" gs-shadow=0x");
-        log_rootserver_hex(launch_gs_base);
+        log_rootserver_hex(s.scheduler.slab.get(id).cpu_context.gs_base);
         crate::arch::log("\n");
     }
     #[cfg(target_arch = "aarch64")]

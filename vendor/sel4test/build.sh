@@ -39,11 +39,11 @@ case "$SEL4TEST_ARCH" in
     ;;
   aarch64|arm64)
     SEL4TEST_ARCH=aarch64
-    BUILD_NAME="${SEL4TEST_BUILD_NAME:-build-aarch64}"
+    BUILD_NAME="${SEL4TEST_BUILD_NAME:-build-aarch64-smp}"
     PLATFORM=qemu-arm-virt
     TRIPLE=aarch64-none-elf
-    NUM_NODES=1
-    SMP=OFF
+    NUM_NODES=4
+    SMP=ON
     ;;
   *)
     echo "error: architecture must be x86_64/amd64 or aarch64/arm64" >&2
@@ -216,9 +216,8 @@ if [ ! -f CMakeCache.txt ]; then
       -DSel4testHaveTimer=ON
       -DKernelArmExportPCNTUser=ON
       -DKernelArmExportPTMRUser=ON
-      -DKernelNumDomains=4
+      -DKernelNumDomains=1
       -DKernelNumDomainSchedules=100
-      -DKernelMaxNumNodes=1
       -DHardwareDebugAPI=ON
       -DCMAKE_AR="$RUST_TOOLBIN/llvm-ar"
       -DCMAKE_RANLIB="$HERE/toolchain/llvm-ranlib"

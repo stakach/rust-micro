@@ -97,21 +97,23 @@ You can re-run the stages individually:
 ./scripts/make_image.sh                   # repack image from existing artifacts
 ```
 
-### AArch64 cross-build
+### AArch64 build and boot
 
-The initial AArch64 port milestone provides a bare-metal target, linker layout,
-seL4-compatible saved-register shape, and architecture-neutral kernel address
-helpers. Cross-check it with:
+The AArch64 port boots QEMU `virt` through a Simpleboot-compatible first stage.
+That stage consumes QEMU's FDT, loads the kernel and rootserver, starts all four
+CPUs with PSCI, and presents the same Multiboot2 tag ABI used by amd64. Build
+and run the kernel and userspace specs with:
 
 ```sh
 ./scripts/check_aarch64.sh
+./vendor/sel4test/build.sh aarch64
+./scripts/run_aarch64_specs.sh
 ```
 
-To produce the current scaffold ELF, replace `check` with `build` in that
-script's Cargo command. This milestone is not bootable yet: exception vectors,
-GIC and MMU initialization, ARM capability/invocation codegen, the Simpleboot
-entry contract, and the AArch64 rootserver ABI remain to be implemented against
-the pinned seL4 reference.
+The pinned upstream Simpleboot release only supplies an AArch64 loader for
+Raspberry Pi, not QEMU `virt`. The repository therefore carries the small
+QEMU-platform first stage under `boot/aarch64-simpleboot/`; the kernel-facing
+Simpleboot ABI remains architecture-independent.
 
 ### Build options (cargo features)
 
@@ -130,7 +132,7 @@ set `KERNEL_SPECS=1`.
 | `libsel4-hello` | Swap the rootserver for `vendor/libsel4-build/out/hello.elf` (C built against upstream libsel4) — validates the SYSCALL ABI end-to-end. |
 | `surt-demo`     | Swap the rootserver for `vendor/surt-demo/` — a root task that consumes the published [`surt-sel4`](https://crates.io/crates/surt-sel4) crate and runs the SURT ring-transport scenarios on the kernel. See `vendor/surt-demo/README.md`. |
 | `arch-x86_64`   | (default) x86_64 architecture selector. |
-| `arch-aarch64`  | AArch64 architecture selector. Use with `--no-default-features` and `triplets/mykernel-aarch64.json`; hardware boot remains in progress. |
+| `arch-aarch64`  | AArch64 architecture selector. Use with `--no-default-features` and `triplets/mykernel-aarch64.json`. |
 | `mcs`           | No-op (retained for compatibility); MCS is always on. |
 
 > Specs are scoped to the `spec` namespace so they can be compiled out of a
@@ -156,8 +158,7 @@ passed, `255` = panic**. Any trailing arguments are forwarded to QEMU, e.g.:
 ## Running the sel4test conformance suite
 
 This builds the **upstream** sel4test against our kernel ABI and runs its
-`sel4test-driver` as the rootserver. The kernel itself is unchanged — only the
-staged rootserver swaps.
+`sel4test-driver` as the rootserver. Both commands use four CPUs.
 
 ```sh
 # 1. Build the kernel (use `smp` for the multicore/FPU/SC families).
@@ -170,6 +171,11 @@ staged rootserver swaps.
 # 3. Repack the image with the sel4test rootserver, then boot.
 ./scripts/make_image.sh
 ./scripts/run_specs.sh
+
+# AArch64: build its four-node driver, then let the run script build and boot
+# the kernel through the AArch64 Simpleboot stage.
+./vendor/sel4test/build.sh aarch64
+./scripts/run_aarch64_specs.sh
 ```
 
 Notes:

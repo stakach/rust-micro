@@ -183,17 +183,18 @@ pub const IPI_VECTOR: u8 = 0x40;
 /// Send an IPI from the current CPU to `target_cpu`. Caller must
 /// hold the BKL — we mutate the target's NodeState under the
 /// assumption that no other CPU's send/handle is racing.
-#[cfg(target_arch = "x86_64")]
 pub fn send_ipi(target_cpu: u32, kind: IpiKind) {
     let from = crate::arch::get_cpu_id();
     if from == target_cpu {
         return; // self-IPI is a no-op (matches signal_ipi semantics).
     }
     signal_ipi(nodes_mut(), from, target_cpu, kind);
-    // Hardware delivery: assume APIC ID == cpu_id. (See main.rs
-    // `ap_main` for the same simplification.) Phase 28+ may need a
-    // MADT-driven cpu_id → apic_id table.
+    // Each boot path assigns dense logical CPU IDs matching the target IDs
+    // used by its interrupt controller.
+    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::lapic::send_ipi(target_cpu as u8, IPI_VECTOR);
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::gic::send_sgi(target_cpu, crate::arch::aarch64::interrupts::IPI_IRQ);
 }
 
 /// Counter bumped by the IPI ISR for spec observability. Each ISR
@@ -219,7 +220,6 @@ const _: () = assert!(
 
 /// Send a `Reschedule` IPI to `target_cpu`. Convenience wrapper
 /// around `send_ipi` for the common case. Caller holds BKL.
-#[cfg(target_arch = "x86_64")]
 pub fn kick_cpu(target_cpu: u32) {
     send_ipi(target_cpu, IpiKind::Reschedule);
 }
@@ -297,7 +297,6 @@ pub fn take_went_idle() -> bool {
 /// On return the remote core is parked (spinning on `bkl_acquire`) and
 /// will not run `tcb` again — by the time it re-acquires the BKL the
 /// caller will have dequeued / freed the thread.
-#[cfg(target_arch = "x86_64")]
 pub fn remote_tcb_stall(tcb: TcbId) -> bool {
     let me = crate::arch::get_cpu_id();
     let (aff, running_there) = unsafe {
@@ -316,9 +315,9 @@ pub fn remote_tcb_stall(tcb: TcbId) -> bool {
     // thread's FPU; the next save races and an old image clobbers the
     // live one (FPU0002 flakiness). The stall handler flushes via
     // `flush_local_fpu`. `owner_is` is one relaxed load.
-    #[cfg(feature = "smp")]
+    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
     let fpu_resident = crate::arch::x86_64::fpu_ctx::owner_is(aff as usize, tcb);
-    #[cfg(not(feature = "smp"))]
+    #[cfg(not(all(feature = "smp", target_arch = "x86_64")))]
     let fpu_resident = false;
     if aff == me || (!running_there && !fpu_resident) {
         return false;
@@ -419,10 +418,45 @@ pub fn shootdown_vspace(pml4_paddr: u64) {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub fn shootdown_tlb(_vaddr: u64) {}
+pub fn shootdown_tlb(vaddr: u64) {
+    let me = crate::arch::get_cpu_id();
+    let n_cores = crate::simpleboot::get_num_cores() as u32;
+    for cpu in 0..n_cores.min(MAX_CPUS as u32) {
+        if cpu == me {
+            continue;
+        }
+        let running = unsafe {
+            let scheduler = &crate::kernel::KERNEL.get().scheduler;
+            scheduler.current_for_cpu(cpu).is_some() || scheduler.active_user_for_cpu(cpu).is_some()
+        };
+        if running {
+            send_ipi(cpu, IpiKind::InvalidateTlb { vaddr });
+        }
+    }
+}
 
 #[cfg(target_arch = "aarch64")]
-pub fn shootdown_vspace(_root_paddr: u64) {}
+pub fn shootdown_vspace(root_paddr: u64) {
+    let me = crate::arch::get_cpu_id();
+    let n_cores = crate::simpleboot::get_num_cores() as u32;
+    for cpu in 0..n_cores.min(MAX_CPUS as u32) {
+        if cpu == me {
+            continue;
+        }
+        let running = unsafe {
+            let scheduler = &crate::kernel::KERNEL.get().scheduler;
+            scheduler.current_for_cpu(cpu).is_some() || scheduler.active_user_for_cpu(cpu).is_some()
+        };
+        if running {
+            send_ipi(
+                cpu,
+                IpiKind::InvalidateVspace {
+                    pml4_paddr: root_paddr,
+                },
+            );
+        }
+    }
+}
 
 /// Maximum CPUs we'll ever run on. Picked small so the per-CPU
 /// arrays fit on the stack inside specs and on the BSS in the
@@ -551,10 +585,10 @@ pub mod spec {
         self_ipi_is_a_no_op();
         all_aps_came_up();
         bkl_acquire_release_round_trip();
+        cross_cpu_ipi_delivers_and_runs_isr();
+        ap_picks_thread_off_its_queue_via_reschedule();
         #[cfg(target_arch = "x86_64")]
         {
-            cross_cpu_ipi_delivers_and_runs_isr();
-            ap_picks_thread_off_its_queue_via_reschedule();
             shootdown_fans_invalidate_tlb_to_aps();
             ap_dispatches_user_thread_end_to_end();
         }
@@ -687,7 +721,6 @@ pub mod spec {
     /// AP1's IPI handler runs `choose_thread` and assigns it as
     /// `nodes[1].current`. Verifies the per-CPU scheduler can be
     /// driven from another CPU end-to-end.
-    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn ap_picks_thread_off_its_queue_via_reschedule() {
         if crate::simpleboot::get_num_cores() < 2 {
@@ -749,11 +782,11 @@ pub mod spec {
     }
 
     /// Phase 28d — fire an IPI from BSP (running this spec) to AP1
-    /// and confirm AP1's ISR ran. AP1 is parked in `hlt`; the IPI
+    /// and confirm AP1's ISR ran. AP1 is parked in its architectural idle
+    /// instruction; the IPI
     /// wakes it, the ISR drains pending IPIs and bumps
     /// `IPI_HANDLED_COUNT`, then `iretq` back to `hlt`. We poll
     /// the counter from BSP outside the BKL.
-    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn cross_cpu_ipi_delivers_and_runs_isr() {
         // Skip if running with -smp 1.

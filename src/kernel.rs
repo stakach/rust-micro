@@ -604,7 +604,7 @@ impl KernelState {
                     // fault. seL4 does the same `remoteTCBStall` before
                     // unbinding an SC. No-op unless the thread is live on a
                     // different core; gated to the smp build.
-                    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                    #[cfg(feature = "smp")]
                     crate::smp::remote_tcb_stall(tcb_id);
                     // Remove from the ready queue / surrender the CPU
                     // before clearing the SC so a runnable thread that

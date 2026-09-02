@@ -622,31 +622,48 @@ pub fn install_kernel_vspace() {
         )
         .unwrap();
 
-        let root = (&raw const BOOT_L0) as u64;
-        let tcr = initial_tcr_el1();
-        asm!(
-            "dsb sy",
-            "msr mair_el1, {mair}",
-            "msr tcr_el1, {tcr}",
-            "msr ttbr0_el1, {root}",
-            "msr ttbr1_el1, xzr",
-            "isb",
-            "tlbi vmalle1is",
-            "dsb ish",
-            "isb",
-            "mrs x9, sctlr_el1",
-            "orr x9, x9, #(1 << 0)",
-            "orr x9, x9, #(1 << 2)",
-            "orr x9, x9, #(1 << 12)",
-            "msr sctlr_el1, x9",
-            "isb",
-            mair = in(reg) MAIR_EL1_VALUE,
-            tcr = in(reg) tcr,
-            root = in(reg) root,
-            out("x9") _,
-            options(nostack),
-        );
+        activate_kernel_vspace();
     }
+}
+
+unsafe fn activate_kernel_vspace() {
+    let root = (&raw const BOOT_L0) as u64;
+    let tcr = initial_tcr_el1();
+    asm!(
+        "dsb sy",
+        "msr mair_el1, {mair}",
+        "msr tcr_el1, {tcr}",
+        "msr ttbr0_el1, {root}",
+        "msr ttbr1_el1, xzr",
+        "isb",
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+        "mrs x9, sctlr_el1",
+        "orr x9, x9, #(1 << 0)",
+        "orr x9, x9, #(1 << 2)",
+        "orr x9, x9, #(1 << 12)",
+        "msr sctlr_el1, x9",
+        "isb",
+        mair = in(reg) MAIR_EL1_VALUE,
+        tcr = in(reg) tcr,
+        root = in(reg) root,
+        out("x9") _,
+        options(nostack),
+    );
+}
+
+/// Leave a user address space before this CPU becomes idle. Page-table
+/// objects belonging to the former thread may be reclaimed by another CPU;
+/// retaining that TTBR0 while executing the kernel would then make instruction
+/// and data walks depend on freed memory.
+pub fn park_on_kernel_root() {
+    unsafe { activate_kernel_vspace() }
+}
+
+/// Install the BSP-constructed kernel tables on a secondary CPU.
+pub fn install_kernel_vspace_for_ap() {
+    park_on_kernel_root()
 }
 
 #[cfg(feature = "spec")]

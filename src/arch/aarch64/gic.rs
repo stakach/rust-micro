@@ -19,6 +19,7 @@ const GICD_ICPENDR: usize = 0x280;
 const GICD_IPRIORITYR: usize = 0x400;
 const GICD_ITARGETSR: usize = 0x800;
 const GICD_ICFGR: usize = 0xc00;
+const GICD_SGIR: usize = 0xf00;
 const GICD_CPENDSGIR: usize = 0xf10;
 
 const GICC_CTLR: usize = 0x000;
@@ -93,7 +94,15 @@ pub fn init() {
         }
         dist_write(GICD_CTLR, 1);
 
-        // Banked SGI/PPI and CPU-interface initialization.
+        init_cpu_interface();
+    }
+}
+
+/// Initialize the banked SGI/PPI state and GIC CPU interface on one CPU.
+/// The distributor-wide SPI setup is BSP-only, while every AP must execute
+/// this portion before enabling IRQs.
+pub unsafe fn init_cpu_interface() {
+    unsafe {
         dist_write(GICD_ICENABLER, u32::MAX);
         dist_write(GICD_ICPENDR, u32::MAX);
         dist_write(GICD_IGROUPR, 0);
@@ -101,6 +110,9 @@ pub fn init() {
         for offset in (0..16).step_by(4) {
             dist_write(GICD_CPENDSGIR + offset, u32::MAX);
         }
+
+        // SGI 1 is the kernel reschedule/remote-call interrupt.
+        dist_write(GICD_ISENABLER, 1 << super::interrupts::IPI_IRQ);
 
         cpu_write(GICC_CTLR, 0);
         cpu_write(GICC_PMR, 0xf0);
@@ -112,6 +124,18 @@ pub fn init() {
         }
         cpu_write(GICC_CTLR, 1);
         core::arch::asm!("dsb sy", "isb", options(nostack));
+    }
+}
+
+/// Send an SGI to one GICv2 CPU target. QEMU virt exposes CPU interface bits
+/// in the same dense order as MPIDR affinity level 0.
+pub fn send_sgi(target_cpu: u32, irq: u32) {
+    assert!(target_cpu < 8);
+    assert!(irq < 16);
+    unsafe {
+        core::arch::asm!("dsb ishst", options(nostack));
+        dist_write(GICD_SGIR, (1 << (16 + target_cpu)) | irq);
+        core::arch::asm!("isb", options(nostack));
     }
 }
 

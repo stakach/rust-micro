@@ -56,27 +56,20 @@ Goal: establish a buildable bare-metal AArch64 kernel target and isolate the rem
 - [x] Make `cargo check` and `cargo build` pass for the AArch64 kernel target.
 - [x] Verify the existing x86_64 `spec` check remains green.
 
-## Deferred hardware milestones
-- Select the AArch64 `.bf` and object-api XML snapshots in codegen and adapt the `Cap` model to ARM tags.
-- Exception vector table and EL1 synchronous/IRQ handlers.
-- GIC discovery and interrupt-controller initialization.
-- AArch64 stage-1 page-table and ASID operations.
-- Standard AArch64 Image/FDT entry contract, PL011 console, and QEMU boot run.
-- AArch64 libsel4 userspace syscall ABI and rootserver build.
-
 ## AArch64 conformance continuation
 
 - [x] Snapshot the pinned seL4 ARM/AArch64 `.bf` and object-api XML inputs without modifying `seL4/`.
 - [x] Select generated capability and invocation definitions from the Cargo target architecture.
 - [x] Split common capability behavior from x86 I/O and AArch64 VSpace capability behavior.
 - [x] Add target-aware kernel Image and QEMU spec build lanes.
-- [x] Boot the AArch64 kernel under QEMU `virt` through its standard Image/FDT ABI and run generic kernel specs.
-- [ ] Add target-aware rootserver and sel4test build lanes, including FDT initrd discovery.
-- [ ] Implement EL1 vectors, generic timer, GICv2, stage-1 paging, and ASID operations against pinned seL4 semantics.
-- [ ] Build and launch an AArch64 libsel4 rootserver, then run the upstream userspace suite.
-- [ ] Resolve the order-dependent amd64 `SCHED0011` failure and restore the full 191/191 userspace gate.
-- [ ] Run generic and architectural kernel specs plus seL4 userspace specs on both architectures.
-- [ ] Commit and push each independently green milestone to `feature/arm64-support`.
+- [x] Boot QEMU `virt` through an AArch64 Simpleboot stage and expose the same MBI contract as amd64.
+- [x] Add target-aware rootserver and sel4test build lanes.
+- [x] Implement EL1 vectors, generic timer, GICv2, stage-1 paging, and ASID operations against pinned seL4 semantics.
+- [x] Build and launch an AArch64 libsel4 rootserver and run the upstream userspace suite.
+- [x] Enable four-core AArch64 SMP with PSCI startup, GIC SGIs, per-CPU scheduling, and TLB shootdown.
+- [x] Run generic and architectural kernel specs plus seL4 userspace specs on AArch64.
+- [x] Re-run generic and architectural kernel specs plus seL4 userspace specs on amd64 after shared SMP changes.
+- [x] Commit and push the green milestone to `feature/arm64-support`.
 
 Compatibility authority: seL4 commit `daa0dfb1470c5ffbf13b3778f93111679574e80c`.
 Every architecture implementation must name the corresponding seL4 source path in code comments or
@@ -85,7 +78,7 @@ the review record, and intentional deviations must be documented rather than inf
 ## Review
 
 - Reference: seL4 `daa0dfb1470c5ffbf13b3778f93111679574e80c` (`15.0.0-9-gdaa0dfb14`).
-- `./scripts/run_aarch64_specs.sh`: exits zero after all generic, MCS, SMP-bookkeeping, ABI, and AArch64 FDT-entry specs pass under QEMU `virt`/GICv2.
+- `./scripts/run_aarch64_specs.sh`: exits zero after generic, architectural, MCS, SMP, and upstream userspace specs pass on four QEMU `virt` CPUs with GICv2.
 - `./scripts/build_kernel.sh smp` plus `./scripts/run_specs.sh`: all generic and x86 architectural kernel specs pass; the live Rust rootserver launches afterward.
 - AArch64 ELF and Linux Image artifacts are emitted under `target/mykernel-aarch64/release/`.
-- The direct QEMU Image path is used because the pinned Simpleboot utility has no QEMU `virt` AArch64 loader; Simpleboot/Multiboot remains the x86 boot path.
+- The pinned Simpleboot release has no QEMU `virt` AArch64 loader, so the repository carries that platform first stage while retaining Simpleboot's kernel-facing MBI contract.

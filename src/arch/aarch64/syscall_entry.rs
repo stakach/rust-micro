@@ -53,7 +53,7 @@ fn completed_receive(
         && Some(next) == invoker
 }
 
-fn activate_thread_vspace(id: TcbId) {
+pub(crate) fn activate_thread_vspace(id: TcbId) {
     let tcb = unsafe { KERNEL.get().scheduler.slab.get(id) };
     if let crate::cap::Cap::PML4 {
         ptr,
@@ -105,6 +105,7 @@ fn publish_receive(context: &mut UserContext, tcb: &crate::tcb::Tcb) {
 
 fn wait_for_runnable() -> TcbId {
     loop {
+        crate::arch::aarch64::vspace::park_on_kernel_root();
         crate::smp::bkl_release();
         unsafe {
             core::arch::asm!(
@@ -177,6 +178,7 @@ pub fn dispatch(frame: *mut UserContext) {
     let mut sink = SerialSink;
     let result = handle_syscall(syscall, &args, &mut sink);
 
+    #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
     if matches!(syscall, Syscall::SysDebugPutChar) {
         if let Some(success) = crate::rootserver::sel4test_check_byte(args.a0 as u8) {
             crate::arch::qemu_exit(if success { 0 } else { 255 });

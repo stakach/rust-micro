@@ -248,8 +248,8 @@ pub fn log_n(tag: &str, n: u32) {
 #[cfg(all(target_arch = "aarch64"))]
 pub fn init_syscall_msrs() {}
 
-/// aarch64 stubs for the SMP per-CPU init shape — APIs are x86_64-shaped
-/// today; aarch64 SMP bring-up is a separate phase.
+/// AArch64 does not need x86 GDT or IDT setup; exception-vector and GIC
+/// initialization are performed by the architecture-specific AP path.
 #[cfg(all(target_arch = "aarch64"))]
 pub fn init_gdt_for_cpu(_cpu_id: CpuId) {}
 #[cfg(all(target_arch = "aarch64"))]

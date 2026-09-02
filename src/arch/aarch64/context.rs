@@ -73,11 +73,39 @@ aarch64_enter_user:
     ldp x28, x29, [x30, #224]
     ldr x30, [x30, #240]
     eret
+
+    .global aarch64_restore_fpu
+aarch64_restore_fpu:
+    ldp x1, x2, [x0, #0]
+    msr fpcr, x1
+    msr fpsr, x2
+    ldp q0,  q1,  [x0, #16]
+    ldp q2,  q3,  [x0, #48]
+    ldp q4,  q5,  [x0, #80]
+    ldp q6,  q7,  [x0, #112]
+    ldp q8,  q9,  [x0, #144]
+    ldp q10, q11, [x0, #176]
+    ldp q12, q13, [x0, #208]
+    ldp q14, q15, [x0, #240]
+    ldp q16, q17, [x0, #272]
+    ldp q18, q19, [x0, #304]
+    ldp q20, q21, [x0, #336]
+    ldp q22, q23, [x0, #368]
+    ldp q24, q25, [x0, #400]
+    ldp q26, q27, [x0, #432]
+    ldp q28, q29, [x0, #464]
+    ldp q30, q31, [x0, #496]
+    ret
 "#
 );
 
 extern "C" {
     fn aarch64_enter_user(context: *const UserContext) -> !;
+    fn aarch64_restore_fpu(state: *const crate::tcb::Aarch64FpuState);
+}
+
+pub unsafe fn restore_fpu_hardware(state: &crate::tcb::Aarch64FpuState) {
+    aarch64_restore_fpu(state);
 }
 
 pub unsafe fn enter_user(context: *const UserContext) -> ! {

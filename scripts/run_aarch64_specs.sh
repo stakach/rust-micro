@@ -10,13 +10,15 @@ if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
 fi
 
 ./scripts/build_aarch64.sh spec smp
+./scripts/make_aarch64_simpleboot.sh
 
 exec qemu-system-aarch64 \
   -machine virt,secure=off,gic-version=2 \
   -cpu cortex-a53 \
   -m "${QEMU_MEMORY:-1024M}" \
-  -smp 1 \
+  -smp 4 \
   -nographic \
   -semihosting-config enable=on,target=native \
-  -kernel target/mykernel-aarch64/release/Image \
+  -kernel .tmp/aarch64-simpleboot/simpleboot-aarch64.img \
+  -initrd .tmp/aarch64-simpleboot/initrd.tar \
   "$@"

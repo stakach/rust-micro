@@ -2674,7 +2674,7 @@ fn decode_sched_context(
             unsafe {
                 let s = KERNEL.get();
                 if let Some(tcb_id) = s.sched_contexts[sc_id as usize].bound_tcb {
-                    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                    #[cfg(feature = "smp")]
                     crate::smp::remote_tcb_stall(tcb_id);
                     // Remove from the ready queue / surrender the CPU
                     // before clearing the SC so a runnable thread that
@@ -2727,7 +2727,7 @@ fn decode_sched_context(
                                 seL4_Error::seL4_IllegalOperation,
                             )));
                         }
-                        #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                        #[cfg(feature = "smp")]
                         crate::smp::remote_tcb_stall(tcb_id);
                         s.scheduler.on_sc_lost(tcb_id);
                         s.scheduler.slab.get_mut(tcb_id).sc = None;
@@ -3036,7 +3036,6 @@ fn decode_sched_control(
                     // bound thread is currently running on another core,
                     // stall that core off it before moving it, so it can't
                     // run on two cores at once (MULTICORE0002/0003).
-                    #[cfg(target_arch = "x86_64")]
                     crate::smp::remote_tcb_stall(tcb);
                     s.scheduler.migrate_tcb(tcb, sched_control_core);
                 }
@@ -3467,7 +3466,7 @@ fn decode_domain(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> 
                     Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
                     _ => return err(seL4_Error::seL4_InvalidArgument),
                 };
-                #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                #[cfg(feature = "smp")]
                 crate::smp::remote_tcb_stall(tcb_id);
                 // setDomain: re-queues the thread under the new domain.
                 s.scheduler.set_domain(tcb_id, domain as u8);
@@ -4969,7 +4968,7 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     // make that core switch off it before we free the slab entry —
     // otherwise the remote core keeps executing a freed TCB
     // (MULTICORE0005 remote-delete).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(feature = "smp")]
     crate::smp::remote_tcb_stall(id);
     crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
     // YieldTo bookkeeping (SCHED0018 delete phases):
@@ -5590,7 +5589,7 @@ fn decode_tcb(
                 // seL4 `remoteTCBStall`: if the thread is running on a
                 // remote core, stall that core off it before suspending
                 // so the counter freezes immediately (MULTICORE0001).
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(feature = "smp")]
                 crate::smp::remote_tcb_stall(id);
                 crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
                 // Upstream suspend() also completes an outstanding
