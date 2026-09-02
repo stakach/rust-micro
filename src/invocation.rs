@@ -2846,6 +2846,20 @@ fn decode_sched_context(
                     s.sched_contexts[sc_id as usize].yield_from = Some(invoker);
                     s.scheduler.slab.get_mut(invoker).yield_to = Some(sc_id);
                     let cpu = s.scheduler.slab.get(invoker).affinity as usize;
+                    let invoker_domain = s.scheduler.slab.get(invoker).domain as usize;
+                    let target_cpu = s.scheduler.slab.get(target_id).affinity as usize;
+                    let target_domain = s.scheduler.slab.get(target_id).domain as usize;
+                    // seL4 dequeues both parties, then SCHED_ENQUEUEs the
+                    // yielder followed by the target. SCHED_ENQUEUE inserts
+                    // at the head, making the target the next runnable TCB.
+                    s.scheduler.nodes[target_cpu].queues[target_domain]
+                        .dequeue(&mut s.scheduler.slab, target_id);
+                    s.scheduler.nodes[cpu].queues[invoker_domain]
+                        .dequeue(&mut s.scheduler.slab, invoker);
+                    s.scheduler.nodes[cpu].queues[invoker_domain]
+                        .enqueue_front(&mut s.scheduler.slab, invoker);
+                    s.scheduler.nodes[target_cpu].queues[target_domain]
+                        .enqueue_front(&mut s.scheduler.slab, target_id);
                     if s.scheduler.nodes[cpu].current == Some(invoker) {
                         s.scheduler.nodes[cpu].current = None;
                     }
@@ -3044,26 +3058,56 @@ fn decode_sched_control(
 fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     match label {
         InvocationLabel::IRQIssueIRQHandler => {
-            // a2 = IRQ number, a3 = dest slot index
+            // Upstream ABI: a2 = IRQ, a3 = destination CPtr, a4 = depth,
+            // extraCaps[0] = destination CNode. Legacy kernel specs omit the
+            // extra cap and address a slot in the invoker's root CNode.
             if args.a2 >= crate::interrupt::MAX_IRQ as u64 {
                 return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_RangeError,
                 )));
             }
             let irq = args.a2 as u16;
-            let dest_index = args.a3 as usize;
             unsafe {
                 let s = KERNEL.get();
-                let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
-                let cnode_ptr = match cspace_root {
-                    Cap::CNode { ptr, .. } => ptr,
-                    _ => {
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                let (cnode_idx, dest_index) = if info.extra_caps() > 0 {
+                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
+                    if info.length() < 3 || inv_tcb.pending_extra_caps_count == 0 {
+                        inv_tcb.pending_extra_caps_count = 0;
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_TruncatedMessage,
+                        )));
+                    }
+                    let root = inv_tcb.pending_extra_caps[0];
+                    inv_tcb.pending_extra_caps_count = 0;
+                    if !matches!(root, Cap::CNode { .. }) {
                         return Err(KException::SyscallError(SyscallError::new(
                             seL4_Error::seL4_InvalidCapability,
-                        )))
+                        )));
                     }
+                    let resolved =
+                        crate::cspace::resolve_address_bits(s, &root, args.a3, args.a4 as u32)?;
+                    if resolved.bits_remaining != 0 {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_FailedLookup,
+                        )));
+                    }
+                    (
+                        KernelState::cnode_index(resolved.slot_ptr),
+                        resolved.slot_index,
+                    )
+                } else {
+                    let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+                    let cnode_ptr = match cspace_root {
+                        Cap::CNode { ptr, .. } => ptr,
+                        _ => {
+                            return Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidCapability,
+                            )))
+                        }
+                    };
+                    (KernelState::cnode_index(cnode_ptr), args.a3 as usize)
                 };
-                let cnode_idx = KernelState::cnode_index(cnode_ptr);
                 let slots = match s.cnode_slots_at(cnode_idx) {
                     Some(s) => s,
                     None => {
@@ -3095,11 +3139,48 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
                 .map_err(|_| {
                     KException::SyscallError(SyscallError::new(seL4_Error::seL4_RevokeFirst))
                 })?;
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::gic::mask(u32::from(irq));
                 s.cnode_slot_mut(cnode_idx, dest_index)
                     .expect("validated IRQ destination slot")
                     .set_cap(&Cap::IrqHandler { irq });
             }
             Ok(())
+        }
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMIRQIssueIRQHandlerTrigger => {
+            if args.a3 > 1 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidArgument,
+                )));
+            }
+            let translated = SyscallArgs {
+                a0: args.a0,
+                a1: args.a1,
+                a2: args.a2,
+                a3: args.a4,
+                a4: args.a5,
+                a5: 0,
+            };
+            decode_irq_control(InvocationLabel::IRQIssueIRQHandler, &translated, invoker)
+        }
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMIRQIssueIRQHandlerTriggerCore => {
+            let target = unsafe { KERNEL.get().scheduler.slab.get(invoker).msg_regs[4] };
+            if args.a3 > 1 || target != 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidArgument,
+                )));
+            }
+            let translated = SyscallArgs {
+                a0: args.a0,
+                a1: args.a1,
+                a2: args.a2,
+                a3: args.a4,
+                a4: args.a5,
+                a5: 0,
+            };
+            decode_irq_control(InvocationLabel::IRQIssueIRQHandler, &translated, invoker)
         }
         #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86IRQIssueIRQHandlerIOAPIC => issue_x86_ioapic_irq_handler(args, invoker),
@@ -3552,6 +3633,10 @@ fn decode_irq_handler(
                     )
                     .expect("a live IOAPIC handler must remain rearmable until Ack");
                 }
+                #[cfg(target_arch = "aarch64")]
+                if source == crate::interrupt::IrqSource::Generic {
+                    crate::arch::aarch64::gic::unmask(u32::from(irq));
+                }
                 crate::interrupt::ack_irq(&mut s.irqs, irq)
                     .expect("validated IRQ binding must remain live under the BKL");
                 Ok(())
@@ -3621,6 +3706,8 @@ fn decode_irq_handler(
                 Ok(())
             }
             InvocationLabel::IRQClearIRQHandler => {
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::gic::mask(u32::from(irq));
                 #[cfg(target_arch = "x86_64")]
                 {
                     if let Ok(crate::interrupt::IrqSource::IoApic { controller, pin }) =
@@ -5106,6 +5193,10 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
         Cap::IrqHandler { irq } => {
             if cap_refcount(cap) == 0 {
                 let source = crate::interrupt::source(&s.irqs, *irq).unwrap_or_default();
+                #[cfg(target_arch = "aarch64")]
+                if source == crate::interrupt::IrqSource::Generic {
+                    crate::arch::aarch64::gic::mask(u32::from(*irq));
+                }
                 #[cfg(target_arch = "x86_64")]
                 if let crate::interrupt::IrqSource::IoApic { controller, pin } = source {
                     crate::arch::x86_64::ioapic::set_route_mask(

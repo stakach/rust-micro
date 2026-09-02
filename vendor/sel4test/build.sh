@@ -190,6 +190,8 @@ if [ ! -f CMakeCache.txt ]; then
     -DKernelMaxNumNodes="$NUM_NODES"
     -DKernelPrinting=ON
     -DKernelDebugBuild=ON
+    -DKernelVerificationBuild=OFF
+    -DKernelBinaryVerificationBuild=OFF
     -DKernelMaxNumBootinfoUntypedCaps=230
     -DKernelSetTLSBaseSelf=ON
     -DTRIPLE="$TRIPLE"
@@ -206,12 +208,24 @@ if [ ! -f CMakeCache.txt ]; then
     )
   else
     CONFIGURE_ARGS+=(
+      -DSel4testAllowSettingsOverride=ON
+      -DSIMULATION=OFF
+      -DSel4testSimulation=ON
+      -DSel4testHaveCache=OFF
+      -DLibPlatSupportHaveTimer=ON
+      -DSel4testHaveTimer=ON
+      -DKernelArmExportPCNTUser=ON
+      -DKernelArmExportPTMRUser=ON
+      -DKernelNumDomains=4
+      -DKernelNumDomainSchedules=100
+      -DKernelMaxNumNodes=1
+      -DHardwareDebugAPI=ON
       -DCMAKE_AR="$RUST_TOOLBIN/llvm-ar"
       -DCMAKE_RANLIB="$HERE/toolchain/llvm-ranlib"
       -DCMAKE_NM="$RUST_TOOLBIN/llvm-nm"
       -DCMAKE_OBJCOPY="$RUST_TOOLBIN/llvm-objcopy"
       -DCMAKE_STRIP="$RUST_TOOLBIN/llvm-strip"
-      "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -L$HERE/.toolchain/lib/aarch64"
+      "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=$HERE/toolchain/ld.lld -L$HERE/.toolchain/lib/aarch64"
     )
   fi
   ../init-build.sh "${CONFIGURE_ARGS[@]}"

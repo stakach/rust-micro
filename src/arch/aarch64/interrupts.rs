@@ -26,23 +26,87 @@ extern "C" fn aarch64_irq_dispatch(context: *mut crate::arch::UserContext) {
     if irq == super::timer::TIMER_IRQ {
         // The architected timer is level-sensitive. Move its compare value
         // before EOI, matching seL4's resetTimer()/isb()/ackInterrupt order.
+        // A domain switch can then wait for another timer interrupt, so the
+        // GIC active state must be dropped before entering the scheduler.
         let from_user = unsafe { (*context).spsr_el1 & 0xf == 0 };
+        let elapsed = super::timer::elapsed_kernel_ticks();
         super::timer::program_ticks((super::timer::frequency_hz() / 1_000).max(1));
         TIMER_INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+        super::gic::end_interrupt(acknowledge);
         if from_user {
-            handle_kernel_tick(context);
+            handle_kernel_tick(context, elapsed);
         } else {
-            handle_idle_tick();
+            handle_idle_tick(elapsed);
         }
     } else {
-        super::gic::mask(irq);
+        handle_userspace_irq(context, irq, acknowledge);
+        return;
+    }
+}
+
+fn handle_userspace_irq(context: *mut crate::arch::UserContext, irq: u32, acknowledge: u32) {
+    crate::smp::bkl_acquire();
+    let context = unsafe { &mut *context };
+    let from_user = context.spsr_el1 & 0xf == 0;
+    let interrupted = unsafe {
+        let state = crate::kernel::KERNEL.get();
+        if from_user {
+            state
+                .scheduler
+                .active_user()
+                .or_else(|| state.scheduler.current())
+        } else {
+            state.scheduler.current()
+        }
+    };
+
+    super::gic::mask(irq);
+    let handled = unsafe {
+        let state = crate::kernel::KERNEL.get();
+        let state_ptr: *mut crate::kernel::KernelState = state;
+        let handled = matches!(
+            (*state_ptr).irqs.get(irq as u16).map(|entry| entry.state),
+            Some(crate::interrupt::IrqState::Signal)
+        );
+        let _ = crate::interrupt::handle_interrupt(
+            &mut (*state_ptr).irqs,
+            &mut (*state_ptr).notifications,
+            &mut (*state_ptr).scheduler,
+            irq as u16,
+        );
+        handled
+    };
+    if !handled {
         UNEXPECTED_INTERRUPTS.fetch_add(1, Ordering::SeqCst);
     }
 
+    // A level-triggered userspace source stays masked until IRQHandler_Ack.
+    // Drop the GIC active state before a possible scheduler wait.
     super::gic::end_interrupt(acknowledge);
+
+    if from_user {
+        if let Some(thread) = interrupted {
+            unsafe {
+                let tcb = crate::kernel::KERNEL.get().scheduler.slab.get_mut(thread);
+                tcb.user_context = *context;
+                crate::arch::aarch64::context::save_exception_fpu(
+                    context,
+                    &mut tcb.aarch64_fpu_state,
+                );
+            }
+        }
+        crate::arch::aarch64::syscall_entry::dispatch_selected(
+            context,
+            interrupted,
+            crate::syscalls::Syscall::SysYield,
+            false,
+            false,
+        );
+    }
+    crate::smp::bkl_release();
 }
 
-fn handle_idle_tick() {
+fn handle_idle_tick(elapsed: u64) {
     // `wait_for_runnable` executes WFI at EL1 after releasing the BKL. A
     // sporadic SC may be the only thing capable of becoming runnable, so an
     // idle timer IRQ must still advance time and process the release queue.
@@ -50,12 +114,12 @@ fn handle_idle_tick() {
     unsafe {
         crate::kernel::KERNEL.get().scheduler.tick();
     }
-    super::timer::TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    crate::sched_context::mcs_tick(1);
+    super::timer::TICK_COUNT.fetch_add(elapsed, Ordering::Relaxed);
+    crate::sched_context::mcs_tick(elapsed);
     crate::smp::bkl_release();
 }
 
-fn handle_kernel_tick(context: *mut crate::arch::UserContext) {
+fn handle_kernel_tick(context: *mut crate::arch::UserContext, elapsed: u64) {
     crate::smp::bkl_acquire();
     let interrupted = unsafe {
         crate::kernel::KERNEL
@@ -71,8 +135,8 @@ fn handle_kernel_tick(context: *mut crate::arch::UserContext) {
             crate::arch::aarch64::context::save_exception_fpu(context, &mut tcb.aarch64_fpu_state);
             crate::kernel::KERNEL.get().scheduler.tick();
         }
-        super::timer::TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-        crate::sched_context::mcs_tick(1);
+        super::timer::TICK_COUNT.fetch_add(elapsed, Ordering::Relaxed);
+        crate::sched_context::mcs_tick(elapsed);
         crate::arch::aarch64::syscall_entry::dispatch_selected(
             unsafe { &mut *context },
             Some(thread),

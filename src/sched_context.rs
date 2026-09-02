@@ -483,15 +483,10 @@ pub fn complete_yield_to(s: &mut crate::kernel::KernelState, yielder: TcbId, sc_
         let _ = t;
         let t = s.scheduler.slab.get_mut(yielder);
         t.yield_to = None;
-        // Syscall return: msginfo label 0 / length 1 in rsi, badge 0
-        // in rdi, mr0 = consumed in r10 (seL4_CallWithMRs register
-        // convention).
-        #[cfg(target_arch = "x86_64")]
-        {
-            t.user_context.rsi = 1;
-            t.user_context.rdi = 0;
-            t.user_context.r10 = consumed_us;
-        }
+        // Syscall return: success label / length 1 and MR0 = consumed.
+        // The shared helper selects x86 r10 or AArch64 X2 according to
+        // libsel4's seL4_CallWithMRs register convention.
+        crate::arch::set_ipc_return(&mut t.user_context, 0, 1, &[consumed_us]);
         t.msg_regs[0] = consumed_us;
         t.ipc_length = 1;
         t.ipc_label = 0;

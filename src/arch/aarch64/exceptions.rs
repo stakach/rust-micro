@@ -186,6 +186,7 @@ pub fn init_exceptions() {
             options(nostack, preserves_flags),
         );
     }
+    crate::arch::aarch64::timer::enable_el0_physical_timer();
     crate::arch::aarch64::debug::init();
 }
 
