@@ -302,7 +302,7 @@ pub struct seL4_BootIoApicTopology {
     pub controllers: [seL4_BootIoApicDesc; CONFIG_MAX_NUM_BOOTINFO_IOAPICS],
 }
 
-/// One BOOTBOOT memory-map extent projected into the conventional 24-byte E820 record shape.
+/// One Simpleboot memory-map extent projected into the conventional 24-byte E820 record shape.
 /// `extendedAttributes` retains the ACPI 3.0 enabled bit separately; the NT loader projection
 /// combines it with the 32-bit E820 type exactly as FreeLdr's `BIOS_MEMORY_MAP` does.
 #[repr(C)]
@@ -342,7 +342,7 @@ pub struct seL4_BootInfo {
     pub schedcontrol: seL4_SlotRegion,
     pub untyped: seL4_SlotRegion,
     pub untypedList: [seL4_UntypedDesc; CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS],
-    // Phase 0a (extern-rootserver only) — BOOTBOOT linear-framebuffer
+    // Phase 0a (extern-rootserver only) — Simpleboot linear-framebuffer
     // geometry, published so the NT-personality rootserver can map +
     // drive the display. These trailing fields are gated on
     // `extern-rootserver` so the default (sel4test) kernel writes the
@@ -389,7 +389,7 @@ pub struct seL4_BootInfo {
     pub persistentClockCenturyRegister: u8,
     #[cfg(feature = "extern-rootserver")]
     pub persistentClockReserved: [u8; 7],
-    /// Loader-selected, checksum-validated ACPI RSDT/XSDT physical extent. BOOTBOOT publishes the
+    /// Loader-selected, checksum-validated ACPI RSDT/XSDT physical extent. Simpleboot publishes the
     /// root table after consuming the firmware RSDP, so this is intentionally not an RSDP field.
     #[cfg(feature = "extern-rootserver")]
     pub acpiRootTablePaddr: seL4_Word,

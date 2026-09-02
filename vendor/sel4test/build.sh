@@ -16,7 +16,7 @@
 # The build emits `vendor/sel4test/build/sel4test-driver/sel4test-
 # driver` — the ELF that sel4test-driver runs as the rootserver.
 # We copy it to `.tmp/rootserver.elf` so `scripts/make_image.sh`
-# packs it into the BOOTBOOT initrd alongside our kernel; from
+# packs it into the Simpleboot module archive alongside our kernel; from
 # there it's just `scripts/run_specs.sh` to boot.
 #
 # This script does not rebuild our kernel — that's

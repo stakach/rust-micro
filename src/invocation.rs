@@ -371,7 +371,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
                 .get(invoker)
                 .pending_extra_caps_count
         };
-        if info.length() < 6 || staged_caps == 0 {
+        if info.length() < 3 || staged_caps == 0 {
             unsafe {
                 KERNEL
                     .get()
@@ -2099,6 +2099,21 @@ fn clear_receiver_call_state_for_reply_caller(s: &mut KernelState, caller: TcbId
         if tcb.composite_reply_handoff == Some(caller) {
             tcb.composite_reply_handoff = None;
         }
+    }
+}
+
+fn cancel_reply_wait_for_caller(s: &mut KernelState, caller: TcbId) {
+    clear_receiver_call_state_for_reply_caller(s, caller);
+    for reply in s.replies.iter_mut() {
+        if reply.bound_tcb == Some(caller) {
+            reply.bound_tcb = None;
+        }
+    }
+    if matches!(
+        s.scheduler.slab.try_get(caller).map(|t| t.state),
+        Some(crate::tcb::ThreadStateType::BlockedOnReply)
+    ) {
+        crate::sched_context::return_donated_sc(s, caller);
     }
 }
 
@@ -3930,11 +3945,24 @@ fn cnode_rotate(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             )));
         }
 
+        let (src_parent, src_child_count) = s
+            .cnode_slot(src_cn, src_si)
+            .map(|c| (c.parent(), c.child_count()))
+            .unwrap_or((None, 0));
+
         // Order of writes matters when dest == src: clear src first
         // would lose the cap. Do dest assignment first; only clear
         // src if it's a distinct slot.
         if let Some(slot) = s.cnode_slot_mut(dest_cn, dest_si) {
             slot.set_cap(&src_cap);
+            slot.set_parent(src_parent);
+            slot.set_child_count(src_child_count);
+            slot.set_revoke_epoch(0);
+        }
+        if !(dest_cn == src_cn && dest_si == src_si) {
+            let src_id = crate::cte::MdbId::pack(src_cn as u32, src_si as u32);
+            let dest_id = crate::cte::MdbId::pack(dest_cn as u32, dest_si as u32);
+            reparent_direct_children(s, src_id, Some(dest_id), src_child_count);
         }
         if let Some(slot) = s.cnode_slot_mut(pivot_cn, pivot_si) {
             slot.set_cap(&pivot_cap);
@@ -3943,6 +3971,8 @@ fn cnode_rotate(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             if let Some(slot) = s.cnode_slot_mut(src_cn, src_si) {
                 slot.set_cap(&Cap::Null);
                 slot.set_parent(None);
+                slot.set_child_count(0);
+                slot.set_revoke_epoch(0);
             }
         }
     }
@@ -4778,20 +4808,12 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
                 // server keeps `active_sc` pointing at a caller SC that
                 // may be deleted immediately afterwards.
                 if let Some(caller) = s.replies[idx].bound_tcb {
-                    clear_receiver_call_state_for_reply_caller(s, caller);
-                    if let Some(caller_tcb) = s.scheduler.slab.try_get(caller) {
-                        // Passive-server call donation still has to be
-                        // returned to the caller before the reply object
-                        // disappears. Guard on BlockedOnReply so we do
-                        // not disturb SC loans unrelated to the canceled
-                        // call (INTERRUPT0005).
-                        if matches!(
-                            caller_tcb.state,
-                            crate::tcb::ThreadStateType::BlockedOnReply
-                        ) {
-                            crate::sched_context::return_donated_sc(s, caller);
-                        }
-                    }
+                    // Passive-server call donation still has to be
+                    // returned to the caller before the reply object
+                    // disappears. Guarded inside the helper so we do
+                    // not disturb SC loans unrelated to the canceled
+                    // call (INTERRUPT0005).
+                    cancel_reply_wait_for_caller(s, caller);
                 }
                 s.free_reply(idx);
             }
@@ -4884,6 +4906,9 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
                             inner_parent, None,
                             "empty CNode slot cannot retain an MDB parent"
                         );
+                        s.cnode_slot_mut(vi, si)
+                            .expect("queued CNode slot must remain registered until cleared")
+                            .set_revoke_epoch(0);
                         continue;
                     }
                     let spliced_parent =
@@ -5457,7 +5482,7 @@ fn decode_tcb(
                     if s.scheduler.nodes[cpu].current == Some(id) {
                         if let Some(top) = s.scheduler.nodes[cpu].queues[dom].peek_highest() {
                             if top > prio {
-                                s.scheduler.nodes[cpu].current = None;
+                                s.scheduler.request_reschedule_on(cpu);
                             }
                         }
                     }
@@ -5469,7 +5494,7 @@ fn decode_tcb(
                         if cur != id {
                             let cur_prio = s.scheduler.slab.get(cur).priority;
                             if prio > cur_prio {
-                                s.scheduler.nodes[cpu].current = None;
+                                s.scheduler.request_reschedule_on(cpu);
                             }
                         }
                     }
@@ -5480,11 +5505,10 @@ fn decode_tcb(
                     // new priority is honoured on the next pop.
                     use crate::tcb::ThreadStateType::*;
                     let state = s.scheduler.slab.get(id).state;
-                    if matches!(
-                        state,
-                        BlockedOnSend | BlockedOnReceive | BlockedOnNotification
-                    ) {
+                    if matches!(state, BlockedOnSend | BlockedOnReceive) {
                         crate::endpoint::reposition_in_wait_queue(&mut s.scheduler, id);
+                    } else if matches!(state, BlockedOnNotification) {
+                        crate::notification::reposition_in_wait_queue(&mut s.scheduler, id);
                     }
                 }
                 Ok(())
@@ -5670,10 +5694,16 @@ fn decode_tcb(
                         // fs_base / gs_base (slots 18, 19) ignored.
                         if resume {
                             // Upstream `restart()` cancels any
-                            // in-flight fault — the thread is being
-                            // forcibly re-pointed, so a later reply
-                            // to its old fault must not rewrite the
-                            // registers we just set.
+                            // in-flight IPC/fault/reply wait — the
+                            // thread is being forcibly re-pointed, so a
+                            // later reply to its old operation must not
+                            // rewrite the registers we just set. sel4test
+                            // restarts helpers after they report
+                            // completion via Call; leaving that Call's
+                            // Reply object bound makes the next helper
+                            // round depend on stale receiver state.
+                            crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
+                            cancel_reply_wait_for_caller(s, id);
                             s.scheduler.slab.get_mut(id).pending_fault = 0;
                             s.scheduler.make_runnable(id);
                         }
@@ -5950,7 +5980,7 @@ fn decode_tcb(
             //   a2 = vaddr the user mapped its IPC buffer at
             //   a3 = Frame cap_ptr backing that mapping; the
             //        kernel reads its paddr to access the buffer
-            //        directly (BOOTBOOT 1 GiB identity map).
+            //        directly through the kernel linear map.
             InvocationLabel::TCBSetIPCBuffer => {
                 // Two ABI shapes:
                 //   * Upstream (sel4test): bufferFrame via extraCaps[0],
@@ -6146,9 +6176,43 @@ fn decode_tcb(
                 } else {
                     s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
                 }
-                let t = s.scheduler.slab.get_mut(id);
-                t.mcp = mcp;
-                t.priority = prio;
+                let cpu = s.scheduler.slab.get(id).affinity as usize;
+                let dom = s.scheduler.slab.get(id).domain as usize;
+                let was_runnable = s.scheduler.slab.get(id).is_runnable();
+                if was_runnable {
+                    s.scheduler.nodes[cpu].queues[dom].dequeue(&mut s.scheduler.slab, id);
+                }
+                {
+                    let t = s.scheduler.slab.get_mut(id);
+                    t.mcp = mcp;
+                    t.priority = prio;
+                }
+                if was_runnable {
+                    s.scheduler.nodes[cpu].queues[dom].enqueue(&mut s.scheduler.slab, id);
+                    if s.scheduler.nodes[cpu].current == Some(id) {
+                        if let Some(top) = s.scheduler.nodes[cpu].queues[dom].peek_highest() {
+                            if top > prio {
+                                s.scheduler.request_reschedule_on(cpu);
+                            }
+                        }
+                    }
+                    if let Some(cur) = s.scheduler.nodes[cpu].current {
+                        if cur != id {
+                            let cur_prio = s.scheduler.slab.get(cur).priority;
+                            if prio > cur_prio {
+                                s.scheduler.request_reschedule_on(cpu);
+                            }
+                        }
+                    }
+                } else {
+                    use crate::tcb::ThreadStateType::*;
+                    let state = s.scheduler.slab.get(id).state;
+                    if matches!(state, BlockedOnSend | BlockedOnReceive) {
+                        crate::endpoint::reposition_in_wait_queue(&mut s.scheduler, id);
+                    } else if matches!(state, BlockedOnNotification) {
+                        crate::notification::reposition_in_wait_queue(&mut s.scheduler, id);
+                    }
+                }
                 Ok(())
             }
             // SetTLSBase via TCB invocation (vs the SysSetTLSBase
@@ -6350,6 +6414,7 @@ pub mod spec {
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
         frame_map_unmap_get_address();
+        frame_map_accepts_upstream_libsel4_abi();
         zero_device_frame_get_address();
         paging_maps_reject_unassigned_explicit_vspace();
         paging_unmap_requires_exact_physical_identity();
@@ -6358,6 +6423,7 @@ pub mod spec {
         tcb_write_read_registers();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
+        tcb_write_registers_resume_cancels_reply_wait();
         tcb_set_space_and_bind_notification();
         tcb_set_space_pml4_pins_cr3();
         tcb_configure_one_shot_setup();
@@ -6625,9 +6691,7 @@ pub mod spec {
         unsafe {
             match KERNEL.get().cnodes[0].0[6].cap() {
                 Cap::PML4 {
-                    mapped: true,
-                    asid,
-                    ..
+                    mapped: true, asid, ..
                 } => {
                     assert!(asid != 0, "Assign should set a non-zero ASID, got {asid}");
                     assert!(
@@ -8083,9 +8147,8 @@ pub mod spec {
 
         let invoker = setup_invoker(0);
         // Plant sibling Frame caps at slots 1 and 2 of CNode 0. Pick a paddr
-        // safely past BOOTBOOT's identity range so map_user_4k
-        // doesn't clash with the loader's 1 GiB pages, and a
-        // vaddr in PML4[2] (= same place the user-mode demo uses).
+        // in the reserved user-page pool and a vaddr in PML4[2]
+        // (= same place the user-mode demo uses).
         let paddr = 0x0000_0000_0090_0000u64;
         let frame_cap = Cap::Frame {
             ptr: PAddr::<FrameStorage>::new(paddr),
@@ -8209,6 +8272,73 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Frame::Map / Unmap / GetAddress round-trip\n");
+    }
+
+    #[inline(never)]
+    fn frame_map_accepts_upstream_libsel4_abi() {
+        use crate::cap::{FrameRights, FrameSize, FrameStorage, Pml4Storage};
+
+        let invoker = setup_invoker(0);
+        let paddr = 0x0000_0000_0094_0000u64;
+        let seed_paddr = paddr + 0x1000;
+        let vaddr = 0x0000_0100_00a0_0000u64;
+        let frame_cap = Cap::Frame {
+            ptr: PAddr::<FrameStorage>::new(paddr),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadWrite,
+            mapped: None,
+            asid: 0,
+            is_device: false,
+            map_type: crate::cap::FrameMapType::None,
+        };
+        let pml4_paddr = crate::arch::x86_64::usermode::current_pml4_paddr();
+        let pml4_cap = Cap::PML4 {
+            ptr: PPtr::<Pml4Storage>::new(pml4_paddr).expect("live PML4 paddr is non-zero"),
+            mapped: true,
+            asid: 1,
+        };
+        unsafe {
+            let s = KERNEL.get();
+            s.cnodes[0].0[2] = Cte::with_cap(&frame_cap);
+            // Seed the intermediate page tables via the legacy live-PML4 mapper,
+            // then clear only the leaf so the upstream path can install it.
+            crate::arch::x86_64::usermode::map_user_4k_public(vaddr, seed_paddr, true, false);
+            assert!(crate::arch::x86_64::usermode::unmap_user_4k_public(
+                vaddr, seed_paddr,
+            ));
+            let t = s.scheduler.slab.get_mut(invoker);
+            t.pending_extra_caps[0] = pml4_cap;
+            t.pending_extra_caps_count = 1;
+        }
+
+        let info_word = ((InvocationLabel::X86PageMap as u64) << 12)
+            | (1u64 << 7) // extra_caps = 1
+            | 3u64; // length = vaddr, rights, attr
+        let args = SyscallArgs {
+            a0: 2,
+            a1: info_word,
+            a2: vaddr,
+            a3: FrameRights::ReadWrite.to_word(),
+            a4: 0, // VM attributes
+            ..Default::default()
+        };
+        decode_invocation(frame_cap, &args, invoker).expect("upstream Page_Map ABI ok");
+
+        unsafe {
+            match KERNEL.get().cnodes[0].0[2].cap() {
+                Cap::Frame {
+                    mapped: Some(v),
+                    asid: 1,
+                    ..
+                } if v == vaddr => {}
+                other => panic!("expected upstream-mapped frame cap, got {:?}", other),
+            }
+            assert!(crate::arch::x86_64::usermode::unmap_user_4k_public(
+                vaddr, paddr,
+            ));
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ Frame::Map accepts upstream libsel4 ABI\n");
     }
 
     /// Explicit frame maps need a real ASID so later unmap/delete can find the same VSpace.
@@ -8483,6 +8613,88 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Reply delete clears receiver call state\n");
+    }
+
+    #[inline(never)]
+    fn tcb_write_registers_resume_cancels_reply_wait() {
+        let invoker = setup_invoker(0);
+        let reply_idx = 11usize;
+        let caller_sc = 16usize;
+        let receiver_sc = 17usize;
+        let (caller, receiver) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            s.replies[reply_idx] = crate::reply::Reply::new();
+            s.sched_contexts[caller_sc] =
+                crate::sched_context::SchedContext::new(/* period */ 10, /* budget */ 10);
+            s.sched_contexts[receiver_sc] =
+                crate::sched_context::SchedContext::new(/* period */ 10, /* budget */ 10);
+
+            let mut caller_t = crate::tcb::Tcb::default();
+            caller_t.priority = 90;
+            caller_t.state = crate::tcb::ThreadStateType::BlockedOnReply;
+            caller_t.sc = Some(caller_sc as u16);
+            caller_t.pending_fault = 6;
+            let caller = s.scheduler.admit(caller_t);
+            s.sched_contexts[caller_sc].bound_tcb = Some(caller);
+
+            let mut receiver_t = crate::tcb::Tcb::default();
+            receiver_t.priority = 100;
+            receiver_t.state = crate::tcb::ThreadStateType::Running;
+            receiver_t.sc = Some(receiver_sc as u16);
+            receiver_t.active_sc = Some(caller_sc as u16);
+            receiver_t.reply_to = Some(caller);
+            let receiver = s.scheduler.admit(receiver_t);
+            s.sched_contexts[receiver_sc].bound_tcb = Some(receiver);
+
+            s.replies[reply_idx].bound_tcb = Some(caller);
+            s.scheduler.set_current(Some(invoker));
+            (caller, receiver)
+        };
+
+        let caller_cap = Cap::Thread {
+            tcb: crate::cap::PPtr::<crate::cap::Tcb>::new(caller.0 as u64).unwrap(),
+        };
+        let args = SyscallArgs {
+            a1: crate::types::seL4_MessageInfo_t::new(
+                InvocationLabel::TCBWriteRegisters as u64,
+                0,
+                0,
+                3,
+            )
+            .words[0],
+            a2: 1, // resume target
+            a3: 2, // rip, rsp
+            a4: 0xCAFE_F00D,
+            a5: 0x0010_4000,
+            ..Default::default()
+        };
+        decode_invocation(caller_cap, &args, invoker).expect("resume cancels old reply wait");
+
+        unsafe {
+            let s = KERNEL.get();
+            let caller_t = s.scheduler.slab.get(caller);
+            assert_eq!(caller_t.state, crate::tcb::ThreadStateType::Running);
+            assert_eq!(caller_t.pending_fault, 0);
+            assert_eq!(caller_t.donated_sc, None);
+            assert_eq!(s.replies[reply_idx].bound_tcb, None);
+
+            let receiver_t = s.scheduler.slab.get(receiver);
+            assert_eq!(receiver_t.reply_to, None);
+            assert_eq!(receiver_t.active_sc, None);
+
+            s.scheduler.scrub_tcb(caller);
+            s.scheduler.scrub_tcb(receiver);
+            s.scheduler.slab.free(caller);
+            s.scheduler.slab.free(receiver);
+            s.replies[reply_idx] = crate::reply::Reply::new();
+            s.sched_contexts[caller_sc] = crate::sched_context::SchedContext::new(0, 0);
+            s.sched_contexts[receiver_sc] = crate::sched_context::SchedContext::new(0, 0);
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
+        }
+        teardown_invoker(invoker);
+        arch::log("  ✓ TCB::WriteRegisters resume cancels stale reply wait\n");
     }
 
     #[inline(never)]

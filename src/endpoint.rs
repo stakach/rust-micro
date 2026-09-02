@@ -164,6 +164,157 @@ fn queue_is_empty(ep: &Endpoint) -> bool {
     ep.head.is_none()
 }
 
+fn normalize_queue_state(ep: &mut Endpoint, sched: &mut Scheduler) {
+    loop {
+        let Some(head) = ep.head else {
+            ep.tail = None;
+            ep.state = EpState::Idle;
+            return;
+        };
+        match sched.slab.try_get(head).map(|t| t.state) {
+            Some(ThreadStateType::BlockedOnSend) => {
+                ep.state = EpState::Send;
+                ep.tail = queue_tail_from(head, sched);
+                return;
+            }
+            Some(ThreadStateType::BlockedOnReceive) => {
+                ep.state = EpState::Recv;
+                ep.tail = queue_tail_from(head, sched);
+                return;
+            }
+            _ => {
+                let _ = queue_pop_head(ep, sched);
+            }
+        }
+    }
+}
+
+fn queue_tail_from(head: TcbId, sched: &Scheduler) -> Option<TcbId> {
+    let mut tail = head;
+    let mut cur = Some(head);
+    let mut guard = 0usize;
+    while let Some(id) = cur {
+        guard += 1;
+        if guard > crate::tcb::MAX_TCBS {
+            break;
+        }
+        tail = id;
+        cur = sched.slab.try_get(id).and_then(|t| t.ep_next);
+    }
+    Some(tail)
+}
+
+fn waiter_kind(sched: &Scheduler, id: TcbId) -> Option<EpState> {
+    match sched.slab.try_get(id).map(|t| t.state) {
+        Some(ThreadStateType::BlockedOnSend) => Some(EpState::Send),
+        Some(ThreadStateType::BlockedOnReceive) => Some(EpState::Recv),
+        _ => None,
+    }
+}
+
+fn opposite_waiter(kind: EpState) -> Option<EpState> {
+    match kind {
+        EpState::Send => Some(EpState::Recv),
+        EpState::Recv => Some(EpState::Send),
+        EpState::Idle => None,
+    }
+}
+
+fn complete_queued_transfer(
+    sched: &mut Scheduler,
+    sender: TcbId,
+    receiver: TcbId,
+    sender_can_donate: bool,
+) {
+    let (badge, sender_can_grant, was_call) = {
+        let s = sched.slab.get_mut(sender);
+        let badge = s.ipc_badge;
+        let sender_can_grant = core::mem::replace(&mut s.blocked_can_grant, false);
+        let was_call = core::mem::replace(&mut s.blocked_is_call, false);
+        (badge, sender_can_grant, was_call)
+    };
+    deliver_message(sched, sender, receiver, badge);
+    if sender_can_grant {
+        transfer_extra_caps(sched, sender, receiver);
+    } else {
+        sched.slab.get_mut(sender).pending_extra_caps_count = 0;
+    }
+    if was_call {
+        finish_call(sched, sender, receiver);
+    } else {
+        sched.make_runnable(sender);
+        if sender_can_donate {
+            maybe_donate_on_send(sched, sender, receiver);
+        }
+    }
+    sched.make_runnable(receiver);
+}
+
+fn repair_mixed_queue(
+    ep: &mut Endpoint,
+    sched: &mut Scheduler,
+    focus_sender: Option<(TcbId, bool)>,
+    focus: Option<TcbId>,
+) -> Option<TcbId> {
+    let mut focus_peer = None;
+    loop {
+        normalize_queue_state(ep, sched);
+        let Some(head) = ep.head else {
+            return focus_peer;
+        };
+        let Some(head_kind) = waiter_kind(sched, head) else {
+            return focus_peer;
+        };
+        let Some(opposite) = opposite_waiter(head_kind) else {
+            return focus_peer;
+        };
+
+        let mut cur = sched.slab.get(head).ep_next;
+        let mut other = None;
+        let mut guard = 0usize;
+        while let Some(id) = cur {
+            guard += 1;
+            if guard > crate::tcb::MAX_TCBS {
+                break;
+            }
+            let next = sched.slab.try_get(id).and_then(|t| t.ep_next);
+            if waiter_kind(sched, id) == Some(opposite) {
+                other = Some(id);
+                break;
+            }
+            cur = next;
+        }
+
+        let Some(other) = other else {
+            return focus_peer;
+        };
+        let (sender, receiver) = match head_kind {
+            EpState::Recv => {
+                queue_remove(ep, sched, other);
+                let popped = queue_pop_head(ep, sched);
+                debug_assert_eq!(popped, Some(head));
+                (other, head)
+            }
+            EpState::Send => {
+                queue_remove(ep, sched, other);
+                let popped = queue_pop_head(ep, sched);
+                debug_assert_eq!(popped, Some(head));
+                (head, other)
+            }
+            EpState::Idle => unreachable!(),
+        };
+        let sender_can_donate = focus_sender
+            .map(|(id, can_donate)| id == sender && can_donate)
+            .unwrap_or(false);
+        complete_queued_transfer(sched, sender, receiver, sender_can_donate);
+        if focus == Some(sender) {
+            focus_peer = Some(receiver);
+        } else if focus == Some(receiver) {
+            focus_peer = Some(sender);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public IPC primitives.
 // ---------------------------------------------------------------------------
@@ -229,8 +380,9 @@ pub enum IpcOutcome {
 /// own) — donate the caller's scheduling context so the server can
 /// run (upstream `reply_push` -> `schedContext_donate`). The donated
 /// SC is remembered on the caller (`donated_sc`) and returned on
-/// reply. Non-passive receivers keep the legacy `active_sc` charge
-/// attribution unchanged.
+/// reply. Non-passive receivers stay on their own SC; carrying the
+/// caller's SC on an already-schedulable receiver leaks helper budget
+/// across unrelated receives in sel4test's helper-completion path.
 fn finish_call(sched: &mut Scheduler, sender: TcbId, receiver: TcbId) {
     sched.block(sender, ThreadStateType::BlockedOnReply);
     sched.slab.get_mut(receiver).reply_to = Some(sender);
@@ -250,10 +402,6 @@ fn finish_call(sched: &mut Scheduler, sender: TcbId, receiver: TcbId) {
             // itself for now) and gets the SC back on reply.
             crate::sched_context::sc_donate(s, sc as usize, receiver);
             s.scheduler.slab.get_mut(sender).donated_sc = Some(sc);
-        } else if caller_sc.is_some() {
-            // Non-passive callee runs on its own SC; keep the legacy
-            // active_sc charge attribution for the call's duration.
-            s.scheduler.slab.get_mut(receiver).active_sc = caller_sc;
         }
     }
 }
@@ -264,6 +412,11 @@ pub fn send_ipc(
     sender: TcbId,
     opts: SendOptions,
 ) -> IpcOutcome {
+    if queue_unlink_id(ep, sched, sender) {
+        normalize_queue_state(ep, sched);
+    } else if ep.head.is_none() || ep.tail.is_none() {
+        normalize_queue_state(ep, sched);
+    }
     match ep.state {
         // No receivers waiting — caller blocks if blocking.
         EpState::Idle | EpState::Send => {
@@ -291,7 +444,13 @@ pub fn send_ipc(
             sched.slab.get_mut(sender).ipc_badge = opts.badge;
             queue_push(ep, sched, sender);
             ep.state = EpState::Send;
-            IpcOutcome::Blocked
+            if let Some(receiver) =
+                repair_mixed_queue(ep, sched, Some((sender, opts.can_donate)), Some(sender))
+            {
+                IpcOutcome::Transferred { peer: receiver }
+            } else {
+                IpcOutcome::Blocked
+            }
         }
         // A receiver is queued — wake the head and transfer.
         EpState::Recv => {
@@ -324,6 +483,8 @@ pub fn send_ipc(
             sched.make_runnable(receiver);
             if queue_is_empty(ep) {
                 ep.state = EpState::Idle;
+            } else {
+                repair_mixed_queue(ep, sched, None, None);
             }
             IpcOutcome::Transferred { peer: receiver }
         }
@@ -351,6 +512,11 @@ pub fn receive_ipc(
     receiver: TcbId,
     opts: RecvOptions,
 ) -> IpcOutcome {
+    if queue_unlink_id(ep, sched, receiver) {
+        normalize_queue_state(ep, sched);
+    } else if ep.head.is_none() || ep.tail.is_none() {
+        normalize_queue_state(ep, sched);
+    }
     match ep.state {
         // No senders queued — block (or skip if NB).
         EpState::Idle | EpState::Recv => {
@@ -360,7 +526,11 @@ pub fn receive_ipc(
             sched.block(receiver, ThreadStateType::BlockedOnReceive);
             queue_push(ep, sched, receiver);
             ep.state = EpState::Recv;
-            IpcOutcome::Blocked
+            if let Some(sender) = repair_mixed_queue(ep, sched, None, Some(receiver)) {
+                IpcOutcome::Transferred { peer: sender }
+            } else {
+                IpcOutcome::Blocked
+            }
         }
         // Sender queued — pair them off.
         EpState::Send => {
@@ -394,6 +564,8 @@ pub fn receive_ipc(
             }
             if queue_is_empty(ep) {
                 ep.state = EpState::Idle;
+            } else {
+                repair_mixed_queue(ep, sched, None, None);
             }
             IpcOutcome::Transferred { peer: sender }
         }
@@ -426,6 +598,8 @@ pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
             }
             if queue_is_empty(ep) {
                 ep.state = EpState::Idle;
+            } else {
+                repair_mixed_queue(ep, sched, None, None);
             }
             if let Some(tcb) = sched.slab.entries[thread.0 as usize].as_mut() {
                 tcb.state = ThreadStateType::Inactive;
@@ -459,6 +633,7 @@ pub fn reposition_in_wait_queue(sched: &mut Scheduler, thread: TcbId) {
         }
         queue_remove(ep, sched, thread);
         queue_push(ep, sched, thread);
+        repair_mixed_queue(ep, sched, None, None);
         return;
     }
     crate::notification::reposition_in_wait_queue(sched, thread);
@@ -497,6 +672,8 @@ pub fn cancel_ipc(ep: &mut Endpoint, sched: &mut Scheduler, thread: TcbId) {
     }
     if queue_is_empty(ep) {
         ep.state = EpState::Idle;
+    } else {
+        repair_mixed_queue(ep, sched, None, None);
     }
 }
 
@@ -747,6 +924,8 @@ pub mod spec {
         non_blocking_send_with_no_receiver();
         cancel_ipc_unblocks_thread();
         multiple_senders_queue_in_order();
+        send_repairs_current_sender_stale_queue_link();
+        send_pairs_receiver_head_when_state_is_stale_send();
         long_message_via_ipc_buffer();
         extra_cap_transfer_via_ipc();
 
@@ -862,10 +1041,9 @@ pub mod spec {
     fn long_message_via_ipc_buffer() {
         // Two backing pages — one per TCB. They sit in BSS so
         // `&raw mut` doubles as a kernel-virt address; for the
-        // kernel-side spec that's all we need (we don't go
-        // through the BOOTBOOT identity map here, we just want
-        // any writable u64 storage shared between sender and
-        // receiver via a known address).
+        // kernel-side spec that's all we need: writable u64
+        // storage shared between sender and receiver via a known
+        // address.
         #[repr(C, align(4096))]
         struct IpcPage([u64; 512]);
         static mut SENDER_BUF: IpcPage = IpcPage([0; 512]);
@@ -1105,5 +1283,79 @@ pub mod spec {
         let out = receive_ipc(&mut ep, &mut sched, r, RecvOptions::blocking());
         assert_eq!(out, IpcOutcome::Transferred { peer: s3 });
         arch::log("  ✓ multiple senders dequeued in FIFO order\n");
+    }
+
+    #[inline(never)]
+    fn send_repairs_current_sender_stale_queue_link() {
+        let mut sched = Scheduler::new();
+        let mut ep = Endpoint::new();
+        let receiver = sched.admit(runnable(100));
+        let sender = sched.admit(runnable(90));
+
+        assert_eq!(
+            receive_ipc(&mut ep, &mut sched, receiver, RecvOptions::blocking()),
+            IpcOutcome::Blocked
+        );
+        sched.slab.get_mut(receiver).ep_next = Some(sender);
+        {
+            let sender_tcb = sched.slab.get_mut(sender);
+            sender_tcb.ep_prev = Some(receiver);
+            sender_tcb.ep_next = None;
+        }
+        ep.tail = Some(sender);
+        ep.state = EpState::Send;
+
+        assert_eq!(
+            send_ipc(&mut ep, &mut sched, sender, SendOptions::blocking(0)),
+            IpcOutcome::Transferred { peer: receiver }
+        );
+        assert_eq!(ep.state, EpState::Idle);
+        assert_eq!(ep.head, None);
+        assert_eq!(ep.tail, None);
+        assert_eq!(sched.slab.get(receiver).state, ThreadStateType::Running);
+        assert_eq!(sched.slab.get(sender).state, ThreadStateType::Running);
+        assert_eq!(sched.slab.get(receiver).ep_next, None);
+        assert_eq!(sched.slab.get(receiver).ep_prev, None);
+        assert_eq!(sched.slab.get(sender).ep_next, None);
+        assert_eq!(sched.slab.get(sender).ep_prev, None);
+        arch::log("  ✓ current sender stale endpoint link is repaired before send\n");
+    }
+
+    #[inline(never)]
+    fn send_pairs_receiver_head_when_state_is_stale_send() {
+        let mut sched = Scheduler::new();
+        let mut ep = Endpoint::new();
+        let receiver = sched.admit(runnable(100));
+        let sender = sched.admit(runnable(90));
+
+        assert_eq!(
+            receive_ipc(&mut ep, &mut sched, receiver, RecvOptions::blocking()),
+            IpcOutcome::Blocked
+        );
+        ep.state = EpState::Send;
+        {
+            let s = sched.slab.get_mut(sender);
+            s.ipc_label = 0xAB;
+            s.ipc_length = 1;
+            s.msg_regs[0] = 0xCD;
+        }
+
+        assert_eq!(
+            send_ipc(&mut ep, &mut sched, sender, SendOptions::blocking(0x1234)),
+            IpcOutcome::Transferred { peer: receiver }
+        );
+        assert_eq!(ep.state, EpState::Idle);
+        assert_eq!(ep.head, None);
+        assert_eq!(ep.tail, None);
+        assert_eq!(sched.slab.get(receiver).state, ThreadStateType::Running);
+        assert_eq!(sched.slab.get(sender).state, ThreadStateType::Running);
+        assert_eq!(sched.slab.get(receiver).ipc_label, 0xAB);
+        assert_eq!(sched.slab.get(receiver).msg_regs[0], 0xCD);
+        assert_eq!(sched.slab.get(receiver).ipc_badge, 0x1234);
+        assert_eq!(sched.slab.get(receiver).ep_next, None);
+        assert_eq!(sched.slab.get(receiver).ep_prev, None);
+        assert_eq!(sched.slab.get(sender).ep_next, None);
+        assert_eq!(sched.slab.get(sender).ep_prev, None);
+        arch::log("  ✓ stale Send state pairs an existing receiver instead of mixing queues\n");
     }
 }

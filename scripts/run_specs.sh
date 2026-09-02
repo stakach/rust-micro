@@ -45,7 +45,7 @@ QEMU_MEMORY="${QEMU_MEMORY:-2048M}"
 DEBUG_FLAGS=()
 # GRAPHICS=1 (or the `--display`/`--graphics` flag) boots with a real QEMU
 # display WINDOW instead of the headless `-nographic` gate, so you can SEE the
-# BOOTBOOT GOP framebuffer that win32k paints (the ReactOS desktop background).
+# Simpleboot GOP framebuffer that win32k paints (the ReactOS desktop background).
 # Default stays headless so the CI/spec gate is unchanged.
 GRAPHICS="${GRAPHICS:-0}"
 while [ $# -gt 0 ]; do

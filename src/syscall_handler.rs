@@ -198,22 +198,17 @@ pub fn handle_syscall(
                     /* donate */ true, true,
                 ) {
                     let label = match &error {
-                        crate::error::KException::SyscallError(
-                            crate::error::SyscallError { code },
-                        ) => *code as u64,
+                        crate::error::KException::SyscallError(crate::error::SyscallError {
+                            code,
+                        }) => *code as u64,
                         crate::error::KException::LookupFault(_) => {
                             crate::types::seL4_Error::seL4_FailedLookup as u64
                         }
                         _ => 0xFFFF,
                     };
                     if let Some(current) = invoker {
-                        let tcb = unsafe {
-                            crate::kernel::KERNEL
-                                .get()
-                                .scheduler
-                                .slab
-                                .get_mut(current)
-                        };
+                        let tcb =
+                            unsafe { crate::kernel::KERNEL.get().scheduler.slab.get_mut(current) };
                         // A composite send failure did not execute the receive half. Reserve an
                         // impossible receive badge so userspace cannot mistake stale in/out
                         // registers for a newly received message.
@@ -297,11 +292,20 @@ pub fn handle_syscall(
         // = CapNull). They're CONFIG_DEBUG_BUILD-only and not
         // load-bearing; full implementations are follow-ups.
         Syscall::SysDebugHalt => {
-            crate::arch::log("[sel4test SysDebugHalt — exiting QEMU]\n");
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::qemu_exit(0);
+            #[cfg(all(target_arch = "x86_64", not(feature = "extern-rootserver")))]
+            {
+                crate::arch::log("[sel4test SysDebugHalt — exiting QEMU]\n");
+                crate::arch::qemu_exit(0);
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "extern-rootserver"))]
+            {
+                crate::arch::log("[sel4test SysDebugHalt ignored]\n");
+                Ok(())
+            }
             #[cfg(not(target_arch = "x86_64"))]
-            Ok(())
+            {
+                Ok(())
+            }
         }
         Syscall::SysDebugCapIdentify => {
             // libsel4's seL4_DebugCapIdentify reads the result from
@@ -1122,11 +1126,7 @@ pub mod spec {
         };
 
         let mut sink = BufferSink::new();
-        let result = handle_syscall(
-            Syscall::SysNBSendRecv,
-            &SyscallArgs::default(),
-            &mut sink,
-        );
+        let result = handle_syscall(Syscall::SysNBSendRecv, &SyscallArgs::default(), &mut sink);
         assert!(result.is_err());
         unsafe {
             let tcb = KERNEL.get().scheduler.slab.get_mut(current);

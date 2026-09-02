@@ -1,31 +1,18 @@
 #!/usr/bin/env bash
-# make_image.sh — wrap the freshly built kernel in a FAT32 EFI disk image.
-# Works on macOS (Homebrew dosfstools+mtools) and Linux. Tools are looked up
-# on PATH; on macOS, /opt/homebrew/sbin (where dosfstools installs mkfs.vfat)
-# is added if it isn't already present.
+# make_image.sh — build a Simpleboot GPT/ESP disk image containing the kernel
+# and the rootserver initrd module.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# macOS: Homebrew installs mkfs.vfat under sbin which isn't always on PATH.
-if [ "$(uname)" = "Darwin" ]; then
-  for d in /opt/homebrew/sbin /usr/local/sbin; do
-    case ":$PATH:" in
-      *":$d:"*) ;;
-      *) [ -d "$d" ] && PATH="$d:$PATH" ;;
-    esac
-  done
-fi
-
-# Verify required tools.
 missing=()
-for tool in dd mkfs.vfat mmd mcopy curl; do
+for tool in cc curl cp dd find mkdir tar wc; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "error: missing required tools: ${missing[*]}" >&2
-  echo "       macOS: brew install qemu mtools dosfstools" >&2
-  echo "       Linux: apt install dosfstools mtools" >&2
+  echo "       macOS: xcode-select --install; brew install qemu" >&2
+  echo "       Linux: apt install build-essential qemu-system-x86" >&2
   exit 1
 fi
 
@@ -33,7 +20,12 @@ mkdir -p .tmp
 IMAGE=.tmp/disk.img
 KERNEL=target/mykernel-x86/release/mykernel-rust
 ROOTSERVER=.tmp/rootserver.elf
-BOOTBOOT_INITRD_MAX_BYTES=$((16 * 1024 * 1024))
+INITRD_STAGE=.tmp/initrd
+ESP_STAGE=.tmp/simpleboot-esp
+SIMPLEBOOT_SRC_DIR=.tmp/simpleboot-src
+SIMPLEBOOT_BIN=.tmp/simpleboot
+SIMPLEBOOT_REF="${SIMPLEBOOT_REF:-main}"
+SIMPLEBOOT_RAW_BASE="${SIMPLEBOOT_RAW_BASE:-https://gitlab.com/bztsrc/simpleboot/-/raw/${SIMPLEBOOT_REF}/src}"
 IMAGE_PROFILE_MARKER=.tmp/image-profile
 
 if [ ! -f "$KERNEL" ]; then
@@ -44,6 +36,7 @@ if [ ! -f "$ROOTSERVER" ]; then
   echo "error: rootserver not staged at $ROOTSERVER — run scripts/build_kernel.sh first" >&2
   exit 1
 fi
+
 IMAGE_PROFILE=production
 if [ -f .tmp/hive.dat ]; then
   if [ ! -f "$IMAGE_PROFILE_MARKER" ]; then
@@ -91,117 +84,102 @@ find_elf_strip() {
   return 1
 }
 
-strip_boot_elf_copy() {
+strip_elf_copy() {
   local path="$1"
   local strip_tool="$2"
   [ -n "$strip_tool" ] || return 0
-  # The BOOTBOOT initrd has a hard 16 MiB load window. The rootserver loader
-  # only needs program headers, but BOOTBOOT itself reads the kernel's linker
-  # symbols below to configure its handoff addresses and stack size.
-  if [ "$path" = "$INITRD_STAGE/sys/core" ]; then
-    "$strip_tool" --strip-all \
-      --keep-symbol=bootboot \
-      --keep-symbol=environment \
-      --keep-symbol=fb \
-      --keep-symbol=mmio \
-      --keep-symbol=initstack \
-      "$path"
-  else
-    "$strip_tool" --strip-all "$path"
-  fi
+  "$strip_tool" --strip-all "$path"
 }
 
-# Create a 256 MiB blank FAT volume. macOS `dd` accepts the same
-# `bs=1M count=256` syntax as GNU dd. P7-A: grown 64->256 MiB to hold the COMPLETE
-# \reactos install tree (~171 MiB) so the executive loads ANY binary BY PATH from the
-# real FS. It stays a superfloppy (no partition table — the storage host reads FAT32
-# from LBA 0); BOOTBOOT (UEFI) + our LBA48 AHCI reader both handle the larger volume.
-#
-# D3 persistence reserve: after the FAT volume is populated, the script appends a raw tail that is
-# outside the BPB TotalSectors count. FAT/BOOTBOOT/mtools ignore it, while the kernel can address it
-# by LBA for its two-slot writable-overlay snapshot store. This avoids mutating FAT metadata before
-# we have a full FAT writer, and it gives the executive a real block range rather than an in-memory
-# "reboot" proof.
+ensure_simpleboot() {
+  if [ -n "${SIMPLEBOOT:-}" ]; then
+    if command -v "$SIMPLEBOOT" >/dev/null 2>&1; then
+      command -v "$SIMPLEBOOT"
+      return 0
+    fi
+    if [ -x "$SIMPLEBOOT" ]; then
+      printf '%s\n' "$SIMPLEBOOT"
+      return 0
+    fi
+    echo "error: SIMPLEBOOT is set but not executable: $SIMPLEBOOT" >&2
+    exit 1
+  fi
+
+  mkdir -p "$SIMPLEBOOT_SRC_DIR"
+  for file in simpleboot.c loader.h data.h; do
+    if [ ! -f "$SIMPLEBOOT_SRC_DIR/$file" ]; then
+      echo "downloading Simpleboot $file..." >&2
+      curl -fL -o "$SIMPLEBOOT_SRC_DIR/$file" "$SIMPLEBOOT_RAW_BASE/$file"
+    fi
+  done
+
+  if [ ! -x "$SIMPLEBOOT_BIN" ] || [ "$SIMPLEBOOT_BIN" -ot "$SIMPLEBOOT_SRC_DIR/simpleboot.c" ]; then
+    echo "building Simpleboot image creator..." >&2
+    (
+      cd "$SIMPLEBOOT_SRC_DIR"
+      cc -ansi -Wall -Wextra simpleboot.c -o ../simpleboot
+    )
+  fi
+  printf '%s\n' "$SIMPLEBOOT_BIN"
+}
+
+stage_file() {
+  local src="$1"
+  local dst="$2"
+  mkdir -p "$(dirname "$dst")"
+  cp "$src" "$dst"
+}
+
 IMAGE_MIB="${IMAGE_MIB:-256}"
 PERSIST_IMAGE_MIB="${PERSIST_IMAGE_MIB:-16}"
-rm -f "$IMAGE"
-dd if=/dev/zero of="$IMAGE" bs=1M count="$IMAGE_MIB" status=none
-mkfs.vfat -F 32 "$IMAGE" >/dev/null
-
-# mtools tries to detect floppy/cdrom devices; tell it to skip those checks
-# since we're operating on a plain image file.
-export MTOOLS_SKIP_CHECK=1
-
-# Bootboot UEFI loader. Cache it under .tmp/ so repeated builds don't re-fetch.
-if [ ! -f .tmp/bootboot.efi ]; then
-  echo "downloading bootboot.efi..."
-  curl -fL -o .tmp/bootboot.efi \
-    https://gitlab.com/bztsrc/bootboot/raw/master/dist/bootboot.efi
+if [ "$IMAGE_MIB" -lt 35 ]; then
+  echo "error: IMAGE_MIB must be at least 35 for Simpleboot FAT32 images" >&2
+  exit 1
 fi
-
-mmd -i "$IMAGE" ::efi
-mmd -i "$IMAGE" ::efi/boot
-mmd -i "$IMAGE" ::bootboot
-mcopy -i "$IMAGE" .tmp/bootboot.efi ::efi/boot/bootx64.efi
-
-# Phase 39 — pack kernel + rootserver into a USTAR tar archive at
-# ::bootboot/INITRD. BOOTBOOT loads it into RAM, extracts sys/core
-# by path as the kernel, and exposes the live archive's physical
-# address to the kernel via `bootboot.initrd_ptr` so userspace ELFs
-# can be located at runtime (see src/initrd.rs). Keep boot/rootserver
-# before the large sys/core payload so the runtime loader can find it
-# even when a loader-visible initrd window is tight.
-INITRD_STAGE=.tmp/initrd
-rm -rf "$INITRD_STAGE"
-mkdir -p "$INITRD_STAGE/sys" "$INITRD_STAGE/boot"
-cp "$KERNEL"     "$INITRD_STAGE/sys/core"
-cp "$ROOTSERVER" "$INITRD_STAGE/boot/rootserver"
-
-if STRIP_TOOL="$(find_elf_strip)"; then
-  strip_boot_elf_copy "$INITRD_STAGE/sys/core" "$STRIP_TOOL"
-  strip_boot_elf_copy "$INITRD_STAGE/boot/rootserver" "$STRIP_TOOL"
-else
-  echo "warning: no ELF strip tool found; BOOTBOOT initrd may exceed the 16 MiB load window" >&2
-fi
-
-# Use a deterministic mtime so reproducible builds produce
-# byte-identical archives. macOS bsdtar and GNU tar both support
-# --format=ustar.
-tar --format=ustar \
-    -C "$INITRD_STAGE" \
-    -cf .tmp/initrd.tar \
-    boot/rootserver sys/core
-
-INITRD_BYTES="$(wc -c < .tmp/initrd.tar | tr -d ' ')"
-if [ "$INITRD_BYTES" -gt "$BOOTBOOT_INITRD_MAX_BYTES" ]; then
-  echo "error: BOOTBOOT initrd is ${INITRD_BYTES} bytes, limit is ${BOOTBOOT_INITRD_MAX_BYTES}" >&2
-  echo "       reduce the staged boot ELF payloads or provide a larger-capacity BOOTBOOT loader" >&2
+BOOT_PARTITION_MIB="${BOOT_PARTITION_MIB:-$((IMAGE_MIB - 2))}"
+if [ "$BOOT_PARTITION_MIB" -lt 33 ] || [ "$BOOT_PARTITION_MIB" -ge "$IMAGE_MIB" ]; then
+  echo "error: BOOT_PARTITION_MIB must be at least 33 and smaller than IMAGE_MIB" >&2
   exit 1
 fi
 
-mcopy -i "$IMAGE" .tmp/initrd.tar ::bootboot/INITRD
+rm -rf "$INITRD_STAGE" "$ESP_STAGE"
+mkdir -p "$INITRD_STAGE/boot" "$ESP_STAGE"
+cp "$KERNEL" "$ESP_STAGE/kernel"
+cp "$ROOTSERVER" "$INITRD_STAGE/boot/rootserver"
 
-# P2: a real registry hive (nt-hive-core image) at ::SYSTEM.DAT for the Config Manager to
-# read off the FS. Guarded so builds without a staged hive still succeed.
+if STRIP_TOOL="$(find_elf_strip)"; then
+  strip_elf_copy "$ESP_STAGE/kernel" "$STRIP_TOOL"
+  strip_elf_copy "$INITRD_STAGE/boot/rootserver" "$STRIP_TOOL"
+else
+  echo "warning: no ELF strip tool found; boot payloads will be larger" >&2
+fi
+
+tar --format=ustar \
+    -C "$INITRD_STAGE" \
+    -cf .tmp/initrd.tar \
+    boot/rootserver
+cp .tmp/initrd.tar "$ESP_STAGE/initrd.tar"
+
+cat > "$ESP_STAGE/simpleboot.cfg" <<EOF
+kernel kernel
+module initrd.tar
+framebuffer ${SIMPLEBOOT_FB_WIDTH:-1024} ${SIMPLEBOOT_FB_HEIGHT:-768} ${SIMPLEBOOT_FB_BPP:-32}
+multicore ${SIMPLEBOOT_SMP_STACK:-65536}
+verbose ${SIMPLEBOOT_BOOT_VERBOSE:-0}
+EOF
+
 if [ -f .tmp/hive.dat ]; then
-  mcopy -i "$IMAGE" .tmp/hive.dat ::SYSTEM.DAT
-  echo "registry hive added: ::SYSTEM.DAT"
+  stage_file .tmp/hive.dat "$ESP_STAGE/SYSTEM.DAT"
+  echo "registry hive added: SYSTEM.DAT"
 fi
 
-# P7-A: the ReactOS binaries are NO LONGER staged as flat ::NAME files. The executive's storage
-# host reads every one of them BY PATH from the real \reactos install tree laid down below (smss,
-# csrss, csrsrv, basesrv, winsrv, ntdll, the Win32 client stack, the vista forwarders, NLS tables,
-# win32k/dxg/dxgthk/ftfd/framebuf, arial.ttf, winlogon, userenv, mpr, and the SYSTEM hive at
-# system32\config\system) — proven by the exec_full_stack_from_fs spec (verdict 0x200, zero flat
-# fallbacks). Only the two NON-tree, build-generated artifacts stay flat at the root: the synthetic
-# Config-Manager hive ::SYSTEM.DAT (above) and the smss import-resolution table ::IMPORTS.BIN.
-# (Set STAGE_FLAT_REACTOS=1 to also re-stage the flat ::NAME copies for A/B debugging.)
 if [ -f .tmp/reactos/imports.bin ]; then
-  mcopy -i "$IMAGE" .tmp/reactos/imports.bin ::IMPORTS.BIN
-  echo "ReactOS import table added: ::IMPORTS.BIN"
+  stage_file .tmp/reactos/imports.bin "$ESP_STAGE/IMPORTS.BIN"
+  echo "ReactOS import table added: IMPORTS.BIN"
 fi
+
 if [ "${STAGE_FLAT_REACTOS:-0}" = "1" ]; then
-  echo "STAGE_FLAT_REACTOS=1: also staging the legacy flat ::NAME ReactOS copies (debug)"
+  echo "STAGE_FLAT_REACTOS=1: also staging the legacy flat ReactOS copies (debug)"
   for pair in \
     ros-csrss.exe:CSRSS.EXE ros-csrsrv.dll:CSRSRV.DLL ros-basesrv.dll:BASESRV.DLL \
     ros-winsrv.dll:WINSRV.DLL ros-win32k.sys:WIN32K.SYS ros-dxg.sys:DXG.SYS \
@@ -213,115 +191,72 @@ if [ "${STAGE_FLAT_REACTOS:-0}" = "1" ]; then
     ros-smss.exe:SMSS.EXE ros-winlogon.exe:WINLOGON.EXE ros-userenv.dll:USERENV.DLL \
     ros-mpr.dll:MPR.DLL ros-system.hiv:ROSSYS.HIV \
     ros-c1252.nls:C_1252.NLS ros-c437.nls:C_437.NLS ros-lintl.nls:L_INTL.NLS ros-c20127.nls:C_20127.NLS; do
-    src=".tmp/reactos/${pair%%:*}"; dst="::${pair##*:}"
-    [ -f "$src" ] && mcopy -i "$IMAGE" "$src" "$dst"
+    src=".tmp/reactos/${pair%%:*}"
+    dst="$ESP_STAGE/${pair##*:}"
+    [ -f "$src" ] && stage_file "$src" "$dst"
   done
 fi
 
-# P7-A: lay down the COMPLETE \reactos install tree so the executive resolves + reads ANY
-# binary BY PATH (\reactos\system32\X.dll) from the real FS via fat_open_path — not just the
-# curated flat ::NAME files above. Recursive mcopy of the whole tree (~171 MiB, ~1000 files;
-# adds a few seconds to the image build). The flat ::NAME files above remain during the loader
-# migration (hybrid), so the boot stays green if the tree is absent. Idempotent: fetch_reactos.sh
-# stages it under .tmp/reactos/reactos with a .fulltree-ok marker.
+REACTOS_TREE_STAGED=0
 if [ -f .tmp/reactos/.fulltree-ok ] && [ -d .tmp/reactos/reactos ]; then
-  echo "staging the full \\reactos tree onto the image (recursive; ~171 MiB)..."
+  echo "staging the full \\reactos tree into the Simpleboot ESP..."
   t0=$(date +%s)
-  mcopy -s -i "$IMAGE" .tmp/reactos/reactos ::
+  cp -R .tmp/reactos/reactos "$ESP_STAGE/"
   t1=$(date +%s)
-  echo "full \\reactos tree added: ::reactos ($(find .tmp/reactos/reactos -type f | wc -l | tr -d ' ') files, $((t1 - t0))s)"
+  echo "full \\reactos tree staged ($(find .tmp/reactos/reactos -type f | wc -l | tr -d ' ') files, $((t1 - t0))s)"
+  REACTOS_TREE_STAGED=1
 else
-  echo "note: full \\reactos tree not staged (.tmp/reactos/.fulltree-ok absent) — flat ::NAME files only"
+  echo "note: full \\reactos tree not staged (.tmp/reactos/.fulltree-ok absent)"
 fi
 
-# ★ THE USER-PROFILE TREE — the ISO's OWN `Profiles/` (a TOP-LEVEL sibling of `reactos/`, 76
-# entries), laid down at `::Profiles` — exactly what `%SystemDrive%\Profiles` resolves to, and so
-# exactly what HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\ProfilesDirectory
-# names. `userenv!CreateUserProfileExW` seeds a new user's profile by COPYING
-# `C:\Profiles\Default User` (profile.c:1000 -> CopyDirectory); before this the tree was being
-# dropped by the scoped `reactos`-only extraction, so the interactive logon died at
-# `profile.c:1002  Error: 3`. Idempotent: fetch_reactos.sh stages it with a .profiles-ok marker.
 if [ -f .tmp/reactos/.profiles-ok ] && [ -d .tmp/reactos/Profiles ]; then
-  mcopy -s -i "$IMAGE" .tmp/reactos/Profiles ::
-  echo "user-profile tree added: ::Profiles ($(find .tmp/reactos/Profiles -mindepth 1 | wc -l | tr -d ' ') entries, incl. 'Default User')"
-  # ReactOS setup.c creates the physical user-profile folder table before any
-  # per-user profile is copied. The LiveCD cache already has most of that tree,
-  # but it lacks Default User\Local Settings\Temp, while hivedef.inf points
-  # TEMP/TMP at %USERPROFILE%\Local Settings\Temp. Put the setup-owned directory
-  # on the installed image so winlogon's real CopyDirectory carries it into the
-  # Administrator profile.
-  setup_profile_temp="::Profiles/Default User/Local Settings/Temp"
-  if mmd -i "$IMAGE" "$setup_profile_temp" 2>/dev/null; then
-    echo "setup profile dir added: $setup_profile_temp"
-  elif mdir -i "$IMAGE" "$setup_profile_temp" >/dev/null 2>&1; then
-    echo "setup profile dir already present: $setup_profile_temp"
-  else
-    echo "ERROR: failed to create setup profile dir: $setup_profile_temp" >&2
-    exit 1
-  fi
+  cp -R .tmp/reactos/Profiles "$ESP_STAGE/"
+  echo "user-profile tree staged: Profiles ($(find .tmp/reactos/Profiles -mindepth 1 | wc -l | tr -d ' ') entries)"
+  mkdir -p "$ESP_STAGE/Profiles/Default User/Local Settings/Temp"
+  echo "setup profile dir ensured: Profiles/Default User/Local Settings/Temp"
 else
-  echo "note: user-profile tree not staged (.tmp/reactos/.profiles-ok absent) — CreateUserProfileW has no copy source"
+  echo "note: user-profile tree not staged (.tmp/reactos/.profiles-ok absent)"
 fi
 
-# Driver-model migration: stage the synthetic driver test fixtures (nt-driver-test-fixtures)
-# BY-PATH under \reactos\system32\drivers so the executive launches them via the general dynamic
-# `load_driver(fs, path, class)` path (like npfs.sys) — NOT baked in via include_bytes!. These are
-# test drivers (PnP/MMIO NIC + KMDF lifecycle), not real ReactOS binaries, so they aren't in the
-# fetched \reactos tree. Ensure the drivers dir exists (in case the tree wasn't staged), then copy.
 FIXTURES=../crates/nt-driver-test-fixtures/fixtures
-# When the full \reactos tree is staged, ::reactos/system32/drivers ALREADY exists (from the
-# recursive mcopy above) — re-creating it with `mmd` is redundant AND has been observed to WEDGE
-# mtools (a lock/race on the freshly written 256 MiB image → the build hangs for minutes at `mmd`,
-# holding disk.img open). So only hand-create the dir when the tree was NOT staged, and run it once
-# (it was previously inside the per-fixture loop, i.e. twice).
-if [ ! -f .tmp/reactos/.fulltree-ok ] || [ ! -d .tmp/reactos/reactos ]; then
-  mmd -i "$IMAGE" ::reactos ::reactos/system32 ::reactos/system32/drivers 2>/dev/null || true
-fi
-
-# The shipped livecd acpi.sys lacks standard namespace enumeration and aliases distinct no-UID
-# PDOs. The source-pinned provider overlay is mandatory: verify it before copying, overwrite the
-# stock tree entry, then read it back and verify the bytes that will actually boot. There is no
-# stock-driver fallback.
-ACPI_PROVIDER=vendor/reactos-acpi/acpi.sys
-./scripts/verify_reactos_acpi_provider.sh "$ACPI_PROVIDER"
-mcopy -o -i "$IMAGE" "$ACPI_PROVIDER" "::reactos/system32/drivers/acpi.sys"
-ACPI_IMAGE_VERIFY=.tmp/reactos-acpi-image-verify.sys
-rm -f "$ACPI_IMAGE_VERIFY"
-mcopy -i "$IMAGE" "::reactos/system32/drivers/acpi.sys" "$ACPI_IMAGE_VERIFY"
-./scripts/verify_reactos_acpi_provider.sh "$ACPI_IMAGE_VERIFY"
-rm -f "$ACPI_IMAGE_VERIFY"
-echo "patched ReactOS ACPI provider added: ::reactos/system32/drivers/acpi.sys"
-
-for fixture_path in "$FIXTURES"/*.sys; do
-  [ -f "$fixture_path" ] || continue
-  fx=$(basename "$fixture_path")
-  if [ "$fx" = "PendingStartTest.sys" ] && [ "$IMAGE_PROFILE" != "pending-start" ]; then
-    continue
-  fi
-  mcopy -o -i "$IMAGE" "$fixture_path" "::reactos/system32/drivers/$fx"
-  echo "driver test fixture added: ::reactos/system32/drivers/$fx"
-done
-
-# ntdll_plan.md: OUR Rust ntdll (crates/nt-ntdll-dll, built to ../.tmp/nt-ntdll.dll by
-# scripts/build_ntdll_dll.sh) IS THE ntdll — it is staged under the SAME NAME as the ReactOS one
-# (\reactos\system32\ntdll.dll), OVERWRITING the real one from the recursive \reactos tree copy. No
-# fallback, no separate path (user directive 2026-07-16: "just give our dll the same name as the
-# reactos one; don't leave any fallback paths; don't even copy the reactos ntdll to the image").
-# Every process that loads "ntdll" gets ours; NO real ReactOS ntdll bytes persist on the image.
 OUR_NTDLL="../.tmp/nt-ntdll.dll"
-if [ -f "$OUR_NTDLL" ]; then
-  # The dir exists from the recursive tree copy or the fixture-staging fallback above. Do not
-  # redundantly recreate it here: mtools can wedge while reopening the freshly populated image.
-  mcopy -o -i "$IMAGE" "$OUR_NTDLL" "::reactos/system32/ntdll.dll"
-  echo "our Rust ntdll staged AS ::reactos/system32/ntdll.dll ($(wc -c < "$OUR_NTDLL" | tr -d ' ') bytes) — real ReactOS ntdll NOT on image (no fallback)"
-else
-  echo "ERROR: our Rust ntdll ($OUR_NTDLL) not built — run scripts/build_ntdll_dll.sh (it is now THE ntdll, no fallback)" >&2
-  exit 1
+if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]; then
+  mkdir -p "$ESP_STAGE/reactos/system32/drivers"
+
+  ACPI_PROVIDER=vendor/reactos-acpi/acpi.sys
+  ./scripts/verify_reactos_acpi_provider.sh "$ACPI_PROVIDER"
+  stage_file "$ACPI_PROVIDER" "$ESP_STAGE/reactos/system32/drivers/acpi.sys"
+  ./scripts/verify_reactos_acpi_provider.sh "$ESP_STAGE/reactos/system32/drivers/acpi.sys"
+  echo "patched ReactOS ACPI provider staged: reactos/system32/drivers/acpi.sys"
+
+  for fixture_path in "$FIXTURES"/*.sys; do
+    [ -f "$fixture_path" ] || continue
+    fx=$(basename "$fixture_path")
+    if [ "$fx" = "PendingStartTest.sys" ] && [ "$IMAGE_PROFILE" != "pending-start" ]; then
+      continue
+    fi
+    stage_file "$fixture_path" "$ESP_STAGE/reactos/system32/drivers/$fx"
+    echo "driver test fixture staged: reactos/system32/drivers/$fx"
+  done
+
+  if [ -f "$OUR_NTDLL" ]; then
+    stage_file "$OUR_NTDLL" "$ESP_STAGE/reactos/system32/ntdll.dll"
+    echo "our Rust ntdll staged AS reactos/system32/ntdll.dll ($(wc -c < "$OUR_NTDLL" | tr -d ' ') bytes)"
+  elif [ "$REACTOS_TREE_STAGED" = "1" ]; then
+    echo "ERROR: our Rust ntdll ($OUR_NTDLL) not built — run scripts/build_ntdll_dll.sh" >&2
+    exit 1
+  else
+    echo "note: Rust ntdll not staged (ReactOS tree absent)"
+  fi
 fi
+
+SIMPLEBOOT_TOOL="$(ensure_simpleboot)"
+rm -f "$IMAGE"
+"$SIMPLEBOOT_TOOL" -c -vv -s "$IMAGE_MIB" -b "$BOOT_PARTITION_MIB" "$ESP_STAGE" "$IMAGE"
 
 if [ "$PERSIST_IMAGE_MIB" -gt 0 ]; then
   dd if=/dev/zero bs=1M count="$PERSIST_IMAGE_MIB" status=none >> "$IMAGE"
-  echo "persistent snapshot reserve appended: ${PERSIST_IMAGE_MIB} MiB after FAT volume"
+  echo "persistent snapshot reserve appended: ${PERSIST_IMAGE_MIB} MiB after Simpleboot image"
 fi
 
-echo "disk image ready: $IMAGE ($((IMAGE_MIB + PERSIST_IMAGE_MIB)) MiB; FAT ${IMAGE_MIB} MiB)"
+echo "disk image ready: $IMAGE ($((IMAGE_MIB + PERSIST_IMAGE_MIB)) MiB; ESP ${BOOT_PARTITION_MIB} MiB)"

@@ -1,18 +1,16 @@
 //! Phase 13a/b — kernel page-table installer.
 //!
-//! BOOTBOOT hands us a working page table: kernel image at
-//! 0xFFFFFFFF_FFE02000+, BootInfo at 0xFFFFFFFF_FFE00000, and an
-//! identity map of low physical memory (so the bootloader's own
-//! code/data + the ACPI tables it discovered remain reachable).
-//! Useful, but it doesn't include MMIO mappings for the LAPIC /
-//! IOAPIC, doesn't have user-accessible pages anywhere, and is
-//! shared between every "thread" (we have one address space).
+//! Simpleboot hands us a working page table: the higher-half kernel
+//! image and enough low physical memory to keep bootloader data and
+//! firmware tables reachable. Useful, but it doesn't include our MMIO
+//! mappings for the LAPIC / IOAPIC, doesn't have user-accessible pages
+//! anywhere, and is shared between every "thread" at early boot.
 //!
 //! This module owns *our* page tables. We read the existing PML4
-//! via CR3 to discover what mappings BOOTBOOT installed, then build
+//! via CR3 to discover what mappings the loader installed, then build
 //! a new PML4 that:
 //!
-//!   * mirrors BOOTBOOT's high-half kernel mappings (so the kernel
+//!   * mirrors the loader's high-half kernel mappings (so the kernel
 //!     keeps running across the CR3 swap)
 //!   * keeps the low-memory identity map (we still need it for ACPI
 //!     tables and for accessing the page tables themselves)
@@ -42,8 +40,8 @@ pub struct PtPage(pub [u64; 512]);
 
 // Sized for sel4test-driver-class workloads: each PML4 + PDPT/PD/PT
 // installed for the rootserver's vaddr range comes from this pool,
-// plus large-page splits when the loader walks into BOOTBOOT's
-// 2 MiB identity entries. 64 pages is generous for current needs.
+// plus large-page splits when the loader exposes 2 MiB identity
+// entries. 64 pages is generous for current needs.
 const POOL_SIZE: usize = 64;
 
 #[no_mangle]
@@ -74,17 +72,16 @@ pub unsafe fn alloc_user_table_va() -> *mut u64 {
 /// Returns the new PML4's physical address (suitable for CR3).
 ///
 /// We copy *every* live PML4 entry verbatim, not just the
-/// kernel-half ones. BOOTBOOT installs its low-memory identity
-/// map at PML4[0], and the kernel relies on it to walk page
-/// tables and reach ACPI / CR3-relative memory; if we zeroed
-/// the user half, the very next instruction the kernel ran
-/// after CR3 swap would page-fault on a missing identity-map
-/// entry. User-mode address-space isolation in our setup comes
-/// from PML4 *user-half* entries that the user code populates
-/// dynamically (above 256 GiB; PML4[2] in our demo) — those land
-/// in fresh sub-tables per PML4, so two threads sharing the
-/// PML4[0] identity map can still hold disjoint user-space
-/// mappings above 256 GiB.
+/// kernel-half ones. The early loader mappings include low-memory
+/// access that the kernel relies on to walk page tables and reach
+/// ACPI / CR3-relative memory; if we zeroed the user half, the very
+/// next instruction after CR3 swap could page-fault on a missing
+/// identity-map entry. User-mode address-space isolation in our setup
+/// comes from PML4 *user-half* entries that the user code populates
+/// dynamically (above 256 GiB; PML4[2] in our demo) — those land in
+/// fresh sub-tables per PML4, so two threads sharing the PML4[0]
+/// identity map can still hold disjoint user-space mappings above
+/// 256 GiB.
 pub unsafe fn make_user_pml4() -> u64 {
     let live = phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *const u64;
     let new_va = alloc_table_va();
@@ -176,15 +173,14 @@ pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
 
 /// Base of the kernel-half "linear map": every physical address `p`
 /// in the range [0, LINEAR_MAP_GIB·1 GiB) is reachable from kernel
-/// mode at vaddr `LINEAR_MAP_BASE + p`. Replaces the BOOTBOOT
+/// mode at vaddr `LINEAR_MAP_BASE + p`. Replaces the loader-provided
 /// PML4[0] identity map for kernel paddr-as-vaddr accesses, so
 /// user vspaces can free PML4[0] for their own mappings.
 ///
 /// `LINEAR_MAP_BASE` is set at boot by `install_kernel_page_tables`,
 /// not at compile time, because the empty PML4 slot we land in
-/// depends on what BOOTBOOT installed (BOOTBOOT touches `PML4[256]`
-/// on at least some firmware revisions). The corresponding PML4
-/// index is stored in `LINEAR_MAP_PML4_IDX`.
+/// depends on what the loader installed. The corresponding PML4 index
+/// is stored in `LINEAR_MAP_PML4_IDX`.
 #[no_mangle]
 pub static mut LINEAR_MAP_BASE: u64 = 0;
 #[no_mangle]
@@ -215,10 +211,10 @@ pub fn read_cr3() -> u64 {
     v
 }
 
-/// The kernel's own page-table root (the BOOTBOOT PML4 we patch in
+/// The kernel's own page-table root (the loader PML4 we patch in
 /// `install_kernel_page_tables`). It maps the full kernel half —
 /// linear map, LAPIC, IDT/GDT/TSS, kernel code/data, and every CPU's
-/// BOOTBOOT stack — and is NEVER freed. Idle cores switch to it (see
+/// kernel stack — and is NEVER freed. Idle cores switch to it (see
 /// `kernel_root_cr3`) so they don't keep a soon-to-be-freed USER vspace
 /// loaded: a user PML4 root reclaimed by process teardown on another
 /// core would otherwise leave the idling core reading an unmapped IDT
@@ -264,11 +260,11 @@ pub fn read_pml4_entry(idx: usize) -> u64 {
 // Strategy (Phase 13b): rather than building a fresh PML4 (which
 // would need to know physical addresses of the new tables — and the
 // kernel BSS pages aren't identity-mapped at their physical
-// address), we *extend* the BOOTBOOT-supplied PML4 in place. We
+// address), we *extend* the loader-supplied PML4 in place. We
 // reach the existing tables through the loader's low-memory
 // identity map (confirmed live by the Phase 13a spec), and we use
 // page-table pages allocated from KPT_POOL — those pages live in
-// the kernel image, which BOOTBOOT identity-mapped along with the
+// the kernel image, which the loader mapped along with the
 // rest of kernel memory.
 //
 // To do that we need physical addresses for kernel-image pages.
@@ -338,7 +334,7 @@ pub fn install_kernel_page_tables() {
         KERNEL_VIRT_TO_PHYS_OFFSET = kpt_va - kpt_pa;
 
         // Patch the existing PML4 directly. We never CR3-swap —
-        // BOOTBOOT's tables already cover the kernel; we just add
+        // the loader's tables already cover the kernel; we just add
         // entries for the linear map, the LAPIC, and (in later
         // phases) user-mode pages.
         let root_cr3 = read_cr3();
@@ -374,8 +370,7 @@ pub fn install_kernel_page_tables() {
 }
 
 /// Build the kernel-half linear map. Scans `PML4[256..510]` for
-/// the first empty slot (BOOTBOOT touches PML4[256] on some
-/// firmware; PML4[511] is the kernel image), allocates a PDPT page,
+/// the first empty slot (PML4[511] is the kernel image), allocates a PDPT page,
 /// and populates it with `LINEAR_MAP_GIB` 1 GiB large-page entries.
 /// Caches the chosen slot's vaddr base in `LINEAR_MAP_BASE` for
 /// `phys_to_lin` to read.
@@ -445,15 +440,13 @@ unsafe fn ensure_table_into(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
             panic!("ensure_table_into: walked into a large page");
         }
         // Existing entry — embedded value is a physical address;
-        // BOOTBOOT identity-maps low memory so it's
-        // dereferenceable as-is.
+        // the kernel linear map makes it dereferenceable.
         return (entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
     }
     // Allocate a fresh table from KPT_POOL. The pool lives in the
-    // kernel image, which BOOTBOOT identity-maps along with the
-    // rest of low physical memory; we install the physical address
-    // into the page-table tree so further walks via the identity
-    // map land on the same page.
+    // kernel image; we install the physical address into the
+    // page-table tree so early low-memory walks land on the same
+    // page until the linear map is ready.
     let table_v = alloc_table_va();
     let table_p = kernel_virt_to_phys(table_v as u64);
     ptr::write_volatile(entry_ptr, (table_p & !0xFFF) | flags);
@@ -503,7 +496,7 @@ pub mod spec {
     #[inline(never)]
     fn install_then_lapic_reads() {
         // Install our own page tables. After this CR3 points at our
-        // PML4, which mirrors BOOTBOOT's mappings + adds the LAPIC.
+        // PML4, which preserves loader mappings + adds the LAPIC.
         install_kernel_page_tables();
 
         // The LAPIC version register should now be readable.

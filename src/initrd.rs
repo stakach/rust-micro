@@ -1,14 +1,14 @@
 //! Phase 39 — initrd (USTAR tar) walker.
 //!
-//! BOOTBOOT loads an initrd into RAM at `bootboot.initrd_ptr` (a
-//! physical address that's also a valid virtual address while the
-//! BOOTBOOT identity map at PML4[0] is live). We pack the initrd as
-//! a USTAR tar so the kernel and any userspace ELFs can be shipped
-//! as separate files inside one archive — see `scripts/make_image.sh`.
+//! Simpleboot loads the initrd archive as the first Multiboot2
+//! module. Its physical address is also a valid virtual address while
+//! the Simpleboot identity map is live. We pack the initrd as a USTAR
+//! tar so userspace ELFs can be shipped as separate files inside one
+//! archive — see `scripts/make_image.sh`.
 //!
-//! BOOTBOOT extracts `sys/core` from the archive and dispatches that
-//! as the kernel; everything else is left in place for the kernel to
-//! enumerate at runtime via `find_file()`.
+//! Simpleboot loads the kernel as a normal ELF and leaves the module
+//! archive in place for the kernel to enumerate at runtime via
+//! `find_file()`.
 //!
 //! USTAR layout (https://www.gnu.org/software/tar/manual/html_node/Standard.html):
 //!   * 512-byte header per entry
@@ -18,21 +18,16 @@
 //!   * file data follows the header, padded to a 512-byte boundary
 //!   * archive ends with two consecutive 512-byte zero blocks
 
-use crate::bootboot::{BOOTBOOT, BOOTBOOT_INFO};
-
 const BLOCK: usize = 512;
 
-/// Read the initrd location BOOTBOOT exposed in its info struct.
-/// Safe because BOOTBOOT_INFO is mapped read-only at a fixed kernel
-/// vaddr and the initrd lives in the lower-half identity map.
+/// Read the initrd location Simpleboot exposed as the first module.
+/// Safe because the module lives in the lower-half identity map.
 pub fn slice() -> &'static [u8] {
-    let bb = unsafe { &*(BOOTBOOT_INFO as *const BOOTBOOT) };
-    let ptr = bb.initrd_ptr as usize;
-    let size = bb.initrd_size as usize;
-    if ptr == 0 || size == 0 {
+    let Some(module) = crate::simpleboot::first_module() else {
         return &[];
-    }
-    unsafe { core::slice::from_raw_parts(ptr as *const u8, size) }
+    };
+    let size = (module.end - module.start) as usize;
+    unsafe { core::slice::from_raw_parts(module.start as *const u8, size) }
 }
 
 /// Find a file in the initrd by its full path (e.g.
@@ -40,7 +35,7 @@ pub fn slice() -> &'static [u8] {
 /// the initrd memory, or `None` if not present.
 ///
 /// The output borrows from the input — callers that pass a
-/// `&'static [u8]` (the live BOOTBOOT initrd) get back
+/// `&'static [u8]` (the live Simpleboot initrd) get back
 /// `Option<&'static [u8]>` automatically.
 pub fn find_file<'a>(initrd: &'a [u8], name: &str) -> Option<&'a [u8]> {
     let mut off = 0;
@@ -109,7 +104,10 @@ pub mod spec {
     #[inline(never)]
     fn finds_rootserver_in_live_initrd() {
         let initrd = slice();
-        assert!(!initrd.is_empty(), "BOOTBOOT initrd must be non-empty");
+        assert!(
+            !initrd.is_empty(),
+            "Simpleboot initrd module must be non-empty"
+        );
         let elf = find_file(initrd, "boot/rootserver")
             .expect("boot/rootserver must be present in initrd");
         // ELF magic.
@@ -130,7 +128,7 @@ pub mod spec {
 
     /// Build a minimal in-memory tar archive and verify the walker
     /// extracts each file's bytes correctly. Doesn't depend on what
-    /// BOOTBOOT loaded.
+    /// Simpleboot loaded.
     #[inline(never)]
     fn synthetic_archive_round_trip() {
         // Two 512-byte headers, each followed by 512 bytes of data

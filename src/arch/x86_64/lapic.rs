@@ -1,10 +1,8 @@
 //! Phase 12a — Local APIC driver.
 //!
 //! The LAPIC sits at the physical address held in IA32_APIC_BASE
-//! (default 0xFEE0_0000). We access it through MMIO. BOOTBOOT
-//! already maps the relevant page at the kernel's `mmio` virtual
-//! address (0xFFFF_FFFF_F800_0000), so we can dereference straight
-//! from there once we add the per-register offsets.
+//! (default 0xFEE0_0000). We access it through the kernel MMIO
+//! mapping installed by the x86_64 paging setup.
 //!
 //! Functions provided:
 //!   - `init_lapic`: enable the LAPIC by setting bit 8 of SVR
@@ -13,8 +11,7 @@
 //!     IRQ handler so the LAPIC unmasks the next interrupt.
 //!   - `send_ipi`: poke the Interrupt Command Register to deliver a
 //!     vector to a target CPU (or self / broadcast).
-//!   - `apic_id`: read the LAPIC ID (different from the BOOTBOOT
-//!     bspid in some configurations).
+//!   - `apic_id`: read the LAPIC ID.
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -45,10 +42,8 @@ const SVR_ENABLE: u32 = 1 << 8;
 const SPURIOUS_VECTOR_NUMBER: u32 = 0xFF;
 
 // ---------------------------------------------------------------------------
-// MMIO base. Captured once at init from the IA32_APIC_BASE MSR.
-// BOOTBOOT identity-maps the LAPIC page via the kernel's `mmio`
-// virtual region; we use that mapping rather than the raw paddr so
-// the access is cacheable per the BOOTBOOT page tables.
+// MMIO base. Captured once at init after the paging layer maps the
+// LAPIC page into the kernel's MMIO window.
 // ---------------------------------------------------------------------------
 
 const KERNEL_MMIO_BASE: u64 = 0xFFFF_FFFF_F800_0000;
@@ -393,16 +388,10 @@ const LAPIC_TIMER_DIVIDE_LOG2: u8 = 3; // ÷16
 /// the period sets preemption/budget GRANULARITY only — never how much time gets accounted. That
 /// makes the rate a pure cost/granularity trade.
 ///
-/// sel4test's SCHED / TIMEOUTFAULT families measure preemption at millisecond granularity, so the
-/// conformance build keeps the historical 1 kHz tick and stays byte-identical. The hosted NTOS
-/// boot (`extern-rootserver`) does not need it: it runs essentially one service thread and takes
-/// its own time from the HPET. Under TCG the emulated ISR — 15 GPR pushes, BKL acquire,
-/// `mcs_tick`, and the iretq context swap — costs a large fraction of a millisecond of REAL time,
-/// so a 1 ms period spends most of the machine servicing its own clock. Sampling the running vCPU
-/// during a hosted boot measured ~85% of it inside interrupt handling and only ~11% in user code.
-#[cfg(feature = "extern-rootserver")]
-const LAPIC_TICK_MS: u32 = 10;
-#[cfg(not(feature = "extern-rootserver"))]
+/// sel4test's SCHED / TIMEOUTFAULT families measure preemption at millisecond granularity,
+/// including in the `extern-rootserver` build that runs the upstream userspace suite. A 1 ms
+/// period leaves enough headroom for SCHED0011's 100 ms budget to be preempted before its
+/// 102 ms tolerance boundary under TCG jitter.
 const LAPIC_TICK_MS: u32 = 1;
 
 /// Calibrated initial count for one `LAPIC_TICK_MS` LAPIC timer period. Set by
@@ -418,10 +407,15 @@ static mut LAPIC_TIMER_INITIAL_COUNT: u32 = 0;
 /// fire ran every budget 3× long (SCHED0011 measured 309 ms for a
 /// 100 ms period, constant to within jitter).
 static mut TSC_PER_MS: u64 = 0;
-/// TSC value up to which time has already been charged. Advanced by
-/// whole milliseconds only, so the sub-ms remainder carries to the
-/// next fire instead of being dropped.
-static mut LAST_CHARGED_TSC: u64 = 0;
+/// TSC value up to which global wall time has already advanced.
+/// Updated under the BKL by whichever CPU takes a LAPIC tick first.
+static mut LAST_WALL_TSC: u64 = 0;
+
+/// Per-CPU TSC value up to which that CPU's running thread has already
+/// been charged. Budget accounting is per core; sharing this baseline
+/// across LAPIC timers lets one CPU's interrupt erase another CPU's
+/// elapsed runtime.
+static mut LAST_CHARGED_TSC_PER_CPU: [u64; crate::smp::MAX_CPUS] = [0; crate::smp::MAX_CPUS];
 
 #[inline(always)]
 fn rdtsc() -> u64 {
@@ -467,6 +461,7 @@ pub fn calibrate_timer_with_pit() -> u32 {
         // TSC rate over the same window — used by the tick ISR to
         // charge measured time rather than fire counts.
         TSC_PER_MS = (tsc1.wrapping_sub(tsc0) / CAL_MS as u64).max(1);
+        LAST_WALL_TSC = tsc1;
         // Stop the calibration countdown.
         write_reg(TIMER_INITIAL_COUNT, 0);
     }
@@ -493,7 +488,8 @@ pub fn enable_periodic_kernel_timer() {
     unsafe {
         IDT[LAPIC_TIMER_VECTOR as usize] =
             IdtEntry::new(lapic_timer_irq_entry as u64, 0x08, 0, 0x8E);
-        LAST_CHARGED_TSC = rdtsc();
+        let cpu = (crate::arch::get_cpu_id() as usize).min(crate::smp::MAX_CPUS - 1);
+        LAST_CHARGED_TSC_PER_CPU[cpu] = rdtsc();
         timer_periodic(
             LAPIC_TIMER_VECTOR,
             LAPIC_TIMER_DIVIDE_LOG2,
@@ -563,21 +559,24 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
     // Charge MEASURED time, not fire counts: virtual time keeps
     // advancing while this ISR executes under TCG, so consecutive
     // fires arrive several ms apart even though the LVT is armed
-    // for 1 ms. Advance LAST_CHARGED_TSC by whole milliseconds only
-    // so the remainder carries instead of dropping.
-    let delta_ms = unsafe {
+    // for 1 ms. Wall time is global; budget charge is per CPU.
+    let (wall_ms, charge_ms) = unsafe {
         let now_tsc = rdtsc();
         let per_ms = TSC_PER_MS.max(1);
-        let d = now_tsc.wrapping_sub(LAST_CHARGED_TSC) / per_ms;
+        let wall = now_tsc.wrapping_sub(LAST_WALL_TSC) / per_ms;
+        let cpu = (crate::arch::get_cpu_id() as usize).min(crate::smp::MAX_CPUS - 1);
+        let charge = now_tsc.wrapping_sub(LAST_CHARGED_TSC_PER_CPU[cpu]) / per_ms;
         // Clamp pathological jumps (TCG pause, debugger) so a
         // single fire can't charge minutes of budget.
-        let d = d.min(1000);
-        LAST_CHARGED_TSC = LAST_CHARGED_TSC.wrapping_add(d * per_ms);
-        d
+        let wall = wall.min(1000);
+        let charge = charge.min(1000);
+        LAST_WALL_TSC = LAST_WALL_TSC.wrapping_add(wall * per_ms);
+        LAST_CHARGED_TSC_PER_CPU[cpu] = LAST_CHARGED_TSC_PER_CPU[cpu].wrapping_add(charge * per_ms);
+        (wall, charge)
     };
 
-    if delta_ms > 0 {
-        super::pit::TICK_COUNT.fetch_add(delta_ms, Ordering::Relaxed);
+    if wall_ms > 0 {
+        super::pit::TICK_COUNT.fetch_add(wall_ms, Ordering::Relaxed);
     }
 
     let from_user = (ctx.cs & 3) == 3;
@@ -590,11 +589,13 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
         }
     };
 
-    if delta_ms > 0 {
+    if charge_ms > 0 {
         unsafe {
             crate::kernel::KERNEL.get().scheduler.tick();
         }
-        crate::sched_context::mcs_tick(delta_ms);
+    }
+    if wall_ms > 0 || charge_ms > 0 {
+        crate::sched_context::mcs_tick(charge_ms);
     }
 
     eoi();

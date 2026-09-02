@@ -17,7 +17,7 @@ pub enum DecodeError {
     InvalidTimezone,
 }
 
-/// Decode BOOTBOOT's UTC `yyyymmddhhiiss` BCD timestamp into a portable Unix epoch.
+/// Decode a bootloader UTC `yyyymmddhhiiss` BCD timestamp into a portable Unix epoch.
 ///
 /// Byte seven is the bootloader's daylight indicator and does not alter the UTC timestamp.
 pub fn decode_bcd_utc(

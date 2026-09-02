@@ -6,11 +6,12 @@
 //! cruft — just the fixed-format tables seL4 actually consumes for
 //! SMP enumeration and interrupt-controller setup.
 //!
-//! BOOTBOOT hands us the RSDP pointer in `BOOTBOOT.arch.x86_64.acpi_ptr`.
+//! Simpleboot hands us an ACPI RSDP copy in the MBI. The boot adapter
+//! extracts the selected RSDT/XSDT physical address from that tag.
 //! Tables live at low physical addresses; we read them through the
-//! identity mapping BOOTBOOT preserves for the loader range. (When
+//! identity mapping Simpleboot preserves for the loader range. (When
 //! that mapping isn't there we'd fault — same caveat as the LAPIC
-//! driver. QEMU + BOOTBOOT in default config does keep low memory
+//! driver. QEMU + Simpleboot in default config does keep low memory
 //! mapped, which the spec confirms.)
 
 use core::ptr::read_unaligned;
@@ -281,7 +282,7 @@ pub struct AcpiRootTableInfo {
 }
 
 /// Validate the loader-provided ACPI root table and retain its real physical extent for the initial
-/// root task. BOOTBOOT has already consumed the RSDP and publishes the selected RSDT/XSDT address.
+/// root task.
 pub fn root_table_info(sdt_addr: u64) -> Result<AcpiRootTableInfo, AcpiError> {
     let header = validate_sdt(sdt_addr)?;
     let signature: [u8; 4] = unsafe { read_unaligned(&raw const header.signature) };
@@ -366,12 +367,7 @@ fn checksum8(bytes: &[u8]) -> u8 {
     sum
 }
 
-/// Top-level helper: from BOOTBOOT's `acpi_ptr`, find the MADT.
-///
-/// Note: the loader hands us the (X)SDT physical address directly
-/// in `BOOTBOOT.arch.x86_64.acpi_ptr` — RSDP scanning happens
-/// inside the loader. We accept either an RSDT (32-bit entries) or
-/// an XSDT (64-bit entries) and walk accordingly.
+/// Top-level helper: from the loader-selected RSDT/XSDT, find the MADT.
 pub fn find_madt(sdt_addr: u64) -> Result<&'static MadtHeader, AcpiError> {
     let table = find_table(sdt_addr, MADT_SIGNATURE)?;
     let header = validate_sdt(table)?;
@@ -395,11 +391,10 @@ pub fn find_madt(sdt_addr: u64) -> Result<&'static MadtHeader, AcpiError> {
 pub mod spec {
     use super::*;
     use crate::arch;
-    use crate::bootboot::*;
 
     pub fn test_acpi() {
         arch::log("Running ACPI tests...\n");
-        bootboot_provides_sdt_pointer();
+        simpleboot_provides_sdt_pointer();
         sdt_signature_is_rsdt_or_xsdt();
         rsdt_walks_to_madt();
         madt_lists_at_least_one_lapic();
@@ -407,32 +402,34 @@ pub mod spec {
         arch::log("ACPI tests completed\n");
     }
 
-    fn rsdp_addr() -> u64 {
-        let bootboot = unsafe { &*(BOOTBOOT_INFO as *const BOOTBOOT) };
-        unsafe { bootboot.arch.x86_64 }.acpi_ptr
+    fn sdt_addr() -> u64 {
+        crate::simpleboot::acpi_table_address()
     }
 
     #[inline(never)]
-    fn bootboot_provides_sdt_pointer() {
-        let p = rsdp_addr();
-        assert!(p != 0, "BOOTBOOT must hand us the (X)SDT physical address");
-        arch::log("  ✓ BOOTBOOT.arch.x86.acpi_ptr is non-null\n");
+    fn simpleboot_provides_sdt_pointer() {
+        let p = sdt_addr();
+        assert!(
+            p != 0,
+            "Simpleboot must hand us the (X)SDT physical address"
+        );
+        arch::log("  ✓ Simpleboot ACPI tag provides an RSDT/XSDT pointer\n");
     }
 
     #[inline(never)]
     fn sdt_signature_is_rsdt_or_xsdt() {
-        let hdr = validate_sdt(rsdp_addr()).expect("SDT must validate");
+        let hdr = validate_sdt(sdt_addr()).expect("SDT must validate");
         let sig: [u8; 4] = unsafe { core::ptr::read_unaligned(&raw const hdr.signature) };
         assert!(
             sig == *b"RSDT" || sig == *b"XSDT",
-            "BOOTBOOT acpi_ptr should land on an RSDT or XSDT",
+            "Simpleboot ACPI root should land on an RSDT or XSDT",
         );
         arch::log("  ✓ acpi_ptr lands on an RSDT or XSDT\n");
     }
 
     #[inline(never)]
     fn rsdt_walks_to_madt() {
-        let madt = find_madt(rsdp_addr()).expect("MADT must be findable from RSDT");
+        let madt = find_madt(sdt_addr()).expect("MADT must be findable from RSDT");
         // The header is packed — pull values out via raw pointer
         // reads to avoid taking unaligned references.
         let madt_ptr = madt as *const MadtHeader;
@@ -450,7 +447,7 @@ pub mod spec {
 
     #[inline(never)]
     fn madt_lists_at_least_one_lapic() {
-        let madt = find_madt(rsdp_addr()).unwrap();
+        let madt = find_madt(sdt_addr()).unwrap();
         let mut n_lapic = 0;
         let mut n_ioapic = 0;
         iter_madt_entries(madt, |e| match e {
@@ -466,7 +463,7 @@ pub mod spec {
 
     #[inline(never)]
     fn ioapic_catalog_matches_madt() {
-        let madt = find_madt(rsdp_addr()).unwrap();
+        let madt = find_madt(sdt_addr()).unwrap();
         let mut expected = 0;
         iter_madt_entries(madt, |entry| {
             if matches!(entry, MadtEntry::IoApic { .. }) {

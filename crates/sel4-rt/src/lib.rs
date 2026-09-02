@@ -580,7 +580,7 @@ pub struct BootInfo {
     pub schedcontrol: SlotRegion,
     pub untyped: SlotRegion,
     pub untyped_list: [UntypedDesc; MAX_BI_UNTYPED],
-    // Phase 0a — BOOTBOOT linear-framebuffer geometry, published by the
+    // Phase 0a — Simpleboot linear-framebuffer geometry, published by the
     // kernel when built with `extern-rootserver` (the only kernel that
     // boots this runtime). Mirrors the trailing gated fields of the
     // kernel's `seL4_BootInfo`. `fb_paddr` == 0 ⇒ no framebuffer. These
@@ -697,7 +697,7 @@ impl BootInfo {
         Some(controllers)
     }
 
-    /// Return the firmware-ordered BOOTBOOT memory map published by the kernel. These records are
+    /// Return the firmware-ordered Simpleboot memory map published by the kernel. These records are
     /// information only; physical authority still comes exclusively from BootInfo capabilities.
     pub fn firmware_memory_map(&self) -> Option<&[BootFirmwareMemoryRange]> {
         let payload = self.extra_bootinfo_chunk(BOOTINFO_HEADER_FIRMWARE_MEMORY_MAP)?;

@@ -224,7 +224,7 @@ fi
 # init (co_IntInitializeDesktopGraphics → PDEVOBJ_Create) loads it via LDEVOBJ_pLoadDriver →
 # ZwSetSystemInformation(SystemLoadGdiDriverInformation), which the executive hosts into win32k's
 # VSpace (like dxg.sys). framebuf imports 11 Eng*/PALOBJ from win32k.sys and queries the video
-# miniport over EngDeviceIoControl; the executive intercepts those IOCTLs to feed it the BOOTBOOT
+# miniport over EngDeviceIoControl; the executive intercepts those IOCTLs to feed it the bootloader
 # framebuffer, so framebuf enables the primary surface → PIXELS. Directly in system32/.
 if [ ! -f "$OUT/ros-framebuf.dll" ]; then
   FB_ISO="$(single_iso)"

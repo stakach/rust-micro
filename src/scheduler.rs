@@ -584,7 +584,8 @@ impl Scheduler {
             return;
         }
         let dom = self.slab.get(id).domain as usize;
-        if self.slab.get(id).enqueued {
+        let was_enqueued = self.slab.get(id).enqueued;
+        if was_enqueued {
             self.nodes[old].queues[dom].dequeue(&mut self.slab, id);
         }
         let was_current = self.nodes[old].current == Some(id);
@@ -592,7 +593,7 @@ impl Scheduler {
             self.nodes[old].current = None;
         }
         self.slab.get_mut(id).affinity = new_core as u32;
-        if self.slab.get(id).is_schedulable() {
+        if was_enqueued && self.slab.get(id).is_schedulable() {
             self.nodes[new_core].queues[dom].enqueue(&mut self.slab, id);
         }
         #[cfg(target_arch = "x86_64")]
@@ -830,6 +831,18 @@ impl Scheduler {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Force `cpu` to re-run its scheduling decision. Caller holds the BKL.
+    pub fn request_reschedule_on(&mut self, cpu: usize) {
+        self.nodes[cpu].current = None;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let my_cpu = crate::arch::get_cpu_id() as usize;
+            if cpu != my_cpu {
+                crate::smp::kick_cpu(cpu as u32);
             }
         }
     }
@@ -1161,6 +1174,7 @@ pub mod spec {
         tick_decrements_timeslice();
         tick_with_no_current_is_noop();
         per_cpu_queues_are_isolated();
+        migrate_inactive_tcb_stays_off_ready_queue();
         active_user_tracks_entry_independently_of_current();
         block_and_sc_loss_clear_active_user();
         scrub_tcb_removes_stale_ready_queue_entries();
@@ -1194,6 +1208,32 @@ pub mod spec {
         assert_eq!(s.current_for_cpu(0), Some(crate::tcb::TcbId(0)));
         assert_eq!(s.current_for_cpu(1), Some(crate::tcb::TcbId(1)));
         arch::log("  ✓ per-CPU queues + current are independent\n");
+    }
+
+    #[inline(never)]
+    fn migrate_inactive_tcb_stays_off_ready_queue() {
+        let mut s = Scheduler::new();
+        let mut inactive = Tcb::default();
+        inactive.priority = 100;
+        inactive.state = ThreadStateType::Inactive;
+        inactive.sc = Some(0);
+        inactive.affinity = 0;
+        let target = s.admit(inactive);
+
+        // Keep the destination CPU non-idle so the spec does not emit
+        // a real IPI while exercising queue membership.
+        let mut peer = runnable(1);
+        peer.affinity = 1;
+        let peer = s.admit(peer);
+        s.nodes[1].current = Some(peer);
+
+        s.migrate_tcb(target, 1);
+
+        assert_eq!(s.slab.get(target).affinity, 1);
+        assert!(!s.slab.get(target).enqueued);
+        assert_eq!(s.nodes[0].queues[0].len_at(&s.slab, 100), 0);
+        assert_eq!(s.nodes[1].queues[0].len_at(&s.slab, 100), 0);
+        arch::log("  ✓ migrating inactive TCBs preserves non-ready state\n");
     }
 
     #[inline(never)]

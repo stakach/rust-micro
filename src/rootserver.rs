@@ -47,9 +47,9 @@ use crate::types::{
 //
 // Phase 41 — instead of preallocating in kernel BSS (which doesn't
 // scale; sel4test-driver alone is ~3.9 MiB of LOAD segments), we
-// reserve a contiguous chunk of BOOTBOOT-identity-mapped low memory
+// reserve a contiguous chunk of Simpleboot-identity-mapped low memory
 // at boot time and hand out paddrs from it. `alloc_page` returns
-// the paddr; because BOOTBOOT identity-maps the lower 1 GiB at
+// the paddr; because Simpleboot identity-maps the lower 1 GiB at
 // PML4[0], that paddr also serves as a valid kernel-virtual pointer
 // for the loader to memcpy ELF data into the page. No translation
 // step needed.
@@ -94,7 +94,7 @@ pub unsafe fn install_rootserver_cnode_backing(paddr: u64) {
 }
 
 /// Allocate a 4 KiB page from the user-page region. Returns the
-/// paddr — also a valid kernel-virtual pointer (BOOTBOOT identity
+/// paddr — also a valid kernel-virtual pointer (Simpleboot identity
 /// at PML4[0]). The page is zero-filled before return.
 unsafe fn alloc_page() -> u64 {
     let region = &raw mut USER_PAGE_REGION;
@@ -305,7 +305,7 @@ fn rootserver_device_untypeds() -> DeviceUntypedList {
 }
 
 fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryRange]) -> usize {
-    const MAX_BOOTBOOT_MMAP_ENTRIES: usize = 240;
+    const MAX_SIMPLEBOOT_MMAP_ENTRIES: usize = 240;
     const E820_USABLE: u32 = 1;
     const E820_RESERVED: u32 = 2;
     const E820_ACPI_RECLAIMABLE: u32 = 3;
@@ -314,8 +314,8 @@ fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryR
     let mut entries = [crate::boot::MemEntry {
         region: crate::region::PRegion::new(0, 0),
         kind: crate::boot::MemKind::Used,
-    }; MAX_BOOTBOOT_MMAP_ENTRIES];
-    let count = crate::boot::read_bootboot_mmap(&mut entries);
+    }; MAX_SIMPLEBOOT_MMAP_ENTRIES];
+    let count = crate::boot::read_simpleboot_mmap(&mut entries);
     let mut published = 0usize;
     for entry in entries[..count].iter().copied() {
         let length = entry.region.end.saturating_sub(entry.region.start);
@@ -338,13 +338,13 @@ fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryR
                 previous.length = previous
                     .length
                     .checked_add(length)
-                    .expect("BOOTBOOT memory range length overflow");
+                    .expect("Simpleboot memory range length overflow");
                 continue;
             }
         }
         let slot = out
             .get_mut(published)
-            .expect("BOOTBOOT memory map exceeds typed extra-BootInfo capacity");
+            .expect("Simpleboot memory map exceeds typed extra-BootInfo capacity");
         *slot = crate::types::seL4_BootFirmwareMemoryRange {
             base: entry.region.start,
             length,
@@ -355,7 +355,7 @@ fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryR
     }
     assert!(
         published != 0,
-        "BOOTBOOT supplied no firmware memory ranges"
+        "Simpleboot supplied no firmware memory ranges"
     );
     published
 }
@@ -539,12 +539,12 @@ fn append_device_region(list: &mut DeviceUntypedList, start: u64, end: u64) -> b
 
 #[cfg(feature = "extern-rootserver")]
 fn append_acpi_device_untypeds(list: &mut DeviceUntypedList) -> bool {
-    const MAX_BOOTBOOT_MMAP_ENTRIES: usize = 240;
+    const MAX_SIMPLEBOOT_MMAP_ENTRIES: usize = 240;
     let mut entries = [crate::boot::MemEntry {
         region: crate::region::PRegion::new(0, 0),
         kind: crate::boot::MemKind::Used,
-    }; MAX_BOOTBOOT_MMAP_ENTRIES];
-    let count = crate::boot::read_bootboot_mmap(&mut entries);
+    }; MAX_SIMPLEBOOT_MMAP_ENTRIES];
+    let count = crate::boot::read_simpleboot_mmap(&mut entries);
     entries[..count]
         .iter()
         .filter(|entry| entry.kind == crate::boot::MemKind::Acpi)
@@ -565,17 +565,17 @@ fn rootserver_device_untypeds() -> DeviceUntypedList {
         "ACPI reclaim ranges exceed rootserver device-untyped authority"
     );
     let acpi_root =
-        crate::arch::x86_64::acpi::root_table_info(crate::bootboot::acpi_table_address())
-            .expect("BOOTBOOT ACPI root table must validate");
+        crate::arch::x86_64::acpi::root_table_info(crate::simpleboot::acpi_table_address())
+            .expect("Simpleboot ACPI root table must validate");
     assert!(
         list.covers(acpi_root.paddr, acpi_root.length as u64),
         "ACPI root table must belong to rootserver device-untyped authority"
     );
-    if let Some(framebuffer) = crate::bootboot::framebuffer_info() {
+    if let Some(framebuffer) = crate::simpleboot::framebuffer_info() {
         assert!(
             list.unique_containing(framebuffer.paddr, framebuffer.size as u64)
                 .is_some(),
-            "BOOTBOOT framebuffer must belong to exactly one PCI BAR device untyped",
+            "Simpleboot framebuffer must belong to exactly one PCI BAR device untyped",
         );
     }
     list
@@ -640,7 +640,7 @@ fn log_device_untyped_list(list: &DeviceUntypedList) {
 }
 
 /// Phase 42 — backing memory for the rootserver's Untyped cap is
-/// reserved at boot from BOOTBOOT free memory rather than from
+/// reserved at boot from Simpleboot free memory rather than from
 /// kernel BSS (kernel-image BSS is constrained by the high-memory
 /// virtual region; sel4test needs tens of MiB). `boot.rs` calls
 /// `install_rootserver_untyped` with the chunk's paddr + power-of-2
@@ -726,7 +726,7 @@ pub enum LoadError {
 //
 // SAFETY: must hold the BKL (we walk shared statics). Run only on
 // BSP with paging set up — we issue MMIO-free kernel-virtual writes
-// that depend on BOOTBOOT's identity map being present.
+// that depend on Simpleboot's identity map being present.
 // ---------------------------------------------------------------------------
 
 pub unsafe fn load() -> Result<RootserverImage, LoadError> {
@@ -777,7 +777,7 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
     let bootinfo_vaddr = ipc_buffer_vaddr + page;
 
     // Allocate + map the stack pages. `alloc_page` returns a paddr
-    // that's also a valid kernel-virtual pointer (BOOTBOOT identity
+    // that's also a valid kernel-virtual pointer (Simpleboot identity
     // at PML4[0]) — the loader maps it user-side at `stack_base + i
     // * page` and the kernel can write into it via paddr-as-vaddr.
     // Each aux page is also recorded in IMAGE_PAGES so it appears in
@@ -805,7 +805,7 @@ pub unsafe fn load() -> Result<RootserverImage, LoadError> {
 
     // Allocate + map the BootInfo page (read-only — userspace reads
     // it but doesn't mutate). The kernel writes the struct via the
-    // BOOTBOOT identity map before dispatch.
+    // Simpleboot identity map before dispatch.
     let bi_phys = alloc_page();
     map_user_4k_into_pml4(pml4, bootinfo_vaddr, bi_phys, false, /* NX */ true);
     record_image_page(seen, &mut n_seen, bootinfo_vaddr, bi_phys, false)?;
@@ -897,6 +897,42 @@ pub fn microtest_check_byte(b: u8) -> bool {
         );
         false
     }
+}
+
+pub static SEL4TEST_SUCCESS_MATCH_POS: AtomicUsize = AtomicUsize::new(0);
+pub static SEL4TEST_FAILURE_MATCH_POS: AtomicUsize = AtomicUsize::new(0);
+pub static SEL4TEST_ABORT_MATCH_POS: AtomicUsize = AtomicUsize::new(0);
+pub const SEL4TEST_SUCCESS_SENTINEL: &[u8] = b"All is well in the universe\n";
+pub const SEL4TEST_FAILURE_SENTINEL: &[u8] = b"*** FAILURES DETECTED ***\n";
+pub const SEL4TEST_ABORT_SENTINEL: &[u8] = b"seL4 root server abort()ed\n";
+
+pub fn sel4test_check_byte(b: u8) -> Option<bool> {
+    if match_sentinel_byte(&SEL4TEST_SUCCESS_MATCH_POS, SEL4TEST_SUCCESS_SENTINEL, b) {
+        return Some(true);
+    }
+    if match_sentinel_byte(&SEL4TEST_FAILURE_MATCH_POS, SEL4TEST_FAILURE_SENTINEL, b) {
+        return Some(false);
+    }
+    if match_sentinel_byte(&SEL4TEST_ABORT_MATCH_POS, SEL4TEST_ABORT_SENTINEL, b) {
+        return Some(false);
+    }
+    None
+}
+
+fn match_sentinel_byte(pos: &AtomicUsize, sentinel: &[u8], b: u8) -> bool {
+    let current = pos.load(Ordering::Relaxed);
+    let expect = sentinel[current];
+    if b == expect {
+        let next = current + 1;
+        if next == sentinel.len() {
+            pos.store(0, Ordering::Relaxed);
+            return true;
+        }
+        pos.store(next, Ordering::Relaxed);
+    } else {
+        pos.store(if b == sentinel[0] { 1 } else { 0 }, Ordering::Relaxed);
+    }
+    false
 }
 
 /// Phase 29e — replace the AY demo. Loads the rootserver, builds
@@ -1147,7 +1183,7 @@ pub unsafe fn launch_rootserver() -> ! {
     );
     // Phase 36e — per-CPU SchedControl caps in the schedcontrol
     // region [16, 16+ncores). bi.schedcontrol points at this range.
-    let n_cores = crate::bootboot::get_num_cores() as usize;
+    let n_cores = crate::simpleboot::get_num_cores() as usize;
     let schedcontrol_start: usize = 16;
     for core in 0..n_cores.min(4) {
         rs_set(
@@ -1158,7 +1194,7 @@ pub unsafe fn launch_rootserver() -> ! {
     }
     // Phase 36e / 42 — Untyped at slot 20 (after the schedcontrol
     // region). bi.untyped points here. Backing memory is reserved
-    // at boot from BOOTBOOT free memory (see install_rootserver_untyped).
+    // at boot from Simpleboot free memory (see install_rootserver_untyped).
     let ut_paddr = ROOTSERVER_UT.base_paddr;
     let ut_size_bits = ROOTSERVER_UT.size_bits;
     let untyped_slot: usize = 20;
@@ -1226,7 +1262,7 @@ pub unsafe fn launch_rootserver() -> ! {
     }
     let user_image_end: Word = user_image_start + n_image_pages as Word;
 
-    // Publish the kernel-validated IOAPIC route extents and the loader's authoritative BOOTBOOT
+    // Publish the kernel-validated IOAPIC route extents and the loader's authoritative Simpleboot
     // memory map as private typed chunks before the standard TSC-frequency chunk. Keeping the
     // 20-byte TSC chunk last preserves its standard declared length while every preceding header
     // remains naturally aligned.
@@ -1305,7 +1341,7 @@ pub unsafe fn launch_rootserver() -> ! {
     );
 
     // Build + write the BootInfo struct into its page. We address
-    // it via its kernel-virt mapping (still BOOTBOOT-identity-mapped)
+    // it via its kernel-virt mapping (still Simpleboot-identity-mapped)
     // before the CR3 swap; the rootserver reads it through its
     // user-half mapping after sysretq.
     let bi_ptr = phys_to_kernel_virt(img.bootinfo_paddr) as *mut seL4_BootInfo;
@@ -1337,6 +1373,7 @@ pub unsafe fn launch_rootserver() -> ! {
     set_syscall_kernel_rsp(rsp);
 
     // Arm the dispatcher's exit hook.
+    #[cfg(not(feature = "extern-rootserver"))]
     ROOTSERVER_DEMO_ACTIVE.store(true, Ordering::Relaxed);
 
     // Phase 44 — initialize per-object cap refcounts from the
@@ -1429,7 +1466,7 @@ pub unsafe fn launch_rootserver() -> ! {
 }
 
 /// Convert a physical address to its kernel-virt counterpart. The
-/// kernel runs with BOOTBOOT's identity map for low memory, so the
+/// kernel runs with Simpleboot's identity map for low memory, so the
 /// kernel virt of a physical page is just `paddr +
 /// KERNEL_VIRT_TO_PHYS_OFFSET`. We avoid exposing the offset
 /// directly; just invert `kernel_virt_to_phys`.
@@ -1475,7 +1512,7 @@ unsafe fn build_bootinfo(
     }
     let untyped_count: Word = 1 + device_untypeds.len() as Word;
 
-    let n_cores = crate::bootboot::get_num_cores() as Word;
+    let n_cores = crate::simpleboot::get_num_cores() as Word;
     // Phase 36e / 42 — canonical slot layout under MCS:
     //   0..15  initial caps (some Null where unsupported)
     //   16..(16+n_cores)  per-CPU SchedControl
@@ -1487,15 +1524,15 @@ unsafe fn build_bootinfo(
     let untyped_end: Word = untyped_start + untyped_count;
     let cnode_slots: Word = 1u64 << ROOTSERVER_CNODE_RADIX;
     #[cfg(feature = "extern-rootserver")]
-    let framebuffer = crate::bootboot::framebuffer_info();
+    let framebuffer = crate::simpleboot::framebuffer_info();
     #[cfg(feature = "extern-rootserver")]
-    let wall_clock = crate::bootboot::wall_clock_snapshot();
+    let wall_clock = crate::simpleboot::wall_clock_snapshot();
     #[cfg(feature = "extern-rootserver")]
     let persistent_clock =
-        crate::arch::x86_64::acpi::find_pc_rtc(crate::bootboot::acpi_table_address()).ok();
+        crate::arch::x86_64::acpi::find_pc_rtc(crate::simpleboot::acpi_table_address()).ok();
     #[cfg(feature = "extern-rootserver")]
     let acpi_root =
-        crate::arch::x86_64::acpi::root_table_info(crate::bootboot::acpi_table_address()).ok();
+        crate::arch::x86_64::acpi::root_table_info(crate::simpleboot::acpi_table_address()).ok();
     seL4_BootInfo {
         extraLen: extra_bi_size,
         nodeID: 0,
@@ -1547,7 +1584,7 @@ unsafe fn build_bootinfo(
         },
         untypedList: empty_untypeds,
         // Phase 0a — framebuffer geometry (extern-rootserver). All-zero
-        // when BOOTBOOT exposed no framebuffer.
+        // when Simpleboot exposed no framebuffer.
         #[cfg(feature = "extern-rootserver")]
         fb_paddr: framebuffer.map(|geometry| geometry.paddr).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]

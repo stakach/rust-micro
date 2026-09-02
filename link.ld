@@ -23,23 +23,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  *
- * This file is part of the BOOTBOOT Protocol package.
- * @brief An example linker script for sample kernel
+ * Higher-half ELF linker script for the Simpleboot-loaded kernel.
  *
  */
 
 ENTRY(_start)
-
-mmio        = 0xfffffffff8000000;              /* these are configurable for level 2 loaders */
-fb          = 0xfffffffffc000000;
-bootboot    = 0xffffffffff800000;
-environment = 0xffffffffff801000;
-/* Bumped from BOOTBOOT's default 4 KiB. Kernel data structures
- * (Scheduler, TcbSlab, ready queues) live on the stack inside
- * specs; with MAX_TCBS = 320 (SCHED0004 needs ~250 helper
- * threads) a stack-built Scheduler is ~170+ KiB, and several
- * specs hold two. 512 KiB per core gives that headroom. */
-initstack = 524288;
 
 KERNEL_OFFSET = 0xfffffffffe002000;
 
@@ -72,7 +60,7 @@ SECTIONS
     } :boot
 
     /* BSS-equivalent. NOLOAD tells the linker not to take file
-     * space; the segment's MemSiz still covers the gap so BOOTBOOT
+     * space; the segment's MemSiz still covers the gap so the loader
      * zeroes the pages on load. Shrinks the kernel ELF on disk by
      * the size of the zero-init statics rust emits as `.bss.*`. */
     .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_OFFSET) {

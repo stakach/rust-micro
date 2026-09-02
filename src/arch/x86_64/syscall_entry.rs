@@ -234,9 +234,9 @@ pub fn init_syscall_msrs() {
     unsafe {
         // Enable SYSCALL/SYSRET via IA32_EFER.SCE, and No-eXecute
         // page-table support via EFER.NXE so PTEs with bit 63 set
-        // don't trip a reserved-bit fault on this CPU. BOOTBOOT
-        // sets these on the BSP but not on APs; per-CPU setup
-        // makes APs match.
+        // don't trip a reserved-bit fault on this CPU. Firmware and
+        // bootloader setup is BSP-centric, so per-CPU setup makes APs
+        // match.
         let efer = rdmsr(IA32_EFER);
         wrmsr(
             IA32_EFER,
@@ -935,6 +935,14 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     let transparent_debug_return = syscall_debug_return_is_transparent(syscall);
     let mut sink = SerialSink;
     let result = handle_syscall(syscall, &args, &mut sink);
+    if matches!(syscall, Syscall::SysDebugCapIdentify) {
+        ctx.rdi = unsafe {
+            entry_invoker
+                .or_else(|| KERNEL.get().scheduler.current())
+                .map(|cur| KERNEL.get().scheduler.slab.get(cur).user_context.rdi)
+                .unwrap_or(0)
+        };
+    }
 
     use core::sync::atomic::Ordering;
     // Phase 13c integration: single-thread launcher signals "test
@@ -976,8 +984,17 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             arch::log("[microtest sentinel matched -- exiting QEMU]\n");
             crate::arch::qemu_exit(0);
         }
+        #[cfg(feature = "extern-rootserver")]
+        if let Some(success) = crate::rootserver::sel4test_check_byte(b) {
+            if success {
+                crate::arch::qemu_exit(0);
+            } else {
+                crate::arch::qemu_exit(255);
+            }
+        }
     }
 
+    #[cfg(not(feature = "extern-rootserver"))]
     if crate::rootserver::ROOTSERVER_DEMO_ACTIVE.load(Ordering::Relaxed)
         && matches!(syscall, Syscall::SysDebugPutChar)
     {
@@ -1098,6 +1115,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         let mut preferred_entry_invoker =
             if prefer_entry_invoker_return && !transparent_debug_return {
                 resumable_entry_invoker
+                    .filter(|&candidate| s.scheduler.current() == Some(candidate))
                     .filter(|&candidate| s.scheduler.slab.get(candidate).is_schedulable())
             } else {
                 None
@@ -2193,7 +2211,7 @@ pub mod spec {
             s.sched_contexts[0].bound_tcb = Some(invoker);
 
             let mut target_tcb = Tcb::default();
-            target_tcb.priority = 80;
+            target_tcb.priority = 40;
             target_tcb.state = ThreadStateType::Inactive;
             target_tcb.sc = Some(1);
             let target = s.scheduler.admit(target_tcb);
@@ -2272,7 +2290,7 @@ pub mod spec {
             let invoker = s.scheduler.admit(invoker_tcb);
 
             let mut target_tcb = Tcb::default();
-            target_tcb.priority = 100;
+            target_tcb.priority = 40;
             target_tcb.state = ThreadStateType::Inactive;
             target_tcb.sc = Some(1);
             let target = s.scheduler.admit(target_tcb);

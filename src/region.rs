@@ -4,7 +4,7 @@
 //! type rather than relying on convention.
 //!
 //! Used by:
-//!   - the boot phase to describe the BOOTBOOT memory map after
+//!   - the boot phase to describe the bootloader memory map after
 //!     conversion to seL4's representation,
 //!   - untyped retype to bound checks,
 //!   - the rootserver placement code (in a later phase) to find a

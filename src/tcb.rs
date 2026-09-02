@@ -191,8 +191,8 @@ pub struct Tcb {
     /// rootserver-launch time). Needed because the kernel
     /// reads/writes message words 4..length through this paddr —
     /// walking user page tables on every IPC would be too slow,
-    /// and the BOOTBOOT 1 GiB identity map makes paddr access a
-    /// direct dereference.
+    /// and the kernel linear map makes paddr access a direct
+    /// dereference.
     pub ipc_buffer_paddr: Word,
     /// Intrusive scheduler-list links. `None` for a thread that
     /// isn't currently enqueued.
@@ -467,13 +467,13 @@ impl Tcb {
 // Slab — fixed-size pool of TCBs addressed by `TcbId`.
 // ---------------------------------------------------------------------------
 
-/// Maximum live TCBs in the kernel. Picks a small bound so the
-/// slab is BSS-allocatable without alloc() and a `Scheduler` value
-/// fits on a 16 KiB BOOTBOOT stack with margin. Production seL4
-/// uses real Untyped retypes for TCBs and there is no upper bound;
-/// raising this here costs ~128 bytes per TCB in BSS plus stack
-/// when a Scheduler is constructed in a spec, so we keep it modest
-/// until phases that actually need more.
+/// Maximum live TCBs in the kernel. Picks a small bound so the slab
+/// is BSS-allocatable without alloc() and a `Scheduler` value fits on
+/// the kernel stack with margin. Production seL4 uses real Untyped
+/// retypes for TCBs and there is no upper bound; raising this here
+/// costs ~128 bytes per TCB in BSS plus stack when a Scheduler is
+/// constructed in a spec, so we keep it modest until phases that
+/// actually need more.
 pub const MAX_TCBS: usize = 320;
 
 #[derive(Copy, Clone, Debug)]

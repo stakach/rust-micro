@@ -203,8 +203,8 @@ pub fn init_gdt() {
 
 /// Per-CPU GDT/TSS init. Populates the shared GDT with all CPU
 /// TSS descriptors (the BSP path), or just loads it (AP path).
-/// `cpu_id == 0` is BSP; non-zero is an AP that joins after BOOTBOOT
-/// has dropped it at `_start`.
+/// `cpu_id == 0` is BSP; non-zero is an AP that joins after the
+/// bootloader drops it at `_start`.
 pub fn init_gdt_for_cpu(cpu_id: u32) {
     let rsp0 = current_rsp();
 

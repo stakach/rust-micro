@@ -2,8 +2,8 @@
 //!
 //! Mirrors libsel4's `seL4_IPCBuffer` struct layout in u64 word
 //! offsets so the kernel can index directly into a user-mode IPC
-//! buffer page (accessed by paddr through the BOOTBOOT identity
-//! map; see `tcb.ipc_buffer_paddr`).
+//! buffer page (accessed by paddr through the kernel linear map; see
+//! `tcb.ipc_buffer_paddr`).
 //!
 //! Layout:
 //! ```text

@@ -12,7 +12,7 @@ use crate::tcb::TcbId;
 // ---------------------------------------------------------------------------
 // AP bring-up barrier (Phase 28a).
 //
-// BOOTBOOT lands every CPU at `_start` in long mode. The BSP path
+// Simpleboot lands every CPU at `_start` in long mode. The BSP path
 // runs full kernel init; AP paths perform per-CPU init then bump
 // `APS_ALIVE`. The BSP busy-waits for the count to match the
 // reported `numcores - 1` before running the spec runner / demo,
@@ -361,7 +361,7 @@ pub fn remote_tcb_stall(tcb: TcbId) -> bool {
 #[cfg(target_arch = "x86_64")]
 pub fn shootdown_tlb(vaddr: u64) {
     let me = crate::arch::get_cpu_id();
-    let n_cores = crate::bootboot::get_num_cores() as u32;
+    let n_cores = crate::simpleboot::get_num_cores() as u32;
     for cpu in 0..n_cores.min(MAX_CPUS as u32) {
         if cpu == me {
             continue;
@@ -403,7 +403,7 @@ pub fn shootdown_vspace(pml4_paddr: u64) {
     }
 
     let me = crate::arch::get_cpu_id();
-    let n_cores = crate::bootboot::get_num_cores() as u32;
+    let n_cores = crate::simpleboot::get_num_cores() as u32;
     for cpu in 0..n_cores.min(MAX_CPUS as u32) {
         if cpu == me {
             continue;
@@ -560,7 +560,7 @@ pub mod spec {
     /// fine — the AY demo on BSP runs in parallel without disturbance.
     #[inline(never)]
     fn ap_dispatches_user_thread_end_to_end() {
-        if crate::bootboot::get_num_cores() < 2 {
+        if crate::simpleboot::get_num_cores() < 2 {
             arch::log("  ✓ AP-dispatch test skipped (single CPU)\n");
             return;
         }
@@ -615,7 +615,7 @@ pub mod spec {
     /// fire one from BSP and watch each AP's IPI counter advance.
     #[inline(never)]
     fn shootdown_fans_invalidate_tlb_to_aps() {
-        let n_cores = crate::bootboot::get_num_cores() as u32;
+        let n_cores = crate::simpleboot::get_num_cores() as u32;
         if n_cores < 2 {
             arch::log("  ✓ TLB-shootdown test skipped (single CPU)\n");
             return;
@@ -638,7 +638,7 @@ pub mod spec {
                     .set_current_for_cpu(ap, Some(crate::tcb::TcbId(0)));
             }
         }
-        // Pick a vaddr that BOOTBOOT does NOT map (kernel half,
+        // Pick a vaddr that Simpleboot does NOT map (kernel half,
         // unused) so each AP's `invlpg` is a harmless no-op rather
         // than perturbing a live mapping.
         shootdown_tlb(0xFFFF_8000_DEAD_F000);
@@ -678,7 +678,7 @@ pub mod spec {
     /// driven from another CPU end-to-end.
     #[inline(never)]
     fn ap_picks_thread_off_its_queue_via_reschedule() {
-        if crate::bootboot::get_num_cores() < 2 {
+        if crate::simpleboot::get_num_cores() < 2 {
             arch::log("  ✓ AP-pick test skipped (single-CPU launch)\n");
             return;
         }
@@ -744,7 +744,7 @@ pub mod spec {
     #[inline(never)]
     fn cross_cpu_ipi_delivers_and_runs_isr() {
         // Skip if running with -smp 1.
-        if crate::bootboot::get_num_cores() < 2 {
+        if crate::simpleboot::get_num_cores() < 2 {
             arch::log("  ✓ IPI test skipped (single-CPU launch)\n");
             return;
         }
@@ -816,7 +816,7 @@ pub mod spec {
     /// path and is parked in HLT.
     #[inline(never)]
     fn all_aps_came_up() {
-        let total = crate::bootboot::get_num_cores() as u32;
+        let total = crate::simpleboot::get_num_cores() as u32;
         let expected_aps = total.saturating_sub(1);
         assert_eq!(
             aps_alive(),

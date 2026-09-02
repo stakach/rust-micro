@@ -3,9 +3,7 @@
 #![no_main]
 
 #[allow(dead_code)]
-#[allow(non_snake_case)]
-#[allow(non_camel_case_types)]
-mod bootboot;
+mod simpleboot;
 
 // Required for -Z build-std flag.
 extern crate rlibc;
@@ -98,14 +96,14 @@ mod boot;
 mod sched_context;
 
 // Phase 10b / 28 — multi-CPU support: per-CPU NodeState + IPI
-// dispatch. Always-on now that BOOTBOOT drops every CPU at
-// `_start`; the `smp` cargo feature still gates the spec runner
+// dispatch. Always-on now that Simpleboot drops every configured CPU
+// at `_start`; the `smp` cargo feature still gates the spec runner
 // for the smp module to keep its tests scoped.
 mod smp;
 
-// Phase 39 — initrd (USTAR tar) walker. BOOTBOOT loads the archive
-// at `bootboot.initrd_ptr`; the kernel walks it at runtime to find
-// the rootserver ELF (and any other userspace artifacts).
+// Phase 39 / Simpleboot — initrd (USTAR tar) walker. Simpleboot loads
+// the archive as the first Multiboot2 module; the kernel walks it at
+// runtime to find the rootserver ELF.
 mod initrd;
 
 // Phase 29a / 39 — locator for the rootserver ELF inside the initrd.
@@ -139,37 +137,39 @@ mod vcpu;
 #[cfg(feature = "spec")]
 mod spec;
 
-/******************************************
- * Entry point, called by BOOTBOOT Loader *
- ******************************************/
+/********************************************
+ * Entry point, called by Simpleboot Loader *
+ ********************************************/
 // NOTE: this code runs on all cores in parallel
 #[no_mangle]
-fn _start() -> ! {
-    use bootboot::*;
-
-    // use the BOOTBOOT_INFO as a pointer, dereference it and immediately borrow it.
-    let _bootboot_r = unsafe { &(*(BOOTBOOT_INFO as *const BOOTBOOT)) };
+extern "C" fn _start(magic: u64, mbi_addr: u64) -> ! {
+    simpleboot::init(magic, mbi_addr);
 
     // Only initialize on the bootstrap processor
-    // Check if current APIC ID matches the BOOTBOOT BSP ID
+    // Check if current APIC ID matches the Simpleboot BSP ID
     let current_apic_id = arch::get_cpu_id();
-    let bootboot_bsp_id = bootboot::get_bootstrap_processor_id() as arch::CpuId;
+    let simpleboot_bsp_id = simpleboot::get_bootstrap_processor_id() as arch::CpuId;
 
-    if current_apic_id == bootboot_bsp_id {
+    if current_apic_id == simpleboot_bsp_id {
         bsp_main();
     } else {
         ap_main(current_apic_id);
     }
 }
 
-/// BOOTBOOT clamps `initstack` to 16 KiB per core — far too small
-/// for kernel specs that build Scheduler/TcbSlab values on the
-/// stack (~170 KiB at MAX_TCBS = 320). The BSP hops onto this
-/// BSS-allocated stack first thing; the BOOTBOOT stack is only
-/// used for the jump itself.
+/// Bootloader stacks are intentionally small. The BSP hops onto this
+/// BSS-allocated stack first thing so kernel specs can build larger
+/// test fixtures without depending on loader stack policy.
 #[repr(C, align(16))]
 struct BspStack([u8; 1024 * 1024]);
 static mut BSP_BIG_STACK: BspStack = BspStack([0; 1024 * 1024]);
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(16))]
+struct ApStack([u8; 1024 * 1024]);
+#[cfg(target_arch = "x86_64")]
+static mut AP_BIG_STACKS: [ApStack; smp::MAX_CPUS] =
+    [const { ApStack([0; 1024 * 1024]) }; smp::MAX_CPUS];
 
 /// BSP entry — runs all global init (serial, GDT contents, IDT
 /// contents, exception vectors), signals APs to come up, waits for
@@ -219,7 +219,7 @@ fn bsp_main_big_stack() -> ! {
         crate::arch::x86_64::paging::install_kernel_page_tables();
         unsafe {
             crate::arch::x86_64::ioapic::initialize(
-                crate::bootboot::acpi_table_address(),
+                crate::simpleboot::acpi_table_address(),
                 crate::arch::get_cpu_id(),
             )
             .expect("firmware IOAPIC topology must validate");
@@ -231,7 +231,7 @@ fn bsp_main_big_stack() -> ! {
 
     // Release APs — the shared GDT and IDT are now populated, so
     // they can safely lgdt/lidt and load their per-CPU TSS.
-    let n_cores = bootboot::get_num_cores() as u32;
+    let n_cores = simpleboot::get_num_cores() as u32;
     let n_aps = n_cores.saturating_sub(1);
     smp::signal_bsp_ready();
     if n_aps > 0 {
@@ -241,7 +241,7 @@ fn bsp_main_big_stack() -> ! {
     }
 
     // Phase 41 — reserve the rootserver user-page region from
-    // BOOTBOOT free memory before specs run. The rootserver-loader
+    // Simpleboot free memory before specs run. The rootserver-loader
     // spec calls super::load() which allocates from this region,
     // and sel4test-driver's image alone is ~3.9 MiB — too big for
     // a kernel-image BSS pool.
@@ -268,7 +268,7 @@ fn bsp_main_big_stack() -> ! {
 
     // Real boot orchestration: read the loader's memory map,
     // place the rootserver. Phase 12d runs this on the live
-    // BOOTBOOT-supplied state — useful as an end-to-end smoke
+    // Simpleboot-supplied state — useful as an end-to-end smoke
     // test that the boot code that's been spec'd in synthetic
     // form actually copes with real-hardware data.
     #[cfg(target_arch = "x86_64")]
@@ -304,8 +304,6 @@ fn bsp_main_big_stack() -> ! {
 /// then load them, set up per-CPU MSRs, signal alive, halt forever.
 /// Phase 28d will replace the halt loop with the per-CPU scheduler.
 fn ap_main(apic_id: arch::CpuId) -> ! {
-    smp::wait_for_bsp_ready();
-
     // For QEMU and most hardware, APIC IDs are dense starting at 0,
     // so we use APIC ID as the per-CPU index. Production may need a
     // MADT-driven apic_id → cpu_index table.
@@ -315,12 +313,38 @@ fn ap_main(apic_id: arch::CpuId) -> ! {
         loop {}
     }
 
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let top = (&raw const AP_BIG_STACKS[cpu_id as usize] as u64)
+            + core::mem::size_of::<ApStack>() as u64;
+        core::arch::asm!(
+            "mov rsp, {top}",
+            "mov rdi, {apic}",
+            "jmp {cont}",
+            top = in(reg) top & !0xF,
+            apic = in(reg) apic_id as u64,
+            cont = sym ap_main_big_stack,
+            options(noreturn),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    ap_main_big_stack(apic_id)
+}
+
+fn ap_main_big_stack(apic_id: arch::CpuId) -> ! {
+    smp::wait_for_bsp_ready();
+
+    // For QEMU and most hardware, APIC IDs are dense starting at 0,
+    // so we use APIC ID as the per-CPU index. Production may need a
+    // MADT-driven apic_id → cpu_index table.
+    let cpu_id = apic_id;
+
     arch::init_gdt_for_cpu(cpu_id);
     arch::load_idt();
     arch::init_syscall_msrs();
     // Phase 28d — each AP needs its own LAPIC software-enabled
     // before it can deliver/receive IPIs. The MMIO mapping is
-    // shared (BOOTBOOT identity-maps the LAPIC page); only the
+    // shared (Simpleboot identity-maps the LAPIC page); only the
     // SVR + TPR writes are per-CPU.
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::lapic::init_lapic();
@@ -351,8 +375,8 @@ fn ap_main(apic_id: arch::CpuId) -> ! {
 fn ap_scheduler_loop() -> ! {
     #[cfg(target_arch = "x86_64")]
     {
-        // Capture this CPU's BOOTBOOT-supplied stack — it doubles as
-        // the kernel-mode stack for SYSCALL re-entry and IRQ entry.
+        // Capture this CPU's high-half AP stack — it doubles as the
+        // kernel-mode stack for SYSCALL re-entry and IRQ entry.
         let my_ksp: u64;
         unsafe {
             core::arch::asm!(

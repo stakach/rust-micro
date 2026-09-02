@@ -4,9 +4,8 @@ use core::arch::asm;
 pub fn get_cpu_id() -> CpuId {
     // Read the APIC ID register. Two regimes coexist:
     //   * Pre-`install_kernel_page_tables` (very-early boot, before
-    //     we have the kernel-half linear map): BOOTBOOT identity-
-    //     maps low memory + MMIO at PML4[0], so dereferencing the
-    //     raw paddr from IA32_APIC_BASE just works.
+    //     we have the kernel-half linear map): use the loader's
+    //     initial low-memory/MMIO mappings.
     //   * After `install_kernel_page_tables`: the linear map is up
     //     and `phys_to_lin` returns a kernel-half vaddr that's
     //     reachable from any vspace (including user vspaces that

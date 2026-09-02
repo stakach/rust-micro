@@ -13,18 +13,18 @@ fn test_cpu_id() {
     crate::arch::log("Testing CPU ID retrieval...\n");
 
     let cpu_id = crate::arch::get_cpu_id();
-    let bsp_id = crate::bootboot::get_bootstrap_processor_id() as crate::arch::CpuId;
+    let bsp_id = crate::simpleboot::get_bootstrap_processor_id() as crate::arch::CpuId;
 
     crate::arch::log("Current CPU APIC ID (from APIC register): ");
     print_number(cpu_id);
-    crate::arch::log("\nBootstrap Processor ID (from BOOTBOOT): ");
+    crate::arch::log("\nBootstrap Processor ID (from Simpleboot): ");
     print_number(bsp_id);
     crate::arch::log("\n");
 
     if cpu_id == bsp_id {
-        crate::arch::log("✓ APIC ID matches BOOTBOOT BSP ID\n");
+        crate::arch::log("✓ APIC ID matches Simpleboot BSP ID\n");
     } else {
-        crate::arch::log("✗ APIC ID mismatch - APIC ID should match BOOTBOOT BSP ID\n");
+        crate::arch::log("✗ APIC ID mismatch - APIC ID should match Simpleboot BSP ID\n");
     }
 }
 

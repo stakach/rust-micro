@@ -628,14 +628,14 @@ unsafe fn ensure_user_table(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
             // 2 MiB large page (PD slot with PS=1). Split it into a
             // PT of 512 4 KiB entries so the rootserver can mutate
             // sub-pages without disturbing the rest of the 2 MiB
-            // region — BOOTBOOT identity-maps the lower 1 GiB at
-            // PML4[0] with 2 MiB pages, and rootservers laying out
+            // region — early boot maps the lower memory at PML4[0]
+            // with 2 MiB pages, and rootservers laying out
             // in PML4[0] (e.g. sel4test-driver at 0x400000) need
             // 4 KiB granularity in those regions.
             let large_paddr = entry & 0x000F_FFFF_FFE0_0000;
             // Carry the entry's low flag bits, dropping PS. PAT
             // moves between bit positions for 2 MiB vs 4 KiB
-            // entries, but BOOTBOOT identity entries don't set
+            // entries, but the early identity entries don't set
             // PAT — masking PS is sufficient here.
             let leaf_flags = (entry & 0xFFF) & !PTE_PS;
             let pt_v = super::paging::alloc_user_table_va();
@@ -648,15 +648,14 @@ unsafe fn ensure_user_table(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
             // (PS=0). The requested mid-flags (PRESENT|RW|USER)
             // overwrite the original — note that user-mode access
             // also requires US=1 in the leaf PT entries, so the
-            // 511 leaves still mapping BOOTBOOT identity remain
+            // 511 leaves still mapping the early identity range remain
             // kernel-only (their leaf_flags inherited PS=0/US=0).
             // Only the leaf the rootserver later overwrites with
             // its own US=1 entry becomes user-accessible.
             let new_pd = (pt_p & 0x000F_FFFF_FFFF_F000) | flags;
             core::ptr::write_volatile(entry_ptr, new_pd);
             // Return the kernel-virtual address of the new PT we
-            // just allocated — pt_v is already kernel-virt; using
-            // pt_p as a pointer would require BOOTBOOT identity.
+            // just allocated — pt_v is already kernel-virt.
             return pt_v;
         }
         let updated = entry | flags;
@@ -696,15 +695,14 @@ pub unsafe fn install_user_table(level: u32, vaddr: u64, table_paddr: u64) -> Re
 ///
 /// SAFETY: `pml4_paddr` must be a valid PML4 paddr and the
 /// rootserver pool memory must be reachable through the kernel's
-/// identity-mapped low memory (the BOOTBOOT 1 GiB identity map).
+/// linear map.
 pub unsafe fn install_user_table_in_paddr(
     pml4_paddr: u64,
     level: u32,
     vaddr: u64,
     table_paddr: u64,
 ) -> Result<(), u32> {
-    // BOOTBOOT identity-maps low memory 1:1 in the kernel half, so a
-    // physical address < 1 GiB also names a kernel-virt address.
+    // Use the kernel linear map for the physical PML4 page.
     let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     install_user_table_in(pml4, level, vaddr, table_paddr)
 }

@@ -69,12 +69,12 @@ if ! rustup +nightly component list --installed 2>/dev/null | grep -q '^rust-src
   rustup +nightly component add rust-src
 fi
 
-# Phase 39 — the rootserver is now delivered to the kernel at
-# runtime via the BOOTBOOT initrd (a USTAR tar archive packed by
+# Phase 39 — the rootserver is delivered to the kernel at runtime
+# via the Simpleboot initrd module (a USTAR tar archive packed by
 # scripts/make_image.sh), not embedded via include_bytes!. Building
-# the rootserver no longer triggers a kernel rebuild — it just
-# stages a fresh ELF at .tmp/rootserver.elf for make_image.sh to
-# bundle into the archive.
+# the rootserver no longer triggers a kernel rebuild — it just stages
+# a fresh ELF at .tmp/rootserver.elf for make_image.sh to bundle into
+# the archive.
 #
 # Phase 34a: the `microtest` cargo feature on the kernel propagates
 # to the rootserver crate so its `_start` runs the structured test

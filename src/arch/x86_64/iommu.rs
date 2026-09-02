@@ -327,9 +327,7 @@ fn log_hex(v: u64) {
 /// IOMMU page pool is installed (`install_iommu_pool`). Idempotent-ish:
 /// safe to call once.
 pub fn vtd_init() {
-    let bootboot =
-        unsafe { &*(crate::bootboot::BOOTBOOT_INFO as *const crate::bootboot::BOOTBOOT) };
-    let sdt_addr = unsafe { bootboot.arch.x86_64 }.acpi_ptr;
+    let sdt_addr = crate::simpleboot::acpi_table_address();
 
     let dmar = match acpi::find_dmar(sdt_addr) {
         Ok(d) => d,

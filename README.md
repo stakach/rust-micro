@@ -3,7 +3,7 @@
 A high-performance, memory-safe microkernel written in Rust — a from-scratch
 reimplementation of the [seL4](https://sel4.systems/) microkernel (the C
 reference lives in [`seL4/`](seL4/)). It boots via
-[BOOTBOOT](https://gitlab.com/bztsrc/bootboot) on UEFI, runs in QEMU, and uses
+[Simpleboot](https://gitlab.com/bztsrc/simpleboot) on UEFI, runs in QEMU, and uses
 an `isa-debug-exit` device so an in-kernel (or userspace) test runner can return
 a pass/fail exit code straight to the host shell. No external crates — the
 kernel depends only on `core`.
@@ -79,9 +79,9 @@ echo $?                          # 0 = all specs passed, 255 = panic
    (the default Rust rootserver, or a variant — see features below),
 2. builds the **kernel** with `-Z build-std=core` against
    `triplets/mykernel-x86.json`,
-3. chains **`make_image.sh`**, which packs `kernel` + `rootserver` into a USTAR
-   initrd and writes a FAT32 EFI image to `.tmp/disk.img` (fetching
-   `bootboot.efi` once into `.tmp/`).
+3. chains **`make_image.sh`**, which packs `rootserver` into a USTAR initrd
+   module and asks Simpleboot to write a GPT/ESP image to `.tmp/disk.img`
+   (fetching and compiling the Simpleboot image creator once into `.tmp/`).
 
 ```sh
 ./scripts/build_kernel.sh                 # default build (spec)

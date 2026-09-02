@@ -7,12 +7,12 @@
 //! The real boot.c does much more — populate the BootInfo frame,
 //! create initial caps, hand control to the init thread. That's
 //! the next phase. This commit lands the algorithmic core with the
-//! BOOTBOOT memory-map adapter so the bring-up has a foundation.
+//! Simpleboot memory-map adapter so the bring-up has a foundation.
 
-use crate::region::{align_up, PRegion};
+use crate::region::{align_down, align_up, PRegion};
 
 // ---------------------------------------------------------------------------
-// Memory-map representation. Independent of BOOTBOOT so the algorithm
+// Memory-map representation. Independent of Simpleboot so the algorithm
 // can be exercised against synthetic maps in specs.
 // ---------------------------------------------------------------------------
 
@@ -36,8 +36,9 @@ pub struct MemEntry {
 // in upstream); we pick the same default.
 // ---------------------------------------------------------------------------
 
-pub const MAX_FREEMEM_REGIONS: usize = 16;
-pub const MAX_RESERVED_REGIONS: usize = 16;
+pub const MAX_BOOT_MMAP_ENTRIES: usize = 240;
+pub const MAX_FREEMEM_REGIONS: usize = 128;
+pub const MAX_RESERVED_REGIONS: usize = 128;
 
 #[derive(Copy, Clone, Debug)]
 pub struct RegionList {
@@ -300,36 +301,113 @@ fn layout_at(base: u64, layout: &RootserverLayout) -> RootserverMem {
 }
 
 // ---------------------------------------------------------------------------
-// BOOTBOOT memory-map adapter. Walks the inline mmap entries that
-// follow the BOOTBOOT header and converts each into a `MemEntry`.
-// Only run on an x86_64 build.
+// Simpleboot memory-map adapter. Walks the Multiboot2 memory-map tag
+// and converts each entry into a `MemEntry`.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
-pub fn read_bootboot_mmap(out: &mut [MemEntry]) -> usize {
-    use crate::bootboot::*;
-    let bootboot = unsafe { &*(BOOTBOOT_INFO as *const BOOTBOOT) };
-    // Number of mmap entries = (header size − offset of mmap field) / 16.
-    let mmap_offset = core::mem::offset_of!(BOOTBOOT, mmap) as u32;
-    let total = (bootboot.size - mmap_offset) / 16;
-    let count = (total as usize).min(out.len());
-    let base_ptr = &bootboot.mmap as *const MMapEnt;
-    for i in 0..count {
-        let ent = unsafe { core::ptr::read_unaligned(base_ptr.add(i)) };
-        let raw_size = ent.size;
-        let kind = match (raw_size & 0xF) as u32 {
-            MMAP_FREE => MemKind::Free,
-            MMAP_ACPI => MemKind::Acpi,
-            MMAP_MMIO => MemKind::Mmio,
+pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> usize {
+    const EFI_MEMORY_MAPPED_IO: u32 = 11;
+    const EFI_MEMORY_MAPPED_IO_PORT_SPACE: u32 = 12;
+
+    let mut count = 0usize;
+    crate::simpleboot::for_each_mmap_entry(|entry| {
+        if count >= out.len() {
+            return;
+        }
+        let kind = match entry.entry_type {
+            crate::simpleboot::MULTIBOOT_MEMORY_AVAILABLE => MemKind::Free,
+            crate::simpleboot::MULTIBOOT_MEMORY_ACPI_RECLAIMABLE
+            | crate::simpleboot::MULTIBOOT_MEMORY_NVS => MemKind::Acpi,
+            _ if entry.reserved == EFI_MEMORY_MAPPED_IO
+                || entry.reserved == EFI_MEMORY_MAPPED_IO_PORT_SPACE =>
+            {
+                MemKind::Mmio
+            }
             _ => MemKind::Used,
         };
-        let bytes = raw_size & !0xF;
-        out[i] = MemEntry {
-            region: PRegion::new(ent.ptr, ent.ptr + bytes),
+        let Some(end) = entry.base_addr.checked_add(entry.length) else {
+            return;
+        };
+        out[count] = MemEntry {
+            region: PRegion::new(entry.base_addr, end),
             kind,
         };
-    }
+        count += 1;
+    });
     count
+}
+
+#[cfg(target_arch = "x86_64")]
+fn reserve_simpleboot_allocations(free: &mut RegionList) -> Result<(), BootError> {
+    if let Some((start, end)) = crate::simpleboot::mbi_region() {
+        reserve_page_range(free, start, end)?;
+    }
+
+    let mut err = None;
+    crate::simpleboot::for_each_module_region(|start, end| {
+        if err.is_none() {
+            err = reserve_page_range(free, start, end).err();
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+
+    crate::simpleboot::for_each_kernel_region(|start, end| {
+        if err.is_none() {
+            err = reserve_page_range(free, start, end).err();
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+
+    reserve_live_page_tables(free)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn reserve_page_range(free: &mut RegionList, start: u64, end: u64) -> Result<(), BootError> {
+    if end <= start {
+        return Ok(());
+    }
+    reserve(free, PRegion::new(align_down(start, 12), align_up(end, 12)))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
+    const PTE_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+    unsafe fn walk(free: &mut RegionList, table_paddr: u64, level: u8) -> Result<(), BootError> {
+        const PTE_PRESENT: u64 = 1 << 0;
+        const PTE_PS: u64 = 1 << 7;
+        const PTE_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+        let table = table_paddr as *const u64;
+        for i in 0..512 {
+            let entry = core::ptr::read_volatile(table.add(i));
+            if entry & PTE_PRESENT == 0 {
+                continue;
+            }
+            if level <= 3 && entry & PTE_PS != 0 {
+                continue;
+            }
+            let child = entry & PTE_PADDR_MASK;
+            if child == 0 {
+                continue;
+            }
+            reserve_page_range(free, child, child + 4096)?;
+            let child_level = level - 1;
+            if child_level > 1 {
+                walk(free, child, child_level)?;
+            }
+        }
+        Ok(())
+    }
+
+    let root = crate::arch::x86_64::paging::read_cr3() & PTE_PADDR_MASK;
+    reserve_page_range(free, root, root + 4096)?;
+    unsafe { walk(free, root, 4) }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,25 +422,22 @@ pub fn read_bootboot_mmap(out: &mut [MemEntry]) -> usize {
 pub fn kernel_init() -> Result<RootserverMem, BootError> {
     use crate::arch;
 
-    arch::log("boot: reading BOOTBOOT memory map\n");
+    arch::log("boot: reading Simpleboot memory map\n");
     let mut entries = [MemEntry {
         region: PRegion::new(0, 0),
         kind: MemKind::Used,
-    }; MAX_FREEMEM_REGIONS];
-    let n = read_bootboot_mmap(&mut entries);
+    }; MAX_BOOT_MMAP_ENTRIES];
+    let n = read_simpleboot_mmap(&mut entries);
     arch::log("boot:   ");
     log_count(n);
     arch::log(" map entries\n");
 
     let mut free = extract_free(&entries[..n])?;
+    reserve_simpleboot_allocations(&mut free)?;
     arch::log("boot: free regions after sort+coalesce: ");
     log_count(free.len);
     arch::log("\n");
 
-    // Reserve the kernel image. Linker symbols `__text_start` /
-    // `__bss_end` would let us bound it; for now we don't have
-    // explicit symbols, so we trust BOOTBOOT to report the kernel's
-    // physical pages as MMAP_USED rather than MMAP_FREE.
     let layout = RootserverLayout::default_x86_64();
     let mem = place_rootserver(&mut free, &layout)?;
 
@@ -383,7 +458,7 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
     Ok(mem)
 }
 
-/// Phase 41 — reserve a contiguous chunk of BOOTBOOT-identity-
+/// Phase 41 — reserve a contiguous chunk of Simpleboot-identity-
 /// mapped low memory for the rootserver loader's user-page
 /// allocator. Sized for sel4test-driver-class workloads (~3.9 MiB
 /// of LOAD segments + aux). Called before specs run so the
@@ -401,9 +476,10 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
     let mut entries = [MemEntry {
         region: PRegion::new(0, 0),
         kind: MemKind::Used,
-    }; MAX_FREEMEM_REGIONS];
-    let n = read_bootboot_mmap(&mut entries);
+    }; MAX_BOOT_MMAP_ENTRIES];
+    let n = read_simpleboot_mmap(&mut entries);
     let mut free = extract_free(&entries[..n])?;
+    reserve_simpleboot_allocations(&mut free)?;
 
     const USER_PAGES_SIZE: u64 = 16 * 1024 * 1024;
     // Phase 44 — the VT-d IOMMU's root + context tables live in a small
@@ -463,7 +539,7 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
     // Phase 42 — backing memory for the rootserver's Untyped cap.
     //
     // This remains a single power-of-two, power-of-two-aligned seL4 Untyped. Size it from the live
-    // BOOTBOOT free map instead of hard-coding the old 256 MiB value: the ReactOS desktop workload
+    // Simpleboot free map instead of hard-coding the old 256 MiB value: the ReactOS desktop workload
     // now reaches a broader steady-state service/process wave, and the normal QEMU launch gives us
     // enough RAM to hand the rootserver 512 MiB while preserving smaller spec maps.
     let ut_size_bits = choose_rootserver_untyped_size_bits(&free)?;
@@ -609,7 +685,7 @@ pub mod spec {
         rootserver_untyped_prefers_target_when_available();
         rootserver_untyped_falls_back_to_minimum();
         rootserver_untyped_fails_below_minimum();
-        bootboot_mmap_yields_at_least_one_free_region();
+        simpleboot_mmap_yields_at_least_one_free_region();
         arch::log("Boot tests completed\n");
     }
 
@@ -748,19 +824,19 @@ pub mod spec {
 
     #[inline(never)]
     #[cfg(target_arch = "x86_64")]
-    fn bootboot_mmap_yields_at_least_one_free_region() {
+    fn simpleboot_mmap_yields_at_least_one_free_region() {
         let mut entries = [MemEntry {
             region: PRegion::new(0, 0),
             kind: MemKind::Used,
         }; 16];
-        let n = read_bootboot_mmap(&mut entries);
-        assert!(n > 0, "BOOTBOOT must report at least one mmap entry");
+        let n = read_simpleboot_mmap(&mut entries);
+        assert!(n > 0, "Simpleboot must report at least one mmap entry");
         let any_free = entries[..n].iter().any(|e| e.kind == MemKind::Free);
-        assert!(any_free, "BOOTBOOT must report at least one free region");
-        arch::log("  ✓ BOOTBOOT mmap parses at least one Free region\n");
+        assert!(any_free, "Simpleboot must report at least one free region");
+        arch::log("  ✓ Simpleboot mmap parses at least one Free region\n");
     }
 
     #[inline(never)]
     #[cfg(not(target_arch = "x86_64"))]
-    fn bootboot_mmap_yields_at_least_one_free_region() {}
+    fn simpleboot_mmap_yields_at_least_one_free_region() {}
 }
