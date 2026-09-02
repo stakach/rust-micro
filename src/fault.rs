@@ -398,6 +398,12 @@ pub fn resume_ip(f: &crate::tcb::Tcb) -> Word {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn resume_ip(f: &crate::tcb::Tcb) -> Word {
+    // seL4/src/arch/arm/machine/hardware.c::getRestartPC.
+    f.user_context.fault_ip
+}
+
 /// IP to REPORT from TCB_ReadRegisters (the "fault IP"). For a thread
 /// blocked in an IPC syscall, the saved IP is the SYSCALL *return*
 /// address; report the syscall instruction itself (2 bytes earlier on
@@ -421,6 +427,11 @@ pub fn reported_ip(f: &crate::tcb::Tcb) -> Word {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn reported_ip(f: &crate::tcb::Tcb) -> Word {
+    f.user_context.fault_ip
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn resume_flags(f: &crate::tcb::Tcb) -> Word {
     if f.use_iretq_resume {
@@ -428,6 +439,11 @@ pub fn resume_flags(f: &crate::tcb::Tcb) -> Word {
     } else {
         f.user_context.r11
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn resume_flags(f: &crate::tcb::Tcb) -> Word {
+    f.user_context.spsr_el1
 }
 
 /// Set the address this thread resumes at, honoring its capture
@@ -441,12 +457,25 @@ pub fn set_resume_ip(f: &mut crate::tcb::Tcb, ip: Word) {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn set_resume_ip(f: &mut crate::tcb::Tcb, ip: Word) {
+    f.user_context.fault_ip = ip;
+    f.user_context.elr_el1 = ip;
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn set_resume_flags(f: &mut crate::tcb::Tcb, flags: Word) {
     f.user_context.rflags = flags;
     if !f.use_iretq_resume {
         f.user_context.r11 = flags;
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn set_resume_flags(f: &mut crate::tcb::Tcb, flags: Word) {
+    // seL4 include/arch/arm/arch/64/mode/kernel/thread.h:
+    // preserve NZCV and force an EL0t user PSTATE with FIQ masked.
+    f.user_context.spsr_el1 = (flags & 0xf000_0000) | (1 << 6);
 }
 
 /// Apply a fault reply to `caller` (a thread blocked on an
@@ -606,20 +635,52 @@ pub unsafe fn apply_fault_reply(
     }
 }
 
-/// Preserve the architecture-independent fault restart rules until the
-/// AArch64 exception-entry path can implement seL4's register writeback.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn apply_fault_reply(
     s: &mut KernelState,
     caller: TcbId,
     label: Word,
-    _length: usize,
-    _regs: &[Word],
+    length: usize,
+    regs: &[Word],
 ) -> bool {
     let fault_type = s.scheduler.slab.get(caller).pending_fault;
-    s.scheduler.slab.get_mut(caller).pending_fault = 0;
+    let t = s.scheduler.slab.get_mut(caller);
+    t.pending_fault = 0;
+    let n = length.min(regs.len());
     match fault_type {
-        2 | 3 => label == 0,
+        2 => {
+            // AArch64 SYSCALL_MESSAGE in the pinned seL4 registerset:
+            // X0..X7, FaultIP, SP_EL0, ELR_EL1 (LR), SPSR_EL1.
+            for (dst, src) in t.user_context.x[..8].iter_mut().zip(regs.iter().take(n)) {
+                *dst = *src;
+            }
+            if n > 8 {
+                t.user_context.fault_ip = regs[8];
+            }
+            if n > 9 {
+                t.user_context.sp_el0 = regs[9];
+            }
+            if n > 10 {
+                t.user_context.elr_el1 = regs[10];
+            }
+            if n > 11 {
+                set_resume_flags(t, regs[11]);
+            }
+            label == 0
+        }
+        3 => {
+            // AArch64 EXCEPTION_MESSAGE: FaultIP, SP_EL0, SPSR_EL1.
+            if n > 0 {
+                set_resume_ip(t, regs[0]);
+            }
+            if n > 1 {
+                t.user_context.sp_el0 = regs[1];
+            }
+            if n > 2 {
+                set_resume_flags(t, regs[2]);
+            }
+            label == 0
+        }
         _ => true,
     }
 }
@@ -731,9 +792,72 @@ fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 fn encode_for_arch(fault: &FaultMessage, f: &mut crate::tcb::Tcb) -> usize {
-    fault.encode(&mut f.msg_regs)
+    let ctx = f.user_context;
+    let ip = resume_ip(f);
+    let regs = &mut f.msg_regs;
+    match *fault {
+        FaultMessage::Null => 0,
+        FaultMessage::CapFault { addr, in_recv } => {
+            regs[0] = ip;
+            regs[1] = addr;
+            regs[2] = in_recv as Word;
+            for r in regs.iter_mut().take(8).skip(3) {
+                *r = 0;
+            }
+            8
+        }
+        FaultMessage::UnknownSyscall { number } => {
+            regs[..8].copy_from_slice(&ctx.x[..8]);
+            regs[8] = ctx.fault_ip;
+            regs[9] = ctx.sp_el0;
+            regs[10] = ctx.elr_el1;
+            regs[11] = ctx.spsr_el1;
+            regs[12] = number;
+            13
+        }
+        FaultMessage::UserException { number, code } => {
+            regs[0] = ctx.fault_ip;
+            regs[1] = ctx.sp_el0;
+            regs[2] = ctx.spsr_el1;
+            regs[3] = number as Word;
+            regs[4] = code as Word;
+            5
+        }
+        FaultMessage::VMFault {
+            addr,
+            fsr,
+            instruction,
+        } => {
+            regs[0] = ip;
+            regs[1] = addr;
+            regs[2] = instruction as Word;
+            regs[3] = fsr;
+            4
+        }
+        FaultMessage::Timeout { data, consumed } => {
+            regs[0] = data;
+            regs[1] = consumed;
+            2
+        }
+        FaultMessage::DebugException {
+            fault_ip,
+            reason,
+            trigger_addr,
+            bp_num,
+        } => {
+            regs[0] = fault_ip;
+            regs[1] = reason;
+            if reason != 2 && reason != 3 {
+                regs[2] = trigger_addr;
+                regs[3] = bp_num;
+                4
+            } else {
+                2
+            }
+        }
+    }
 }
 
 #[cfg(feature = "spec")]

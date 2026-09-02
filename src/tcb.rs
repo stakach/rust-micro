@@ -514,7 +514,7 @@ impl TcbSlab {
                 // (SMP FPU save/restore). The `Default` is already a
                 // valid FINIT image; this just adopts the canonical
                 // boot-captured one for fidelity.
-                #[cfg(feature = "smp")]
+                #[cfg(all(feature = "smp", target_arch = "x86_64"))]
                 crate::arch::x86_64::fpu_ctx::stamp_template(&mut slot.as_mut().unwrap().fpu_state);
                 return Some(TcbId(i as u16));
             }

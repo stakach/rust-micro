@@ -551,10 +551,13 @@ pub mod spec {
         self_ipi_is_a_no_op();
         all_aps_came_up();
         bkl_acquire_release_round_trip();
-        cross_cpu_ipi_delivers_and_runs_isr();
-        ap_picks_thread_off_its_queue_via_reschedule();
-        shootdown_fans_invalidate_tlb_to_aps();
-        ap_dispatches_user_thread_end_to_end();
+        #[cfg(target_arch = "x86_64")]
+        {
+            cross_cpu_ipi_delivers_and_runs_isr();
+            ap_picks_thread_off_its_queue_via_reschedule();
+            shootdown_fans_invalidate_tlb_to_aps();
+            ap_dispatches_user_thread_end_to_end();
+        }
         arch::log("SMP tests completed\n");
     }
 
@@ -564,6 +567,7 @@ pub mod spec {
     /// bumps the counter from inside `rust_syscall_dispatch` on AP1).
     /// The ping thread keeps running after this spec returns; that's
     /// fine — the AY demo on BSP runs in parallel without disturbance.
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn ap_dispatches_user_thread_end_to_end() {
         if crate::simpleboot::get_num_cores() < 2 {
@@ -619,6 +623,7 @@ pub mod spec {
     /// Phase 28g — `shootdown_tlb(vaddr)` must fan an
     /// `InvalidateTlb` IPI to every CPU other than the caller. We
     /// fire one from BSP and watch each AP's IPI counter advance.
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn shootdown_fans_invalidate_tlb_to_aps() {
         let n_cores = crate::simpleboot::get_num_cores() as u32;
@@ -682,6 +687,7 @@ pub mod spec {
     /// AP1's IPI handler runs `choose_thread` and assigns it as
     /// `nodes[1].current`. Verifies the per-CPU scheduler can be
     /// driven from another CPU end-to-end.
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn ap_picks_thread_off_its_queue_via_reschedule() {
         if crate::simpleboot::get_num_cores() < 2 {
@@ -747,6 +753,7 @@ pub mod spec {
     /// wakes it, the ISR drains pending IPIs and bumps
     /// `IPI_HANDLED_COUNT`, then `iretq` back to `hlt`. We poll
     /// the counter from BSP outside the BKL.
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn cross_cpu_ipi_delivers_and_runs_isr() {
         // Skip if running with -smp 1.

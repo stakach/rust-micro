@@ -61,6 +61,21 @@ pub fn phys_to_virt(paddr: u64) -> u64 {
     }
 }
 
+/// Translate a kernel virtual address back to the physical address stored in
+/// capability and IPC-buffer metadata.
+#[inline(always)]
+pub fn virt_to_phys(vaddr: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64::paging::kernel_virt_to_phys(vaddr)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // The initial AArch64 boot contract keeps kernel RAM identity mapped.
+        vaddr
+    }
+}
+
 /// Read the send destination used by seL4's combined send/receive ABI.
 #[inline]
 pub fn composite_send_destination(context: &UserContext, wait_variant: bool) -> u64 {
@@ -77,6 +92,100 @@ pub fn composite_send_destination(context: &UserContext, wait_variant: bool) -> 
         // seL4 registerset.h: replyRegister = X6 and
         // nbsendRecvDest = X8.
         context.x[if wait_variant { 6 } else { 8 }]
+    }
+}
+
+#[inline]
+pub fn set_composite_send_destination(
+    context: &mut UserContext,
+    wait_variant: bool,
+    destination: u64,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if wait_variant {
+            context.r12 = destination;
+        } else {
+            context.r13 = destination;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        context.x[if wait_variant { 6 } else { 8 }] = destination;
+    }
+}
+
+#[inline]
+pub fn ipc_badge(context: &UserContext) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    return context.rdi;
+    #[cfg(target_arch = "aarch64")]
+    return context.x[0];
+}
+
+#[inline]
+pub fn ipc_message_info(context: &UserContext) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    return context.rsi;
+    #[cfg(target_arch = "aarch64")]
+    return context.x[1];
+}
+
+#[inline]
+pub fn ipc_message_register(context: &UserContext, index: usize) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match index {
+            0 => context.r10,
+            1 => context.r8,
+            2 => context.r9,
+            3 => context.r15,
+            _ => 0,
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        context.x.get(index + 2).copied().unwrap_or(0)
+    }
+}
+
+#[inline]
+pub fn syscall_result(context: &UserContext) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    return context.rax;
+    #[cfg(target_arch = "aarch64")]
+    return context.x[0];
+}
+
+#[inline]
+pub fn set_syscall_result(context: &mut UserContext, result: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        context.rax = result;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        context.x[0] = result;
+    }
+}
+
+#[inline]
+pub fn stack_pointer(context: &UserContext) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    return context.rsp;
+    #[cfg(target_arch = "aarch64")]
+    return context.sp_el0;
+}
+
+#[inline]
+pub fn set_stack_pointer(context: &mut UserContext, sp: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        context.rsp = sp;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        context.sp_el0 = sp;
     }
 }
 

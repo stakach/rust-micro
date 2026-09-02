@@ -827,25 +827,22 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         // below installs a fresh offer after bound-notification
         // delivery has been ruled out.
         s.scheduler.slab.get_mut(current).pending_reply = None;
-        // Phase 36d / 43 — MCS reply cap is in `replyRegister = R12`
-        // per upstream's `registerset.h`. libsel4's `MCS_REPLY_DECL`
-        // pins it via `register seL4_Word reply_reg asm("r12") = reply;`.
-        // Read it from the saved `user_context.r12` (NOT args.a2 / r10
-        // which is mr0). cptr 0 means "no reply" — we fall back to the
-        // legacy Tcb.reply_to path that handle_reply consults.
+        // Phase 36d / 43 — read seL4's architecture-defined reply register
+        // (x86 R12, AArch64 X6). cptr 0 means "no reply" — we fall back to
+        // the legacy Tcb.reply_to path that handle_reply consults.
         //
         // The offer is only committed for Endpoint receives. A bound
         // notification that satisfies Recv must not leave the reply
         // object pending, or a later unrelated Call on this TCB could
         // bind that stale reply object to the wrong caller.
         let mut endpoint_reply_idx: Option<u16> = None;
-        #[cfg(target_arch = "x86_64")]
-        {
-            let reply_cptr = s.scheduler.slab.get(current).user_context.r12;
-            if reply_cptr != 0 {
-                if let Ok(Cap::Reply { ptr, .. }) = lookup_cap(s, &cspace_root, reply_cptr) {
-                    endpoint_reply_idx = Some(crate::kernel::KernelState::reply_index(ptr) as u16);
-                }
+        let reply_cptr = crate::arch::composite_send_destination(
+            &s.scheduler.slab.get(current).user_context,
+            true,
+        );
+        if reply_cptr != 0 {
+            if let Ok(Cap::Reply { ptr, .. }) = lookup_cap(s, &cspace_root, reply_cptr) {
+                endpoint_reply_idx = Some(crate::kernel::KernelState::reply_index(ptr) as u16);
             }
         }
         let ep_ptr = match target {
@@ -890,11 +887,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                     // NBWait on Idle notification — return 0 badge.
                     let tcb = sched.slab.get_mut(current);
                     tcb.ipc_badge = 0;
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        tcb.user_context.rdi = 0;
-                        tcb.user_context.rsi = 0;
-                    }
+                    crate::arch::set_ipc_return(&mut tcb.user_context, 0, 0, &[]);
                     return Ok(());
                 }
                 let _outcome = crate::notification::wait(ntfn, sched, current);
@@ -923,11 +916,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 {
                     let tcb = s.scheduler.slab.get_mut(current);
                     tcb.ipc_badge = badge;
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        tcb.user_context.rdi = badge;
-                        tcb.user_context.rsi = 0;
-                    }
+                    crate::arch::set_ipc_return(&mut tcb.user_context, badge, 0, &[]);
                 }
                 s.scheduler.rotate_current_after_bound_notification(current);
                 return Ok(());
@@ -950,12 +939,10 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         // contract: badge = 0 in rdi, msginfo = 0 in rsi. Without
         // this, userspace reads stale registers and NBWAIT0001 sees
         // a non-zero badge.
-        #[cfg(target_arch = "x86_64")]
         if matches!(outcome, crate::endpoint::IpcOutcome::Skipped) {
             let tcb = s.scheduler.slab.get_mut(current);
             tcb.ipc_badge = 0;
-            tcb.user_context.rdi = 0;
-            tcb.user_context.rsi = 0;
+            crate::arch::set_ipc_return(&mut tcb.user_context, 0, 0, &[]);
         }
         Ok(())
     }
@@ -1117,18 +1104,13 @@ pub mod spec {
     fn nbsendrecv_bad_send_marks_receive_as_not_executed() {
         use crate::kernel::KERNEL;
 
-        let (current, saved_r13, saved_rdi, saved_rsi) = unsafe {
+        let (current, saved_context) = unsafe {
             let s = KERNEL.get();
             let current = s.scheduler.current().expect("spec boot thread");
             let tcb = s.scheduler.slab.get_mut(current);
-            let saved = (
-                current,
-                tcb.user_context.r13,
-                tcb.user_context.rdi,
-                tcb.user_context.rsi,
-            );
-            tcb.user_context.r13 = u64::MAX - 1;
-            saved
+            let saved_context = tcb.user_context;
+            crate::arch::set_composite_send_destination(&mut tcb.user_context, false, u64::MAX - 1);
+            (current, saved_context)
         };
 
         let mut sink = BufferSink::new();
@@ -1136,11 +1118,9 @@ pub mod spec {
         assert!(result.is_err());
         unsafe {
             let tcb = KERNEL.get().scheduler.slab.get_mut(current);
-            assert_eq!(tcb.user_context.rdi, u64::MAX);
-            assert_ne!(tcb.user_context.rsi >> 12, 0);
-            tcb.user_context.r13 = saved_r13;
-            tcb.user_context.rdi = saved_rdi;
-            tcb.user_context.rsi = saved_rsi;
+            assert_eq!(crate::arch::ipc_badge(&tcb.user_context), u64::MAX);
+            assert_ne!(crate::arch::ipc_message_info(&tcb.user_context) >> 12, 0);
+            tcb.user_context = saved_context;
         }
         arch::log("  ✓ NBSendRecv send failure cannot masquerade as a receive\n");
     }
@@ -1467,10 +1447,11 @@ pub mod spec {
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
             server_t.active_sc = Some(1);
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r13 = REPLY_HANDOFF_MAGIC;
-            }
+            crate::arch::set_composite_send_destination(
+                &mut server_t.user_context,
+                false,
+                REPLY_HANDOFF_MAGIC,
+            );
             server_t.cspace_root = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
@@ -1529,7 +1510,14 @@ pub mod spec {
         let status = 0x1234_5678u64;
         let resume_ip = 0x0000_0000_801f_0c4eu64;
         let resume_sp = 0x0000_0100_105c_3cf8u64;
+        #[cfg(target_arch = "x86_64")]
         let resume_flags = 0x202u64;
+        #[cfg(target_arch = "aarch64")]
+        let resume_flags = 0xa000_0040u64;
+        #[cfg(target_arch = "x86_64")]
+        const FAULT_REPLY_LENGTH: Word = 18;
+        #[cfg(target_arch = "aarch64")]
+        const FAULT_REPLY_LENGTH: Word = 12;
 
         let (server, caller, reply_idx) = unsafe {
             let s = KERNEL.get();
@@ -1549,14 +1537,13 @@ pub mod spec {
             caller_t.priority = 40;
             caller_t.state = ThreadStateType::BlockedOnReply;
             caller_t.pending_fault = 2;
-            caller_t.user_context.rsp = 0xaaaa;
+            crate::arch::set_stack_pointer(&mut caller_t.user_context, 0xaaaa);
             let caller = s.scheduler.admit(caller_t);
 
             let mut server_t = Tcb::default();
             server_t.priority = 255;
             server_t.state = ThreadStateType::Running;
-            server_t.ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut SERVER_BUF) as u64);
+            server_t.ipc_buffer_paddr = crate::arch::virt_to_phys((&raw mut SERVER_BUF) as u64);
             server_t.cspace_root = Cap::CNode {
                 ptr: KernelState::cnode_ptr(cn),
                 radix: 5,
@@ -1574,12 +1561,24 @@ pub mod spec {
 
         unsafe {
             let buf = (&raw mut SERVER_BUF) as *mut u64;
-            for i in 4..18 {
+            for i in 4..FAULT_REPLY_LENGTH as usize {
                 core::ptr::write_volatile(buf.add(1 + i), 0);
             }
-            core::ptr::write_volatile(buf.add(1 + 15), resume_ip);
-            core::ptr::write_volatile(buf.add(1 + 16), resume_sp);
-            core::ptr::write_volatile(buf.add(1 + 17), resume_flags);
+            #[cfg(target_arch = "x86_64")]
+            {
+                core::ptr::write_volatile(buf.add(1 + 15), resume_ip);
+                core::ptr::write_volatile(buf.add(1 + 16), resume_sp);
+                core::ptr::write_volatile(buf.add(1 + 17), resume_flags);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // seL4's AArch64 UnknownSyscall reply register order is
+                // X0..X7, FaultIP, SP_EL0, ELR_EL1, SPSR_EL1.
+                core::ptr::write_volatile(buf.add(1 + 8), resume_ip);
+                core::ptr::write_volatile(buf.add(1 + 9), resume_sp);
+                core::ptr::write_volatile(buf.add(1 + 10), resume_ip);
+                core::ptr::write_volatile(buf.add(1 + 11), resume_flags);
+            }
         }
 
         let mut sink = BufferSink::new();
@@ -1587,7 +1586,7 @@ pub mod spec {
             Syscall::SysCall,
             &SyscallArgs {
                 a0: 2,
-                a1: 18,
+                a1: FAULT_REPLY_LENGTH,
                 a2: status as Word,
                 ..Default::default()
             },
@@ -1599,8 +1598,11 @@ pub mod spec {
             let caller_t = s.scheduler.slab.get(caller);
             assert_eq!(caller_t.state, ThreadStateType::Running);
             assert_eq!(caller_t.pending_fault, 0);
-            assert_eq!(caller_t.user_context.rax, status);
-            assert_eq!(caller_t.user_context.rsp, resume_sp);
+            assert_eq!(crate::arch::syscall_result(&caller_t.user_context), status);
+            assert_eq!(
+                crate::arch::stack_pointer(&caller_t.user_context),
+                resume_sp
+            );
             assert_eq!(crate::fault::resume_ip(caller_t), resume_ip);
             assert_eq!(crate::fault::resume_flags(caller_t), resume_flags);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
@@ -1629,7 +1631,10 @@ pub mod spec {
         let initial_rax = 0x7777_8888u64;
         let resume_ip = 0x0000_0100_0085_76b8u64;
         let resume_sp = 0x0000_0100_105b_feb0u64;
+        #[cfg(target_arch = "x86_64")]
         let resume_flags = 0x202u64;
+        #[cfg(target_arch = "aarch64")]
+        let resume_flags = 0xa000_0040u64;
 
         let (server, caller, ep_idx, reply_idx) = unsafe {
             let s = KERNEL.get();
@@ -1661,8 +1666,8 @@ pub mod spec {
             caller_t.priority = 40;
             caller_t.state = ThreadStateType::BlockedOnReply;
             caller_t.pending_fault = 6;
-            caller_t.user_context.rax = initial_rax;
-            caller_t.user_context.rsp = resume_sp;
+            crate::arch::set_syscall_result(&mut caller_t.user_context, initial_rax);
+            crate::arch::set_stack_pointer(&mut caller_t.user_context, resume_sp);
             crate::fault::set_resume_ip(&mut caller_t, resume_ip);
             crate::fault::set_resume_flags(&mut caller_t, resume_flags);
             caller_t.sc = Some(1);
@@ -1679,19 +1684,15 @@ pub mod spec {
             server_t.priority = 255;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.ipc_buffer_paddr =
-                crate::arch::x86_64::paging::kernel_virt_to_phys((&raw mut SERVER_BUF) as u64);
+            server_t.ipc_buffer_paddr = crate::arch::virt_to_phys((&raw mut SERVER_BUF) as u64);
             server_t.cspace_root = Cap::CNode {
                 ptr: KernelState::cnode_ptr(cn),
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r12 = 2;
-                server_t.user_context.r13 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, false, 2);
             let server = s.scheduler.admit(server_t);
 
             s.replies[reply_idx] = Reply {
@@ -1727,8 +1728,14 @@ pub mod spec {
             let caller_t = s.scheduler.slab.get(caller);
             assert_eq!(caller_t.state, ThreadStateType::Running);
             assert_eq!(caller_t.pending_fault, 0);
-            assert_eq!(caller_t.user_context.rax, initial_rax);
-            assert_eq!(caller_t.user_context.rsp, resume_sp);
+            assert_eq!(
+                crate::arch::syscall_result(&caller_t.user_context),
+                initial_rax
+            );
+            assert_eq!(
+                crate::arch::stack_pointer(&caller_t.user_context),
+                resume_sp
+            );
             assert_eq!(crate::fault::resume_ip(caller_t), resume_ip);
             assert_eq!(crate::fault::resume_flags(caller_t), resume_flags);
 
@@ -1758,12 +1765,27 @@ pub mod spec {
             assert_eq!(server_t.state, ThreadStateType::Running);
             assert_eq!(server_t.pending_reply, None);
             assert_eq!(server_t.reply_to, Some(caller));
-            assert_eq!(server_t.user_context.rdi, 0xF1);
-            assert_eq!(server_t.user_context.rsi, 6 << 12 | 4);
-            assert_eq!(server_t.user_context.r10, resume_ip);
-            assert_eq!(server_t.user_context.r8, 0x0000_0100_0094_46b8);
-            assert_eq!(server_t.user_context.r9, 0);
-            assert_eq!(server_t.user_context.r15, 0x7);
+            assert_eq!(crate::arch::ipc_badge(&server_t.user_context), 0xF1);
+            assert_eq!(
+                crate::arch::ipc_message_info(&server_t.user_context),
+                6 << 12 | 4
+            );
+            assert_eq!(
+                crate::arch::ipc_message_register(&server_t.user_context, 0),
+                resume_ip
+            );
+            assert_eq!(
+                crate::arch::ipc_message_register(&server_t.user_context, 1),
+                0x0000_0100_0094_46b8
+            );
+            assert_eq!(
+                crate::arch::ipc_message_register(&server_t.user_context, 2),
+                0
+            );
+            assert_eq!(
+                crate::arch::ipc_message_register(&server_t.user_context, 3),
+                0x7
+            );
             assert_eq!(s.replies[reply_idx].bound_tcb, Some(caller));
             assert!(matches!(s.endpoints[ep_idx].state, EpState::Idle));
 
@@ -1810,10 +1832,11 @@ pub mod spec {
             server_t.priority = 255;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r13 = REPLY_HANDOFF_MAGIC;
-            }
+            crate::arch::set_composite_send_destination(
+                &mut server_t.user_context,
+                false,
+                REPLY_HANDOFF_MAGIC,
+            );
             server_t.cspace_root = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
@@ -1908,10 +1931,7 @@ pub mod spec {
                 guard: 0,
             };
             t.bound_notification = Some(ntfn_idx as u16);
-            #[cfg(target_arch = "x86_64")]
-            {
-                t.user_context.r12 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut t.user_context, true, 2);
             let server = s.scheduler.admit(t);
             s.scheduler.set_current(Some(server));
             (server, ep_idx, ntfn_idx, reply_idx)
@@ -2089,10 +2109,7 @@ pub mod spec {
                 guard: 0,
             };
             server_t.bound_notification = Some(ntfn_idx as u16);
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r12 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
             let server = s.scheduler.admit(server_t);
             s.notifications[ntfn_idx] = Notification {
                 bound_tcb: Some(server),
@@ -2201,10 +2218,7 @@ pub mod spec {
                 guard: 0,
             };
             server_t.bound_notification = Some(ntfn_idx as u16);
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r12 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
             let server = s.scheduler.admit(server_t);
             s.notifications[ntfn_idx] = Notification {
                 bound_tcb: Some(server),
@@ -2322,10 +2336,7 @@ pub mod spec {
                 guard: 0,
             };
             server_t.bound_notification = Some(ntfn_idx as u16);
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r12 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
             let server = s.scheduler.admit(server_t);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
@@ -2467,8 +2478,8 @@ pub mod spec {
             let server_t = s.scheduler.slab.get(server);
             assert_eq!(server_t.reply_to, None);
             assert_eq!(server_t.composite_reply_handoff, None);
-            assert_eq!(server_t.user_context.rdi, 0xD3);
-            assert_eq!(server_t.user_context.rsi, 0);
+            assert_eq!(crate::arch::ipc_badge(&server_t.user_context), 0xD3);
+            assert_eq!(crate::arch::ipc_message_info(&server_t.user_context), 0);
             assert_eq!(s.notifications[ntfn_idx].state, NtfnState::Idle);
             assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.current(), Some(caller));
@@ -2532,11 +2543,8 @@ pub mod spec {
             server_t.sc = Some(0);
             server_t.cspace_root = cspace;
             server_t.bound_notification = Some(ntfn_idx as u16);
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r12 = 2;
-                server_t.user_context.r13 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, false, 2);
             let server = s.scheduler.admit(server_t);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
@@ -2567,8 +2575,8 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             let server_t = s.scheduler.slab.get(server);
-            assert_eq!(server_t.user_context.rdi, 0xD1);
-            assert_eq!(server_t.user_context.rsi, 0);
+            assert_eq!(crate::arch::ipc_badge(&server_t.user_context), 0xD1);
+            assert_eq!(crate::arch::ipc_message_info(&server_t.user_context), 0);
             assert_eq!(s.notifications[ntfn_idx].state, NtfnState::Idle);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
@@ -2635,11 +2643,8 @@ pub mod spec {
             server_t.sc = Some(0);
             server_t.cspace_root = cspace;
             server_t.bound_notification = Some(ntfn_idx as u16);
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r12 = 2;
-                server_t.user_context.r13 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, false, 2);
             let server = s.scheduler.admit(server_t);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
@@ -2691,7 +2696,10 @@ pub mod spec {
                 (*s_ptr).scheduler.slab.get(server).composite_reply_handoff,
                 None
             );
-            assert_eq!((*s_ptr).scheduler.slab.get(server).user_context.rdi, 0xD2);
+            assert_eq!(
+                crate::arch::ipc_badge(&(*s_ptr).scheduler.slab.get(server).user_context),
+                0xD2
+            );
             assert_eq!((*s_ptr).scheduler.current(), Some(caller));
             assert_eq!((*s_ptr).scheduler.take_direct_handoff(), Some(caller));
 
@@ -2756,11 +2764,8 @@ pub mod spec {
             server_t.sc = Some(0);
             server_t.cspace_root = cspace;
             server_t.bound_notification = Some(ntfn_idx as u16);
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_t.user_context.r12 = 2;
-                server_t.user_context.r13 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
+            crate::arch::set_composite_send_destination(&mut server_t.user_context, false, 2);
             let server = s.scheduler.admit(server_t);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
@@ -2815,7 +2820,10 @@ pub mod spec {
                 (*s_ptr).scheduler.slab.get(server).composite_reply_handoff,
                 None
             );
-            assert_eq!((*s_ptr).scheduler.slab.get(server).user_context.rdi, 0xD3);
+            assert_eq!(
+                crate::arch::ipc_badge(&(*s_ptr).scheduler.slab.get(server).user_context),
+                0xD3
+            );
             assert_eq!((*s_ptr).scheduler.current(), None);
             assert_eq!((*s_ptr).scheduler.take_direct_handoff(), None);
             assert_eq!((*s_ptr).scheduler.choose_thread(), Some(server));
@@ -2873,10 +2881,7 @@ pub mod spec {
                 guard_size: 59,
                 guard: 0,
             };
-            #[cfg(target_arch = "x86_64")]
-            {
-                t.user_context.r12 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut t.user_context, true, 2);
             let server = s.scheduler.admit(t);
             s.scheduler.set_current(Some(server));
             (server, ep_idx, reply_idx)
@@ -2958,10 +2963,7 @@ pub mod spec {
             };
             let sender = s.scheduler.admit(mk_tcb());
             let mut server_tcb = mk_tcb();
-            #[cfg(target_arch = "x86_64")]
-            {
-                server_tcb.user_context.r12 = 2;
-            }
+            crate::arch::set_composite_send_destination(&mut server_tcb.user_context, true, 2);
             let server = s.scheduler.admit(server_tcb);
             (sender, server, ep_idx, reply_idx)
         };

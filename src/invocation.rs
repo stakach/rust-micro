@@ -2116,15 +2116,8 @@ static NEXT_ASID_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::Ato
 pub(crate) const REPLY_HANDOFF_MAGIC: Word = 0x4e54_4f53_5245_5431;
 
 fn reply_handoff_requested(s: &KernelState, invoker: TcbId) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        s.scheduler.slab.get(invoker).user_context.r13 == REPLY_HANDOFF_MAGIC
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (s, invoker);
-        false
-    }
+    crate::arch::composite_send_destination(&s.scheduler.slab.get(invoker).user_context, false)
+        == REPLY_HANDOFF_MAGIC
 }
 
 fn handoff_marked_reply_to_caller(
@@ -4756,6 +4749,17 @@ unsafe fn reparent_direct_children(
             moved = moved.checked_add(1).expect("MDB child count overflow");
         }
     }
+    if moved != expected_children {
+        crate::arch::log("MDB reparent mismatch: moved=");
+        log_dec(moved as u64);
+        crate::arch::log(" expected=");
+        log_dec(expected_children as u64);
+        crate::arch::log(" parent_cnode=");
+        log_dec(old_parent.cnode_idx() as u64);
+        crate::arch::log(" parent_slot=");
+        log_dec(old_parent.slot() as u64);
+        crate::arch::log("\n");
+    }
     assert_eq!(
         moved, expected_children,
         "MDB child count must equal the registered direct derivation edges"
@@ -5229,7 +5233,6 @@ fn debug_tcb_fault_slot(s: &KernelState, cspace_idx: Word) -> [Word; 6] {
     [cspace_idx, kind, detail, ep_state, ep_head, ep_tail]
 }
 
-#[cfg(target_arch = "x86_64")]
 fn write_invocation_words(invoker_tcb: &mut crate::tcb::Tcb, ipc_paddr: Word, words: &[Word]) {
     let in_regs = words.len().min(invoker_tcb.msg_regs.len());
     for (i, word) in words.iter().copied().enumerate().take(in_regs) {
@@ -5249,19 +5252,12 @@ fn write_invocation_words(invoker_tcb: &mut crate::tcb::Tcb, ipc_paddr: Word, wo
             }
         }
     }
-    if !words.is_empty() {
-        invoker_tcb.user_context.r10 = words[0];
-    }
-    if words.len() > 1 {
-        invoker_tcb.user_context.r8 = words[1];
-    }
-    if words.len() > 2 {
-        invoker_tcb.user_context.r9 = words[2];
-    }
-    if words.len() > 3 {
-        invoker_tcb.user_context.r15 = words[3];
-    }
-    invoker_tcb.user_context.rsi = (words.len() as u64) & 0x7F;
+    crate::arch::set_ipc_return(
+        &mut invoker_tcb.user_context,
+        0,
+        (words.len() as u64) & 0x7f,
+        &words[..words.len().min(4)],
+    );
 }
 
 fn decode_tcb(
@@ -5395,12 +5391,9 @@ fn decode_tcb(
                     queue_top_priority,
                     direct_handoff,
                 ];
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
-                    let inv = s.scheduler.slab.get_mut(invoker);
-                    write_invocation_words(inv, ipc_paddr, &words);
-                }
+                let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                let inv = s.scheduler.slab.get_mut(invoker);
+                write_invocation_words(inv, ipc_paddr, &words);
                 Ok(())
             }
             // `seL4_TCB_Configure` — one-shot TCB setup. Two ABI
@@ -5778,6 +5771,79 @@ fn decode_tcb(
                         }
                     }
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                    if info.length() == 0 {
+                        let t = s.scheduler.slab.get_mut(id);
+                        t.user_context.fault_ip = args.a2;
+                        t.user_context.elr_el1 = args.a2;
+                        t.user_context.sp_el0 = args.a3;
+                        t.user_context.x[0] = args.a4;
+                        t.user_context.spsr_el1 = 1 << 6;
+                    } else {
+                        let resume = args.a2 & 1 != 0;
+                        let count = (args.a3 as usize).min(36);
+                        let inv = s.scheduler.slab.get(invoker);
+                        let mut regs = [0u64; 36];
+                        if count > 0 {
+                            regs[0] = args.a4;
+                        }
+                        if count > 1 {
+                            regs[1] = args.a5;
+                        }
+                        for i in 2..count {
+                            let msg_idx = i + 2;
+                            if msg_idx < inv.msg_regs.len() {
+                                regs[i] = inv.msg_regs[msg_idx];
+                            } else if inv.ipc_buffer_paddr != 0 {
+                                let buf = (crate::arch::phys_to_virt(inv.ipc_buffer_paddr)
+                                    as *const u64)
+                                    .wrapping_add(1);
+                                regs[i] = core::ptr::read_volatile(buf.add(msg_idx));
+                            }
+                        }
+
+                        let t = s.scheduler.slab.get_mut(id);
+                        if count > 0 {
+                            t.user_context.fault_ip = regs[0];
+                            t.user_context.elr_el1 = regs[0];
+                        }
+                        if count > 1 {
+                            t.user_context.sp_el0 = regs[1];
+                        }
+                        if count > 2 {
+                            t.user_context.spsr_el1 = (regs[2] & 0xf000_0000) | (1 << 6);
+                        }
+                        for public in 3..count.min(12) {
+                            t.user_context.x[public - 3] = regs[public];
+                        }
+                        for (public, register) in [(12, 16), (13, 17), (14, 18), (15, 29), (16, 30)]
+                        {
+                            if count > public {
+                                t.user_context.x[register] = regs[public];
+                            }
+                        }
+                        for public in 17..count.min(24) {
+                            t.user_context.x[public - 8] = regs[public];
+                        }
+                        for public in 24..count.min(34) {
+                            t.user_context.x[public - 5] = regs[public];
+                        }
+                        if count > 34 {
+                            t.user_context.tpidr_el0 = regs[34];
+                        }
+                        if count > 35 {
+                            t.user_context.tpidrro_el0 = regs[35];
+                        }
+                        if resume {
+                            crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
+                            cancel_reply_wait_for_caller(s, id);
+                            s.scheduler.slab.get_mut(id).pending_fault = 0;
+                            s.scheduler.make_runnable(id);
+                        }
+                    }
+                }
                 Ok(())
             }
             InvocationLabel::TCBReadRegisters => {
@@ -5894,6 +5960,32 @@ fn decode_tcb(
                         let mi = (count as u64) & 0x7F;
                         inv.user_context.rsi = mi;
                     }
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                    let t = s.scheduler.slab.get(id);
+                    let mut regs = [0u64; 36];
+                    regs[0] = t.user_context.fault_ip;
+                    regs[1] = t.user_context.sp_el0;
+                    regs[2] = t.user_context.spsr_el1;
+                    regs[3..12].copy_from_slice(&t.user_context.x[0..9]);
+                    for (public, register) in [(12, 16), (13, 17), (14, 18), (15, 29), (16, 30)] {
+                        regs[public] = t.user_context.x[register];
+                    }
+                    regs[17..24].copy_from_slice(&t.user_context.x[9..16]);
+                    regs[24..34].copy_from_slice(&t.user_context.x[19..29]);
+                    regs[34] = t.user_context.tpidr_el0;
+                    regs[35] = t.user_context.tpidrro_el0;
+
+                    let count = if info.length() == 0 {
+                        3
+                    } else {
+                        (args.a3 as usize).min(regs.len())
+                    };
+                    let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                    let inv = s.scheduler.slab.get_mut(invoker);
+                    write_invocation_words(inv, ipc_paddr, &regs[..count]);
                 }
                 Ok(())
             }
@@ -6483,13 +6575,16 @@ pub mod spec {
         mdb_revoke_walks_grandchildren();
         irq_control_issues_handler_cap();
         irq_handler_set_clear_ack();
-        frame_map_unmap_get_address();
-        frame_map_accepts_upstream_libsel4_abi();
         zero_device_frame_get_address();
-        paging_maps_reject_unassigned_explicit_vspace();
-        paging_unmap_requires_exact_physical_identity();
-        page_table_invocation_tracks_asid_and_detaches_hardware();
-        page_table_map_updates_invoked_slot_not_first_alias();
+        #[cfg(target_arch = "x86_64")]
+        {
+            frame_map_unmap_get_address();
+            frame_map_accepts_upstream_libsel4_abi();
+            paging_maps_reject_unassigned_explicit_vspace();
+            paging_unmap_requires_exact_physical_identity();
+            page_table_invocation_tracks_asid_and_detaches_hardware();
+            page_table_map_updates_invoked_slot_not_first_alias();
+        }
         tcb_write_read_registers();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
@@ -6507,6 +6602,14 @@ pub mod spec {
 
     static mut POOL_EXHAUSTION_SCRATCH: [u16; crate::kernel::MAX_DYNAMIC_CNODES] =
         [0; crate::kernel::MAX_DYNAMIC_CNODES];
+
+    #[inline]
+    fn spec_ram_paddr(paddr: u64) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        return paddr;
+        #[cfg(target_arch = "aarch64")]
+        return paddr + 0x4000_0000;
+    }
 
     fn pooled_available(object_type: ObjectType) -> usize {
         unsafe {
@@ -6536,7 +6639,7 @@ pub mod spec {
             ObjectType::Endpoint => s.alloc_endpoint().map(|i| i as u16),
             ObjectType::Notification => s.alloc_notification().map(|i| i as u16),
             ObjectType::CapTable => {
-                let paddr = 0x1800_0000 + (ordinal as u64) * 64;
+                let paddr = spec_ram_paddr(0x1800_0000 + (ordinal as u64) * 64);
                 let backing = crate::arch::phys_to_virt(paddr) as *mut u8;
                 core::ptr::write_bytes(backing, 0, 64);
                 s.alloc_dynamic_cnode(paddr, 1)
@@ -6563,6 +6666,7 @@ pub mod spec {
 
     fn assert_pooled_retype_capacity(object_type: ObjectType, size_bits: u32, base: u64) {
         let invoker = setup_invoker(0);
+        let base = spec_ram_paddr(base);
         let source = Cap::Untyped {
             ptr: PAddr::<crate::cap::UntypedStorage>::new(base),
             block_bits: 16,
@@ -6730,8 +6834,12 @@ pub mod spec {
         }
 
         // AsidControl::MakePool — pool lands in slot 7.
+        #[cfg(target_arch = "x86_64")]
+        let make_pool_label = InvocationLabel::X86ASIDControlMakePool;
+        #[cfg(target_arch = "aarch64")]
+        let make_pool_label = InvocationLabel::ARMASIDControlMakePool;
         let args = SyscallArgs {
-            a1: (InvocationLabel::X86ASIDControlMakePool as u64) << 12,
+            a1: (make_pool_label as u64) << 12,
             a2: 5, // Untyped cap_ptr
             a3: 0, // dest_cnode (ignored — we use invoker's CSpace)
             a4: 7, // dest slot
@@ -6746,8 +6854,12 @@ pub mod spec {
         let _: PPtr<AsidPoolStorage> = pool_ptr; // type assertion
 
         // AsidPool::Assign — give the PML4 in slot 6 an ASID.
+        #[cfg(target_arch = "x86_64")]
+        let assign_label = InvocationLabel::X86ASIDPoolAssign;
+        #[cfg(target_arch = "aarch64")]
+        let assign_label = InvocationLabel::ARMASIDPoolAssign;
         let args = SyscallArgs {
-            a1: (InvocationLabel::X86ASIDPoolAssign as u64) << 12,
+            a1: (assign_label as u64) << 12,
             a2: 6, // vspace cap_ptr
             ..Default::default()
         };
@@ -6947,6 +7059,7 @@ pub mod spec {
         arch::log("  ✓ Revoke walks derivation graph transitively (MDB)\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn paging_unmap_requires_exact_physical_identity() {
         #[repr(C, align(4096))]
@@ -7050,6 +7163,7 @@ pub mod spec {
         arch::log("  ✓ paging unmap requires exact physical identity at every level\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn page_table_invocation_tracks_asid_and_detaches_hardware() {
         #[repr(C, align(4096))]
@@ -7208,6 +7322,7 @@ pub mod spec {
     /// Page-structure map must update the cap slot the caller invoked, not the first sibling cap
     /// with the same object paddr. The NT rootserver keeps copied aliases and a large root CSpace; a
     /// full-CNode scan both mutates the wrong sibling and becomes a boot-time cliff.
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn page_table_map_updates_invoked_slot_not_first_alias() {
         use crate::cap::PageTableStorage;
@@ -8199,8 +8314,12 @@ pub mod spec {
             is_device: true,
             map_type: crate::cap::FrameMapType::None,
         };
+        #[cfg(target_arch = "x86_64")]
+        let get_address_label = InvocationLabel::X86PageGetAddress;
+        #[cfg(target_arch = "aarch64")]
+        let get_address_label = InvocationLabel::ARMPageGetAddress;
         let args = SyscallArgs {
-            a1: (InvocationLabel::X86PageGetAddress as u64) << 12,
+            a1: (get_address_label as u64) << 12,
             ..Default::default()
         };
         decode_invocation(frame_cap, &args, invoker).expect("get page-zero address");
@@ -8211,6 +8330,7 @@ pub mod spec {
         arch::log("  ✓ page-zero device frame GetAddress preserves physical zero\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn frame_map_unmap_get_address() {
         use crate::cap::{FrameRights, FrameSize, FrameStorage};
@@ -8344,6 +8464,7 @@ pub mod spec {
         arch::log("  ✓ Frame::Map / Unmap / GetAddress round-trip\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn frame_map_accepts_upstream_libsel4_abi() {
         use crate::cap::{FrameRights, FrameSize, FrameStorage, Pml4Storage};
@@ -8412,6 +8533,7 @@ pub mod spec {
     }
 
     /// Explicit frame maps need a real ASID so later unmap/delete can find the same VSpace.
+    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn paging_maps_reject_unassigned_explicit_vspace() {
         use crate::cap::{FrameRights, FrameSize, FrameStorage, PageTableStorage, Pml4Storage};

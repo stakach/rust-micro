@@ -4,8 +4,19 @@ pub fn test_architecture() {
 
     test_cpu_id();
     test_bootstrap_processor();
+    #[cfg(target_arch = "aarch64")]
+    test_fdt_handoff();
 
     crate::arch::log("Architecture tests completed\n");
+}
+
+#[cfg(all(feature = "spec", target_arch = "aarch64"))]
+fn test_fdt_handoff() {
+    let fdt = crate::simpleboot::fdt_addr();
+    assert_ne!(fdt, 0, "QEMU must pass a live FDT to the Image entry");
+    let magic = unsafe { core::ptr::read_volatile(fdt as *const u32) };
+    assert_eq!(u32::from_be(magic), 0xd00d_feed);
+    crate::arch::log("AArch64 FDT handoff validated\n");
 }
 
 #[cfg(feature = "spec")]

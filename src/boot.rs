@@ -685,6 +685,7 @@ pub mod spec {
         rootserver_untyped_prefers_target_when_available();
         rootserver_untyped_falls_back_to_minimum();
         rootserver_untyped_fails_below_minimum();
+        #[cfg(target_arch = "x86_64")]
         simpleboot_mmap_yields_at_least_one_free_region();
         arch::log("Boot tests completed\n");
     }

@@ -61,7 +61,7 @@ Goal: establish a buildable bare-metal AArch64 kernel target and isolate the rem
 - Exception vector table and EL1 synchronous/IRQ handlers.
 - GIC discovery and interrupt-controller initialization.
 - AArch64 stage-1 page-table and ASID operations.
-- Simpleboot AArch64 entry contract, PL011 discovery, and QEMU boot run.
+- Standard AArch64 Image/FDT entry contract, PL011 console, and QEMU boot run.
 - AArch64 libsel4 userspace syscall ABI and rootserver build.
 
 ## AArch64 conformance continuation
@@ -69,8 +69,9 @@ Goal: establish a buildable bare-metal AArch64 kernel target and isolate the rem
 - [x] Snapshot the pinned seL4 ARM/AArch64 `.bf` and object-api XML inputs without modifying `seL4/`.
 - [x] Select generated capability and invocation definitions from the Cargo target architecture.
 - [x] Split common capability behavior from x86 I/O and AArch64 VSpace capability behavior.
-- [ ] Add target-aware kernel, rootserver, image, QEMU, and sel4test build lanes.
-- [ ] Boot the AArch64 kernel under QEMU `virt` through Simpleboot and run generic kernel specs.
+- [x] Add target-aware kernel Image and QEMU spec build lanes.
+- [x] Boot the AArch64 kernel under QEMU `virt` through its standard Image/FDT ABI and run generic kernel specs.
+- [ ] Add target-aware rootserver and sel4test build lanes, including FDT initrd discovery.
 - [ ] Implement EL1 vectors, generic timer, GICv2, stage-1 paging, and ASID operations against pinned seL4 semantics.
 - [ ] Build and launch an AArch64 libsel4 rootserver, then run the upstream userspace suite.
 - [ ] Resolve the order-dependent amd64 `SCHED0011` failure and restore the full 191/191 userspace gate.
@@ -84,7 +85,7 @@ the review record, and intentional deviations must be documented rather than inf
 ## Review
 
 - Reference: seL4 `daa0dfb1470c5ffbf13b3778f93111679574e80c` (`15.0.0-9-gdaa0dfb14`).
-- `./scripts/check_aarch64.sh`: passes (warnings remain from currently unreachable subsystems).
-- AArch64 debug ELF: links at `target/mykernel-aarch64/debug/mykernel-rust`.
-- x86_64 regression: `cargo check` with `triplets/mykernel-x86.json` and `spec` passes.
-- The AArch64 ELF is a cross-build artifact, not yet a bootable kernel.
+- `./scripts/run_aarch64_specs.sh`: exits zero after all generic, MCS, SMP-bookkeeping, ABI, and AArch64 FDT-entry specs pass under QEMU `virt`/GICv2.
+- `./scripts/build_kernel.sh smp` plus `./scripts/run_specs.sh`: all generic and x86 architectural kernel specs pass; the live Rust rootserver launches afterward.
+- AArch64 ELF and Linux Image artifacts are emitted under `target/mykernel-aarch64/release/`.
+- The direct QEMU Image path is used because the pinned Simpleboot utility has no QEMU `virt` AArch64 loader; Simpleboot/Multiboot remains the x86 boot path.

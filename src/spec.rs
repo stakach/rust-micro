@@ -43,6 +43,7 @@ pub fn test_main() {
     crate::endpoint::spec::test_endpoint();
     crate::notification::spec::test_notification();
     crate::interrupt::spec::test_interrupt();
+    #[cfg(target_arch = "x86_64")]
     crate::vspace::spec::test_vspace();
     crate::boot::spec::test_boot();
     crate::initrd::spec::test_initrd();
@@ -61,6 +62,8 @@ pub fn test_main() {
     crate::vcpu::spec::test_vcpu();
 
     arch::log("All specs passed!\n");
+    #[cfg(target_arch = "aarch64")]
+    arch::qemu_exit(0);
     // Don't `qemu_exit` here — control returns to `main` so the
     // real-hardware boot path (Phase 12d's `boot::kernel_init`)
     // gets exercised before we leave QEMU.

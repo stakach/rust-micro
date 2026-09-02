@@ -1040,7 +1040,7 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             let kva = core::ptr::addr_of_mut!(DYNAMIC_SPEC_CNODE) as u64;
-            let paddr = crate::arch::x86_64::paging::kernel_virt_to_phys(kva);
+            let paddr = crate::arch::virt_to_phys(kva);
             let vi = s
                 .alloc_dynamic_cnode(paddr, SMALL_CNODE_RADIX)
                 .expect("dynamic descriptor");

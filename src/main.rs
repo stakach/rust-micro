@@ -155,11 +155,65 @@ mod spec;
 /********************************************
  * Entry point, called by Simpleboot Loader *
  ********************************************/
-// NOTE: this code runs on all cores in parallel
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    r#"
+    .section .text.boot,"ax"
+    .global _arm64_image_start
+_arm64_image_start:
+    b _start
+    nop
+    .quad 0x00200000
+    .quad __kernel_end - _arm64_image_start
+    .quad 0
+    .quad 0
+    .quad 0
+    .quad 0
+    .word 0x644d5241
+    .word 0
+"#
+);
+
+// NOTE: Simpleboot enters this path on all configured x86 cores.
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 extern "C" fn _start(magic: u64, mbi_addr: u64) -> ! {
     simpleboot::init(magic, mbi_addr);
+    kernel_entry()
+}
 
+/// QEMU's AArch64 `virt` direct-kernel ABI enters with the FDT physical
+/// address in X0. Establish a kernel-owned stack before calling Rust.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+#[no_mangle]
+extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "adrp x2, {stack}",
+        "add x2, x2, :lo12:{stack}",
+        "add x2, x2, {stack_size}",
+        "and x2, x2, #-16",
+        "mov sp, x2",
+        // Match seL4's non-hypervisor `disableFpuEL0`: EL1 may use
+        // FP/SIMD while EL0 remains trapped for lazy context switching.
+        "mrs x3, cpacr_el1",
+        "orr x3, x3, #0x100000",
+        "msr cpacr_el1, x3",
+        "isb",
+        "b {entry}",
+        stack = sym BSP_BIG_STACK,
+        stack_size = const core::mem::size_of::<BspStack>(),
+        entry = sym aarch64_start,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+extern "C" fn aarch64_start(fdt_addr: u64) -> ! {
+    simpleboot::init_fdt(fdt_addr);
+    kernel_entry()
+}
+
+fn kernel_entry() -> ! {
     // Only initialize on the bootstrap processor
     // Check if current APIC ID matches the Simpleboot BSP ID
     let current_apic_id = arch::get_cpu_id();
@@ -176,8 +230,8 @@ extern "C" fn _start(magic: u64, mbi_addr: u64) -> ! {
 /// BSS-allocated stack first thing so kernel specs can build larger
 /// test fixtures without depending on loader stack policy.
 #[repr(C, align(16))]
-struct BspStack([u8; 1024 * 1024]);
-static mut BSP_BIG_STACK: BspStack = BspStack([0; 1024 * 1024]);
+struct BspStack([u8; 4 * 1024 * 1024]);
+static mut BSP_BIG_STACK: BspStack = BspStack([0; 4 * 1024 * 1024]);
 
 #[cfg(target_arch = "x86_64")]
 #[repr(C, align(16))]

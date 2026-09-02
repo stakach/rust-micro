@@ -1099,6 +1099,7 @@ pub mod spec {
         roundtrip_asid_caps();
         roundtrip_sched_context_cap();
         roundtrip_sched_control_cap();
+        #[cfg(target_arch = "x86_64")]
         roundtrip_iommu_caps();
         type_tag_dispatch();
 
@@ -1123,31 +1124,31 @@ pub mod spec {
         assert_eq!(cap_type_of(words), tag::PAGE_TABLE);
         assert_eq!(from_words(words), pt);
 
-        // PageDirectory: cap_type tag = 5. shift = 48-19 = 29
-        // (~512 MiB resolution). Test with the unmapped variant so
-        // the address field's narrowness doesn't show through.
-        let pd = Cap::PageDirectory {
-            ptr: PPtr::<PageDirectoryStorage>::new(0x0000_0000_0030_1000).unwrap(),
-            mapped: None,
-            asid: 0,
-        };
-        let words = to_words(&pd);
-        assert_eq!(cap_type_of(words), tag::PAGE_DIRECTORY);
-        assert_eq!(from_words(words), pd);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // PageDirectory: cap_type tag = 5. shift = 48-19 = 29.
+            let pd = Cap::PageDirectory {
+                ptr: PPtr::<PageDirectoryStorage>::new(0x0000_0000_0030_1000).unwrap(),
+                mapped: None,
+                asid: 0,
+            };
+            let words = to_words(&pd);
+            assert_eq!(cap_type_of(words), tag::PAGE_DIRECTORY);
+            assert_eq!(from_words(words), pd);
 
-        // Pdpt: cap_type tag = 7. shift = 48-10 = 38 (256 GiB
-        // resolution). Pick 0x80_0000_0000 (= 1<<39 = 512 GiB).
-        let pdpt = Cap::Pdpt {
-            ptr: PPtr::<PdptStorage>::new(0x0000_0000_0030_2000).unwrap(),
-            mapped: Some(0x0000_0080_0000_0000),
-            asid: 9,
-        };
-        let words = to_words(&pdpt);
-        assert_eq!(cap_type_of(words), tag::PDPT);
-        assert_eq!(from_words(words), pdpt);
+            // Pdpt: cap_type tag = 7. shift = 48-10 = 38.
+            let pdpt = Cap::Pdpt {
+                ptr: PPtr::<PdptStorage>::new(0x0000_0000_0030_2000).unwrap(),
+                mapped: Some(0x0000_0080_0000_0000),
+                asid: 9,
+            };
+            let words = to_words(&pdpt);
+            assert_eq!(cap_type_of(words), tag::PDPT);
+            assert_eq!(from_words(words), pdpt);
+        }
 
-        // PML4: cap_type tag = 9. capPML4BasePtr is `field 64` so
-        // there's no shift — full 64-bit address round-trips.
+        // The architecture root cap: x86 PML4 and AArch64 VSpace both
+        // occupy tag 9 in the pinned seL4 configurations.
         let pml4 = Cap::PML4 {
             ptr: PPtr::<Pml4Storage>::new(0x0000_0000_0030_3000).unwrap(),
             mapped: true,
@@ -1157,7 +1158,10 @@ pub mod spec {
         assert_eq!(cap_type_of(words), tag::PML4);
         assert_eq!(from_words(words), pml4);
 
+        #[cfg(target_arch = "x86_64")]
         arch::log("  ✓ page-table / directory / PDPT / PML4 caps round-trip\n");
+        #[cfg(target_arch = "aarch64")]
+        arch::log("  ✓ page-table / VSpace caps round-trip\n");
     }
 
     fn roundtrip_sched_context_cap() {
@@ -1337,6 +1341,7 @@ pub mod spec {
         arch::log("  ✓ arch cap passes through opaquely (un-typed tags)\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn roundtrip_iommu_caps() {
         // io_space_cap (tag 15): domain_id + pci_device round-trip.
         let ios = Cap::IoSpace {

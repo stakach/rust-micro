@@ -239,11 +239,7 @@ pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Op
                         {
                             let tcb = sched.slab.get_mut(bt);
                             tcb.ipc_badge = badge;
-                            #[cfg(target_arch = "x86_64")]
-                            {
-                                tcb.user_context.rdi = badge;
-                                tcb.user_context.rsi = 0;
-                            }
+                            crate::arch::set_ipc_return(&mut tcb.user_context, badge, 0, &[]);
                         }
                         let interrupted_current = sched.user_entry_thread();
                         sched.make_runnable(bt);
@@ -280,13 +276,7 @@ pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Op
             {
                 let tcb = sched.slab.get_mut(t);
                 tcb.ipc_badge = badge;
-                #[cfg(target_arch = "x86_64")]
-                {
-                    tcb.user_context.rdi = badge;
-                    // rsi (msginfo) — Wait returns an empty msginfo
-                    // (no message words from notifications).
-                    tcb.user_context.rsi = 0;
-                }
+                crate::arch::set_ipc_return(&mut tcb.user_context, badge, 0, &[]);
             }
             // Passive-server SC donation (mirrors the bound-TCB
             // branch above): if the woken waiter has no SC of its own

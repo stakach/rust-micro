@@ -34,5 +34,7 @@ SECTIONS
     __bss_end = .;
   } :kernel
 
+  __kernel_end = .;
+
   /DISCARD/ : { *(.eh_frame) *(.comment) }
 }

@@ -31,6 +31,8 @@ pub const FB_ABGR: u32 = 2;
 pub const FB_BGRA: u32 = 3;
 
 static MBI_ADDR: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static FDT_ADDR: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn phys_ptr(paddr: u64) -> *const u8 {
@@ -57,6 +59,28 @@ pub fn init(magic: u64, mbi_addr: u64) {
         halt_invalid_boot();
     }
     MBI_ADDR.store(mbi_addr, Ordering::Release);
+}
+
+/// Record the flattened-device-tree pointer supplied by QEMU's direct
+/// AArch64 kernel boot protocol. Device discovery is added incrementally;
+/// until PSCI enumeration lands this path intentionally exposes one BSP.
+#[cfg(target_arch = "aarch64")]
+pub fn init_fdt(fdt_addr: u64) {
+    // An FDT header is big-endian and starts with 0xd00dfeed. Validate it
+    // without requiring the full parser during the earliest boot milestone.
+    if fdt_addr & 7 != 0 {
+        halt_invalid_boot();
+    }
+    let magic = unsafe { core::ptr::read_volatile(fdt_addr as *const u32) };
+    if u32::from_be(magic) != 0xd00d_feed {
+        halt_invalid_boot();
+    }
+    FDT_ADDR.store(fdt_addr, Ordering::Release);
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn fdt_addr() -> u64 {
+    FDT_ADDR.load(Ordering::Acquire)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -258,6 +282,10 @@ pub struct SmpInfo {
 }
 
 pub fn smp_info() -> Option<SmpInfo> {
+    #[cfg(target_arch = "aarch64")]
+    if MBI_ADDR.load(Ordering::Acquire) == 0 {
+        return None;
+    }
     for tag in tags() {
         if tag.tag_type() == MULTIBOOT_TAG_TYPE_SMP && tag.size() >= 20 {
             return Some(SmpInfo {
