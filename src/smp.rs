@@ -418,6 +418,12 @@ pub fn shootdown_vspace(pml4_paddr: u64) {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn shootdown_tlb(_vaddr: u64) {}
+
+#[cfg(target_arch = "aarch64")]
+pub fn shootdown_vspace(_root_paddr: u64) {}
+
 /// Maximum CPUs we'll ever run on. Picked small so the per-CPU
 /// arrays fit on the stack inside specs and on the BSS in the
 /// production kernel without alloc().

@@ -2,6 +2,21 @@
 #![no_std]
 #![no_main]
 
+#[cfg(all(feature = "arch-x86_64", feature = "arch-aarch64"))]
+compile_error!("select exactly one architecture feature");
+#[cfg(not(any(feature = "arch-x86_64", feature = "arch-aarch64")))]
+compile_error!("select an architecture feature");
+#[cfg(all(target_arch = "x86_64", not(feature = "arch-x86_64")))]
+compile_error!("x86_64 targets require the `arch-x86_64` feature");
+#[cfg(all(target_arch = "aarch64", not(feature = "arch-aarch64")))]
+compile_error!("aarch64 targets require the `arch-aarch64` feature");
+#[cfg(all(feature = "arch-x86_64", not(target_arch = "x86_64")))]
+compile_error!("the `arch-x86_64` feature requires an x86_64 target");
+#[cfg(all(feature = "arch-aarch64", not(target_arch = "aarch64")))]
+compile_error!("the `arch-aarch64` feature requires an aarch64 target");
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("supported kernel targets are x86_64 and aarch64");
+
 #[allow(dead_code)]
 mod simpleboot;
 
@@ -551,8 +566,15 @@ fn ap_scheduler_loop() -> ! {
         // the top, so an IRQ can't re-enter bkl_acquire while we hold it
         // (the BKL re-entrancy / silent-hang class fixed in the BSP idle
         // loops — syscall_entry.rs / exceptions.rs).
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!("sti", "hlt", "cli", options(nostack, preserves_flags),);
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // seL4's AArch64 idle path ultimately waits with WFI. Exception
+            // entry will own DAIF masking once the vector table lands.
+            core::arch::asm!("wfi", options(nostack, nomem));
         }
     }
 }

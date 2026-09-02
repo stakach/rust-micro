@@ -217,7 +217,7 @@ pub fn retype(
         let total_bytes = num_objects * plan.per_object;
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let lin = crate::arch::x86_64::paging::phys_to_lin(untyped.base + plan.aligned_offset);
+            let lin = crate::arch::phys_to_virt(untyped.base + plan.aligned_offset);
             core::ptr::write_bytes(lin as *mut u8, 0, total_bytes as usize);
         }
     }

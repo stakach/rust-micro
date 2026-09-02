@@ -227,8 +227,7 @@ pub struct Tcb {
     /// SYSCALL_SAVE area into here on entry and back out before
     /// sysretq, so each thread's user state survives across
     /// schedule() calls.
-    #[cfg(target_arch = "x86_64")]
-    pub user_context: crate::arch::x86_64::syscall_entry::UserContext,
+    pub user_context: crate::arch::UserContext,
     /// Phase 15b — non-MCS reply tracking. When this thread is on
     /// the receive side of a Call, `reply_to` holds the TCB of the
     /// caller that's waiting for SysReply. seL4 calls this
@@ -355,7 +354,7 @@ pub struct Tcb {
     pub timeout_endpoint_cap: crate::cap::Cap,
     /// Per-thread hardware-debug state (CONFIG_HARDWARE_DEBUG_API).
     /// Mirrors seL4's `user_breakpoint_state_t`.
-    pub debug: crate::arch::x86_64::debug::DebugState,
+    pub debug: crate::arch::DebugState,
     /// Fault-type of the in-flight fault this thread is blocked on
     /// (0 = none; otherwise a `seL4_Fault_*` discriminant: 2 =
     /// UnknownSyscall, 3 = UserException, 6 = VMFault). Replying to
@@ -413,8 +412,7 @@ impl Default for Tcb {
                 gs_base: 0,
             },
             cspace_root: crate::cap::Cap::Null,
-            #[cfg(target_arch = "x86_64")]
-            user_context: crate::arch::x86_64::syscall_entry::UserContext::new_zero(),
+            user_context: crate::arch::UserContext::new_zero(),
             reply_to: None,
             vspace_root: crate::cap::Cap::Null,
             bound_notification: None,
@@ -435,7 +433,7 @@ impl Default for Tcb {
             donated_sc: None,
             fault_handler_cap: crate::cap::Cap::Null,
             timeout_endpoint_cap: crate::cap::Cap::Null,
-            debug: crate::arch::x86_64::debug::DebugState::new(),
+            debug: crate::arch::DebugState::new(),
             pending_fault: 0,
             hosted_syscalls: false,
             #[cfg(feature = "smp")]

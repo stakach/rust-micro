@@ -38,3 +38,36 @@ Files changed:
 Two non-obvious bugs found + fixed:
 1. IOMMU pool carved at paddr 0 collided with place_rootserver (vtd_init zeroed rootserver TCB). Fix: bundle pool into the 16MiB user-pages carve so it lands at 0x1900000.
 2. IOPT0008 needs a fresh depth-4 tree, but leaked VT-d mappings (same badge across all tests → same PCI context) corrupted it. Fix: finalise-on-delete clears VT-d entries at test teardown.
+
+---
+
+# AArch64 support - cross-build milestone
+
+Goal: establish a buildable bare-metal AArch64 kernel target and isolate the remaining hardware bring-up work behind architecture boundaries.
+
+## Plan / checklist
+- [x] Create `feature/arm64-support` from `main` and capture the baseline cross-build failures.
+- [x] Add a custom AArch64 target and linker script.
+- [x] Validate Cargo architecture features against the Rust compilation target.
+- [x] Move physical-to-kernel-address translation behind the architecture module.
+- [x] Gate PC-only RTC access and x86-only capability operations.
+- [x] Add the minimum AArch64 context/debug types required by portable kernel state.
+- [x] Match IPC register mappings and the 37-word saved context to pinned seL4.
+- [x] Make `cargo check` and `cargo build` pass for the AArch64 kernel target.
+- [x] Verify the existing x86_64 `spec` check remains green.
+
+## Deferred hardware milestones
+- Select the AArch64 `.bf` and object-api XML snapshots in codegen and adapt the `Cap` model to ARM tags.
+- Exception vector table and EL1 synchronous/IRQ handlers.
+- GIC discovery and interrupt-controller initialization.
+- AArch64 stage-1 page-table and ASID operations.
+- Simpleboot AArch64 entry contract, PL011 discovery, and QEMU boot run.
+- AArch64 libsel4 userspace syscall ABI and rootserver build.
+
+## Review
+
+- Reference: seL4 `daa0dfb1470c5ffbf13b3778f93111679574e80c` (`15.0.0-9-gdaa0dfb14`).
+- `./scripts/check_aarch64.sh`: passes (warnings remain from currently unreachable subsystems).
+- AArch64 debug ELF: links at `target/mykernel-aarch64/debug/mykernel-rust`.
+- x86_64 regression: `cargo check` with `triplets/mykernel-x86.json` and `spec` passes.
+- The AArch64 ELF is a cross-build artifact, not yet a bootable kernel.

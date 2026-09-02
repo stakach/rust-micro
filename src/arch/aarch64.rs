@@ -3,11 +3,15 @@ pub mod serial;
 #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
 pub mod qemu;
 
+pub mod context;
 pub mod cpu;
+pub mod debug;
 pub mod exceptions;
 pub mod interrupts;
 
+pub use context::UserContext;
 pub use cpu::{get_cpu_id, halt_cpu};
+pub use debug::DebugState;
 pub use exceptions::init_exceptions;
 pub use interrupts::init_interrupts;
 

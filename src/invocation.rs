@@ -268,9 +268,13 @@ fn decode_frame(
     invoker: TcbId,
 ) -> KResult<()> {
     match label {
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageMap => decode_frame_map(target, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageUnmap => decode_frame_unmap(target, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageMapIO => decode_x86_iomap(target, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageGetAddress => decode_frame_get_address(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
@@ -323,6 +327,7 @@ unsafe fn update_invoked_frame_slot(
 /// a4 = vspace cap_ptr (0 = current CR3 — backward-compatible
 /// default; non-zero = invoker-owned PML4 cap to map the frame
 /// into, used by the Phase 33d multi-vspace path).
+#[cfg(target_arch = "x86_64")]
 fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     use crate::arch::x86_64::usermode;
     let (frame_ptr, paddr, size, _device, current_mapped) = match target {
@@ -1080,6 +1085,7 @@ fn decode_pdpt(
 /// ABI: a2 = vaddr, a3 = vspace cap_ptr (0 = current CR3 —
 /// backward-compatible default; non-zero = invoker-owned PML4 cap
 /// added by Phase 33d for multi-vspace setup).
+#[cfg(target_arch = "x86_64")]
 fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32) -> KResult<()> {
     use crate::arch::x86_64::usermode;
     let (paddr, current_mapped) = paging_struct_state(&target);
@@ -1212,6 +1218,18 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
     Ok(())
 }
 
+#[cfg(target_arch = "aarch64")]
+fn map_paging_struct(
+    _target: Cap,
+    _args: &SyscallArgs,
+    _invoker: TcbId,
+    _level: u32,
+) -> KResult<()> {
+    Err(KException::SyscallError(SyscallError::new(
+        seL4_Error::seL4_IllegalOperation,
+    )))
+}
+
 fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     unsafe {
         if !paging_cap_is_final(KERNEL.get(), &target) {
@@ -1226,8 +1244,7 @@ fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResu
         detach_paging_structure(&target);
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let table =
-                crate::arch::x86_64::paging::phys_to_lin(paging_struct_state(&target).0) as *mut u8;
+            let table = crate::arch::phys_to_virt(paging_struct_state(&target).0) as *mut u8;
             core::ptr::write_bytes(table, 0, 4096);
         }
     }
@@ -1334,6 +1351,7 @@ fn paging_structure_mapping(cap: &Cap) -> Option<(u64, u64, u16, u32)> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn detach_paging_structure(cap: &Cap) -> bool {
     let Some((paddr, vaddr, asid, level)) = paging_structure_mapping(cap) else {
         return false;
@@ -1351,6 +1369,7 @@ fn detach_paging_structure(cap: &Cap) -> bool {
     detached
 }
 
+#[cfg(target_arch = "x86_64")]
 fn detach_frame_mapping(cap: &Cap) {
     if let Cap::Frame {
         ptr,
@@ -1398,6 +1417,14 @@ fn detach_frame_mapping(cap: &Cap) {
         }
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+fn detach_paging_structure(_cap: &Cap) -> bool {
+    false
+}
+
+#[cfg(target_arch = "aarch64")]
+fn detach_frame_mapping(_cap: &Cap) {}
 
 const CNODE_WORK_CAPACITY: usize = KernelState::cnode_pool_count();
 const CNODE_WORK_WORDS: usize = (CNODE_WORK_CAPACITY + 63) / 64;
@@ -1933,7 +1960,7 @@ fn decode_asid_pool(
                             seL4_Error::seL4_InvalidCapability,
                         )));
                     }
-                    let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr) as *const u64;
+                    let buf = crate::arch::phys_to_virt(buf_paddr) as *const u64;
                     let cptr =
                         core::ptr::read_volatile(buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET));
                     let res = crate::cspace::resolve_address_bits(s, &invoker_cspace, cptr, 64)?;
@@ -2157,9 +2184,8 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             let me = s.scheduler.slab.get_mut(invoker);
             let length = me.ipc_length as usize;
             if length > 4 && me.ipc_buffer_paddr != 0 {
-                let buf = (crate::arch::x86_64::paging::phys_to_lin(me.ipc_buffer_paddr)
-                    as *const u64)
-                    .wrapping_add(1);
+                let buf =
+                    (crate::arch::phys_to_virt(me.ipc_buffer_paddr) as *const u64).wrapping_add(1);
                 let max = length.min(me.msg_regs.len());
                 for i in 4..max {
                     me.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -2839,6 +2865,7 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
             }
             Ok(())
         }
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86IRQIssueIRQHandlerIOAPIC => issue_x86_ioapic_irq_handler(args, invoker),
         InvocationLabel::X86IRQIssueIRQHandlerMSI => {
             // MSI needs an interrupt-remapping/configuration implementation. Never mint a handler
@@ -2855,6 +2882,7 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
 
 /// Resolve an IOAPIC request against the immutable boot catalog, then program the exact
 /// controller-local pin before publishing the handler capability.
+#[cfg(target_arch = "x86_64")]
 fn issue_x86_ioapic_irq_handler(_args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
@@ -5167,7 +5195,7 @@ fn write_invocation_words(invoker_tcb: &mut crate::tcb::Tcb, ipc_paddr: Word, wo
     }
     invoker_tcb.ipc_length = words.len() as u32;
     if words.len() > invoker_tcb.msg_regs.len() && ipc_paddr != 0 {
-        let buf = (crate::arch::x86_64::paging::phys_to_lin(ipc_paddr) as *mut u64).wrapping_add(1);
+        let buf = (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
         for (i, word) in words
             .iter()
             .copied()
@@ -5574,10 +5602,9 @@ fn decode_tcb(
                             if msg_idx < inv.msg_regs.len() {
                                 regs[i] = inv.msg_regs[msg_idx];
                             } else if inv.ipc_buffer_paddr != 0 {
-                                let buf =
-                                    (crate::arch::x86_64::paging::phys_to_lin(inv.ipc_buffer_paddr)
-                                        as *const u64)
-                                        .wrapping_add(1);
+                                let buf = (crate::arch::phys_to_virt(inv.ipc_buffer_paddr)
+                                    as *const u64)
+                                    .wrapping_add(1);
                                 regs[i] = core::ptr::read_volatile(buf.add(msg_idx));
                             }
                         }
@@ -5792,9 +5819,8 @@ fn decode_tcb(
                         // invoker's IPC buffer so userspace's
                         // libsel4 stub can read the whole array.
                         if count > inv.msg_regs.len() && ipc_paddr != 0 {
-                            let buf = (crate::arch::x86_64::paging::phys_to_lin(ipc_paddr)
-                                as *mut u64)
-                                .wrapping_add(1);
+                            let buf =
+                                (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
                             for i in inv.msg_regs.len()..count {
                                 core::ptr::write_volatile(buf.add(i), regs[i]);
                             }
@@ -5856,8 +5882,7 @@ fn decode_tcb(
                     let fault_cptr = if count > 0 && ipc_paddr != 0 {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            let buf =
-                                crate::arch::x86_64::paging::phys_to_lin(ipc_paddr) as *const u64;
+                            let buf = crate::arch::phys_to_virt(ipc_paddr) as *const u64;
                             core::ptr::read_volatile(
                                 buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET),
                             )
@@ -6262,6 +6287,7 @@ fn decode_tcb(
                 Ok(())
             }
             // --- Hardware debug API (CONFIG_HARDWARE_DEBUG_API) ----------
+            #[cfg(target_arch = "x86_64")]
             InvocationLabel::TCBSetBreakpoint => {
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
@@ -6275,8 +6301,7 @@ fn decode_tcb(
                     if paddr == 0 {
                         0
                     } else {
-                        let buf = (crate::arch::x86_64::paging::phys_to_lin(paddr) as *const u64)
-                            .wrapping_add(1);
+                        let buf = (crate::arch::phys_to_virt(paddr) as *const u64).wrapping_add(1);
                         core::ptr::read_volatile(buf.add(4))
                     }
                 };
@@ -6320,6 +6345,7 @@ fn decode_tcb(
                 );
                 Ok(())
             }
+            #[cfg(target_arch = "x86_64")]
             InvocationLabel::TCBGetBreakpoint => {
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
@@ -6342,6 +6368,7 @@ fn decode_tcb(
                 inv.ipc_length = 5;
                 Ok(())
             }
+            #[cfg(target_arch = "x86_64")]
             InvocationLabel::TCBUnsetBreakpoint => {
                 use crate::arch::x86_64::debug as dbg;
                 let bp_num = args.a2;
@@ -6353,6 +6380,7 @@ fn decode_tcb(
                 dbg::unset_breakpoint(&mut s.scheduler.slab.get_mut(id).debug, bp_num as usize);
                 Ok(())
             }
+            #[cfg(target_arch = "x86_64")]
             InvocationLabel::TCBConfigureSingleStepping => {
                 use crate::arch::x86_64::debug as dbg;
                 let _bp_num = args.a2; // ignored on x86 (TF-based)
@@ -6467,7 +6495,7 @@ pub mod spec {
             ObjectType::Notification => s.alloc_notification().map(|i| i as u16),
             ObjectType::CapTable => {
                 let paddr = 0x1800_0000 + (ordinal as u64) * 64;
-                let backing = crate::arch::x86_64::paging::phys_to_lin(paddr) as *mut u8;
+                let backing = crate::arch::phys_to_virt(paddr) as *mut u8;
                 core::ptr::write_bytes(backing, 0, 64);
                 s.alloc_dynamic_cnode(paddr, 1)
                     .map(|i| u16::try_from(i).expect("CNode identity fits scratch"))

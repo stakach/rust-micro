@@ -108,7 +108,7 @@ unsafe fn alloc_page() -> u64 {
     let paddr = (*region).base_paddr + used;
     (*region).used = used + 4096;
     // Zero the page through the kernel-half linear map.
-    let p = crate::arch::x86_64::paging::phys_to_lin(paddr) as *mut u8;
+    let p = crate::arch::phys_to_virt(paddr) as *mut u8;
     for i in 0..4096 {
         core::ptr::write_volatile(p.add(i), 0);
     }
@@ -972,7 +972,7 @@ pub unsafe fn launch_rootserver() -> ! {
     #[cfg(feature = "extern-rootserver")]
     {
         let backing = ROOTSERVER_CNODE_BACKING.expect("rootserver CNode backing reserved at boot");
-        let slots = crate::arch::x86_64::paging::phys_to_lin(backing) as *mut u8;
+        let slots = crate::arch::phys_to_virt(backing) as *mut u8;
         core::ptr::write_bytes(slots, 0, ROOTSERVER_CNODE_BYTES as usize);
         let registered = s
             .alloc_dynamic_cnode(backing, ROOTSERVER_CNODE_RADIX)
@@ -1474,7 +1474,7 @@ unsafe fn phys_to_kernel_virt(paddr: u64) -> u64 {
     // Phase 42 — single regime: every paddr (alloc_page output,
     // kernel-image-pool output, etc.) is reachable through the
     // kernel-half linear map.
-    crate::arch::x86_64::paging::phys_to_lin(paddr)
+    crate::arch::phys_to_virt(paddr)
 }
 
 unsafe fn build_bootinfo(
@@ -1721,7 +1721,7 @@ unsafe fn load_segment(
                 phys
             }
         };
-        let kva = crate::arch::x86_64::paging::phys_to_lin(phys_addr);
+        let kva = crate::arch::phys_to_virt(phys_addr);
 
         // Copy the slice of this segment that lies in this page:
         // [max(seg.vaddr, page_vaddr) .. min(seg.vaddr + filesize, page_vaddr + 4096)).

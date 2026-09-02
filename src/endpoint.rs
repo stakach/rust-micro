@@ -715,8 +715,7 @@ pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: Tc
     // registers (rdx/r10/r8/r9 below) and don't need the buffer.
     let recv_buf_paddr = r.ipc_buffer_paddr;
     if length > 4 && recv_buf_paddr != 0 {
-        let buf =
-            (crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr) as *mut u64).wrapping_add(1); // skip tag word
+        let buf = (crate::arch::phys_to_virt(recv_buf_paddr) as *mut u64).wrapping_add(1); // skip tag word
         let staged_max = (length as usize).min(regs.len());
         for i in 4..staged_max {
             unsafe {
@@ -731,8 +730,7 @@ pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: Tc
         // were allocated as user Frames whose phys range is in our
         // mapped low-mem region.
         if length as usize > regs.len() && snd_buf_paddr != 0 {
-            let snd_buf = (crate::arch::x86_64::paging::phys_to_lin(snd_buf_paddr) as *const u64)
-                .wrapping_add(1);
+            let snd_buf = (crate::arch::phys_to_virt(snd_buf_paddr) as *const u64).wrapping_add(1);
             for i in regs.len()..(length as usize).min(crate::types::seL4_MsgMaxLength) {
                 let w = unsafe { core::ptr::read_volatile(snd_buf.add(i)) };
                 unsafe {
@@ -791,7 +789,7 @@ pub fn transfer_extra_caps(
 
     // Read receive descriptor from receiver's IPC buffer.
     let (recv_cnode_cptr, recv_index, recv_depth) = unsafe {
-        let buf = crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr) as *const u64;
+        let buf = crate::arch::phys_to_virt(recv_buf_paddr) as *const u64;
         (
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET)),
             core::ptr::read_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET)),

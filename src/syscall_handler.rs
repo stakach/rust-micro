@@ -180,7 +180,10 @@ pub fn handle_syscall(
                         crate::types::seL4_Error::seL4_InvalidCapability,
                     ))
                 })?;
-                s.scheduler.slab.get(cur).user_context.r13
+                crate::arch::composite_send_destination(
+                    &s.scheduler.slab.get(cur).user_context,
+                    false,
+                )
             };
             let send_args = SyscallArgs {
                 a0: dest_cptr,
@@ -212,8 +215,12 @@ pub fn handle_syscall(
                         // A composite send failure did not execute the receive half. Reserve an
                         // impossible receive badge so userspace cannot mistake stale in/out
                         // registers for a newly received message.
-                        tcb.user_context.rdi = u64::MAX;
-                        tcb.user_context.rsi = label << 12;
+                        crate::arch::set_ipc_return(
+                            &mut tcb.user_context,
+                            u64::MAX,
+                            label << 12,
+                            &[],
+                        );
                     }
                     return Err(error);
                 }
@@ -255,7 +262,10 @@ pub fn handle_syscall(
                 // Reading r13 here gave a null cptr, so the send-half
                 // was silently dropped — e.g. IPC0022's worker
                 // nbsend_wait failed to wake the stack spawner.
-                s.scheduler.slab.get(cur).user_context.r12
+                crate::arch::composite_send_destination(
+                    &s.scheduler.slab.get(cur).user_context,
+                    true,
+                )
             };
             let send_args = SyscallArgs {
                 a0: dest_cptr,
@@ -484,8 +494,7 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             if length > 4 && me.ipc_buffer_paddr != 0 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    let buf = (crate::arch::x86_64::paging::phys_to_lin(me.ipc_buffer_paddr)
-                        as *const u64)
+                    let buf = (crate::arch::phys_to_virt(me.ipc_buffer_paddr) as *const u64)
                         .wrapping_add(1);
                     let max = (length as usize).min(me.msg_regs.len());
                     for i in 4..max {
@@ -596,8 +605,7 @@ fn handle_send(
                     };
                     let inv_tcb = s.scheduler.slab.get_mut(current);
                     let mi = label << 12;
-                    inv_tcb.user_context.rsi = mi;
-                    inv_tcb.user_context.rdi = 0;
+                    crate::arch::set_ipc_return(&mut inv_tcb.user_context, 0, mi, &[]);
                 }
                 return Err(e);
             }
@@ -630,8 +638,7 @@ fn handle_send(
             // msg[] starts at offset 1).
             if length > 4 && snd.ipc_buffer_paddr != 0 {
                 let buf_paddr = snd.ipc_buffer_paddr;
-                let buf = (crate::arch::x86_64::paging::phys_to_lin(buf_paddr) as *const u64)
-                    .wrapping_add(1);
+                let buf = (crate::arch::phys_to_virt(buf_paddr) as *const u64).wrapping_add(1);
                 let max = (length as usize).min(snd.msg_regs.len());
                 for i in 4..max {
                     snd.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -647,7 +654,7 @@ fn handle_send(
                 (snd.ipc_buffer_paddr, snd.cspace_root)
             };
             if buf_paddr != 0 {
-                let buf = crate::arch::x86_64::paging::phys_to_lin(buf_paddr) as *const u64;
+                let buf = crate::arch::phys_to_virt(buf_paddr) as *const u64;
                 let mut staged: [crate::cap::Cap; 3] = [crate::cap::Cap::Null; 3];
                 let mut count = 0u8;
                 let n = n_caps.min(staged.len());
@@ -749,21 +756,20 @@ fn handle_send(
                     };
                     let length = inv_tcb.ipc_length as u64 & 0x7F;
                     let mi = (label << 12) | length;
-                    inv_tcb.user_context.rsi = mi;
-                    inv_tcb.user_context.rdi = 0; // no badge on reply
-                                                  // Fan msg_regs into the IPC return registers so
-                                                  // invocation results (e.g. RDMSR) reach userspace.
-                    inv_tcb.user_context.r10 = inv_tcb.msg_regs[0];
-                    inv_tcb.user_context.r8 = inv_tcb.msg_regs[1];
-                    inv_tcb.user_context.r9 = inv_tcb.msg_regs[2];
-                    inv_tcb.user_context.r15 = inv_tcb.msg_regs[3];
+                    let msg_regs = [
+                        inv_tcb.msg_regs[0],
+                        inv_tcb.msg_regs[1],
+                        inv_tcb.msg_regs[2],
+                        inv_tcb.msg_regs[3],
+                    ];
+                    crate::arch::set_ipc_return(&mut inv_tcb.user_context, 0, mi, &msg_regs);
                     // libsel4's seL4_GetMR(i) reads from the IPC
                     // buffer (not registers), so also stage there.
                     // Buffer layout: word 0 = tag, words 1..N = msg.
                     let ipc_paddr = inv_tcb.ipc_buffer_paddr;
                     if ipc_paddr != 0 {
-                        let buf = (crate::arch::x86_64::paging::phys_to_lin(ipc_paddr) as *mut u64)
-                            .wrapping_add(1);
+                        let buf =
+                            (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
                         let n = (length as usize).min(inv_tcb.msg_regs.len());
                         for i in 0..n {
                             core::ptr::write_volatile(buf.add(i), inv_tcb.msg_regs[i]);

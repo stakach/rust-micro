@@ -30,6 +30,8 @@ pub use x86_64::qemu::qemu_exit;
 ))]
 pub use aarch64::qemu::qemu_exit;
 
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::{debug::DebugState, syscall_entry::UserContext};
 #[cfg(all(target_arch = "x86_64"))]
 pub use x86_64::{
     get_cpu_id, halt_cpu, init_exceptions, init_gdt, init_gdt_for_cpu, init_interrupts,
@@ -38,8 +40,77 @@ pub use x86_64::{
 
 #[cfg(all(target_arch = "aarch64"))]
 pub use aarch64::{
-    get_cpu_id, halt_cpu, init_exceptions, init_interrupts, serial::init_serial, serial::log,
+    get_cpu_id, halt_cpu, init_exceptions, init_gdt, init_interrupts, serial::init_serial,
+    serial::log, DebugState, UserContext,
 };
+
+/// Translate a physical address into the address used by kernel code.
+///
+/// Both supported boot paths begin with RAM identity-mapped. x86_64 later
+/// installs a kernel-half linear map; AArch64 will replace its identity
+/// implementation when the EL1 page-table milestone lands.
+#[inline(always)]
+pub fn phys_to_virt(paddr: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64::paging::phys_to_lin(paddr)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        paddr
+    }
+}
+
+/// Read the send destination used by seL4's combined send/receive ABI.
+#[inline]
+pub fn composite_send_destination(context: &UserContext, wait_variant: bool) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if wait_variant {
+            context.r12
+        } else {
+            context.r13
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // seL4 registerset.h: replyRegister = X6 and
+        // nbsendRecvDest = X8.
+        context.x[if wait_variant { 6 } else { 8 }]
+    }
+}
+
+/// Populate the seL4 IPC syscall-return registers.
+#[inline]
+pub fn set_ipc_return(context: &mut UserContext, badge: u64, info: u64, msg: &[u64]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        context.rdi = badge;
+        context.rsi = info;
+        if let Some(value) = msg.first() {
+            context.r10 = *value;
+        }
+        if let Some(value) = msg.get(1) {
+            context.r8 = *value;
+        }
+        if let Some(value) = msg.get(2) {
+            context.r9 = *value;
+        }
+        if let Some(value) = msg.get(3) {
+            context.r15 = *value;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // seL4 aarch64 syscalls.h: badge/cap = X0, info = X1,
+        // and the four fast message registers = X2..X5.
+        context.x[0] = badge;
+        context.x[1] = info;
+        for (register, value) in context.x[2..6].iter_mut().zip(msg.iter()) {
+            *register = *value;
+        }
+    }
+}
 
 /// Debug helper: log a tag followed by a decimal number + space.
 #[allow(dead_code)]

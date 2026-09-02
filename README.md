@@ -97,6 +97,22 @@ You can re-run the stages individually:
 ./scripts/make_image.sh                   # repack image from existing artifacts
 ```
 
+### AArch64 cross-build
+
+The initial AArch64 port milestone provides a bare-metal target, linker layout,
+seL4-compatible saved-register shape, and architecture-neutral kernel address
+helpers. Cross-check it with:
+
+```sh
+./scripts/check_aarch64.sh
+```
+
+To produce the current scaffold ELF, replace `check` with `build` in that
+script's Cargo command. This milestone is not bootable yet: exception vectors,
+GIC and MMU initialization, ARM capability/invocation codegen, the Simpleboot
+entry contract, and the AArch64 rootserver ABI remain to be implemented against
+the pinned seL4 reference.
+
 ### Build options (cargo features)
 
 Passed positionally to `build_kernel.sh`. Standalone builds include `spec` by
@@ -113,7 +129,8 @@ set `KERNEL_SPECS=1`.
 | `microtest`     | Also build the rootserver with its structured test harness instead of the legacy demos. |
 | `libsel4-hello` | Swap the rootserver for `vendor/libsel4-build/out/hello.elf` (C built against upstream libsel4) — validates the SYSCALL ABI end-to-end. |
 | `surt-demo`     | Swap the rootserver for `vendor/surt-demo/` — a root task that consumes the published [`surt-sel4`](https://crates.io/crates/surt-sel4) crate and runs the SURT ring-transport scenarios on the kernel. See `vendor/surt-demo/README.md`. |
-| `arch-x86_64`   | (default) architecture selector. `arch-aarch64` exists in-tree, but the build scripts target x86_64 (`triplets/mykernel-x86.json`); AArch64 needs its own triplet. |
+| `arch-x86_64`   | (default) x86_64 architecture selector. |
+| `arch-aarch64`  | AArch64 architecture selector. Use with `--no-default-features` and `triplets/mykernel-aarch64.json`; hardware boot remains in progress. |
 | `mcs`           | No-op (retained for compatibility); MCS is always on. |
 
 > Specs are scoped to the `spec` namespace so they can be compiled out of a

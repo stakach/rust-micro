@@ -606,6 +606,24 @@ pub unsafe fn apply_fault_reply(
     }
 }
 
+/// Preserve the architecture-independent fault restart rules until the
+/// AArch64 exception-entry path can implement seL4's register writeback.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn apply_fault_reply(
+    s: &mut KernelState,
+    caller: TcbId,
+    label: Word,
+    _length: usize,
+    _regs: &[Word],
+) -> bool {
+    let fault_type = s.scheduler.slab.get(caller).pending_fault;
+    s.scheduler.slab.get_mut(caller).pending_fault = 0;
+    match fault_type {
+        2 | 3 => label == 0,
+        _ => true,
+    }
+}
+
 /// Per-arch fault payload encoder. Mirrors libsel4's
 /// `seL4_*_Msg` enums so `sel4utils_print_fault_message`'s
 /// length assertions pass.
