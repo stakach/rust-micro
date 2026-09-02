@@ -64,6 +64,23 @@ Goal: establish a buildable bare-metal AArch64 kernel target and isolate the rem
 - Simpleboot AArch64 entry contract, PL011 discovery, and QEMU boot run.
 - AArch64 libsel4 userspace syscall ABI and rootserver build.
 
+## AArch64 conformance continuation
+
+- [x] Snapshot the pinned seL4 ARM/AArch64 `.bf` and object-api XML inputs without modifying `seL4/`.
+- [x] Select generated capability and invocation definitions from the Cargo target architecture.
+- [x] Split common capability behavior from x86 I/O and AArch64 VSpace capability behavior.
+- [ ] Add target-aware kernel, rootserver, image, QEMU, and sel4test build lanes.
+- [ ] Boot the AArch64 kernel under QEMU `virt` through Simpleboot and run generic kernel specs.
+- [ ] Implement EL1 vectors, generic timer, GICv2, stage-1 paging, and ASID operations against pinned seL4 semantics.
+- [ ] Build and launch an AArch64 libsel4 rootserver, then run the upstream userspace suite.
+- [ ] Resolve the order-dependent amd64 `SCHED0011` failure and restore the full 191/191 userspace gate.
+- [ ] Run generic and architectural kernel specs plus seL4 userspace specs on both architectures.
+- [ ] Commit and push each independently green milestone to `feature/arm64-support`.
+
+Compatibility authority: seL4 commit `daa0dfb1470c5ffbf13b3778f93111679574e80c`.
+Every architecture implementation must name the corresponding seL4 source path in code comments or
+the review record, and intentional deviations must be documented rather than inferred from x86.
+
 ## Review
 
 - Reference: seL4 `daa0dfb1470c5ffbf13b3778f93111679574e80c` (`15.0.0-9-gdaa0dfb14`).

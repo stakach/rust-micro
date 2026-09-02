@@ -136,12 +136,8 @@ fn plan_retype(
     // TCB, Endpoint, ...) require kernel-tracked state that can't
     // safely live in MMIO and stay rejected.
     if untyped.is_device {
-        let allowed = matches!(obj_ty, ObjectType::Untyped)
-            || matches!(
-                obj_ty,
-                ObjectType::Arch(crate::object_type::X86_4K)
-                    | ObjectType::Arch(crate::object_type::X86_LARGE_PAGE)
-            );
+        let allowed =
+            matches!(obj_ty, ObjectType::Untyped) || crate::object_type::is_frame_type(obj_ty);
         if !allowed {
             return Err(RetypeError::IllegalOperationDeviceMemory);
         }
@@ -318,87 +314,132 @@ fn make_object_cap(
                 can_grant: true,
             })
         }
-        ObjectType::Arch(t) => {
-            // x86_64 frame types — see object_type::X86_* constants.
-            use crate::cap::{
-                FrameRights, FrameSize, FrameStorage, PageDirectoryStorage, PageTableStorage,
-                PdptStorage, Pml4Storage,
-            };
-            use crate::object_type::{
-                X86_4K, X86_IO_PAGE_TABLE, X86_LARGE_PAGE, X86_PAGE_DIRECTORY, X86_PAGE_TABLE,
-                X86_PDPT, X86_PML4,
-            };
-            match t {
-                X86_4K | X86_LARGE_PAGE => {
-                    let size = match t {
-                        X86_4K => FrameSize::Small,
-                        X86_LARGE_PAGE => FrameSize::Large,
-                        _ => unreachable!(),
-                    };
-                    let ptr = PAddr::<FrameStorage>::new(obj_addr);
-                    Ok(Cap::Frame {
-                        ptr,
-                        size,
-                        // Newly retyped frames have full rights; mapping
-                        // narrows them.
-                        rights: FrameRights::ReadWrite,
-                        mapped: None,
-                        asid: 0,
-                        is_device: parent_is_device,
-                        map_type: crate::cap::FrameMapType::None,
-                    })
-                }
-                X86_IO_PAGE_TABLE => {
-                    let ptr = PPtr::<crate::cap::IoPageTableStorage>::new(obj_addr)
-                        .ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::IoPageTable {
-                        ptr,
-                        is_mapped: false,
-                        level: 0,
-                        mapped_address: 0,
-                        ioasid: 0,
-                    })
-                }
-                X86_PAGE_TABLE => {
-                    let ptr = PPtr::<PageTableStorage>::new(obj_addr)
-                        .ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::PageTable {
-                        ptr,
-                        mapped: None,
-                        asid: 0,
-                    })
-                }
-                X86_PAGE_DIRECTORY => {
-                    let ptr = PPtr::<PageDirectoryStorage>::new(obj_addr)
-                        .ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::PageDirectory {
-                        ptr,
-                        mapped: None,
-                        asid: 0,
-                    })
-                }
-                X86_PDPT => {
-                    let ptr =
-                        PPtr::<PdptStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::Pdpt {
-                        ptr,
-                        mapped: None,
-                        asid: 0,
-                    })
-                }
-                X86_PML4 => {
-                    let ptr =
-                        PPtr::<Pml4Storage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
-                    Ok(Cap::PML4 {
-                        ptr,
-                        mapped: false,
-                        asid: 0,
-                    })
-                }
-                _ => Err(RetypeError::InvalidArgument),
-            }
-        }
+        ObjectType::Arch(t) => make_arch_object_cap(t, obj_addr, parent_is_device),
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn make_arch_object_cap(
+    ty: Word,
+    obj_addr: u64,
+    parent_is_device: bool,
+) -> Result<Cap, RetypeError> {
+    use crate::cap::{FrameSize, PageDirectoryStorage, PageTableStorage, PdptStorage, Pml4Storage};
+    use crate::object_type::{
+        X86_4K, X86_IO_PAGE_TABLE, X86_LARGE_PAGE, X86_PAGE_DIRECTORY, X86_PAGE_TABLE, X86_PDPT,
+        X86_PML4,
+    };
+
+    match ty {
+        X86_4K | X86_LARGE_PAGE => fresh_frame_cap(
+            obj_addr,
+            if ty == X86_4K {
+                FrameSize::Small
+            } else {
+                FrameSize::Large
+            },
+            parent_is_device,
+        ),
+        X86_IO_PAGE_TABLE => {
+            let ptr = PPtr::<crate::cap::IoPageTableStorage>::new(obj_addr)
+                .ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::IoPageTable {
+                ptr,
+                is_mapped: false,
+                level: 0,
+                mapped_address: 0,
+                ioasid: 0,
+            })
+        }
+        X86_PAGE_TABLE => {
+            let ptr =
+                PPtr::<PageTableStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::PageTable {
+                ptr,
+                mapped: None,
+                asid: 0,
+            })
+        }
+        X86_PAGE_DIRECTORY => {
+            let ptr =
+                PPtr::<PageDirectoryStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::PageDirectory {
+                ptr,
+                mapped: None,
+                asid: 0,
+            })
+        }
+        X86_PDPT => {
+            let ptr = PPtr::<PdptStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::Pdpt {
+                ptr,
+                mapped: None,
+                asid: 0,
+            })
+        }
+        X86_PML4 => {
+            let ptr = PPtr::<Pml4Storage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::PML4 {
+                ptr,
+                mapped: false,
+                asid: 0,
+            })
+        }
+        _ => Err(RetypeError::InvalidArgument),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn make_arch_object_cap(
+    ty: Word,
+    obj_addr: u64,
+    parent_is_device: bool,
+) -> Result<Cap, RetypeError> {
+    use crate::cap::{FrameSize, PageTableStorage, Pml4Storage};
+    use crate::object_type::{
+        ARM_HUGE_PAGE, ARM_LARGE_PAGE, ARM_PAGE_TABLE, ARM_SMALL_PAGE, ARM_VSPACE,
+    };
+
+    // Mirrors seL4/src/arch/arm/64/object/objecttype.c::Arch_createObject.
+    match ty {
+        ARM_SMALL_PAGE => fresh_frame_cap(obj_addr, FrameSize::Small, parent_is_device),
+        ARM_LARGE_PAGE => fresh_frame_cap(obj_addr, FrameSize::Large, parent_is_device),
+        ARM_HUGE_PAGE => fresh_frame_cap(obj_addr, FrameSize::Huge, parent_is_device),
+        ARM_VSPACE => {
+            let ptr = PPtr::<Pml4Storage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::PML4 {
+                ptr,
+                mapped: false,
+                asid: 0,
+            })
+        }
+        ARM_PAGE_TABLE => {
+            let ptr =
+                PPtr::<PageTableStorage>::new(obj_addr).ok_or(RetypeError::InvalidArgument)?;
+            Ok(Cap::PageTable {
+                ptr,
+                mapped: None,
+                asid: 0,
+            })
+        }
+        _ => Err(RetypeError::InvalidArgument),
+    }
+}
+
+fn fresh_frame_cap(
+    obj_addr: u64,
+    size: crate::cap::FrameSize,
+    is_device: bool,
+) -> Result<Cap, RetypeError> {
+    Ok(Cap::Frame {
+        ptr: PAddr::<crate::cap::FrameStorage>::new(obj_addr),
+        size,
+        rights: crate::cap::FrameRights::ReadWrite,
+        mapped: None,
+        asid: 0,
+        is_device,
+        map_type: crate::cap::FrameMapType::None,
+    })
 }
 
 /// Compute `1 << bits` with overflow checking. `bits == 64` overflows
@@ -496,6 +537,7 @@ pub mod spec {
         arch::log("  ✓ Untyped::Retype produces a typed SchedContext cap\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn retype_into_paging_structs() {
         use crate::object_type::{X86_PAGE_DIRECTORY, X86_PAGE_TABLE, X86_PDPT, X86_PML4};
         // 16 KiB untyped — enough for 4 separate 4 KiB paging
@@ -570,6 +612,82 @@ pub mod spec {
         }
 
         arch::log("  ✓ Untyped::Retype produces typed PT / PD / PDPT / PML4 caps\n");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn retype_into_paging_structs() {
+        use crate::cap::FrameSize;
+        use crate::object_type::{
+            ARM_HUGE_PAGE, ARM_LARGE_PAGE, ARM_PAGE_TABLE, ARM_SMALL_PAGE, ARM_VSPACE,
+        };
+
+        let mut produced = Cap::Null;
+        let mut small = UntypedState::new(0x0040_0000, 12, false);
+        retype(&mut small, ObjectType::Arch(ARM_SMALL_PAGE), 0, 1, |c| {
+            produced = c
+        })
+        .expect("retype ARM small page");
+        assert!(matches!(
+            produced,
+            Cap::Frame {
+                size: FrameSize::Small,
+                ..
+            }
+        ));
+
+        let mut large = UntypedState::new(0x0080_0000, 21, false);
+        retype(&mut large, ObjectType::Arch(ARM_LARGE_PAGE), 0, 1, |c| {
+            produced = c
+        })
+        .expect("retype ARM large page");
+        assert!(matches!(
+            produced,
+            Cap::Frame {
+                size: FrameSize::Large,
+                ..
+            }
+        ));
+
+        let mut huge = UntypedState::new(0x4000_0000, 30, false);
+        retype(&mut huge, ObjectType::Arch(ARM_HUGE_PAGE), 0, 1, |c| {
+            produced = c
+        })
+        .expect("retype ARM huge page");
+        assert!(matches!(
+            produced,
+            Cap::Frame {
+                size: FrameSize::Huge,
+                ..
+            }
+        ));
+
+        let mut tables = UntypedState::new(0x8000_0000, 13, false);
+        retype(&mut tables, ObjectType::Arch(ARM_VSPACE), 0, 1, |c| {
+            produced = c
+        })
+        .expect("retype ARM VSpace");
+        assert!(matches!(
+            produced,
+            Cap::PML4 {
+                mapped: false,
+                asid: 0,
+                ..
+            }
+        ));
+        retype(&mut tables, ObjectType::Arch(ARM_PAGE_TABLE), 0, 1, |c| {
+            produced = c
+        })
+        .expect("retype ARM page table");
+        assert!(matches!(
+            produced,
+            Cap::PageTable {
+                mapped: None,
+                asid: 0,
+                ..
+            }
+        ));
+
+        arch::log("  ✓ Untyped::Retype produces ARM frame / VSpace / page-table caps\n");
     }
 
     fn retype_into_endpoints() {
@@ -728,13 +846,16 @@ pub mod spec {
 
     fn zero_base_device_frame() {
         use crate::cap::{FrameStorage, PAddr};
-        use crate::object_type::X86_4K;
+        #[cfg(target_arch = "aarch64")]
+        use crate::object_type::ARM_SMALL_PAGE as FRAME_OBJECT;
+        #[cfg(target_arch = "x86_64")]
+        use crate::object_type::X86_4K as FRAME_OBJECT;
 
         let cap = UntypedState::new(0, 12, true).to_cap();
         let mut state = UntypedState::from_cap(&cap).expect("page-zero untyped state");
         assert_eq!(state.base, 0);
         let mut frame = Cap::Null;
-        retype(&mut state, ObjectType::Arch(X86_4K), 0, 1, |cap| {
+        retype(&mut state, ObjectType::Arch(FRAME_OBJECT), 0, 1, |cap| {
             frame = cap
         })
         .expect("retype page-zero frame");

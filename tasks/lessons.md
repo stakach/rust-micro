@@ -1,5 +1,13 @@
 # Lessons captured this session
 
+## Pattern: architecture ports must start from the matching seL4 implementation
+
+The target is seL4 userspace compatibility, not merely a bootable kernel with similar primitives.
+For architecture-specific ABI, exception, timer, interrupt-controller, paging, and ASID behavior,
+use the matching files in the pinned `seL4/` checkout as the source of truth. Record the exact source
+path and keep `seL4/` read-only. Do not extrapolate AArch64 behavior from the existing x86 port when
+an ARM implementation or generated interface exists upstream.
+
 ## Pattern: rootserver constants silently drift from the kernel's codegen
 
 Symptom — the microtest suite regressed (child_send "wrong payload", reply_cap

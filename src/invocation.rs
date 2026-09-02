@@ -225,7 +225,9 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         Cap::IrqHandler { irq } => decode_irq_handler(irq, label, args, invoker),
         Cap::Frame { .. } => decode_frame(target, label, args, invoker),
         Cap::PageTable { .. } => decode_page_table(target, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::PageDirectory { .. } => decode_page_directory(target, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::Pdpt { .. } => decode_pdpt(target, label, args, invoker),
         Cap::AsidControl => decode_asid_control(label, args, invoker),
         Cap::AsidPool { .. } => decode_asid_pool(target, label, args, invoker),
@@ -233,14 +235,18 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         Cap::SchedControl { core } => decode_sched_control(core, label, args, invoker),
         Cap::Reply { .. } => decode_reply(target, args, invoker),
         Cap::Domain => decode_domain(label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::IOPort {
             first_port,
             last_port,
         } => decode_io_port(first_port, last_port, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::IOPortControl => decode_io_port_control(label, args, invoker),
         // Phase 44 — VT-d. IoPageTable caps take Map/Unmap; IoSpace
         // caps have no invocations of their own.
+        #[cfg(target_arch = "x86_64")]
         Cap::IoPageTable { .. } => decode_x86_iopt(target, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::IoSpace { .. } => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
@@ -276,6 +282,12 @@ fn decode_frame(
         InvocationLabel::X86PageMapIO => decode_x86_iomap(target, args, invoker),
         #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageGetAddress => decode_frame_get_address(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageMap => decode_frame_map(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageUnmap => decode_frame_unmap(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageGetAddress => decode_frame_get_address(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
@@ -530,6 +542,13 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         update_invoked_frame_slot(args, invoker, paddr, updated)?;
     }
     Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decode_frame_map(_target: Cap, _args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
+    Err(KException::SyscallError(SyscallError::new(
+        seL4_Error::seL4_IllegalOperation,
+    )))
 }
 
 /// Phase 44 — indexed ASID-pool lookup. Returns 0 if the ASID is
@@ -1040,14 +1059,21 @@ fn decode_page_table(
     invoker: TcbId,
 ) -> KResult<()> {
     match label {
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageTableMap => decode_pt_map(target, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86PageTableUnmap => decode_pt_unmap(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageTableMap => decode_pt_map(target, args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMPageTableUnmap => decode_pt_unmap(target, args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn decode_page_directory(
     target: Cap,
     label: InvocationLabel,
@@ -1063,6 +1089,7 @@ fn decode_page_directory(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn decode_pdpt(
     target: Cap,
     label: InvocationLabel,
@@ -1756,168 +1783,167 @@ pub fn reset_asid_state() {
 }
 
 fn decode_asid_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    use core::sync::atomic::Ordering;
     match label {
-        InvocationLabel::X86ASIDControlMakePool => {
-            // Two ABI shapes coexist:
-            //   * Upstream (libsel4 `seL4_X86_ASIDControl_MakePool`):
-            //       extraCaps[0] = Untyped (pool storage)
-            //       extraCaps[1] = dest CNode (root)
-            //       mr0 (a2)     = dest slot index
-            //       mr1 (a3)     = depth
-            //   * Legacy (kernel spec): a2 = Untyped cap_ptr,
-            //       a3 = dest CNode cptr (ignored → invoker CSpace),
-            //       a4 = dest slot index.
-            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-            let upstream = info.extra_caps() >= 2;
-
-            unsafe {
-                let s = KERNEL.get();
-                let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-
-                let (untyped, dest_cnode_cap, dest_index, depth) = if upstream {
-                    let inv = s.scheduler.slab.get(invoker);
-                    if inv.pending_extra_caps_count < 2 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                    let untyped = inv.pending_extra_caps[0];
-                    let root = inv.pending_extra_caps[1];
-                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
-                    (untyped, root, args.a2 as usize, args.a3 as u32)
-                } else {
-                    let untyped = crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?;
-                    (untyped, invoker_cspace, args.a4 as usize, 0u32)
-                };
-
-                // Pools are limited (MAX_ASID_POOLS); the 8th MakePool
-                // must fail (VSPACE0004). Check up front so we don't
-                // consume the untyped on a doomed call; the index is
-                // actually claimed below once all validation passes.
-                if (ASID_POOL_INUSE.load(Ordering::Relaxed) & ((1u16 << MAX_ASID_POOLS) - 1))
-                    == ((1u16 << MAX_ASID_POOLS) - 1)
-                {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst,
-                    )));
-                }
-
-                let mut state = match crate::untyped::UntypedState::from_cap(&untyped) {
-                    Some(s) => s,
-                    None => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-
-                // Resolve the dest slot within the dest CNode cap at
-                // `depth` (upstream) or directly (legacy depth==0).
-                let cnode_ptr = match dest_cnode_cap {
-                    Cap::CNode { ptr, .. } => ptr,
-                    _ => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-                let (cnode_idx, dest_offset) = if upstream && depth != 0 {
-                    let res = crate::cspace::resolve_address_bits(
-                        s,
-                        &dest_cnode_cap,
-                        dest_index as u64,
-                        depth,
-                    )?;
-                    if res.bits_remaining != 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_FailedLookup,
-                        )));
-                    }
-                    (KernelState::cnode_index(res.slot_ptr), res.slot_index)
-                } else {
-                    (KernelState::cnode_index(cnode_ptr), dest_index)
-                };
-
-                let slots = match s.cnode_slots_at_mut(cnode_idx) {
-                    Some(s) => s,
-                    None => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-                if dest_offset >= slots.len() || !slots[dest_offset].cap().is_null() {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst,
-                    )));
-                }
-
-                // Carve 4 KiB out of the Untyped for the pool storage.
-                // Manual carve (mirrors what `retype()` does for one
-                // child of size 2^12 = 4 KiB).
-                let aligned = (state.free_index_bytes + 0xFFF) & !0xFFF;
-                let block_total = 1u64 << state.block_bits;
-                if aligned + 0x1000 > block_total {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_NotEnoughMemory,
-                    )));
-                }
-                let pool_paddr = state.base + aligned;
-                state.free_index_bytes = aligned + 0x1000;
-                // Claim a bounded pool index (validation has passed).
-                // `alloc_asid_pool_index` also zeroes this pool's
-                // per-pool ASID-used counter so Assign can enforce the
-                // 512-ASID limit (VSPACE0005). asid_base = index * 512.
-                let pool_index = match alloc_asid_pool_index() {
-                    Some(i) => i,
-                    None => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_DeleteFirst,
-                        )))
-                    }
-                };
-                let asid_base = (pool_index as u16) * 512;
-
-                let pool_cap = Cap::AsidPool {
-                    ptr: PPtr::<crate::cap::AsidPoolStorage>::new(pool_paddr).ok_or_else(|| {
-                        KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidArgument,
-                        ))
-                    })?,
-                    asid_base,
-                };
-                slots[dest_offset].set_cap(&pool_cap);
-                // Locate the source Untyped's slot in this CNode (the
-                // upstream extraCap resolves into the rootserver's flat
-                // cspace, same CNode as the dest). Used for the MDB
-                // parent link and to commit the bumped free_index.
-                let mut untyped_slot = None;
-                for (i, slot) in slots.iter().enumerate() {
-                    if let Cap::Untyped { ptr, .. } = slot.cap() {
-                        if ptr.addr() == state.base {
-                            untyped_slot = Some(i);
-                            break;
-                        }
-                    }
-                }
-                if let Some(usl) = untyped_slot {
-                    // Phase 30 — record the new pool's MDB parent as
-                    // the source Untyped's slot.
-                    let parent_id = crate::cte::MdbId::pack(cnode_idx as u32, usl as u32);
-                    slots[dest_offset].set_parent(Some(parent_id));
-                    child_count_inc(parent_id, 1);
-                    // Commit the bumped Untyped state back into its slot.
-                    slots[usl].set_cap(&state.to_cap());
-                }
-                let _ = pool_index; // index claimed above
-            }
-            Ok(())
-        }
+        #[cfg(target_arch = "x86_64")]
+        InvocationLabel::X86ASIDControlMakePool => decode_asid_control_make_pool(args, invoker),
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMASIDControlMakePool => decode_asid_control_make_pool(args, invoker),
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
     }
+}
+
+fn decode_asid_control_make_pool(args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    use core::sync::atomic::Ordering;
+    // Two ABI shapes coexist:
+    //   * Upstream (libsel4 `seL4_X86_ASIDControl_MakePool`):
+    //       extraCaps[0] = Untyped (pool storage)
+    //       extraCaps[1] = dest CNode (root)
+    //       mr0 (a2)     = dest slot index
+    //       mr1 (a3)     = depth
+    //   * Legacy (kernel spec): a2 = Untyped cap_ptr,
+    //       a3 = dest CNode cptr (ignored → invoker CSpace),
+    //       a4 = dest slot index.
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() >= 2;
+
+    unsafe {
+        let s = KERNEL.get();
+        let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+
+        let (untyped, dest_cnode_cap, dest_index, depth) = if upstream {
+            let inv = s.scheduler.slab.get(invoker);
+            if inv.pending_extra_caps_count < 2 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )));
+            }
+            let untyped = inv.pending_extra_caps[0];
+            let root = inv.pending_extra_caps[1];
+            s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+            (untyped, root, args.a2 as usize, args.a3 as u32)
+        } else {
+            let untyped = crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?;
+            (untyped, invoker_cspace, args.a4 as usize, 0u32)
+        };
+
+        // Pools are limited (MAX_ASID_POOLS); the 8th MakePool
+        // must fail (VSPACE0004). Check up front so we don't
+        // consume the untyped on a doomed call; the index is
+        // actually claimed below once all validation passes.
+        if (ASID_POOL_INUSE.load(Ordering::Relaxed) & ((1u16 << MAX_ASID_POOLS) - 1))
+            == ((1u16 << MAX_ASID_POOLS) - 1)
+        {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
+
+        let mut state = match crate::untyped::UntypedState::from_cap(&untyped) {
+            Some(s) => s,
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        };
+
+        // Resolve the dest slot within the dest CNode cap at
+        // `depth` (upstream) or directly (legacy depth==0).
+        let cnode_ptr = match dest_cnode_cap {
+            Cap::CNode { ptr, .. } => ptr,
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        };
+        let (cnode_idx, dest_offset) = if upstream && depth != 0 {
+            let res =
+                crate::cspace::resolve_address_bits(s, &dest_cnode_cap, dest_index as u64, depth)?;
+            if res.bits_remaining != 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_FailedLookup,
+                )));
+            }
+            (KernelState::cnode_index(res.slot_ptr), res.slot_index)
+        } else {
+            (KernelState::cnode_index(cnode_ptr), dest_index)
+        };
+
+        let slots = match s.cnode_slots_at_mut(cnode_idx) {
+            Some(s) => s,
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        };
+        if dest_offset >= slots.len() || !slots[dest_offset].cap().is_null() {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
+
+        // Carve 4 KiB out of the Untyped for the pool storage.
+        // Manual carve (mirrors what `retype()` does for one
+        // child of size 2^12 = 4 KiB).
+        let aligned = (state.free_index_bytes + 0xFFF) & !0xFFF;
+        let block_total = 1u64 << state.block_bits;
+        if aligned + 0x1000 > block_total {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_NotEnoughMemory,
+            )));
+        }
+        let pool_paddr = state.base + aligned;
+        state.free_index_bytes = aligned + 0x1000;
+        // Claim a bounded pool index (validation has passed).
+        // `alloc_asid_pool_index` also zeroes this pool's
+        // per-pool ASID-used counter so Assign can enforce the
+        // 512-ASID limit (VSPACE0005). asid_base = index * 512.
+        let pool_index = match alloc_asid_pool_index() {
+            Some(i) => i,
+            None => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_DeleteFirst,
+                )))
+            }
+        };
+        let asid_base = (pool_index as u16) * 512;
+
+        let pool_cap = Cap::AsidPool {
+            ptr: PPtr::<crate::cap::AsidPoolStorage>::new(pool_paddr).ok_or_else(|| {
+                KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidArgument))
+            })?,
+            asid_base,
+        };
+        slots[dest_offset].set_cap(&pool_cap);
+        // Locate the source Untyped's slot in this CNode (the
+        // upstream extraCap resolves into the rootserver's flat
+        // cspace, same CNode as the dest). Used for the MDB
+        // parent link and to commit the bumped free_index.
+        let mut untyped_slot = None;
+        for (i, slot) in slots.iter().enumerate() {
+            if let Cap::Untyped { ptr, .. } = slot.cap() {
+                if ptr.addr() == state.base {
+                    untyped_slot = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(usl) = untyped_slot {
+            // Phase 30 — record the new pool's MDB parent as
+            // the source Untyped's slot.
+            let parent_id = crate::cte::MdbId::pack(cnode_idx as u32, usl as u32);
+            slots[dest_offset].set_parent(Some(parent_id));
+            child_count_inc(parent_id, 1);
+            // Commit the bumped Untyped state back into its slot.
+            slots[usl].set_cap(&state.to_cap());
+        }
+        let _ = pool_index; // index claimed above
+    }
+    Ok(())
 }
 
 fn decode_asid_pool(
@@ -1926,140 +1952,153 @@ fn decode_asid_pool(
     args: &SyscallArgs,
     invoker: TcbId,
 ) -> KResult<()> {
-    use core::sync::atomic::Ordering;
     let (asid_base, pool_paddr) = match target {
         Cap::AsidPool { asid_base, ptr } => (asid_base, ptr.addr()),
         _ => unreachable!(),
     };
     match label {
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86ASIDPoolAssign => {
-            // Two ABI shapes coexist:
-            //   * Upstream (libsel4 stub `seL4_X86_ASIDPool_Assign`):
-            //     vspace cap passed as `extraCaps[0]`. Tag carries
-            //     `extra_caps=1`. The cptr the sender used appears
-            //     in the IPC buffer at `caps_or_badges_offset[0]`.
-            //   * Legacy (internal specs): vspace cap_ptr in `a2`.
-            //     No extra caps.
-            let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-            let upstream = info.extra_caps() > 0;
-            unsafe {
-                let s = KERNEL.get();
-                let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let (slot_cnode_idx, slot_idx, vspace_cap) = if upstream {
-                    let inv_tcb = s.scheduler.slab.get(invoker);
-                    if inv_tcb.pending_extra_caps_count == 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                    let cap = inv_tcb.pending_extra_caps[0];
-                    let buf_paddr = inv_tcb.ipc_buffer_paddr;
-                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
-                    if buf_paddr == 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                    let buf = crate::arch::phys_to_virt(buf_paddr) as *const u64;
-                    let cptr =
-                        core::ptr::read_volatile(buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET));
-                    let res = crate::cspace::resolve_address_bits(s, &invoker_cspace, cptr, 64)?;
-                    if res.bits_remaining != 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_FailedLookup,
-                        )));
-                    }
-                    (KernelState::cnode_index(res.slot_ptr), res.slot_index, cap)
-                } else {
-                    let cnode_ptr = match invoker_cspace {
-                        Cap::CNode { ptr, .. } => ptr,
-                        _ => {
-                            return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_InvalidCapability,
-                            )))
-                        }
-                    };
-                    let cnode_idx = KernelState::cnode_index(cnode_ptr);
-                    let slot_idx = args.a2 as usize;
-                    let slots = match s.cnode_slots_at(cnode_idx) {
-                        Some(s) => s,
-                        None => {
-                            return Err(KException::SyscallError(SyscallError::new(
-                                seL4_Error::seL4_InvalidCapability,
-                            )))
-                        }
-                    };
-                    if slot_idx >= slots.len() {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_RangeError,
-                        )));
-                    }
-                    (cnode_idx, slot_idx, slots[slot_idx].cap())
-                };
-                let ptr = match vspace_cap {
-                    Cap::PML4 { ptr, asid: 0, .. } => ptr,
-                    // Already assigned to an ASID — upstream
-                    // decodeX86ASIDPoolAssign returns InvalidCapability
-                    // (VSPACE0002 assigns the already-mapped
-                    // page_directory and expects exactly that).
-                    Cap::PML4 { .. } => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                    _ => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-                // Allocate the next ASID in this pool.
-                //   * MakePool'd pools (asid_base != 0): use a per-pool
-                //     used-counter in the storage page so the pool
-                //     enforces its 512-ASID limit (VSPACE0005 assigns
-                //     512 then expects DeleteFirst). These pools don't
-                //     unassign mid-test, so a counter (not a bitmap)
-                //     is sufficient.
-                //   * Init pool (asid_base == 0): the rootserver pool
-                //     that every inter-AS test process draws from —
-                //     keep the existing global wrapping offset (never
-                //     exhausts), so its many assign/teardown cycles
-                //     across the suite stay unaffected.
-                let _ = pool_paddr;
-                let assigned = if asid_base != 0 {
-                    let idx = (asid_base / 512) as usize;
-                    let used = ASID_POOL_USED
-                        .get(idx)
-                        .map(|u| u.load(Ordering::Relaxed))
-                        .unwrap_or(0);
-                    if used >= 512 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_DeleteFirst,
-                        )));
-                    }
-                    if let Some(u) = ASID_POOL_USED.get(idx) {
-                        u.store(used + 1, Ordering::Relaxed);
-                    }
-                    asid_base.saturating_add(used)
-                } else {
-                    asid_base.saturating_add(
-                        (NEXT_ASID_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-                            & 0x1FF) as u16,
-                    )
-                };
-                if let Some(slot) = s.cnode_slot_mut(slot_cnode_idx, slot_idx) {
-                    slot.set_cap(&Cap::PML4 {
-                        ptr,
-                        mapped: true,
-                        asid: assigned,
-                    });
-                }
-                Ok(())
-            }
+            decode_asid_pool_assign(asid_base, pool_paddr, args, invoker)
+        }
+        #[cfg(target_arch = "aarch64")]
+        InvocationLabel::ARMASIDPoolAssign => {
+            decode_asid_pool_assign(asid_base, pool_paddr, args, invoker)
         }
         _ => Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_IllegalOperation,
         ))),
+    }
+}
+
+fn decode_asid_pool_assign(
+    asid_base: u16,
+    pool_paddr: u64,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    use core::sync::atomic::Ordering;
+    // Two ABI shapes coexist:
+    //   * Upstream (libsel4 stub `seL4_X86_ASIDPool_Assign`):
+    //     vspace cap passed as `extraCaps[0]`. Tag carries
+    //     `extra_caps=1`. The cptr the sender used appears
+    //     in the IPC buffer at `caps_or_badges_offset[0]`.
+    //   * Legacy (internal specs): vspace cap_ptr in `a2`.
+    //     No extra caps.
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() > 0;
+    unsafe {
+        let s = KERNEL.get();
+        let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+        let (slot_cnode_idx, slot_idx, vspace_cap) = if upstream {
+            let inv_tcb = s.scheduler.slab.get(invoker);
+            if inv_tcb.pending_extra_caps_count == 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )));
+            }
+            let cap = inv_tcb.pending_extra_caps[0];
+            let buf_paddr = inv_tcb.ipc_buffer_paddr;
+            s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
+            if buf_paddr == 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )));
+            }
+            let buf = crate::arch::phys_to_virt(buf_paddr) as *const u64;
+            let cptr = core::ptr::read_volatile(buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET));
+            let res = crate::cspace::resolve_address_bits(s, &invoker_cspace, cptr, 64)?;
+            if res.bits_remaining != 0 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_FailedLookup,
+                )));
+            }
+            (KernelState::cnode_index(res.slot_ptr), res.slot_index, cap)
+        } else {
+            let cnode_ptr = match invoker_cspace {
+                Cap::CNode { ptr, .. } => ptr,
+                _ => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
+            };
+            let cnode_idx = KernelState::cnode_index(cnode_ptr);
+            let slot_idx = args.a2 as usize;
+            let slots = match s.cnode_slots_at(cnode_idx) {
+                Some(s) => s,
+                None => {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))
+                }
+            };
+            if slot_idx >= slots.len() {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_RangeError,
+                )));
+            }
+            (cnode_idx, slot_idx, slots[slot_idx].cap())
+        };
+        let ptr = match vspace_cap {
+            Cap::PML4 { ptr, asid: 0, .. } => ptr,
+            // Already assigned to an ASID — upstream
+            // decodeX86ASIDPoolAssign returns InvalidCapability
+            // (VSPACE0002 assigns the already-mapped
+            // page_directory and expects exactly that).
+            Cap::PML4 { .. } => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+            _ => {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )))
+            }
+        };
+        // Allocate the next ASID in this pool.
+        //   * MakePool'd pools (asid_base != 0): use a per-pool
+        //     used-counter in the storage page so the pool
+        //     enforces its 512-ASID limit (VSPACE0005 assigns
+        //     512 then expects DeleteFirst). These pools don't
+        //     unassign mid-test, so a counter (not a bitmap)
+        //     is sufficient.
+        //   * Init pool (asid_base == 0): the rootserver pool
+        //     that every inter-AS test process draws from —
+        //     keep the existing global wrapping offset (never
+        //     exhausts), so its many assign/teardown cycles
+        //     across the suite stay unaffected.
+        let _ = pool_paddr;
+        let assigned = if asid_base != 0 {
+            let idx = (asid_base / 512) as usize;
+            let used = ASID_POOL_USED
+                .get(idx)
+                .map(|u| u.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if used >= 512 {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_DeleteFirst,
+                )));
+            }
+            if let Some(u) = ASID_POOL_USED.get(idx) {
+                u.store(used + 1, Ordering::Relaxed);
+            }
+            asid_base.saturating_add(used)
+        } else {
+            asid_base.saturating_add(
+                (NEXT_ASID_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) & 0x1FF)
+                    as u16,
+            )
+        };
+        if let Some(slot) = s.cnode_slot_mut(slot_cnode_idx, slot_idx) {
+            slot.set_cap(&Cap::PML4 {
+                ptr,
+                mapped: true,
+                asid: assigned,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2867,6 +2906,7 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
         }
         #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86IRQIssueIRQHandlerIOAPIC => issue_x86_ioapic_irq_handler(args, invoker),
+        #[cfg(target_arch = "x86_64")]
         InvocationLabel::X86IRQIssueIRQHandlerMSI => {
             // MSI needs an interrupt-remapping/configuration implementation. Never mint a handler
             // for hardware the kernel has not actually programmed.
@@ -3058,6 +3098,7 @@ unsafe fn io_out16(_p: u16, _v: u16) {}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn io_out32(_p: u16, _v: u32) {}
 
+#[cfg(target_arch = "x86_64")]
 fn decode_io_port(
     first_port: u16,
     last_port: u16,
@@ -3213,6 +3254,7 @@ fn decode_domain(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> 
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn decode_io_port_control(
     label: InvocationLabel,
     args: &SyscallArgs,

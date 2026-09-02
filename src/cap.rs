@@ -17,9 +17,12 @@
 //! objects, not accessing their fields. Dereferencing happens in
 //! later phases inside small, well-encapsulated `unsafe` helpers.
 
+#[cfg(target_arch = "aarch64")]
+use crate::structures::arch::VspaceCap;
+use crate::structures::arch::{AsidControlCap, AsidPoolCap, FrameCap, PageTableCap};
+#[cfg(target_arch = "x86_64")]
 use crate::structures::arch::{
-    AsidControlCap, AsidPoolCap, FrameCap, IoPageTableCap, IoPortCap, IoPortControlCap, IoSpaceCap,
-    PageDirectoryCap, PageTableCap, PdptCap, Pml4Cap,
+    IoPageTableCap, IoPortCap, IoPortControlCap, IoSpaceCap, PageDirectoryCap, PdptCap, Pml4Cap,
 };
 use crate::structures::*;
 use crate::structures::{SchedContextCap, SchedControlCap};
@@ -54,12 +57,15 @@ pub mod tag {
     pub const SCHED_CONTEXT: u64 = 22;
     pub const SCHED_CONTROL: u64 = 24;
 
-    // Arch (odd) tags — x86_64 specific subset we decode today.
+    // Arch (odd) tags. FRAME, PAGE_TABLE, VSPACE, ASID_CONTROL and
+    // ASID_POOL match seL4's AArch64 and x86_64 layouts. Tags 5/7 and
+    // 15+ below are x86-only in the current configurations.
     pub const FRAME: u64 = 1;
     pub const PAGE_TABLE: u64 = 3;
     pub const PAGE_DIRECTORY: u64 = 5;
     pub const PDPT: u64 = 7;
     pub const PML4: u64 = 9;
+    pub const VSPACE: u64 = 9;
     pub const ASID_CONTROL: u64 = 11;
     pub const ASID_POOL: u64 = 13;
     pub const IO_SPACE: u64 = 15;
@@ -630,6 +636,14 @@ pub fn from_words(words: [Word; 2]) -> Cap {
         tag::DOMAIN => Cap::Domain,
         tag::FRAME => {
             let c = FrameCap { words };
+            #[cfg(target_arch = "x86_64")]
+            let map_type = FrameMapType::from_word(c.capFMapType());
+            #[cfg(target_arch = "aarch64")]
+            let map_type = if c.capFMappedASID() != 0 {
+                FrameMapType::VSpace
+            } else {
+                FrameMapType::None
+            };
             Cap::Frame {
                 ptr: PAddr::new(c.capFBasePtr()),
                 size: FrameSize::from_word(c.capFSize()).unwrap_or_default(),
@@ -644,7 +658,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 },
                 asid: c.capFMappedASID() as u16,
                 is_device: c.capFIsDevice() != 0,
-                map_type: FrameMapType::from_word(c.capFMapType()),
+                map_type,
             }
         }
         tag::PAGE_TABLE => {
@@ -662,6 +676,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 asid: c.capPTMappedASID() as u16,
             }
         }
+        #[cfg(target_arch = "x86_64")]
         tag::PAGE_DIRECTORY => {
             let c = PageDirectoryCap { words };
             let Some(ptr) = PPtr::<PageDirectoryStorage>::new(c.capPDBasePtr()) else {
@@ -677,6 +692,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 asid: c.capPDMappedASID() as u16,
             }
         }
+        #[cfg(target_arch = "x86_64")]
         tag::PDPT => {
             let c = PdptCap { words };
             let Some(ptr) = PPtr::<PdptStorage>::new(c.capPDPTBasePtr()) else {
@@ -692,6 +708,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 asid: c.capPDPTMappedASID() as u16,
             }
         }
+        #[cfg(target_arch = "x86_64")]
         tag::PML4 => {
             let c = Pml4Cap { words };
             let Some(ptr) = PPtr::<Pml4Storage>::new(c.capPML4BasePtr()) else {
@@ -701,6 +718,18 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 ptr,
                 mapped: c.capPML4IsMapped() != 0,
                 asid: c.capPML4MappedASID() as u16,
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        tag::VSPACE => {
+            let c = VspaceCap { words };
+            let Some(ptr) = PPtr::<Pml4Storage>::new(c.capVSBasePtr()) else {
+                return Cap::Null;
+            };
+            Cap::PML4 {
+                ptr,
+                mapped: c.capVSIsMapped() != 0,
+                asid: c.capVSMappedASID() as u16,
             }
         }
         tag::ASID_CONTROL => Cap::AsidControl,
@@ -730,6 +759,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 core: c.core() as u32,
             }
         }
+        #[cfg(target_arch = "x86_64")]
         tag::IO_PORT => {
             let c = IoPortCap { words };
             Cap::IOPort {
@@ -737,7 +767,9 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 last_port: c.capIOPortLastPort() as u16,
             }
         }
+        #[cfg(target_arch = "x86_64")]
         tag::IO_PORT_CONTROL => Cap::IOPortControl,
+        #[cfg(target_arch = "x86_64")]
         tag::IO_SPACE => {
             let c = IoSpaceCap { words };
             Cap::IoSpace {
@@ -745,6 +777,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 pci_device: c.capPCIDevice() as u16,
             }
         }
+        #[cfg(target_arch = "x86_64")]
         tag::IO_PAGE_TABLE => {
             let c = IoPageTableCap { words };
             let Some(ptr) = PPtr::<IoPageTableStorage>::new(c.capIOPTBasePtr()) else {
@@ -864,6 +897,7 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             )
             .words
         }
+        #[cfg(target_arch = "x86_64")]
         Cap::PageDirectory { ptr, mapped, asid } => {
             PageDirectoryCap::new(
                 *asid as u64,
@@ -874,6 +908,7 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             )
             .words
         }
+        #[cfg(target_arch = "x86_64")]
         Cap::Pdpt { ptr, mapped, asid } => {
             PdptCap::new(
                 *asid as u64,
@@ -884,11 +919,16 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             )
             .words
         }
+        #[cfg(target_arch = "x86_64")]
         Cap::PML4 { ptr, mapped, asid } => {
             // pml4_cap has explicit_params (capPML4MappedASID,
             // capPML4BasePtr, capType, capPML4IsMapped) — pass them
             // in that order.
             Pml4Cap::new(*asid as u64, ptr.addr(), tag::PML4, *mapped as u64).words
+        }
+        #[cfg(target_arch = "aarch64")]
+        Cap::PML4 { ptr, mapped, asid } => {
+            VspaceCap::new(*asid as u64, ptr.addr(), tag::VSPACE, *mapped as u64).words
         }
         Cap::AsidControl => {
             let mut c = AsidControlCap::zeroed();
@@ -906,6 +946,7 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             SchedContextCap::new(ptr.addr(), *size_bits as u64, tag::SCHED_CONTEXT).words
         }
         Cap::SchedControl { core } => SchedControlCap::new(*core as u64, tag::SCHED_CONTROL).words,
+        #[cfg(target_arch = "x86_64")]
         Cap::IOPort {
             first_port,
             last_port,
@@ -916,6 +957,7 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             c = c.with_capIOPortLastPort(*last_port as u64);
             c.words
         }
+        #[cfg(target_arch = "x86_64")]
         Cap::IOPortControl => {
             let mut c = IoPortControlCap::zeroed();
             c = c.with_capType(tag::IO_PORT_CONTROL);
@@ -934,18 +976,36 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             //   capFMappedASID, capFBasePtr, capType, capFSize,
             //   capFMapType, capFMappedAddress, capFVMRights,
             //   capFIsDevice
-            FrameCap::new(
-                *asid as u64,
-                ptr.addr(),
-                tag::FRAME,
-                size.to_word(),
-                map_type.to_word(), // capFMapType: None/VSpace/IOSpace
-                mapped.unwrap_or(0),
-                rights.to_word(),
-                *is_device as u64,
-            )
-            .words
+            #[cfg(target_arch = "x86_64")]
+            {
+                FrameCap::new(
+                    *asid as u64,
+                    ptr.addr(),
+                    tag::FRAME,
+                    size.to_word(),
+                    map_type.to_word(),
+                    mapped.unwrap_or(0),
+                    rights.to_word(),
+                    *is_device as u64,
+                )
+                .words
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = map_type;
+                FrameCap::new(
+                    *asid as u64,
+                    ptr.addr(),
+                    tag::FRAME,
+                    size.to_word(),
+                    mapped.unwrap_or(0),
+                    rights.to_word(),
+                    *is_device as u64,
+                )
+                .words
+            }
         }
+        #[cfg(target_arch = "x86_64")]
         Cap::IoSpace {
             domain_id,
             pci_device,
@@ -958,6 +1018,7 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             c = c.with_capPCIDevice(*pci_device as u64);
             c.words
         }
+        #[cfg(target_arch = "x86_64")]
         Cap::IoPageTable {
             ptr,
             is_mapped,
@@ -978,6 +1039,13 @@ pub fn to_words(cap: &Cap) -> [Word; 2] {
             )
             .words
         }
+        #[cfg(target_arch = "aarch64")]
+        Cap::PageDirectory { .. }
+        | Cap::Pdpt { .. }
+        | Cap::IOPort { .. }
+        | Cap::IOPortControl
+        | Cap::IoSpace { .. }
+        | Cap::IoPageTable { .. } => NullCap::new(tag::NULL).words,
         Cap::Arch { cap_type: _, words } => *words,
     }
 }

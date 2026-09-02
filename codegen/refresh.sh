@@ -10,6 +10,10 @@ cp seL4/libsel4/include/interfaces/object-api.xml                    codegen/obj
 cp seL4/libsel4/arch_include/x86/interfaces/object-api-arch.xml      codegen/object-api-arch.xml
 cp seL4/libsel4/sel4_arch_include/x86_64/interfaces/object-api-sel4-arch.xml \
                                                                      codegen/object-api-sel4-arch.xml
+cp seL4/include/arch/arm/arch/64/mode/object/structures.bf           codegen/structures_aarch64.bf
+cp seL4/libsel4/arch_include/arm/interfaces/object-api-arch.xml      codegen/object-api-arm.xml
+cp seL4/libsel4/sel4_arch_include/aarch64/interfaces/object-api-sel4-arch.xml \
+                                                                     codegen/object-api-aarch64.xml
 
 REV=$(git -C seL4 rev-parse HEAD 2>/dev/null || echo "unknown")
 echo "refreshed codegen/ from seL4 @ $REV"

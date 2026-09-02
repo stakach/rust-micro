@@ -58,9 +58,12 @@ pub const MIN_SCHED_CONTEXT_BITS: u32 = 7;
 /// (`capSCSizeBits`, 6 bits) addressable.
 pub const MAX_SCHED_CONTEXT_BITS: u32 = 16;
 
-// x86_64 arch object types — must match upstream libsel4's numeric
-// values exactly (seL4_NonArchObjectTypeCount = 7 with MCS,
-// seL4_ModeObjectTypeCount = 9 on x86_64 without HUGE_PAGE).
+// Architecture object types. These values come from the pinned seL4
+// libsel4 objecttype.h headers and deliberately overlap across architectures.
+// seL4_NonArchObjectTypeCount is 7 with MCS enabled.
+//
+// x86_64: libsel4/sel4_arch_include/x86_64/sel4/sel4_arch/objecttype.h and
+//          libsel4/arch_include/x86/sel4/arch/objecttype.h.
 // Our previous numbering had X86_4K = 7 etc. which collided with
 // upstream's X86_PDPT — sel4test's allocman sent type=10 expecting
 // LargePage and we retyped a PageTable; the cap-type mismatch
@@ -77,6 +80,14 @@ pub const X86_PAGE_DIRECTORY: u64 = 12;
 /// Phase 44 — 4 KiB VT-d IO page table — backs `Cap::IoPageTable`
 /// (512 VT-d PTEs). `seL4_X86_IOPageTableObject` with CONFIG_IOMMU.
 pub const X86_IO_PAGE_TABLE: u64 = 13;
+
+// AArch64: libsel4/sel4_arch_include/aarch64/sel4/sel4_arch/objecttype.h and
+//          libsel4/arch_include/arm/sel4/arch/objecttype.h.
+pub const ARM_HUGE_PAGE: u64 = 7;
+pub const ARM_VSPACE: u64 = 8;
+pub const ARM_SMALL_PAGE: u64 = 9;
+pub const ARM_LARGE_PAGE: u64 = 10;
+pub const ARM_PAGE_TABLE: u64 = 11;
 
 // ---------------------------------------------------------------------------
 // ObjectType enum.
@@ -175,14 +186,42 @@ pub fn size_in_bits(ty: ObjectType, user_size_bits: u32) -> Result<u32, SizeErro
             MAX_SCHED_CONTEXT_BITS,
         ),
         ObjectType::Reply => Ok(REPLY_SIZE_BITS),
-        ObjectType::Arch(t) => match t {
-            X86_4K => Ok(12),
-            X86_LARGE_PAGE => Ok(21),
-            // PT/PD/PDPT/PML4/IOPT are each one 4 KiB page of bitfield entries.
-            X86_PAGE_TABLE | X86_PAGE_DIRECTORY | X86_PDPT | X86_PML4 | X86_IO_PAGE_TABLE => Ok(12),
-            _ => Err(SizeError::Unsupported),
-        },
+        ObjectType::Arch(t) => arch_size_in_bits(t),
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn arch_size_in_bits(t: Word) -> Result<u32, SizeError> {
+    match t {
+        X86_4K => Ok(12),
+        X86_LARGE_PAGE => Ok(21),
+        // PT/PD/PDPT/PML4/IOPT are each one 4 KiB page of bitfield entries.
+        X86_PAGE_TABLE | X86_PAGE_DIRECTORY | X86_PDPT | X86_PML4 | X86_IO_PAGE_TABLE => Ok(12),
+        _ => Err(SizeError::Unsupported),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+const fn arch_size_in_bits(t: Word) -> Result<u32, SizeError> {
+    // Mirrors seL4/src/arch/arm/64/object/objecttype.c::Arch_getObjectSize.
+    match t {
+        ARM_HUGE_PAGE => Ok(30),
+        ARM_VSPACE | ARM_SMALL_PAGE | ARM_PAGE_TABLE => Ok(12),
+        ARM_LARGE_PAGE => Ok(21),
+        _ => Err(SizeError::Unsupported),
+    }
+}
+
+pub const fn is_frame_type(ty: ObjectType) -> bool {
+    let ObjectType::Arch(t) = ty else {
+        return false;
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    return matches!(t, X86_4K | X86_LARGE_PAGE);
+
+    #[cfg(target_arch = "aarch64")]
+    return matches!(t, ARM_SMALL_PAGE | ARM_LARGE_PAGE | ARM_HUGE_PAGE);
 }
 
 fn bounds_check(value: u32, min: u32, max: u32) -> Result<u32, SizeError> {
@@ -233,7 +272,31 @@ pub mod spec {
         // Radix 4 → 16 slots → 16 * 32 = 512 bytes → 9 bits.
         assert_eq!(size_in_bits(ObjectType::CapTable, 4), Ok(9));
         assert_eq!(size_in_bits(ObjectType::Untyped, 12), Ok(12));
+        arch_sizes();
         arch::log("  ✓ size_in_bits matches seL4's per-type sizes\n");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn arch_sizes() {
+        assert_eq!(size_in_bits(ObjectType::Arch(X86_PDPT), 0), Ok(12));
+        assert_eq!(size_in_bits(ObjectType::Arch(X86_PML4), 0), Ok(12));
+        assert_eq!(size_in_bits(ObjectType::Arch(X86_4K), 0), Ok(12));
+        assert_eq!(size_in_bits(ObjectType::Arch(X86_LARGE_PAGE), 0), Ok(21));
+        assert_eq!(size_in_bits(ObjectType::Arch(X86_PAGE_TABLE), 0), Ok(12));
+        assert_eq!(
+            size_in_bits(ObjectType::Arch(X86_PAGE_DIRECTORY), 0),
+            Ok(12)
+        );
+        assert_eq!(size_in_bits(ObjectType::Arch(X86_IO_PAGE_TABLE), 0), Ok(12));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn arch_sizes() {
+        assert_eq!(size_in_bits(ObjectType::Arch(ARM_HUGE_PAGE), 0), Ok(30));
+        assert_eq!(size_in_bits(ObjectType::Arch(ARM_VSPACE), 0), Ok(12));
+        assert_eq!(size_in_bits(ObjectType::Arch(ARM_SMALL_PAGE), 0), Ok(12));
+        assert_eq!(size_in_bits(ObjectType::Arch(ARM_LARGE_PAGE), 0), Ok(21));
+        assert_eq!(size_in_bits(ObjectType::Arch(ARM_PAGE_TABLE), 0), Ok(12));
     }
 
     fn bounds() {

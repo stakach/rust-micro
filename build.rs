@@ -22,6 +22,11 @@ use std::path::PathBuf;
 fn main() {
     let codegen_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("codegen");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
+    assert!(
+        matches!(target_arch.as_str(), "x86_64" | "aarch64"),
+        "unsupported codegen target architecture: {target_arch}"
+    );
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support/bf.rs");
@@ -46,9 +51,17 @@ fn main() {
     let rust = bf::generate(&bf_src).unwrap_or_else(|e| panic!("bf codegen: {e}"));
     fs::write(out_dir.join("structures.rs"), rust).expect("write structures.rs");
 
-    // arch x86_64 .bf -> structures_arch.rs
-    let bf_arch = read("structures_x86_64.bf");
-    let rust = bf::generate(&bf_arch).unwrap_or_else(|e| panic!("arch bf codegen: {e}"));
+    // Architecture .bf -> structures_arch.rs. These are exact snapshots from
+    // the pinned seL4 architecture directories; never use x86 definitions as
+    // an AArch64 compatibility fallback.
+    let bf_arch_name = match target_arch.as_str() {
+        "x86_64" => "structures_x86_64.bf",
+        "aarch64" => "structures_aarch64.bf",
+        _ => unreachable!(),
+    };
+    let bf_arch = read(bf_arch_name);
+    let rust = bf::generate_for_arch(&bf_arch, &target_arch)
+        .unwrap_or_else(|e| panic!("arch bf codegen ({target_arch}): {e}"));
     fs::write(out_dir.join("structures_arch.rs"), rust).expect("write structures_arch.rs");
 
     // syscall.xml -> syscalls.rs
@@ -59,9 +72,16 @@ fn main() {
 
     // object-api*.xml -> invocations.rs
     let common = read("object-api.xml");
-    let sel4_arch = read("object-api-sel4-arch.xml");
-    let arch = read("object-api-arch.xml");
-    let rust = xml::generate_invocations(&common, &sel4_arch, &arch)
+    let (sel4_arch_name, arch_name) = match target_arch.as_str() {
+        "x86_64" => ("object-api-sel4-arch.xml", "object-api-arch.xml"),
+        "aarch64" => ("object-api-aarch64.xml", "object-api-arm.xml"),
+        _ => unreachable!(),
+    };
+    let sel4_arch = read(sel4_arch_name);
+    let arch = read(arch_name);
+    let extension = read("object-api-rust-micro.xml");
+    let arch_and_extension = format!("{arch}\n{extension}");
+    let rust = xml::generate_invocations(&common, &sel4_arch, &arch_and_extension)
         .unwrap_or_else(|e| panic!("invocation codegen: {e}"));
     fs::write(out_dir.join("invocations.rs"), rust).expect("write invocations.rs");
 }
