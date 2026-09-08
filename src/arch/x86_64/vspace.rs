@@ -33,6 +33,33 @@ pub const ENTRIES_PER_TABLE: usize = 512;
 pub const PAGE_BITS_4K: u32 = 12;
 pub const PAGE_BITS_2M: u32 = 21;
 pub const PAGE_BITS_1G: u32 = 30;
+pub const USER_VADDR_END: Word = 1u64 << 47;
+
+/// Whether a complete mapping extent lies in the lower canonical user half. This does not
+/// enforce alignment: paging-structure callers pass the base of the containing table span.
+/// Internal kernel mappings continue to use `canonical`, which permits the upper half.
+pub const fn user_mapping_range(vaddr: Word, size_bits: u32) -> bool {
+    let Some(bytes) = 1u64.checked_shl(size_bits) else {
+        return false;
+    };
+    let Some(end) = vaddr.checked_add(bytes) else {
+        return false;
+    };
+    vaddr < USER_VADDR_END && end <= USER_VADDR_END
+}
+
+/// Public frame-map boundary. seL4 compares the exclusive frame end against inclusive
+/// `USER_TOP` (2^47 - 1), so the final aligned user page is reserved. Paging containers may
+/// still span that page; their admission uses `user_mapping_range` instead.
+pub const fn user_frame_mapping_range(vaddr: Word, size_bits: u32) -> bool {
+    let Some(bytes) = 1u64.checked_shl(size_bits) else {
+        return false;
+    };
+    let Some(end) = vaddr.checked_add(bytes) else {
+        return false;
+    };
+    vaddr < USER_VADDR_END && end < USER_VADDR_END
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct VAddrIndices {
@@ -266,11 +293,55 @@ pub mod spec {
         decompose_user_addr();
         decompose_kernel_addr();
         canonical_check();
+        user_mapping_extents();
         pte_round_trip();
         frame_map_writes_pte();
         frame_map_rejects_alignment();
         frame_map_rejects_double_map();
         arch::log("vspace tests completed\n");
+    }
+
+    #[inline(never)]
+    fn user_mapping_extents() {
+        const PS_BRANCH: u64 = 129u64 << 39;
+        for bits in [12u32, 21, 30, 39] {
+            let bytes = 1u64 << bits;
+            assert!(user_mapping_range(0, bits));
+            assert!(user_mapping_range(PS_BRANCH, bits));
+            assert!(user_mapping_range(USER_VADDR_END - bytes, bits));
+            assert!(!user_mapping_range(USER_VADDR_END - bytes + 1, bits));
+            for address in [
+                USER_VADDR_END,
+                0x0001_0000_0000_0000,
+                0xffff_8000_0000_0000,
+                u64::MAX - bytes + 1,
+                u64::MAX,
+            ] {
+                assert!(!user_mapping_range(address, bits));
+            }
+        }
+        for bits in [12u32, 21, 30] {
+            let bytes = 1u64 << bits;
+            assert!(user_frame_mapping_range(0, bits));
+            assert!(user_frame_mapping_range(PS_BRANCH, bits));
+            assert!(user_frame_mapping_range(USER_VADDR_END - 2 * bytes, bits));
+            assert!(!user_frame_mapping_range(USER_VADDR_END - bytes, bits));
+            for address in [
+                USER_VADDR_END,
+                0x0001_0000_0000_0000,
+                0xffff_8000_0000_0000,
+                u64::MAX - bytes + 1,
+                u64::MAX,
+            ] {
+                assert!(!user_frame_mapping_range(address, bits));
+            }
+        }
+        assert!(!user_mapping_range(0, 64));
+        assert!(!user_mapping_range(0, u32::MAX));
+        assert!(!user_frame_mapping_range(0, 64));
+        assert!(!user_frame_mapping_range(0, u32::MAX));
+        assert!(canonical(0xffff_8000_0000_0000));
+        arch::log("  user mapping extents exclude noncanonical and kernel addresses\n");
     }
 
     #[inline(never)]

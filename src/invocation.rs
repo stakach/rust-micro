@@ -536,10 +536,24 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         _ => unreachable!(),
     };
     let vaddr = args.a2;
+    let align_bits: u32 = match size {
+        crate::cap::FrameSize::Small => 12,
+        crate::cap::FrameSize::Large => 21,
+        crate::cap::FrameSize::Huge => 30,
+    };
     if let Some(prev) = current_mapped {
-        // Upstream `decodeX86FrameMapInvocation` allows re-mapping a
-        // Frame cap at the *same* vaddr as a no-op. Different vaddr
-        // requires Unmap first.
+        if vaddr & ((1u64 << align_bits) - 1) != 0 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_AlignmentError,
+            )));
+        }
+        if !crate::arch::x86_64::vspace::user_frame_mapping_range(vaddr, align_bits) {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidArgument,
+            )));
+        }
+        // Preserve the existing same-address shortcut after validating its range.
+        // Different vaddr requires Unmap first.
         if prev == vaddr {
             return Ok(());
         }
@@ -590,15 +604,15 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     // Huge=1 GiB (30-bit). FRAMEEXPORTS0001 reserves a 1 GiB-aligned
     // vaddr range so all three sizes share the same base — only the
     // size_bits-derived stride between mappings matters.
-    let align_bits: u32 = match size {
-        crate::cap::FrameSize::Small => 12,
-        crate::cap::FrameSize::Large => 21,
-        crate::cap::FrameSize::Huge => 30,
-    };
     let align_mask = (1u64 << align_bits) - 1;
     if vaddr & align_mask != 0 {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_AlignmentError,
+        )));
+    }
+    if !crate::arch::x86_64::vspace::user_frame_mapping_range(vaddr, align_bits) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
         )));
     }
 
@@ -1452,6 +1466,22 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
     if vaddr & 0xFFF != 0 {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_AlignmentError,
+        )));
+    }
+    let span_bits = match level {
+        1 => 21,
+        2 => 30,
+        3 => 39,
+        _ => {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidArgument,
+            )))
+        }
+    };
+    let span_base = vaddr & !((1u64 << span_bits) - 1);
+    if !crate::arch::x86_64::vspace::user_mapping_range(span_base, span_bits) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
         )));
     }
 
@@ -7098,6 +7128,8 @@ pub mod spec {
             frame_map_unmap_get_address();
             frame_map_accepts_upstream_libsel4_abi();
             paging_maps_reject_unassigned_explicit_vspace();
+            frame_maps_reject_non_user_extents();
+            paging_maps_reject_non_user_extents();
             paging_unmap_requires_exact_physical_identity();
             page_table_invocation_tracks_asid_and_detaches_hardware();
             page_table_map_updates_invoked_slot_not_first_alias();
@@ -7678,6 +7710,152 @@ pub mod spec {
         }
 
         arch::log("  ✓ paging unmap requires exact physical identity at every level\n");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    fn frame_maps_reject_non_user_extents() {
+        use crate::cap::{FrameMapType, FrameRights, FrameSize, FrameStorage, PAddr, Pml4Storage};
+        let invoker = setup_invoker(0);
+        let vspace = Cap::PML4 {
+            ptr: PPtr::<Pml4Storage>::new(0x4000).unwrap(),
+            mapped: true,
+            asid: 7,
+        };
+        unsafe { KERNEL.get().cnodes[0].0[3].set_cap(&vspace); }
+        for size in [FrameSize::Small, FrameSize::Large, FrameSize::Huge] {
+            let bits = match size {
+                FrameSize::Small => 12,
+                FrameSize::Large => 21,
+                FrameSize::Huge => 30,
+            };
+            for address in [0x0000_8000_0000_0000u64, 0x0001_0000_0000_0000,
+                0xffff_8000_0000_0000, 0xffff_ffff_c000_0000,
+                (1u64 << 47) - (1u64 << bits)] {
+                for mapped in [None, Some(address)] {
+                    let frame = Cap::Frame {
+                        ptr: PAddr::<FrameStorage>::new(0x4000_0000),
+                        size,
+                        rights: FrameRights::ReadWrite,
+                        mapped,
+                        asid: if mapped.is_some() { 7 } else { 0 },
+                        is_device: false,
+                        map_type: FrameMapType::VSpace,
+                    };
+                    for format in 0..3 {
+                        unsafe {
+                            let s = KERNEL.get();
+                            s.cnodes[0].0[1].set_cap(&frame);
+                            let tcb = s.scheduler.slab.get_mut(invoker);
+                            tcb.pending_extra_caps_count = if format == 2 { 1 } else { 0 };
+                            tcb.pending_extra_caps[0] = vspace;
+                        }
+                        // CTE packing canonicalizes the mapped-address field; compare and invoke
+                        // the actual stored capability, not an unrepresentable test description.
+                        let retained_frame = unsafe { KERNEL.get().cnodes[0].0[1].cap() };
+                        let retained_vspace = unsafe { KERNEL.get().cnodes[0].0[3].cap() };
+                        let args = SyscallArgs {
+                            a0: 1,
+                            a1: ((InvocationLabel::X86PageMap as u64) << 12)
+                                | if format == 2 { (1 << 7) | 3 } else { 3 },
+                            a2: address,
+                            a3: FrameRights::ReadWrite.to_word(),
+                            a4: if format == 1 { 3 } else { 0 },
+                            ..Default::default()
+                        };
+                        assert_eq!(decode_invocation(retained_frame, &args, invoker),
+                            Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_InvalidArgument))));
+                        unsafe {
+                            assert_eq!(KERNEL.get().cnodes[0].0[1].cap(), retained_frame);
+                            assert_eq!(KERNEL.get().cnodes[0].0[3].cap(), retained_vspace);
+                        }
+                        let unaligned = SyscallArgs { a2: address + 1, ..args };
+                        assert_eq!(decode_invocation(retained_frame, &unaligned, invoker),
+                            Err(KException::SyscallError(SyscallError::new(
+                                seL4_Error::seL4_AlignmentError))));
+                        unsafe {
+                            assert_eq!(KERNEL.get().cnodes[0].0[1].cap(), retained_frame);
+                            assert_eq!(KERNEL.get().cnodes[0].0[3].cap(), retained_vspace);
+                        }
+                    }
+                }
+            }
+        }
+        teardown_invoker(invoker);
+        arch::log("  frame map rejects non-user extents before mapping or same-VA replay\n");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    fn paging_maps_reject_non_user_extents() {
+        use crate::cap::{PageTableStorage, PageDirectoryStorage, PdptStorage, Pml4Storage};
+        let invoker = setup_invoker(0);
+        let vspace = Cap::PML4 {
+            ptr: PPtr::<Pml4Storage>::new(0x4000).unwrap(),
+            mapped: true,
+            asid: 7,
+        };
+        unsafe { KERNEL.get().cnodes[0].0[3].set_cap(&vspace); }
+        let tables = [
+            (Cap::PageTable { ptr: PPtr::<PageTableStorage>::new(0x1000).unwrap(),
+                mapped: None, asid: 0 }, InvocationLabel::X86PageTableMap),
+            (Cap::PageDirectory { ptr: PPtr::<PageDirectoryStorage>::new(0x2000).unwrap(),
+                mapped: None, asid: 0 }, InvocationLabel::X86PageDirectoryMap),
+            (Cap::Pdpt { ptr: PPtr::<PdptStorage>::new(0x3000).unwrap(),
+                mapped: None, asid: 0 }, InvocationLabel::X86PDPTMap),
+        ];
+        for (table, label) in tables {
+            for address in [0x0000_8000_0000_0000u64, 0x0001_0000_0000_0000,
+                0xffff_8000_0000_0000, 0xffff_ffff_ffff_f000] {
+                for format in 0..3 {
+                    unsafe {
+                        let s = KERNEL.get();
+                        s.cnodes[0].0[1].set_cap(&table);
+                        let tcb = s.scheduler.slab.get_mut(invoker);
+                        tcb.pending_extra_caps_count = if format == 2 { 1 } else { 0 };
+                        tcb.pending_extra_caps[0] = vspace;
+                    }
+                    let args = SyscallArgs {
+                        a0: 1,
+                        a1: ((label as u64) << 12)
+                            | if format == 2 { (1 << 7) | 2 } else { 2 },
+                        a2: address,
+                        a3: if format == 1 { 3 } else { 0 },
+                        ..Default::default()
+                    };
+                    assert_eq!(decode_invocation(table, &args, invoker),
+                        Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidArgument))));
+                    unsafe {
+                        assert_eq!(KERNEL.get().cnodes[0].0[1].cap(), table);
+                        assert_eq!(KERNEL.get().cnodes[0].0[3].cap(), vspace);
+                    }
+                    let unaligned = SyscallArgs { a2: address + 1, ..args };
+                    assert_eq!(decode_invocation(table, &unaligned, invoker),
+                        Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_AlignmentError))));
+                }
+            }
+            // A page-aligned address need not be aligned to the table span. These valid
+            // containers pass the range guard and reach explicit VSpace-cap validation.
+            unsafe { KERNEL.get().cnodes[0].0[3].set_cap(&Cap::Null); }
+            for address in [(129u64 << 39) + 0x1000, (1u64 << 47) - 0x1000] {
+                let args = SyscallArgs {
+                    a0: 1,
+                    a1: ((label as u64) << 12) | 2,
+                    a2: address,
+                    a3: 3,
+                    ..Default::default()
+                };
+                assert_eq!(decode_invocation(table, &args, invoker),
+                    Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability))));
+            }
+            unsafe { KERNEL.get().cnodes[0].0[3].set_cap(&vspace); }
+        }
+        teardown_invoker(invoker);
+        arch::log("  PT/PD/PDPT map rejects non-user containers before table access\n");
     }
 
     #[cfg(target_arch = "x86_64")]
