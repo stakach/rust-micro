@@ -142,17 +142,14 @@ pub struct CpuContext {
     pub gs_base: u64,
 }
 
-/// 512-byte, 16-byte-aligned FXSAVE region carried on each TCB (SMP
-/// FPU save/restore — see `arch::x86_64::fpu_ctx`). Only present in the
-/// `smp` build; the default single-node kernel needs no per-TCB FPU
-/// storage because a thread's FPU state stays resident in the hardware
-/// until it next runs (no cross-core migration to carry it).
-#[cfg(feature = "smp")]
+/// 512-byte, 16-byte-aligned x86 FXSAVE region carried on each TCB.
+/// Ownership follows the thread across context switches and CPU migration.
+#[cfg(target_arch = "x86_64")]
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
 pub struct FxArea(pub [u8; 512]);
 
-#[cfg(feature = "smp")]
+#[cfg(target_arch = "x86_64")]
 impl FxArea {
     /// A valid FINIT FXSAVE image: FCW=0x037F (offset 0) and
     /// MXCSR=0x1F80 (offset 24); everything else zero (abridged FTW =
@@ -202,18 +199,8 @@ pub struct Tcb {
     pub domain: u8,
     /// Remaining timeslice in scheduler ticks (non-MCS).
     pub time_slice: u32,
-    /// Fault handler CPtr. 0 = no handler.
-    pub fault_handler: Word,
     /// User-mode IPC-buffer virtual address.
     pub ipc_buffer: Word,
-    /// Phase 34c — physical address of the user-mode IPC buffer
-    /// page. Set by `seL4_TCB_SetIPCBuffer` (or implicitly at
-    /// rootserver-launch time). Needed because the kernel
-    /// reads/writes message words 4..length through this paddr —
-    /// walking user page tables on every IPC would be too slow,
-    /// and the kernel linear map makes paddr access a direct
-    /// dereference.
-    pub ipc_buffer_paddr: Word,
     /// Intrusive scheduler-list links. `None` for a thread that
     /// isn't currently enqueued.
     pub sched_next: Option<TcbId>,
@@ -238,10 +225,8 @@ pub struct Tcb {
     pub ipc_badge: Word,
     /// Architecture context for context-switching.
     pub cpu_context: CpuContext,
-    /// Root of this thread's CSpace. Must be `Cap::CNode` for any
-    /// invocation that does cap lookup; defaults to `Cap::Null` for
-    /// boot threads that haven't been wired up yet.
-    pub cspace_root: crate::cap::Cap,
+    /// Actual MDB-participating references, installed only after slab admission.
+    cap_slots: [crate::cte::Cte; 5],
     /// Saved user-mode register state for SYSCALL/SYSRET. The
     /// arch-specific syscall dispatcher copies the in-flight
     /// SYSCALL_SAVE area into here on entry and back out before
@@ -255,12 +240,8 @@ pub struct Tcb {
     /// we keep it as a direct TcbId to skip the cap-derivation
     /// dance (added later in Phase 17).
     pub reply_to: Option<TcbId>,
-    /// Owned VSpace root, changed only through the checked setter and released with this TCB.
-    /// Return paths also validate its ASID assignment before using the cached architecture root.
-    vspace_root: crate::cap::Cap,
     /// Phase 20 — bound notification slot index (within the
     /// kernel notification pool). `None` if not bound.
-    /// (`fault_handler` cptr already exists above.)
     pub bound_notification: Option<u16>,
     /// Phase 28c — CPU affinity (0..MAX_CPUS). The thread is enqueued
     /// onto this CPU's per-CPU runqueue; only that CPU runs it. seL4
@@ -353,26 +334,13 @@ pub struct Tcb {
     /// call-stack's SC link; we store it on the caller for our flat
     /// reply model. (SC-donation rework step 3.)
     pub donated_sc: Option<u16>,
-    /// MCS-resolved fault-handler endpoint cap. Upstream MCS
-    /// resolves the fault EP at `TCB_SetSpace` time in the
-    /// INVOKER's cspace and stores the derived cap in the TCB —
-    /// the cptr in `fault_handler` is only meaningful in whatever
-    /// cspace the setter used, which for inter-AS setups (PAGEFAULT
-    /// 1001+) is NOT the faulter's. When this is an Endpoint cap,
-    /// `deliver_fault` uses it directly; `Cap::Null` falls back to
-    /// the legacy resolve-cptr-in-faulter's-cspace path.
-    /// NOTE: not revoke-tracked (a copy, not a CTE) — deleting the
-    /// EP leaves a dangling handler cap until SetSpace is re-run;
-    /// upstream invalidates via the MDB. Acceptable for sel4test.
-    pub fault_handler_cap: crate::cap::Cap,
-    /// MCS timeout-fault endpoint cap (seL4_TCB_SetTimeoutEndpoint).
-    /// When this thread exhausts its SC budget and this is a valid
-    /// Endpoint, a `Timeout` fault is delivered here instead of the
-    /// thread being parked (TIMEOUTFAULT). Null = no handler.
-    pub timeout_endpoint_cap: crate::cap::Cap,
     /// Per-thread hardware-debug state (CONFIG_HARDWARE_DEBUG_API).
     /// Mirrors seL4's `user_breakpoint_state_t`.
     pub debug: crate::arch::DebugState,
+    #[cfg(target_arch = "x86_64")]
+    pub deferred_debug: Option<crate::arch::x86_64::exceptions::DeferredDebugTrap>,
+    #[cfg(target_arch = "aarch64")]
+    pub deferred_debug: Option<crate::arch::aarch64::exceptions::DeferredDebugTrap>,
     /// Fault-type of the in-flight fault this thread is blocked on
     /// (0 = none; otherwise a `seL4_Fault_*` discriminant: 2 =
     /// UnknownSyscall, 3 = UserException, 6 = VMFault). Replying to
@@ -396,11 +364,11 @@ pub struct Tcb {
     /// that make ordinary seL4 syscalls (the executive, sel4test)
     /// leave this `false` and are completely unaffected.
     pub hosted_syscalls: bool,
-    /// SMP-only saved FPU (x87/SSE) register file. Live state is held
+    /// Saved x86 FPU (x87/SSE) register file. Live state is held
     /// in the hardware while this thread owns a core's FPU; it is
     /// `fxsave`d here on a switch-away / cross-core migration and
     /// `fxrstor`d on switch-to. Initialised to a valid FINIT image.
-    #[cfg(feature = "smp")]
+    #[cfg(target_arch = "x86_64")]
     pub fpu_state: FxArea,
     #[cfg(target_arch = "aarch64")]
     pub aarch64_fpu_state: Aarch64FpuState,
@@ -414,9 +382,7 @@ impl Default for Tcb {
             mcp: 0,
             domain: 0,
             time_slice: 0,
-            fault_handler: 0,
             ipc_buffer: 0,
-            ipc_buffer_paddr: 0,
             sched_next: None,
             sched_prev: None,
             ep_next: None,
@@ -431,10 +397,9 @@ impl Default for Tcb {
                 fs_base: 0,
                 gs_base: 0,
             },
-            cspace_root: crate::cap::Cap::Null,
+            cap_slots: [crate::cte::Cte::null(); 5],
             user_context: crate::arch::UserContext::new_zero(),
             reply_to: None,
-            vspace_root: crate::cap::Cap::Null,
             bound_notification: None,
             affinity: 0,
             sc: None,
@@ -451,12 +416,14 @@ impl Default for Tcb {
             flags: 0,
             enqueued: false,
             donated_sc: None,
-            fault_handler_cap: crate::cap::Cap::Null,
-            timeout_endpoint_cap: crate::cap::Cap::Null,
             debug: crate::arch::DebugState::new(),
+            #[cfg(target_arch = "x86_64")]
+            deferred_debug: None,
+            #[cfg(target_arch = "aarch64")]
+            deferred_debug: None,
             pending_fault: 0,
             hosted_syscalls: false,
-            #[cfg(feature = "smp")]
+            #[cfg(target_arch = "x86_64")]
             fpu_state: FxArea::FINIT,
             #[cfg(target_arch = "aarch64")]
             aarch64_fpu_state: Aarch64FpuState::ZERO,
@@ -465,45 +432,100 @@ impl Default for Tcb {
 }
 
 impl Tcb {
-    pub const fn vspace_root(&self) -> crate::cap::Cap {
-        self.vspace_root
+    pub fn cspace_root(&self) -> crate::cap::Cap {
+        self.cap_slot(crate::cte::TcbSlot::CSpace).cap()
+    }
+
+    pub fn vspace_root(&self) -> crate::cap::Cap {
+        self.cap_slot(crate::cte::TcbSlot::VSpace).cap()
+    }
+
+    pub fn ipc_buffer_cap(&self) -> crate::cap::Cap {
+        self.cap_slot(crate::cte::TcbSlot::IpcBuffer).cap()
+    }
+
+    pub fn ipc_buffer_send_paddr(&self) -> Word {
+        self.ipc_buffer_paddr_for(false)
+    }
+
+    pub fn ipc_buffer_receive_paddr(&self) -> Word {
+        self.ipc_buffer_paddr_for(true)
+    }
+
+    fn ipc_buffer_paddr_for(&self, receive: bool) -> Word {
+        use crate::cap::{Cap, FrameRights};
+        let Cap::Frame { ptr, size, rights, is_device: false, .. } = self.ipc_buffer_cap() else {
+            return 0;
+        };
+        let buffer_bytes = crate::ipc_buffer::SIZE_BYTES as u64;
+        if self.ipc_buffer == 0 || self.ipc_buffer & (buffer_bytes - 1) != 0
+            || matches!(rights, FrameRights::KernelOnly)
+            || (receive && !matches!(rights, FrameRights::ReadWrite))
+        {
+            return 0;
+        }
+        let frame_bytes = 1u64 << size.bits();
+        let offset = self.ipc_buffer & (frame_bytes - 1);
+        if offset + buffer_bytes > frame_bytes {
+            return 0;
+        }
+        ptr.addr().checked_add(offset).unwrap_or(0)
+    }
+
+    pub fn fault_handler_cap(&self) -> crate::cap::Cap {
+        self.cap_slot(crate::cte::TcbSlot::FaultHandler).cap()
+    }
+
+    pub fn timeout_endpoint_cap(&self) -> crate::cap::Cap {
+        self.cap_slot(crate::cte::TcbSlot::Timeout).cap()
+    }
+
+    pub(crate) fn cap_slot(&self, slot: crate::cte::TcbSlot) -> &crate::cte::Cte {
+        &self.cap_slots[slot as usize]
+    }
+
+    pub(crate) fn cap_slot_mut(&mut self, slot: crate::cte::TcbSlot) -> &mut crate::cte::Cte {
+        &mut self.cap_slots[slot as usize]
+    }
+
+    pub fn internal_caps_are_empty(&self) -> bool {
+        self.cap_slots.iter().all(|slot| {
+            matches!(slot.cap(), crate::cap::Cap::Null) && slot.parent().is_none()
+                && slot.child_count() == 0
+        })
     }
 
     pub fn has_current_vspace(&self) -> bool {
-        crate::asid::root_is_current(&self.vspace_root)
+        crate::asid::root_is_current(&self.vspace_root())
     }
 
-    /// Replace the TCB's real held VSpace reference. Validation precedes both reference-count
-    /// changes and cached-root publication; moving the TCB into or within a slab adds no reference.
-    pub fn set_vspace_root(&mut self, root: crate::cap::Cap) -> bool {
+    pub(crate) fn update_cap_cache(&mut self, slot: crate::cte::TcbSlot, cap: crate::cap::Cap) {
         use crate::cap::Cap;
-        if !matches!(root, Cap::Null) && !crate::asid::root_is_current(&root) {
-            return false;
-        }
-        let root_address = match root {
-            Cap::PML4 { ptr, .. } => ptr.addr(),
-            _ => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let root = crate::arch::x86_64::paging::kernel_root_cr3();
-                    assert_ne!(root, 0, "clearing a VSpace requires the boot kernel root");
-                    root
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                { 0 }
+        use crate::cte::TcbSlot;
+        match slot {
+            TcbSlot::VSpace => {
+                self.cpu_context.cr3 = match cap {
+                    Cap::PML4 { ptr, .. } => ptr.addr(),
+                    _ => {
+                        #[cfg(target_arch = "x86_64")]
+                        { crate::arch::x86_64::paging::kernel_root_cr3() }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        { 0 }
+                    }
+                };
             }
-        };
-        crate::asid::note_tcb_root_write(&self.vspace_root, &root);
-        self.vspace_root = root;
-        self.cpu_context.cr3 = root_address;
-        true
+            TcbSlot::IpcBuffer => {
+                self.ipc_buffer = 0;
+            }
+            _ => {}
+        }
     }
 
     /// ASID-pool retirement invalidates a held root even while the TCB retains its capability.
     /// Never select a stale cached user root, nor use zero (which means keep the current CR3).
     #[cfg(target_arch = "x86_64")]
     pub fn vm_root_cr3(&self) -> u64 {
-        if let crate::cap::Cap::PML4 { ptr, .. } = self.vspace_root {
+        if let crate::cap::Cap::PML4 { ptr, .. } = self.vspace_root() {
             if self.has_current_vspace() {
                 return ptr.addr();
             }
@@ -546,7 +568,7 @@ pub const MAX_TCBS: usize = 320;
 
 impl Drop for Tcb {
     fn drop(&mut self) {
-        crate::asid::note_tcb_root_write(&self.vspace_root, &crate::cap::Cap::Null);
+        assert!(self.internal_caps_are_empty(), "TCB internal CTEs must be drained before drop");
     }
 }
 
@@ -582,6 +604,7 @@ impl TcbSlab {
     }
 
     fn alloc_from(&mut self, tcb: Tcb, first: usize) -> Option<TcbId> {
+        assert!(tcb.internal_caps_are_empty(), "TCB references are installed after admission");
         for (i, slot) in self.entries.iter_mut().enumerate().skip(first) {
             if slot.is_none() {
                 *slot = Some(tcb);
@@ -590,7 +613,7 @@ impl TcbSlab {
                 // (SMP FPU save/restore). The `Default` is already a
                 // valid FINIT image; this just adopts the canonical
                 // boot-captured one for fidelity.
-                #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+                #[cfg(target_arch = "x86_64")]
                 crate::arch::x86_64::fpu_ctx::stamp_template(&mut slot.as_mut().unwrap().fpu_state);
                 return Some(TcbId(i as u16));
             }
@@ -621,6 +644,7 @@ impl TcbSlab {
     }
 
     pub fn free(&mut self, id: TcbId) {
+        assert!(self.get(id).internal_caps_are_empty(), "TCB internal CTEs must be drained before free");
         self.entries[id.0 as usize] = None;
     }
 }
@@ -647,6 +671,7 @@ pub mod spec {
         thread_state_runnable();
         slab_alloc_get_free();
         super::vspace_spec::run();
+        super::ipc_buffer_spec::run();
         arch::log("TCB tests completed\n");
     }
 
@@ -687,3 +712,7 @@ pub mod spec {
 #[cfg(feature = "spec")]
 #[path = "tcb_vspace_spec.rs"]
 mod vspace_spec;
+
+#[cfg(feature = "spec")]
+#[path = "tcb_ipc_buffer_spec.rs"]
+mod ipc_buffer_spec;

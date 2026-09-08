@@ -983,6 +983,12 @@ unsafe fn rs_set(s: &mut KernelState, si: usize, cap: &Cap) {
 }
 
 pub unsafe fn launch_rootserver() -> ! {
+    // AP schedulers are already live. Publish the initial user task as one BKL-owned transaction.
+    #[cfg(target_arch = "x86_64")]
+    core::arch::asm!("cli", options(nostack));
+    #[cfg(target_arch = "aarch64")]
+    core::arch::asm!("msr daifset, #2", "isb", options(nostack));
+    crate::smp::bkl_acquire();
     #[cfg(target_arch = "x86_64")]
     install_kernel_page_tables();
 
@@ -1076,21 +1082,6 @@ pub unsafe fn launch_rootserver() -> ! {
     #[cfg(target_arch = "aarch64")]
     let initial_sp = img.stack_top;
     t.user_context = UserContext::for_entry(img.entry, initial_sp, img.bootinfo_vaddr);
-    // Phase 34c — register the rootserver's IPC buffer with the
-    // kernel so long-message IPC can read/write it via paddr.
-    t.ipc_buffer = img.ipc_buffer_vaddr;
-    t.ipc_buffer_paddr = img.ipc_buffer_paddr;
-    t.cspace_root = cnode_cap;
-    // Phase 43 — assign a reserved sentinel ASID (1) to the
-    // rootserver's vspace so Frame::Unmap can locate this PML4 by
-    // asid lookup. ASID 0 means "unmapped/unassigned" and would
-    // make our Frame::Unmap no-op even for legitimate same-vspace
-    // unmaps.
-    assert!(t.set_vspace_root(Cap::PML4 {
-        ptr: PPtr::<Pml4Storage>::new(img.pml4_paddr).expect("pml4 paddr"),
-        mapped: true,
-        asid: ROOTSERVER_ASID,
-    }));
     let id = s.scheduler.admit(t);
 
     // Phase 37b — pre-allocate the InitThreadSC. The rootserver
@@ -1182,6 +1173,22 @@ pub unsafe fn launch_rootserver() -> ! {
             asid_base: 0,
         },
     );
+    // Bootstrap uses the same derivation graph as later TCB configuration.
+    // Publish source CTEs before installing any thread-held capability.
+    for (slot, source, data) in [
+        (crate::cte::TcbSlot::CSpace, 2, 0),
+        (crate::cte::TcbSlot::VSpace, 3, 0),
+        (crate::cte::TcbSlot::IpcBuffer, 10, img.ipc_buffer_vaddr),
+    ] {
+        crate::invocation::derive_tcb_cap(
+            s,
+            id,
+            slot,
+            Some(crate::cte::MdbId::pack(ROOTSERVER_CNODE_IDX as u32, source)),
+            data,
+        )
+        .expect("bootstrap thread capability derivation");
+    }
     // Phase 42 — IOPortControl at canonical slot 7
     // (`seL4_CapIOPortControl`). sel4test's pc99 timer driver
     // calls `seL4_X86_IOPortControl_Issue` here when it falls back
@@ -1470,10 +1477,9 @@ pub unsafe fn launch_rootserver() -> ! {
             options(nostack, preserves_flags),
         );
 
-        // SMP: establish the rootserver as this core's FPU owner so its
+        // Establish the rootserver as this core's FPU owner so its
         // x87/SSE state is tracked from first entry (otherwise a later
         // switch wouldn't save it).
-        #[cfg(feature = "smp")]
         crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, id);
 
         let launch_fs_base = s.scheduler.slab.get(id).cpu_context.fs_base;
@@ -1514,11 +1520,15 @@ pub unsafe fn launch_rootserver() -> ! {
     let ctx = &s.scheduler.slab.get(id).user_context as *const UserContext;
     s.scheduler.set_active_user(Some(id));
     #[cfg(target_arch = "x86_64")]
-    enter_user_via_iretq(ctx);
+    {
+        crate::smp::bkl_release();
+        enter_user_via_iretq(ctx);
+    }
     #[cfg(target_arch = "aarch64")]
     {
         crate::arch::aarch64::vspace::activate_user_vspace(img.pml4_paddr, ROOTSERVER_ASID);
         crate::arch::aarch64::timer::enable_periodic_kernel_timer();
+        crate::smp::bkl_release();
         crate::arch::aarch64::context::enter_user(ctx);
     }
 }

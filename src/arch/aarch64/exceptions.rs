@@ -6,6 +6,8 @@ static EXPECTED_BRK: AtomicBool = AtomicBool::new(false);
 static LAST_ESR: AtomicU64 = AtomicU64::new(0);
 static EL0_SPEC_STATE: AtomicU8 = AtomicU8::new(0);
 
+include!("exceptions/deferred_debug.rs");
+
 core::arch::global_asm!(
     r#"
     .section .text.aarch64_vectors,"ax"
@@ -285,7 +287,14 @@ fn handle_user_fault(context: *mut crate::arch::UserContext, fault: crate::fault
     use crate::syscalls::Syscall;
     use crate::tcb::ThreadStateType;
 
-    crate::smp::bkl_acquire();
+    let entry = unsafe { crate::smp::arm_user_entry(context, crate::smp::UserEntryKind::Fault) };
+    if crate::smp::bkl_acquire_for_user_entry(entry) {
+        crate::arch::aarch64::syscall_entry::dispatch_selected(
+            unsafe { &mut *context }, None, Syscall::SysYield, false, false,
+        );
+        crate::smp::bkl_release();
+        return;
+    }
     let context = unsafe { &mut *context };
     let Some(faulter) = (unsafe {
         crate::kernel::KERNEL
@@ -319,23 +328,11 @@ fn handle_user_fault(context: *mut crate::arch::UserContext, fault: crate::fault
 }
 
 fn handle_user_debug_exception(esr: u64, context: *mut crate::arch::UserContext) {
-    use crate::arch::aarch64::debug;
     use crate::syscalls::Syscall;
-    use crate::tcb::ThreadStateType;
-
-    crate::smp::bkl_acquire();
-    let context = unsafe { &mut *context };
-    let Some(faulter) = (unsafe {
-        crate::kernel::KERNEL
-            .get()
-            .scheduler
-            .active_user()
-            .or_else(|| crate::kernel::KERNEL.get().scheduler.current())
-    }) else {
-        crate::smp::bkl_release();
-        fatal_exception("AArch64 debug exception without an active thread\n");
-    };
-
+    if unsafe { (*context).spsr_el1 & 0xf } != 0 {
+        log_sync_exception(esr, context);
+        fatal_exception("Unexpected kernel debug exception\n");
+    }
     let class = esr >> 26;
     let far = if class == 0x34 {
         let value: u64;
@@ -344,98 +341,32 @@ fn handle_user_debug_exception(esr: u64, context: *mut crate::arch::UserContext)
         }
         value
     } else {
-        context.elr_el1
+        unsafe { (*context).elr_el1 }
     };
-
+    let kind = crate::smp::UserEntryKind::ArmDebug { esr, far };
+    let entry = unsafe { crate::smp::arm_user_entry(context, kind) };
+    if crate::smp::bkl_acquire_for_user_entry(entry) {
+        crate::arch::aarch64::syscall_entry::dispatch_selected(
+            unsafe { &mut *context }, None, Syscall::SysYield, false, false,
+        );
+        crate::smp::bkl_release();
+        return;
+    }
+    let context = unsafe { &mut *context };
+    let state = unsafe { crate::kernel::KERNEL.get() };
+    let Some(faulter) = state.scheduler.active_user().or_else(|| state.scheduler.current()) else {
+        crate::smp::bkl_release();
+        fatal_exception("AArch64 debug exception without an active thread\n");
+    };
     unsafe {
-        let tcb = crate::kernel::KERNEL.get().scheduler.slab.get_mut(faulter);
+        let tcb = state.scheduler.slab.get_mut(faulter);
         tcb.user_context = *context;
         crate::arch::aarch64::context::save_exception_fpu(context, &mut tcb.aarch64_fpu_state);
+        defer_quiesced_debug(tcb, kind);
     }
-
-    let fault = match class {
-        0x30 => {
-            let bp = unsafe {
-                debug::active_breakpoint(
-                    &crate::kernel::KERNEL
-                        .get()
-                        .scheduler
-                        .slab
-                        .get(faulter)
-                        .debug,
-                    far,
-                    debug::SEL4_INSTRUCTION_BREAKPOINT,
-                )
-            };
-            bp.map(|bp_num| crate::fault::FaultMessage::DebugException {
-                fault_ip: context.elr_el1,
-                reason: debug::SEL4_INSTRUCTION_BREAKPOINT,
-                trigger_addr: far,
-                bp_num: bp_num as u64,
-            })
-        }
-        0x34 => {
-            let bp = unsafe {
-                debug::active_breakpoint(
-                    &crate::kernel::KERNEL
-                        .get()
-                        .scheduler
-                        .slab
-                        .get(faulter)
-                        .debug,
-                    far,
-                    debug::SEL4_DATA_BREAKPOINT,
-                )
-            };
-            bp.map(|bp_num| crate::fault::FaultMessage::DebugException {
-                fault_ip: context.elr_el1,
-                reason: debug::SEL4_DATA_BREAKPOINT,
-                trigger_addr: far,
-                bp_num: bp_num as u64,
-            })
-        }
-        0x32 => {
-            let ready = unsafe {
-                debug::single_step_counter_ready(
-                    &mut crate::kernel::KERNEL
-                        .get()
-                        .scheduler
-                        .slab
-                        .get_mut(faulter)
-                        .debug,
-                )
-            };
-            if !ready {
-                crate::smp::bkl_release();
-                return;
-            }
-            Some(crate::fault::FaultMessage::DebugException {
-                fault_ip: context.elr_el1,
-                reason: debug::SEL4_SINGLE_STEP,
-                trigger_addr: 0,
-                bp_num: 0,
-            })
-        }
-        0x3c => Some(crate::fault::FaultMessage::DebugException {
-            fault_ip: context.elr_el1,
-            reason: debug::SEL4_SOFTWARE_BREAK_REQUEST,
-            trigger_addr: 0,
-            bp_num: 0,
-        }),
-        _ => unreachable!(),
-    };
-
-    let Some(fault) = fault else {
+    if !deliver_deferred_debug(state, faulter) {
         crate::smp::bkl_release();
-        fatal_exception("AArch64 debug exception did not match saved state\n");
-    };
-    unsafe {
-        if crate::fault::deliver_fault(faulter, fault).is_err() {
-            crate::kernel::KERNEL
-                .get()
-                .scheduler
-                .block(faulter, ThreadStateType::Inactive);
-        }
+        return;
     }
     crate::arch::aarch64::syscall_entry::dispatch_selected(
         context,
@@ -560,5 +491,6 @@ pub mod spec {
         }
         assert_eq!((cpacr >> 20) & 0x3, 0x3);
         arch::log(" ok\n");
+        test_deferred_debug();
     }
 }

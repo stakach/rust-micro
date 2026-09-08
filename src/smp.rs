@@ -97,27 +97,30 @@ static BKL_WAITERS: AtomicU32 = AtomicU32::new(0);
 /// Acquire the BKL. Spins until granted. Caller must be in kernel
 /// mode with IF=0 (so the same CPU can't re-enter via interrupt).
 pub fn bkl_acquire() {
+    let _ = bkl_acquire_for_user_entry(None);
+}
+
+/// Acquire BKL with the exact architectural entry snapshot available to a remote quiescence
+/// request. A true result means the controller adopted this entry; do not execute it again.
+pub(crate) fn bkl_acquire_for_user_entry(mut entry: Option<UserEntrySnapshot>) -> bool {
+    let mut adopted = false;
+    #[cfg(all(target_arch = "x86_64", feature = "spec"))]
+    observe_waiting_entry(&entry);
     #[cfg(target_arch = "x86_64")]
     service_retirement_shootdown();
+    adopted |= service_quiescence(&mut entry);
     let me = crate::arch::get_cpu_id() + 1;
-    // Defensive: a re-entrant acquire by the SAME cpu must never happen —
-    // the kernel keeps IF=0 while holding the BKL and clears IF (`cli`)
-    // after every idle `sti;hlt` before re-acquiring (see the BSP idle
-    // loops in syscall_entry.rs / exceptions.rs and the AP loop in
-    // main.rs). If it ever does, bkl_acquire would otherwise deadlock-spin
-    // forever with interrupts off, freezing the kernel clock silently.
-    // Log loudly and proceed instead — on a single node the kernel data
-    // is already exclusively ours, so recursing is safe and visible.
-    if BKL.load(Ordering::Relaxed) == me {
-        crate::arch::log("!!! BUG: re-entrant BKL acquire (IF discipline violated)\n");
-        return;
-    }
+    // A nested acquire cannot mint a second exclusive KernelState borrower.
+    assert_ne!(BKL.load(Ordering::Relaxed), me, "nested BKL ownership");
     loop {
         match BKL.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => {
                 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
-                BKL_WAITERS.fetch_and(!(1 << (me - 1)), Ordering::Release);
-                return;
+                {
+                    BKL_WAITERS.fetch_and(!(1 << (me - 1)), Ordering::Release);
+                    WAITING_ENTRY_KIND[(me - 1) as usize].store(0, Ordering::Release);
+                }
+                return adopted;
             }
             Err(_) => {
                 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
@@ -127,6 +130,7 @@ pub fn bkl_acquire() {
                     // independent mailbox without borrowing scheduler state or acquiring BKL.
                     #[cfg(target_arch = "x86_64")]
                     service_retirement_shootdown();
+                    adopted |= service_quiescence(&mut entry);
                     core::hint::spin_loop();
                 }
             }
@@ -247,35 +251,8 @@ pub fn kick_cpu(target_cpu: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Blocking remote-TCB stall (mirrors seL4 `remoteTCBStall` +
-// `IpiRemoteCall_Stall` / `ipiStallCoreCallback`).
-//
-// Before a controlling core (e.g. core 0 running SchedControl_Configure,
-// TCB_Suspend, or a TCB delete) mutates / frees a TCB that is currently
-// RUNNING on another core, it must make that core switch off the thread —
-// otherwise the remote core keeps executing it (use-after-free /
-// double-run). Our IPIs are async, so we synthesise the blocking
-// handshake with two per-core flags:
-//   * `STALL_REQUESTED[target]` — set by the controlling core; the
-//     target's IPI handler keys off it to park itself.
-//   * `STALL_ACK[target]`       — set by the target once it is off the
-//     thread; the controlling core spins on it.
-// `AtomicBool` isn't `Copy`, so the arrays are hand-listed (like
-// `SYSCALL_COUNT_PER_CPU`).
+// Remote execution quiescence is implemented below without releasing BKL.
 // ---------------------------------------------------------------------------
-
-pub static STALL_REQUESTED: [AtomicBool; MAX_CPUS] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
-pub static STALL_ACK: [AtomicBool; MAX_CPUS] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
 
 /// Per-core "went idle since last dispatch" flag. Set just before a
 /// core HLTs in an idle loop; checked + cleared when it next dispatches
@@ -310,70 +287,7 @@ pub fn take_went_idle() -> bool {
     WENT_IDLE[crate::arch::get_cpu_id() as usize].swap(false, Ordering::AcqRel)
 }
 
-/// seL4 `remoteTCBStall`: if `tcb` is currently the running thread on a
-/// *remote* core, make that core switch off it (to idle) before the
-/// caller mutates or frees it. Caller MUST hold the BKL; this routine
-/// releases + re-acquires it internally while spinning, and the BKL is
-/// held again on return. Returns `true` if a stall was performed.
-///
-/// On return the remote core is parked (spinning on `bkl_acquire`) and
-/// will not run `tcb` again — by the time it re-acquires the BKL the
-/// caller will have dequeued / freed the thread.
-pub fn remote_tcb_stall(tcb: TcbId) -> bool {
-    let me = crate::arch::get_cpu_id();
-    let (aff, running_there) = unsafe {
-        let s = crate::kernel::KERNEL.get();
-        let aff = s.scheduler.slab.get(tcb).affinity;
-        (
-            aff,
-            s.scheduler.current_for_cpu(aff) == Some(tcb)
-                || s.scheduler.active_user_for_cpu(aff) == Some(tcb),
-        )
-    };
-    // Stall the source core not only when it is actively running `tcb`,
-    // but also when `tcb`'s FPU image is still resident in that core's
-    // registers (it ran there, then the core went idle without flushing).
-    // Migrating without flushing leaves two cores believing they own the
-    // thread's FPU; the next save races and an old image clobbers the
-    // live one (FPU0002 flakiness). The stall handler flushes via
-    // `flush_local_fpu`. `owner_is` is one relaxed load.
-    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
-    let fpu_resident = crate::arch::x86_64::fpu_ctx::owner_is(aff as usize, tcb);
-    #[cfg(not(all(feature = "smp", target_arch = "x86_64")))]
-    let fpu_resident = false;
-    if aff == me || (!running_there && !fpu_resident) {
-        return false;
-    }
-    let a = aff as usize;
-    STALL_ACK[a].store(false, Ordering::Release);
-    STALL_REQUESTED[a].store(true, Ordering::Release);
-    // Kick the remote core into its IPI handler (registers the cause +
-    // fires the LAPIC vector).
-    send_ipi(aff, IpiKind::Reschedule);
-    // Drop the BKL so the remote core can enter the kernel, park itself,
-    // and acknowledge; spin until it does.
-    bkl_release();
-    let mut spins: u64 = 0;
-    let mut acknowledged = true;
-    while !STALL_ACK[a].load(Ordering::Acquire) {
-        core::hint::spin_loop();
-        spins += 1;
-        if spins > 10_000_000_000 {
-            acknowledged = false;
-            break;
-        }
-    }
-    bkl_acquire();
-    if !acknowledged {
-        panic!("remote TCB stall was not acknowledged");
-    }
-    // The remote core is now parked on `bkl_acquire` (inside its stall
-    // wait-loop). Clear the request: it can't observe this until it
-    // re-acquires the BKL, which it cannot do until we finish our
-    // mutation and release. Safe to clear now.
-    STALL_REQUESTED[a].store(false, Ordering::Release);
-    true
-}
+include!("smp/quiescence.rs");
 
 /// Fan a TLB-shootdown for `vaddr` to every CPU other than the
 /// caller. Used by vspace ops (Frame::Unmap, etc.) after they
@@ -480,6 +394,15 @@ static RETIREMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RETIREMENT_FLUSHES: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(0) }; MAX_CPUS];
 
+#[cfg(all(target_arch = "x86_64", feature = "spec"))]
+pub(crate) fn retirement_spec_snapshot() -> (u32, [u32; MAX_CPUS], bool) {
+    (
+        ONLINE_CPUS.load(Ordering::Acquire),
+        core::array::from_fn(|cpu| RETIREMENT_FLUSHES[cpu].load(Ordering::Acquire)),
+        RETIREMENT_ACTIVE.load(Ordering::Acquire),
+    )
+}
+
 #[cfg(target_arch = "x86_64")]
 fn flush_retired_translations() {
     // Changing CR4.PGE invalidates translations for all PCIDs, including global entries. Both
@@ -510,14 +433,14 @@ pub(crate) fn service_retirement_shootdown() {
     }
 }
 
-/// Synchronous assignment retirement, unlike the ordinary queued mapping shootdown. The caller
+/// Synchronous translation retirement for root withdrawal, unmap, or mapping replacement. The caller
 /// holds BKL, or is in the pre-user quiescent bootstrap/spec phase. It may hold a mutable TCB
 /// borrow: no scheduler access occurs here. One batch must finish before another can begin.
 #[cfg(target_arch = "x86_64")]
-pub fn retire_vspace_assignment(pml4_paddr: u64) {
+pub fn retire_vspace_translations(pml4_paddr: u64) {
     assert!(pml4_paddr != 0 && pml4_paddr & 0xfff == 0);
     assert!(!RETIREMENT_ACTIVE.swap(true, Ordering::AcqRel),
-        "reentrant or concurrent ASID retirement shootdown");
+        "reentrant or concurrent translation retirement shootdown");
     let me = crate::arch::get_cpu_id();
     let targets = ONLINE_CPUS.load(Ordering::Acquire) & !(1 << me);
     for cpu in 0..MAX_CPUS as u32 {
@@ -745,13 +668,13 @@ pub mod spec {
             core::array::from_fn(|cpu| RETIREMENT_FLUSHES[cpu].load(Ordering::Relaxed));
         // The physical value is only an identity: retirement invalidates all translations and
         // never dereferences this address. Both requests must receive real remote flush ACKs.
-        retire_vspace_assignment(0x1000);
+        retire_vspace_translations(0x1000);
         while BKL_WAITERS.load(Ordering::Acquire) & targets != targets {
             core::hint::spin_loop();
         }
         // APs are now waiting for our BKL with IF clear. This second request can complete only
         // through the lock-independent service in their acquisition loop, not their IPI ISR.
-        retire_vspace_assignment(0x2000);
+        retire_vspace_translations(0x2000);
         for cpu in 0..MAX_CPUS {
             if online & (1 << cpu) != 0 {
                 assert_eq!(RETIREMENT_FLUSHES[cpu].load(Ordering::Acquire), before[cpu] + 2);
@@ -799,10 +722,12 @@ pub mod spec {
                 // Otherwise it stays in a SysYield loop forever and
                 // throttles the rest of the kernel via the BKL.
                 unsafe {
+                    quiescence_captures_waiting_syscall(id);
                     bkl_acquire();
                     let state = crate::kernel::KERNEL.get();
+                    remote_tcb_stall(state, id);
                     state.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
-                    assert!(state.scheduler.slab.get_mut(id).set_vspace_root(crate::cap::Cap::Null));
+                    crate::invocation::retire_tcb(state, id);
                     drop(owners);
                     bkl_release();
                 }
@@ -818,6 +743,58 @@ pub mod spec {
             }
             core::hint::spin_loop();
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn quiescence_captures_waiting_syscall(id: TcbId) {
+        // An IRQ may reach the lock first. Let that real event finish before
+        // selecting an actual SYSCALL waiting with IF clear.
+        for _ in 0..256 {
+            bkl_acquire();
+            let mut spins = 0;
+            while BKL_WAITERS.load(Ordering::Acquire) & 2 == 0 && spins < 10_000_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+            if WAITING_ENTRY_KIND[1].load(Ordering::Acquire) != 1 {
+                bkl_release();
+                continue;
+            }
+            let state = crate::kernel::KERNEL.get();
+            assert_eq!(state.scheduler.active_user_for_cpu(1), Some(id));
+            let before = SYSCALL_COUNT_PER_CPU[1].load(Ordering::Acquire);
+            let holder = bkl_holder();
+            assert!(remote_tcb_stall(state, id));
+            assert_eq!(bkl_holder(), holder, "quiescence must retain exclusive BKL ownership");
+            assert_eq!(SYSCALL_COUNT_PER_CPU[1].load(Ordering::Acquire), before);
+            let saved = state.scheduler.slab.get(id).user_context;
+            assert_eq!(saved.r12, crate::arch::x86_64::usermode::PING_REGISTER_SENTINEL);
+            assert_eq!(saved.rip, crate::arch::x86_64::usermode::PING_SYSCALL_PC);
+            assert_eq!(saved.rcx, saved.rip + 2);
+            assert!(state.scheduler.slab.get(id).use_iretq_resume);
+            {
+                let bytes = &state.scheduler.slab.get(id).fpu_state.0[160..168];
+                assert_eq!(bytes, &crate::arch::x86_64::usermode::PING_REGISTER_SENTINEL.to_le_bytes());
+                assert!(!crate::arch::x86_64::fpu_ctx::owner_is(1, id));
+            }
+            assert_eq!(state.scheduler.current_for_cpu(1), None);
+            assert_eq!(state.scheduler.active_user_for_cpu(1), None);
+            assert!(state.scheduler.slab.get(id).enqueued, "withdrawal retains runnable queue membership");
+            assert!(!remote_tcb_stall(state, id));
+            assert_eq!(state.scheduler.slab.get(id).user_context.rip, saved.rip);
+            retire_vspace_translations(state.scheduler.slab.get(id).vm_root_cr3());
+            kick_cpu(1);
+            bkl_release();
+            for _ in 0..100_000_000 {
+                if SYSCALL_COUNT_PER_CPU[1].load(Ordering::Acquire) > before {
+                    arch::log("  remote quiescence retained BKL and captured/replayed real IF-clear syscall + FPU\n");
+                    return;
+                }
+                core::hint::spin_loop();
+            }
+            panic!("adopted syscall did not resume");
+        }
+        panic!("AP1 never reached an observable pre-BKL syscall entry");
     }
 
     /// Phase 28g — `shootdown_tlb(vaddr)` must fan an
@@ -920,7 +897,10 @@ pub mod spec {
         // its pick at the tail, so the value remains visible.
         let mut spins = 0u64;
         loop {
-            let cur = unsafe { crate::kernel::KERNEL.get().scheduler.current_for_cpu(1) };
+            let cur = {
+                let _guard = crate::spec::KernelGuard::acquire();
+                unsafe { crate::kernel::KERNEL.get().scheduler.current_for_cpu(1) }
+            };
             if cur == Some(admitted_id) {
                 break;
             }
@@ -998,27 +978,20 @@ pub mod spec {
     }
 
     /// Phase 28b — BKL primitive.
-    /// Acquire then release leaves the lock free; a second acquire
-    /// after release succeeds. (We don't try to test contention
-    /// from the spec runner since it runs single-threaded; that
-    /// surfaces in 28d when APs make actual kernel calls.)
+    /// Both acquisitions must establish this CPU's ownership. APs may acquire
+    /// the lock whenever this CPU releases it.
     #[inline(never)]
     fn bkl_acquire_release_round_trip() {
-        // BKL must be free at the start of each spec — earlier
-        // tests ran in a single-CPU context that didn't leak it.
-        assert_eq!(bkl_holder(), 0, "BKL should be free at spec start");
-
-        bkl_acquire();
         let me = crate::arch::get_cpu_id() + 1;
+        let guard = crate::spec::KernelGuard::acquire();
         assert_eq!(bkl_holder(), me, "BKL should record this CPU's id+1");
-        bkl_release();
-        assert_eq!(bkl_holder(), 0, "BKL should be free after release");
+        drop(guard);
 
         // A second cycle proves release actually frees the lock
         // (not just that we crashed and restarted).
-        bkl_acquire();
-        bkl_release();
-        assert_eq!(bkl_holder(), 0);
+        let guard = crate::spec::KernelGuard::acquire();
+        assert_eq!(bkl_holder(), me, "BKL reacquisition must restore this CPU's ownership");
+        drop(guard);
         arch::log("  ✓ BKL acquire/release round-trip\n");
     }
 

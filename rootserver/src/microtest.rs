@@ -340,7 +340,7 @@ mod tests {
 
     /// Phase 37c — upstream-shape `seL4_TCB_Configure`:
     /// extraCaps[0..3] = cspace, vspace, ipc_buffer_frame; msg
-    /// words = fault_ep + ignored data fields + ipc_buffer vaddr.
+    /// words = cspace data, vspace data, ipc_buffer vaddr (MCS ABI).
     /// Verifies the kernel reads from extraCaps + msg_regs (not
     /// from `args.a3`/`a4` like the legacy form).
     pub(super) fn tcb_configure_upstream() -> TestResult {
@@ -367,46 +367,11 @@ mod tests {
             core::ptr::write_volatile(buf.add(123), CAP_INIT_THREAD_VSPACE);
             core::ptr::write_volatile(buf.add(124), ipcbuf_slot);
 
-            // SysSend: msginfo.label = TCBConfigure (5),
-            // length = 4 (fault_ep + cspace_data + vspace_data +
-            // ipc_buffer), extraCaps = 3.
-            let label_cfg: u64 = 5;
-            let length: u64 = 4;
-            let extra_caps: u64 = 3;
-            let msg_info: u64 =
-                (label_cfg << 12)
-                | (extra_caps << 7)
-                | (length & 0x7F);
-            const FAULT_EP: u64 = 0xFEEDC0DE;
-            const CSPACE_DATA: u64 = 0;
-            const VSPACE_DATA: u64 = 0;
+            // Actual MCS Configure: three words and three source capabilities.
+            let msg_info = (5u64 << 12) | (3u64 << 7) | 3;
             const IPC_BUFFER_VADDR: u64 = 0x0000_0100_00A0_0000;
-            let r = syscall5(
-                SYS_SEND, tcb_slot, msg_info,
-                FAULT_EP,
-                CSPACE_DATA,
-                VSPACE_DATA,
-            );
-            // a5 = ipc_buffer_vaddr — needs the 6-arg form.
-            // We cheated above with syscall5 (only stages a4); the
-            // upstream Configure path reads ipc_buffer from a5, so
-            // re-issue with the right asm.
-            let _ = r;
-            // Phase 38c — upstream SYSCALL ABI; rax preserved.
-            core::arch::asm!(
-                "syscall",
-                in("rdx") SYS_SEND as u64,
-                in("rdi") tcb_slot,
-                in("rsi") msg_info,
-                in("r10") /* a2 */ FAULT_EP,
-                in("r8")  /* a3 */ CSPACE_DATA,
-                in("r9")  /* a4 */ VSPACE_DATA,
-                in("r15") /* a5 */ IPC_BUFFER_VADDR,
-                lateout("rax") _,
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack, preserves_flags),
-            );
+            let status = syscall5_call(tcb_slot, msg_info, 0, 0, IPC_BUFFER_VADDR);
+            if status != 0 { return Err("MCS Configure rejected"); }
         }
         Ok(())
     }

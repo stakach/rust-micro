@@ -1,13 +1,9 @@
 //! Eager per-CPU FPU (x87/SSE) context save/restore for SMP.
 //!
-//! The default single-node kernel passes every FPU test without any
-//! save/restore: with effectively one FPU user live at a time, a
-//! thread's x87/SSE state simply stays resident in the hardware until
-//! it next runs. That breaks the moment a thread MIGRATES between
-//! cores (sel4test FPU0002): a worker resumes on a new core whose FPU
-//! registers hold some *other* thread's state, reads garbage, and
-//! corrupts (the observed failure is a #GP from a RIP that is actually
-//! an FPU `double`).
+//! Every x86 build supports the CPUs actually started by the loader. FPU
+//! ownership cannot depend on an optional Cargo feature: even a single CPU
+//! must preserve distinct thread states, and migration requires saving the
+//! source CPU's exact hardware state before another CPU can restore it.
 //!
 //! Because the kernel itself is built `-sse,-sse2,+soft-float`, kernel
 //! code never touches user xmm/x87 registers. A user thread's FPU
@@ -22,18 +18,11 @@
 //!     `fxsave64` the outgoing owner into its TCB and `fxrstor64` the
 //!     incoming thread's saved state.
 //!   * When a running thread is migrated off a core (the remote-stall
-//!     park point), the core flushes its resident FPU state back to the
-//!     migrating thread's TCB so the destination core restores fresh
-//!     state — `flush_local_fpu`.
+//!     park point), the core captures its resident FPU state into an owned
+//!     mailbox. The controller writes the exact owner's TCB while retaining
+//!     BKL, so the destination restores fresh state without a remote slab borrow.
 //!   * On thread teardown we drop any core's ownership of the freed
 //!     TCB — `fpu_release` (mirrors seL4's `fpuRelease`).
-//!
-//! This whole module is gated behind the `smp` cargo feature; the
-//! default build compiles it away entirely and is byte-for-byte
-//! unchanged.
-
-#![cfg(feature = "smp")]
-
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::smp::MAX_CPUS;
@@ -169,11 +158,9 @@ pub unsafe fn fpu_switch_to(slab: &mut TcbSlab, next: TcbId) {
     }
 }
 
-/// Flush the calling core's resident FPU state back to its owner TCB
-/// and mark the core as owning nobody. Used at the remote-stall park
-/// point: a thread migrated off this core has its live FPU state here,
-/// not in its TCB, so it must be written back before it runs elsewhere.
-/// Caller holds the BKL.
+
+/// Flush local hardware before an ordinary idle transition. Caller holds BKL;
+/// remote quiescence instead uses its independent owned mailbox capture.
 pub unsafe fn flush_local_fpu(slab: &mut TcbSlab) {
     let me = crate::arch::get_cpu_id() as usize;
     if me >= MAX_CPUS {
@@ -181,7 +168,6 @@ pub unsafe fn flush_local_fpu(slab: &mut TcbSlab) {
     }
     let cur = FPU_OWNER[me].load(Ordering::Relaxed);
     if cur != 0 {
-        // `fxsave` #NMs if TS=1 (the migrating thread may be fpuDisabled).
         core::arch::asm!("clts", options(nomem, nostack, preserves_flags));
         let prev = TcbId((cur - 1) as u16);
         if let Some(t) = slab.try_get(prev) {
@@ -199,6 +185,21 @@ pub unsafe fn flush_local_fpu(slab: &mut TcbSlab) {
 /// image stranded in registers (the FPU0002 double-ownership window).
 pub fn owner_is(cpu: usize, id: TcbId) -> bool {
     cpu < MAX_CPUS && FPU_OWNER[cpu].load(Ordering::Relaxed) == id.0 as u32 + 1
+}
+
+/// Capture only local hardware into an owned mailbox value. No kernel/slab borrow
+/// is permitted here: another CPU holds BKL while waiting for this acknowledgement.
+pub(crate) fn capture_local_for_quiescence() -> Option<(TcbId, FxArea)> {
+    let cpu = crate::arch::get_cpu_id() as usize;
+    let encoded = FPU_OWNER[cpu].load(Ordering::Relaxed);
+    if encoded == 0 { return None; }
+    let mut state = FxArea::FINIT;
+    unsafe {
+        core::arch::asm!("clts", options(nomem, nostack, preserves_flags));
+        fxsave64(state.0.as_mut_ptr());
+    }
+    FPU_OWNER[cpu].store(0, Ordering::Release);
+    Some((TcbId((encoded - 1) as u16), state))
 }
 
 /// Drop any core's ownership of `id` (mirrors seL4 `fpuRelease`). Call

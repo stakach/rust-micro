@@ -115,7 +115,7 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
     use core::sync::atomic::Ordering;
 
     crate::smp::service_retirement_shootdown();
-    crate::smp::bkl_acquire();
+    let adopted = crate::smp::bkl_acquire_for_user_entry(super::interrupts::quiescence_entry(ctx));
     struct BklGuard;
     impl Drop for BklGuard {
         fn drop(&mut self) {
@@ -180,77 +180,13 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
 
     crate::smp::IPI_HANDLED_COUNT.fetch_add(1, Ordering::SeqCst);
 
-    // Blocking-stall handshake (seL4 `ipiStallCoreCallback`): a
-    // controlling core asked us to get off whatever we're running so it
-    // can migrate / delete it. Switch to idle, acknowledge, and park on
-    // the BKL until it finishes — by then the thread is gone from our
-    // queue, so the dispatcher picks up whatever legitimately belongs
-    // here (usually nothing → HLT).
-    if crate::smp::STALL_REQUESTED[me as usize].load(Ordering::Acquire) {
-        unsafe {
-            let s = crate::kernel::KERNEL.get();
-            // Save the interrupted user thread's full register context
-            // so it resumes correctly on its new core / state. Mirrors
-            // the full save in `swap_iretq_context_if_preempted`.
-            if from_user {
-                if let Some(prev) = interrupted {
-                    let p = s.scheduler.slab.get_mut(prev);
-                    p.user_context.rax = ctx.rax;
-                    p.user_context.rbx = ctx.rbx;
-                    p.user_context.rcx = ctx.rcx;
-                    p.user_context.rdx = ctx.rdx;
-                    p.user_context.rsi = ctx.rsi;
-                    p.user_context.rdi = ctx.rdi;
-                    p.user_context.rbp = ctx.rbp;
-                    p.user_context.r8 = ctx.r8;
-                    p.user_context.r9 = ctx.r9;
-                    p.user_context.r10 = ctx.r10;
-                    p.user_context.r11 = ctx.r11;
-                    p.user_context.r12 = ctx.r12;
-                    p.user_context.r13 = ctx.r13;
-                    p.user_context.r14 = ctx.r14;
-                    p.user_context.r15 = ctx.r15;
-                    p.user_context.rsp = ctx.rsp;
-                    p.user_context.rip = ctx.rip;
-                    p.user_context.rflags = ctx.rflags;
-                    p.use_iretq_resume = true;
-                }
-            }
-            // A thread migrated off this core has its live FPU state in
-            // THIS core's registers, not its TCB. Flush it back so the
-            // destination core restores fresh state (the crux of
-            // FPU0002). Clears this core's FPU ownership.
-            #[cfg(feature = "smp")]
-            crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
-            s.scheduler.set_current(None);
-            s.scheduler.set_active_user(None);
-        }
+    if adopted {
         eoi();
-        // Acknowledge: we are now off the thread.
-        crate::smp::STALL_ACK[me as usize].store(true, Ordering::Release);
-        // Drop the BKL so the controlling core can grab it and perform
-        // its mutation, then spin on the request flag WITHOUT touching
-        // the BKL. Bouncing the lock here would starve the controlling
-        // core (it needs the BKL to clear the flag) → livelock under the
-        // stall-stress test (MULTICORE0004). Re-acquire exactly once,
-        // after the flag clears.
-        crate::smp::bkl_release();
-        while crate::smp::STALL_REQUESTED[me as usize].load(Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
-        crate::smp::bkl_acquire();
-        // We hold the BKL; hand off to the dispatcher (never returns —
-        // it manages the BKL + the idle HLT loop itself).
         core::mem::forget(_bkl);
-        unsafe {
-            if from_user {
-                // LAPIC IRQ entry leaves the interrupted user's GS active;
-                // dispatch_next_or_idle expects the post-swapgs kernel regime.
-                core::arch::asm!("swapgs", options(nostack, preserves_flags));
-            }
-            super::exceptions::dispatch_next_or_idle("");
-        }
+        unsafe { super::interrupts::dispatch_adopted_irq(); }
     }
+
+
 
     // Idle-core wakeup: the IPI hit this core while it was parked in the
     // AP scheduler loop's `sti; hlt` (kernel CS ⇒ `from_user` false).
@@ -548,7 +484,7 @@ pub unsafe extern "C" fn lapic_timer_irq_entry() {
 extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext) {
     use core::sync::atomic::Ordering;
 
-    crate::smp::bkl_acquire();
+    let adopted = crate::smp::bkl_acquire_for_user_entry(super::interrupts::quiescence_entry(ctx));
     struct BklGuard;
     impl Drop for BklGuard {
         fn drop(&mut self) {
@@ -601,6 +537,10 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
 
     eoi();
 
+    if adopted {
+        core::mem::forget(_bkl);
+        unsafe { super::interrupts::dispatch_adopted_irq(); }
+    }
     super::interrupts::swap_iretq_context_if_preempted(ctx, from_user, interrupted);
 }
 

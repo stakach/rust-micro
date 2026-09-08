@@ -85,6 +85,7 @@ fn choose_next(may_handoff: bool) -> Option<TcbId> {
             .or_else(|| state.scheduler.current())
             .or_else(|| state.scheduler.choose_thread());
             match next {
+                Some(id) if super::exceptions::deliver_deferred_debug(state, id) => continue,
                 Some(id) if !crate::sched_context::dispatch_budget_check(id) => continue,
                 other => return other,
             }
@@ -98,8 +99,9 @@ fn publish_receive(context: &mut UserContext, tcb: &crate::tcb::Tcb) {
         | (tcb.ipc_length as u64 & 0x7f);
     crate::arch::set_ipc_return(context, tcb.ipc_badge, info, &tcb.msg_regs[..4]);
 
-    if tcb.ipc_length as usize > 4 && tcb.ipc_buffer_paddr != 0 {
-        let buffer = (crate::arch::phys_to_virt(tcb.ipc_buffer_paddr) as *mut u64).wrapping_add(1);
+    let ipc_paddr = tcb.ipc_buffer_receive_paddr();
+    if tcb.ipc_length as usize > 4 && ipc_paddr != 0 {
+        let buffer = (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
         let count = (tcb.ipc_length as usize).min(tcb.msg_regs.len());
         for index in 4..count {
             unsafe { core::ptr::write_volatile(buffer.add(index), tcb.msg_regs[index]) };
@@ -128,8 +130,13 @@ fn wait_for_runnable() -> TcbId {
 
 /// Handle one lower-EL SVC using seL4's AArch64 register ABI.
 pub fn dispatch(frame: *mut UserContext) {
-    crate::smp::bkl_acquire();
+    let entry = unsafe { crate::smp::arm_user_entry(frame, crate::smp::UserEntryKind::Syscall) };
+    let adopted = crate::smp::bkl_acquire_for_user_entry(entry);
     let _guard = BklGuard;
+    if adopted {
+        dispatch_selected(unsafe { &mut *frame }, None, Syscall::SysYield, false, false);
+        return;
+    }
     crate::smp::SYSCALL_COUNT_PER_CPU[crate::arch::get_cpu_id() as usize]
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 

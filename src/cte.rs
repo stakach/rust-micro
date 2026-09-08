@@ -16,7 +16,7 @@ use crate::structures::MdbNode;
 use crate::types::seL4_Word as Word;
 
 #[repr(C)]
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, Debug)]
 pub struct Cte {
     /// Two-word `cap_t` storage — accessed via the typed `cap()`/
     /// `set_cap()` helpers below.
@@ -52,14 +52,13 @@ impl Cte {
 
     /// Write a cap back to the bitfield words.
     ///
-    /// Phase 44 — when this CTE lives inside a kernel CNode pool,
+    /// When this CTE lives in a kernel CNode or admitted TCB,
     /// the overwrite is noted in the per-object refcounts (old cap
     /// −1, new cap +1). Stack-built `Cte` temporaries (specs,
-    /// `with_cap`) fall outside the pool address ranges and are
-    /// not counted; boot-era writes are absorbed by the
-    /// `recount_refcounts()` sweep at production start.
+    /// `with_cap`) fall outside managed storage and are not counted.
+    /// Internal TCB references are installed only after slab admission.
     pub fn set_cap(&mut self, cap: &Cap) {
-        if crate::kernel::slot_in_pools(self as *const _ as usize) {
+        if crate::kernel::slot_is_managed(self as *const _ as usize) {
             let old = self.cap();
             crate::kernel::note_cap_write(&old, cap);
             crate::asid::note_cap_write(&old, cap);
@@ -136,17 +135,34 @@ impl Cte {
     }
 }
 
-/// Packed (cnode_idx, slot) handle on a CTE somewhere in
-/// `KernelState`'s CNode registry. The complete 52-bit identity lives in the
+/// Identity of a CNode CTE or one of an admitted TCB's five internal CTEs.
+/// The tagged 53-bit identity lives in the
 /// first 64-bit MDB word, leaving the second word for per-CTE ownership state.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct MdbId(pub u64);
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[repr(u8)]
+pub enum TcbSlot {
+    CSpace,
+    VSpace,
+    IpcBuffer,
+    FaultHandler,
+    Timeout,
+}
+
+impl TcbSlot {
+    pub const ALL: [Self; 5] = [
+        Self::CSpace, Self::VSpace, Self::IpcBuffer, Self::FaultHandler, Self::Timeout,
+    ];
+}
 
 impl MdbId {
     pub const SLOT_BITS: u32 = 20;
     pub const SLOT_MASK: u64 = (1u64 << Self::SLOT_BITS) - 1;
     pub const CNODE_IDX_BITS: u32 = 32;
-    pub const MASK: u64 = (1u64 << (Self::CNODE_IDX_BITS + Self::SLOT_BITS)) - 1;
+    const TCB_TAG: u64 = 1u64 << (Self::CNODE_IDX_BITS + Self::SLOT_BITS);
+    pub const MASK: u64 = (Self::TCB_TAG << 1) - 1;
     pub const STORED_NONE: u64 = 0;
 
     /// Kept as a storage-level alias for older comments/tests that referred to "sentinel"; raw
@@ -156,6 +172,30 @@ impl MdbId {
     /// `cnode_idx` is a descriptor identity; `slot` supports CNodes through radix 20.
     pub const fn pack(cnode_idx: u32, slot: u32) -> Self {
         Self(((cnode_idx as u64) << Self::SLOT_BITS) | ((slot as u64) & Self::SLOT_MASK))
+    }
+    pub const fn tcb(id: crate::tcb::TcbId, slot: TcbSlot) -> Self {
+        Self(Self::TCB_TAG | ((id.0 as u64) << Self::SLOT_BITS) | slot as u64)
+    }
+    pub const fn tcb_slot(self) -> Option<(crate::tcb::TcbId, TcbSlot)> {
+        if self.0 & Self::TCB_TAG == 0 {
+            return None;
+        }
+        let id = (self.0 & !Self::TCB_TAG) >> Self::SLOT_BITS;
+        if id >= crate::tcb::MAX_TCBS as u64 {
+            return None;
+        }
+        let slot = match self.0 & Self::SLOT_MASK {
+            0 => TcbSlot::CSpace,
+            1 => TcbSlot::VSpace,
+            2 => TcbSlot::IpcBuffer,
+            3 => TcbSlot::FaultHandler,
+            4 => TcbSlot::Timeout,
+            _ => return None,
+        };
+        Some((crate::tcb::TcbId(id as u16), slot))
+    }
+    pub const fn is_tcb(self) -> bool {
+        self.0 & Self::TCB_TAG != 0
     }
     pub const fn cnode_idx(self) -> u32 {
         (self.0 >> Self::SLOT_BITS) as u32

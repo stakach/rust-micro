@@ -264,6 +264,7 @@ pub fn vspace_assign_asid(pml4_cap_ptr: u64) -> u64 {
 }
 
 /// `TCB::SetSpace(target, fault_ep, cnode_cptr, vspace_cptr)`.
+/// The compressed ABI resolves `fault_ep` in the supplied target CSpace at configuration time.
 #[inline(always)]
 pub fn tcb_set_space(target: u64, fault_ep: u64, cnode: u64, vspace: u64) -> u64 {
     let msg_info = LBL_TCB_SET_SPACE << 12;

@@ -474,6 +474,41 @@ impl KernelState {
         self.cnode_slots_at_mut(vi).and_then(|s| s.get_mut(si))
     }
 
+    pub fn cte(&self, id: crate::cte::MdbId) -> Option<&Cte> {
+        if id.is_tcb() {
+            let (thread, slot) = id.tcb_slot()?;
+            Some(self.scheduler.slab.try_get(thread)?.cap_slot(slot))
+        } else {
+            self.cnode_slot(id.cnode_idx() as usize, id.slot() as usize)
+        }
+    }
+
+    pub fn cte_mut(&mut self, id: crate::cte::MdbId) -> Option<&mut Cte> {
+        if id.is_tcb() {
+            let (thread, slot) = id.tcb_slot()?;
+            Some(self.scheduler.slab.entries.get_mut(thread.0 as usize)?.as_mut()?.cap_slot_mut(slot))
+        } else {
+            self.cnode_slot_mut(id.cnode_idx() as usize, id.slot() as usize)
+        }
+    }
+
+    /// Capability replacement for all managed locations. MDB edges are handled by the caller;
+    /// architectural projections are invalidated here before the counted CTE write.
+    pub fn write_cte_cap(&mut self, id: crate::cte::MdbId, cap: &Cap) -> bool {
+        if id.is_tcb() {
+            let Some((thread, slot)) = id.tcb_slot() else { return false; };
+            let Some(tcb) = self.scheduler.slab.entries.get_mut(thread.0 as usize).and_then(Option::as_mut) else {
+                return false;
+            };
+            tcb.update_cap_cache(slot, *cap);
+            tcb.cap_slot_mut(slot).set_cap(cap);
+        } else {
+            let Some(cte) = self.cte_mut(id) else { return false; };
+            cte.set_cap(cap);
+        }
+        true
+    }
+
     // Phase 43 — bitmap-based "in-use" tracking for pool recycling.
     fn ep_in_use(&self, i: usize) -> bool {
         unsafe { (POOL_BITMAPS.endpoints[i / 64] >> (i % 64)) & 1 == 1 }
@@ -603,9 +638,8 @@ impl KernelState {
                     // under it here) and the next trap delivers a garbage
                     // fault. seL4 does the same `remoteTCBStall` before
                     // unbinding an SC. No-op unless the thread is live on a
-                    // different core; gated to the smp build.
-                    #[cfg(feature = "smp")]
-                    crate::smp::remote_tcb_stall(tcb_id);
+                    // different core.
+                    crate::smp::remote_tcb_stall(self, tcb_id);
                     // Remove from the ready queue / surrender the CPU
                     // before clearing the SC so a runnable thread that
                     // loses its SC can't keep being scheduled.
@@ -823,7 +857,12 @@ pub fn cap_refcount(cap: &Cap) -> u32 {
     refcount_cell(cap).map(|p| unsafe { *p }).unwrap_or(0)
 }
 
-/// Called by `Cte::set_cap` for slots inside the kernel CNode pools.
+/// Internal TCB retirement includes slot zero, which cannot be encoded in a public Thread cap.
+pub(crate) fn thread_cap_refcount(id: TcbId) -> u32 {
+    unsafe { (*core::ptr::addr_of!(OBJ_REFCOUNTS)).tcbs[id.0 as usize] }
+}
+
+/// Called by `Cte::set_cap` for managed CNode and TCB slots.
 pub(crate) fn note_cap_write(old: &Cap, new: &Cap) {
     unsafe {
         if let Some(p) = refcount_cell(old) {
@@ -835,29 +874,36 @@ pub(crate) fn note_cap_write(old: &Cap, new: &Cap) {
     }
 }
 
-/// Does `addr` point inside one of the kernel CNode pools? Filters
+/// Does `addr` point inside managed CNode or TCB storage? Filters
 /// `Cte::set_cap` calls on stack temporaries / spec-local arrays out
 /// of the refcounting.
-pub(crate) fn slot_in_pools(addr: usize) -> bool {
-    let s = unsafe { KERNEL.get() };
+pub(crate) fn slot_is_managed(addr: usize) -> bool {
+    let s = KERNEL.0.get();
     let within = |base: *const u8, len: usize| {
         let b = base as usize;
         addr >= b && addr < b + len
     };
-    within(
-        s.cnodes.as_ptr() as *const u8,
-        core::mem::size_of_val(&s.cnodes),
-    ) || within(
-        s.small_cnodes.as_ptr() as *const u8,
-        core::mem::size_of_val(&s.small_cnodes),
-    ) || s.dynamic_cnodes.iter().any(|descriptor| {
-        if !descriptor.in_use {
-            return false;
-        }
-        let base = crate::arch::phys_to_virt(descriptor.paddr) as usize;
-        let len = (1usize << descriptor.radix) * Cte::SIZE_BYTES;
-        addr >= base && addr < base.saturating_add(len)
-    })
+    // Address-only checks avoid reborrowing a KernelState or TCB while its CTE is being written.
+    // Only the five typed internal CTEs expose Cte::set_cap within slab storage.
+    unsafe {
+        within(
+            core::ptr::addr_of!((*s).cnodes).cast(),
+            core::mem::size_of::<[CNodePage; MAX_CNODES]>(),
+        ) || within(
+            core::ptr::addr_of!((*s).small_cnodes).cast(),
+            core::mem::size_of::<[SmallCNodePage; MAX_SMALL_CNODES]>(),
+        ) || within(
+            core::ptr::addr_of!((*s).scheduler.slab.entries).cast(),
+            core::mem::size_of::<[Option<crate::tcb::Tcb>; crate::tcb::MAX_TCBS]>(),
+        ) || (*core::ptr::addr_of!((*s).dynamic_cnodes)).iter().any(|descriptor| {
+            if !descriptor.in_use {
+                return false;
+            }
+            let base = crate::arch::phys_to_virt(descriptor.paddr) as usize;
+            let len = (1usize << descriptor.radix) * Cte::SIZE_BYTES;
+            addr >= base && addr < base.saturating_add(len)
+        })
+    }
 }
 
 /// Rebuild every refcount from the actual pool contents. Run once at
@@ -874,15 +920,51 @@ pub fn recount_refcounts() {
         (*rc).tcbs = [0; crate::tcb::MAX_TCBS];
         (*rc).irq_handlers = [0; crate::interrupt::MAX_IRQ];
         let s = KERNEL.get();
-        for vi in 0..KernelState::cnode_pool_count() {
-            let n = s.cnode_slots_at(vi).map(|sl| sl.len()).unwrap_or(0);
-            for si in 0..n {
-                let cap = s.cnode_slot(vi, si).map(|c| c.cap()).unwrap_or(Cap::Null);
-                if let Some(p) = refcount_cell(&cap) {
-                    *p = (*p).checked_add(1).expect("cap refcount overflow");
-                }
+        let mut cursor = CteCursor::new();
+        while let Some(id) = cursor.next(s) {
+            let cap = s.cte(id).unwrap().cap();
+            if let Some(p) = refcount_cell(&cap) {
+                *p = (*p).checked_add(1).expect("cap refcount overflow");
             }
         }
+    }
+}
+
+/// An owned traversal position, never a borrow held across CTE deletion or insertion.
+pub struct CteCursor {
+    cnode: usize,
+    slot: usize,
+    thread: usize,
+    thread_slot: usize,
+}
+
+impl CteCursor {
+    pub const fn new() -> Self {
+        Self { cnode: 0, slot: 0, thread: 0, thread_slot: 0 }
+    }
+
+    pub fn next(&mut self, state: &KernelState) -> Option<crate::cte::MdbId> {
+        while self.cnode < KernelState::cnode_pool_count() {
+            let count = state.cnode_slots_at(self.cnode).map_or(0, |slots| slots.len());
+            if self.slot < count {
+                let id = crate::cte::MdbId::pack(self.cnode as u32, self.slot as u32);
+                self.slot += 1;
+                return Some(id);
+            }
+            self.cnode += 1;
+            self.slot = 0;
+        }
+        while self.thread < crate::tcb::MAX_TCBS {
+            let thread = crate::tcb::TcbId(self.thread as u16);
+            if state.scheduler.slab.try_get(thread).is_some() && self.thread_slot < crate::cte::TcbSlot::ALL.len() {
+                let id = crate::cte::MdbId::tcb(thread, crate::cte::TcbSlot::ALL[self.thread_slot]);
+                self.thread_slot += 1;
+                return Some(id);
+            }
+            self.thread += 1;
+            self.thread_slot = 0;
+        }
+        None
     }
 }
 
@@ -1055,6 +1137,21 @@ pub mod spec {
             let wide = crate::cte::MdbId::pack(1000, (1 << 19) + 7);
             assert_eq!(wide.cnode_idx(), 1000);
             assert_eq!(wide.slot(), (1 << 19) + 7);
+            assert!(!wide.is_tcb());
+            for slot in crate::cte::TcbSlot::ALL {
+                let thread = crate::tcb::TcbId((crate::tcb::MAX_TCBS - 1) as u16);
+                let identity = crate::cte::MdbId::tcb(thread, slot);
+                assert_eq!(identity.tcb_slot(), Some((thread, slot)));
+                let mut child = Cte::null();
+                child.set_parent(Some(identity));
+                child.set_child_count(3);
+                child.set_revoke_epoch(7);
+                assert_eq!(child.parent(), Some(identity));
+                assert_eq!(child.child_count(), 3);
+                assert_eq!(child.revoke_epoch(), 7);
+                child.set_parent(Some(wide));
+                assert_eq!(child.parent(), Some(wide));
+            }
             s.free_cnode_virt(vi);
             assert!(s.cnode_slots_at(vi).is_none());
             arch::log("  \u{2713} dynamic CNode uses exact Untyped-style physical backing\n");

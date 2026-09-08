@@ -16,9 +16,9 @@
 
 use crate::cap::{Cap, PAddr, PPtr};
 use crate::cspace::lookup_cap;
-use crate::cte::Cte;
+use crate::cte::{Cte, MdbId, TcbSlot};
 use crate::error::{KException, KResult, SyscallError};
-use crate::kernel::{KernelState, KERNEL};
+use crate::kernel::{CteCursor, KernelState, KERNEL};
 use crate::object_type::ObjectType;
 use crate::syscall_handler::SyscallArgs;
 use crate::syscalls::InvocationLabel;
@@ -484,7 +484,7 @@ unsafe fn update_invoked_frame_slot(
     new_cap: Cap,
 ) -> KResult<()> {
     let s = KERNEL.get();
-    let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+    let cspace_root = s.scheduler.slab.get(invoker).cspace_root();
     let Ok(res) =
         crate::cspace::resolve_address_bits(s, &cspace_root, args.a0, crate::cspace::WORD_BITS)
     else {
@@ -521,7 +521,7 @@ unsafe fn preflight_invoked_mapping_slot(
     invoker: TcbId,
 ) -> KResult<(usize, usize)> {
     let s = KERNEL.get();
-    let cspace = s.scheduler.slab.get(invoker).cspace_root;
+    let cspace = s.scheduler.slab.get(invoker).cspace_root();
     let resolved = crate::cspace::resolve_address_bits(
         s, &cspace, args.a0, crate::cspace::WORD_BITS,
     ).map_err(|_| KException::SyscallError(SyscallError::new(
@@ -556,7 +556,7 @@ fn resolve_x86_mapping_root(
             Some(cap)
         } else if compressed_cptr != 0 {
             let s = KERNEL.get();
-            let cspace = s.scheduler.slab.get(invoker).cspace_root;
+            let cspace = s.scheduler.slab.get(invoker).cspace_root();
             Some(crate::cspace::lookup_cap(s, &cspace, compressed_cptr)?)
         } else {
             None
@@ -689,7 +689,7 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
                 map_type: FrameMapType::VSpace,
             });
     }
-    crate::smp::shootdown_vspace(root);
+    crate::smp::retire_vspace_translations(root);
     Ok(())
 }
 
@@ -877,7 +877,7 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
                     }
                 };
                 if unmapped {
-                    crate::smp::shootdown_tlb(vaddr);
+                    crate::smp::retire_vspace_translations(pml4_paddr);
                 }
             }
         }
@@ -1276,7 +1276,7 @@ fn update_invoked_iopt_slot(
 ) -> KResult<()> {
     unsafe {
         let s = KERNEL.get();
-        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+        let cspace_root = s.scheduler.slab.get(invoker).cspace_root();
         let Ok(res) =
             crate::cspace::resolve_address_bits(s, &cspace_root, args.a0, crate::cspace::WORD_BITS)
         else {
@@ -1480,7 +1480,7 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
         KERNEL.get().cnode_slot_mut(cnode, slot)
             .expect("preflighted paging capability remains present").set_cap(&updated);
     }
-    crate::smp::shootdown_vspace(root);
+    crate::smp::retire_vspace_translations(root);
     Ok(())
 }
 
@@ -1575,16 +1575,12 @@ unsafe fn paging_cap_is_final(s: &crate::kernel::KernelState, cap: &Cap) -> bool
         return false;
     }
     let mut references = 0u32;
-    for ci in 0..KernelState::cnode_pool_count() {
-        let Some(slots) = s.cnode_slots_at(ci) else {
-            continue;
-        };
-        for slot in slots {
-            if same_paging_object(&slot.cap(), cap) {
-                references += 1;
-                if references > 1 {
-                    return false;
-                }
+    let mut cursor = CteCursor::new();
+    while let Some(id) = cursor.next(s) {
+        if same_paging_object(&s.cte(id).unwrap().cap(), cap) {
+            references += 1;
+            if references > 1 {
+                return false;
             }
         }
     }
@@ -1665,7 +1661,7 @@ fn detach_paging_structure(cap: &Cap) -> bool {
         crate::arch::x86_64::usermode::unmap_user_table_in_paddr(pml4_paddr, level, vaddr, paddr)
     };
     if detached {
-        crate::smp::shootdown_vspace(pml4_paddr);
+        crate::smp::retire_vspace_translations(pml4_paddr);
     }
     detached
 }
@@ -1711,7 +1707,7 @@ fn detach_frame_mapping(cap: &Cap) {
                         }
                     };
                     if unmapped {
-                        crate::smp::shootdown_tlb(vaddr);
+                        crate::smp::retire_vspace_translations(pml4_paddr);
                     }
                 }
             }
@@ -1879,36 +1875,28 @@ unsafe fn cnode_release_mappings_valid(
 }
 
 unsafe fn revoke_cnode_clear_counts(
-    s: &crate::kernel::KernelState,
+    s: &KernelState,
     object_vi: usize,
     revoke_epoch: u32,
-    source: (usize, usize),
+    source: MdbId,
 ) -> (u32, u32) {
-    let mut refs = 0u32;
-    let mut self_refs = 0u32;
-    for ci in 0..KernelState::cnode_pool_count() {
-        let slot_count = s.cnode_slots_at(ci).map_or(0, |slots| slots.len());
-        for si in 0..slot_count {
-            if (ci, si) == source || !cte_revoke_marked(s, ci, si, revoke_epoch) {
-                continue;
-            }
-            let Some(Cap::CNode { ptr, .. }) = s.cnode_slot(ci, si).map(|slot| slot.cap()) else {
-                continue;
-            };
-            if KernelState::cnode_index(ptr) != object_vi {
-                continue;
-            }
-            refs = refs
-                .checked_add(1)
-                .expect("CNode clear reference count overflow");
-            if ci == object_vi {
-                self_refs = self_refs
-                    .checked_add(1)
-                    .expect("CNode self-reference count overflow");
-            }
+    let mut references = 0u32;
+    let mut self_references = 0u32;
+    let mut cursor = CteCursor::new();
+    while let Some(id) = cursor.next(s) {
+        if id == source || !cte_revoke_marked(s, id, revoke_epoch) {
+            continue;
+        }
+        let Cap::CNode { ptr, .. } = s.cte(id).unwrap().cap() else { continue; };
+        if KernelState::cnode_index(ptr) != object_vi {
+            continue;
+        }
+        references = references.checked_add(1).expect("CNode clear count overflow");
+        if id.tcb_slot().is_none() && id.cnode_idx() as usize == object_vi {
+            self_references = self_references.checked_add(1).expect("CNode self count overflow");
         }
     }
-    (refs, self_refs)
+    (references, self_references)
 }
 
 fn paging_cap_with_mapping(
@@ -1947,7 +1935,7 @@ fn update_invoked_paging_slot(
     let target_paddr = paging_struct_state(cap).0;
     unsafe {
         let s = KERNEL.get();
-        let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+        let cspace_root = s.scheduler.slab.get(invoker).cspace_root();
         let Ok(res) =
             crate::cspace::resolve_address_bits(s, &cspace_root, args.a0, crate::cspace::WORD_BITS)
         else {
@@ -2050,7 +2038,7 @@ fn decode_asid_control_make_pool(args: &SyscallArgs, invoker: TcbId) -> KResult<
     let upstream = info.extra_caps() != 0;
     unsafe {
         let s = KERNEL.get();
-        let cspace = s.scheduler.slab.get(invoker).cspace_root;
+        let cspace = s.scheduler.slab.get(invoker).cspace_root();
         let (source_ci, source_si, untyped, destination, index, depth) = if upstream {
             let tcb = s.scheduler.slab.get(invoker);
             if info.length() < 2 || info.extra_caps() < 2 || tcb.pending_extra_caps_count < 2 {
@@ -2058,7 +2046,7 @@ fn decode_asid_control_make_pool(args: &SyscallArgs, invoker: TcbId) -> KResult<
             }
             let staged_source = tcb.pending_extra_caps[0];
             let staged_destination = tcb.pending_extra_caps[1];
-            let buffer = tcb.ipc_buffer_paddr;
+            let buffer = tcb.ipc_buffer_send_paddr();
             if buffer == 0 {
                 return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability)));
             }
@@ -2165,7 +2153,7 @@ fn decode_asid_pool_assign(
     let upstream = info.extra_caps() != 0;
     unsafe {
         let s = KERNEL.get();
-        let cspace = s.scheduler.slab.get(invoker).cspace_root;
+        let cspace = s.scheduler.slab.get(invoker).cspace_root();
         let pool = Cap::AsidPool {
             ptr: PPtr::<crate::cap::AsidPoolStorage>::new(pool_paddr).ok_or_else(|| {
                 KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
@@ -2179,7 +2167,7 @@ fn decode_asid_pool_assign(
                 return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_TruncatedMessage)));
             }
             let expected = tcb.pending_extra_caps[0];
-            let buffer = tcb.ipc_buffer_paddr;
+            let buffer = tcb.ipc_buffer_send_paddr();
             if buffer == 0 {
                 return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability)));
             }
@@ -2314,9 +2302,9 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         {
             let me = s.scheduler.slab.get_mut(invoker);
             let length = me.ipc_length as usize;
-            if length > 4 && me.ipc_buffer_paddr != 0 {
+            if length > 4 && me.ipc_buffer_send_paddr() != 0 {
                 let buf =
-                    (crate::arch::phys_to_virt(me.ipc_buffer_paddr) as *const u64).wrapping_add(1);
+                    (crate::arch::phys_to_virt(me.ipc_buffer_send_paddr()) as *const u64).wrapping_add(1);
                 let max = length.min(me.msg_regs.len());
                 for i in 4..max {
                     me.msg_regs[i] = core::ptr::read_volatile(buf.add(i));
@@ -2431,7 +2419,7 @@ fn decode_sched_context(
                     inv_tcb.pending_extra_caps_count = 0;
                     c
                 } else {
-                    let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root();
                     crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?
                 };
                 // Phase 43 — also accept Notification cap (passive
@@ -2458,6 +2446,8 @@ fn decode_sched_context(
                                 seL4_Error::seL4_IllegalOperation,
                             )));
                         }
+                        // Quiescence must find execution/FPU ownership on the old affinity.
+                        crate::smp::remote_tcb_stall(s, tcb_id);
                         let was_runnable = s.scheduler.slab.get(tcb_id).is_runnable();
                         s.scheduler.slab.get_mut(tcb_id).sc = Some(sc_id);
                         s.sched_contexts[sc_id as usize].bound_tcb = Some(tcb_id);
@@ -2469,9 +2459,8 @@ fn decode_sched_context(
                         // no bound TCB to migrate. Pull an already-queued
                         // thread off its old core first; the make_runnable /
                         // on_sc_gained paths below re-enqueue on the new
-                        // affinity. Gated to the smp build (the default
-                        // single-node build ignores per-core affinity).
-                        #[cfg(feature = "smp")]
+                        // affinity. The actual SchedControl core is authoritative
+                        // regardless of how many CPUs this boot brought online.
                         {
                             let target = s.sched_contexts[sc_id as usize].core as u32;
                             let old = s.scheduler.slab.get(tcb_id).affinity;
@@ -2569,8 +2558,7 @@ fn decode_sched_context(
             unsafe {
                 let s = KERNEL.get();
                 if let Some(tcb_id) = s.sched_contexts[sc_id as usize].bound_tcb {
-                    #[cfg(feature = "smp")]
-                    crate::smp::remote_tcb_stall(tcb_id);
+                    crate::smp::remote_tcb_stall(s, tcb_id);
                     // Remove from the ready queue / surrender the CPU
                     // before clearing the SC so a runnable thread that
                     // loses its SC can't keep being scheduled. IPC0017
@@ -2611,7 +2599,7 @@ fn decode_sched_context(
                     inv.pending_extra_caps_count = 0;
                     c
                 } else {
-                    let cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    let cspace = s.scheduler.slab.get(invoker).cspace_root();
                     crate::cspace::lookup_cap(s, &cspace, args.a2)?
                 };
                 match obj_cap {
@@ -2622,8 +2610,7 @@ fn decode_sched_context(
                                 seL4_Error::seL4_IllegalOperation,
                             )));
                         }
-                        #[cfg(feature = "smp")]
-                        crate::smp::remote_tcb_stall(tcb_id);
+                        crate::smp::remote_tcb_stall(s, tcb_id);
                         s.scheduler.on_sc_lost(tcb_id);
                         s.scheduler.slab.get_mut(tcb_id).sc = None;
                         s.sched_contexts[sc_id as usize].bound_tcb = None;
@@ -2837,7 +2824,7 @@ fn decode_sched_control(
             } else {
                 unsafe {
                     let s = KERNEL.get();
-                    let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    let invoker_cspace = s.scheduler.slab.get(invoker).cspace_root();
                     let cap = crate::cspace::lookup_cap(s, &invoker_cspace, args.a2)?;
                     (Some(cap), args.a3, args.a4)
                 }
@@ -2917,25 +2904,14 @@ fn decode_sched_control(
                 // bound thread there. seL4 binds the core to the SC; we
                 // drive the bound TCB's affinity directly. MULTICORE0002
                 // /0003/0005 need the helper to actually run on `core`.
-                // Gated behind the `smp` cargo feature. The default
-                // (DOMAINS / single-node) build reports numNodes=4 but
-                // must IGNORE per-core affinity, exactly as it did
-                // before SMP landed — otherwise the cross-core IPC tests
-                // (IPC0001/0003 "SMP Send+Recv", which loop over
-                // env->cores) migrate threads onto APs and hit the
-                // unfinished inter-AS-process-on-AP path and hang. The
-                // MULTICORE build (`build_kernel.sh smp`) enables it.
-                #[cfg(feature = "smp")]
                 if let Some(tcb) = keep_bound {
                     // seL4 `remoteTCBStall` precedes `migrateTCB`: if the
                     // bound thread is currently running on another core,
                     // stall that core off it before moving it, so it can't
                     // run on two cores at once (MULTICORE0002/0003).
-                    crate::smp::remote_tcb_stall(tcb);
+                    crate::smp::remote_tcb_stall(s, tcb);
                     s.scheduler.migrate_tcb(tcb, sched_control_core);
                 }
-                #[cfg(not(feature = "smp"))]
-                let _ = (keep_bound, sched_control_core);
             }
             Ok(())
         }
@@ -2991,7 +2967,7 @@ fn decode_irq_control(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId
                         resolved.slot_index,
                     )
                 } else {
-                    let cspace_root = s.scheduler.slab.get(invoker).cspace_root;
+                    let cspace_root = s.scheduler.slab.get(invoker).cspace_root();
                     let cnode_ptr = match cspace_root {
                         Cap::CNode { ptr, .. } => ptr,
                         _ => {
@@ -3361,8 +3337,7 @@ fn decode_domain(label: InvocationLabel, args: &SyscallArgs, invoker: TcbId) -> 
                     Cap::Thread { tcb } => crate::tcb::TcbId(tcb.addr() as u16),
                     _ => return err(seL4_Error::seL4_InvalidArgument),
                 };
-                #[cfg(feature = "smp")]
-                crate::smp::remote_tcb_stall(tcb_id);
+                crate::smp::remote_tcb_stall(s, tcb_id);
                 // setDomain: re-queues the thread under the new domain.
                 s.scheduler.set_domain(tcb_id, domain as u8);
             }
@@ -3554,7 +3529,7 @@ fn decode_irq_handler(
                     inv_tcb.pending_extra_caps_count = 0;
                     c
                 } else {
-                    let cspace_root = inv_tcb.cspace_root;
+                    let cspace_root = inv_tcb.cspace_root();
                     crate::cspace::lookup_cap(s, &cspace_root, args.a2)?
                 };
                 let (ntfn_ptr, ntfn_badge) = match ntfn_cap {
@@ -3804,7 +3779,7 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
                     .unwrap_or(Cap::Null)
             }
         } else {
-            s.scheduler.slab.get(invoker).cspace_root
+            s.scheduler.slab.get(invoker).cspace_root()
         };
         let (cnode_ptr, dest_radix) = match dest_cnode_cap {
             Cap::CNode { ptr, radix, .. } => (ptr, radix),
@@ -3833,7 +3808,7 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         // the dest CNode would point children at random slots in the
         // test process's CNode and Revoke would shoot down unrelated
         // caps.)
-        let invoker_root = s.scheduler.slab.get(invoker).cspace_root;
+        let invoker_root = s.scheduler.slab.get(invoker).cspace_root();
         let src_res = crate::cspace::resolve_address_bits(
             s,
             &invoker_root,
@@ -4329,12 +4304,9 @@ static mut REVOKE_EPOCH: u32 = 0;
 unsafe fn begin_revoke_epoch(s: &mut KernelState) -> u32 {
     let mut epoch = REVOKE_EPOCH.wrapping_add(1);
     if epoch == 0 {
-        for ci in 0..KernelState::cnode_pool_count() {
-            if let Some(slots) = s.cnode_slots_at_mut(ci) {
-                for slot in slots {
-                    slot.set_revoke_epoch(0);
-                }
-            }
+        let mut cursor = CteCursor::new();
+        while let Some(id) = cursor.next(s) {
+            s.cte_mut(id).unwrap().set_revoke_epoch(0);
         }
         epoch = 1;
     }
@@ -4342,174 +4314,68 @@ unsafe fn begin_revoke_epoch(s: &mut KernelState) -> u32 {
     epoch
 }
 
-fn cte_revoke_marked(s: &KernelState, ci: usize, si: usize, epoch: u32) -> bool {
-    s.cnode_slot(ci, si)
-        .is_some_and(|slot| slot.revoke_epoch() == epoch)
-}
-
-fn mark_cte_revoke(s: &mut KernelState, ci: usize, si: usize, epoch: u32) {
-    if let Some(slot) = s.cnode_slot_mut(ci, si) {
-        slot.set_revoke_epoch(epoch);
-    }
+fn cte_revoke_marked(s: &KernelState, id: MdbId, epoch: u32) -> bool {
+    s.cte(id).is_some_and(|slot| slot.revoke_epoch() == epoch)
 }
 
 fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
-    let src_index = args.a2 as usize;
-    let cnode_ptr = match target {
-        Cap::CNode { ptr, .. } => ptr,
-        _ => unreachable!(),
-    };
+    let Cap::CNode { ptr, .. } = target else { unreachable!() };
     unsafe {
         let s = KERNEL.get();
-        let cnode_idx = KernelState::cnode_index(cnode_ptr);
-        let cn_slot_count = s.cnode_slots_at(cnode_idx).map(|sl| sl.len()).unwrap_or(0);
-        if src_index >= cn_slot_count {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_RangeError,
-            )));
+        let source = MdbId::pack(KernelState::cnode_index(ptr) as u32, args.a2 as u32);
+        if args.a2 > MdbId::SLOT_MASK || s.cte(source).is_none() {
+            return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_RangeError)));
         }
-        // Mark this walk in each CTE's transient MDB generation. This is BKL-serialized and avoids
-        // a second bitmap proportional to every possible CSpace slot.
-        let revoke_epoch = begin_revoke_epoch(s);
-        mark_cte_revoke(s, cnode_idx, src_index, revoke_epoch);
-
-        // Iterate to fixed point: any CTE whose parent is revoked
-        // gets revoked too. Capacity-bounded — at most
-        // `cnode_pool_count() * CNODE_SLOTS` CTEs to mark.
+        let epoch = begin_revoke_epoch(s);
+        s.cte_mut(source).unwrap().set_revoke_epoch(epoch);
         let mut progress = true;
         while progress {
             progress = false;
-            for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-                let slot_count = s.cnode_slots_at(ci).map(|slots| slots.len()).unwrap_or(0);
-                for si in 0..slot_count {
-                    if cte_revoke_marked(s, ci, si, revoke_epoch) {
-                        continue;
-                    }
-                    let parent = s.cnode_slot(ci, si).and_then(|c| c.parent());
-                    if let Some(p) = parent {
-                        let pi = p.cnode_idx() as usize;
-                        let ps = p.slot() as usize;
-                        if cte_revoke_marked(s, pi, ps, revoke_epoch) {
-                            mark_cte_revoke(s, ci, si, revoke_epoch);
-                            progress = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Validate that every CNode which would become final still has registered backing before
-        // changing any CTE. Paging edges are deliberately not preconditions: seL4 finalizes a
-        // final paging-structure cap with a best-effort unmap even if its parent disappeared first.
-        for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-            let slot_count = s.cnode_slots_at(ci).map(|slots| slots.len()).unwrap_or(0);
-            for si in 0..slot_count {
-                if !cte_revoke_marked(s, ci, si, revoke_epoch)
-                    || (ci == cnode_idx && si == src_index)
-                {
+            let mut cursor = CteCursor::new();
+            while let Some(id) = cursor.next(s) {
+                if cte_revoke_marked(s, id, epoch) {
                     continue;
                 }
-                let cap = s
-                    .cnode_slot(ci, si)
-                    .map(|cte| cte.cap())
-                    .unwrap_or(Cap::Null);
-                let valid = match cap {
-                    Cap::CNode { ptr, .. } => {
-                        let vi = KernelState::cnode_index(ptr);
-                        let (cleared_refs, cleared_self_refs) =
-                            revoke_cnode_clear_counts(s, vi, revoke_epoch, (cnode_idx, src_index));
-                        cnode_release_mappings_valid(s, &cap, cleared_refs, cleared_self_refs)
-                    }
-                    _ => true,
-                };
-                if !valid {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_IllegalOperation,
-                    )));
-                }
-            }
-        }
-
-        // Clear every revoked slot except the source itself.
-        // Also reset the child_count for both the cleared slot
-        // (no longer holds anything that has children) and decrement
-        // the parent's count (we just removed one of its children).
-        for ci in 0..crate::kernel::KernelState::cnode_pool_count() {
-            let slot_count = s.cnode_slots_at(ci).map(|sl| sl.len()).unwrap_or(0);
-            for si in 0..slot_count {
-                if !cte_revoke_marked(s, ci, si, revoke_epoch)
-                    || (ci == cnode_idx && si == src_index)
+                if s.cte(id).and_then(|slot| slot.parent())
+                    .is_some_and(|parent| cte_revoke_marked(s, parent, epoch))
                 {
-                    continue;
+                    s.cte_mut(id).unwrap().set_revoke_epoch(epoch);
+                    progress = true;
                 }
-                let id = crate::cte::MdbId::pack(ci as u32, si as u32);
-                // Phase 43 — free pool slots so long sel4test
-                // runs don't exhaust the static pools. Only the
-                // FIRST cap (where the object was retyped from
-                // an Untyped) does the free; copies via Mint
-                // would call free again for the same pool slot
-                // which is harmless (free is idempotent).
-                let cap_to_free = s
-                    .cnode_slot(ci, si)
-                    .expect("marked revoke slot must remain registered under the BKL")
-                    .cap();
-                let parent = splice_cte_out(s, id);
-                finalise_cap_mapping(s, &cap_to_free);
-                // Phase 44 — clear the slot FIRST (the set_cap hook
-                // drops the refcount), then release the object if
-                // that was its last reference. Replaces the
-                // whole-pool same_obj_lives sweep; the
-                // revoked-but-uncleared siblings still hold counts,
-                // so the object frees exactly when the LAST holder
-                // is cleared — same semantics as the old
-                // is_revoked-excluding sweep.
-                let slot = s
-                    .cnode_slot_mut(ci, si)
-                    .expect("marked revoke slot must remain registered until cleared");
-                slot.set_cap(&Cap::Null);
-                slot.set_parent(None);
-                slot.set_child_count(0);
-                slot.set_revoke_epoch(0);
-                maybe_free_object(s, &cap_to_free);
-                release_parent_edge(parent);
             }
         }
-        // The source itself kept the cap but lost all its descendants.
-        assert_eq!(
-            s.cnode_slot(cnode_idx, src_index)
-                .expect("revoke source must remain registered")
-                .child_count(),
-            0,
-            "revoke must retire or splice every source descendant"
-        );
-
-        // Phase 43 — if the source is an Untyped, every derived
-        // object has been cleared, so reset the source's free index
-        // back to 0 so the next Retype starts from the bottom of the
-        // block. Otherwise the second test's allocations exhaust the
-        // untyped even though the memory is now free.
-        let source = s
-            .cnode_slot(cnode_idx, src_index)
-            .map(|c| c.cap())
-            .unwrap_or(Cap::Null);
-        if let Cap::Untyped {
-            ptr,
-            block_bits,
-            is_device,
-            ..
-        } = source
-        {
-            if let Some(slot) = s.cnode_slot_mut(cnode_idx, src_index) {
-                slot.set_cap(&Cap::Untyped {
-                    ptr,
-                    block_bits,
-                    free_index: 0,
-                    is_device,
-                });
+        // Validate every complex object before any marked ownership edge is retired.
+        let mut cursor = CteCursor::new();
+        while let Some(id) = cursor.next(s) {
+            if id == source || !cte_revoke_marked(s, id, epoch) {
+                continue;
+            }
+            let cap = s.cte(id).unwrap().cap();
+            if let Cap::CNode { ptr, .. } = cap {
+                let vi = KernelState::cnode_index(ptr);
+                let (references, self_references) = revoke_cnode_clear_counts(s, vi, epoch, source);
+                if !cnode_release_mappings_valid(s, &cap, references, self_references) {
+                    return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
+                }
             }
         }
+        let mut cursor = CteCursor::new();
+        while let Some(id) = cursor.next(s) {
+            if id != source && cte_revoke_marked(s, id, epoch) {
+                delete_cap_slot(s, id).expect("prevalidated revoke slot remains finalizable under BKL");
+            }
+        }
+        // The source may live inside a CNode retired by this revoke. Only the still-marked
+        // original slot may be reset; absence is a completed destructive traversal, not an error.
+        if let Some(slot) = s.cte_mut(source).filter(|slot| slot.revoke_epoch() == epoch) {
+            assert_eq!(slot.child_count(), 0, "revoke must retire every derived CNode and TCB slot");
+            slot.set_revoke_epoch(0);
+            if let Cap::Untyped { ptr, block_bits, is_device, .. } = slot.cap() {
+                slot.set_cap(&Cap::Untyped { ptr, block_bits, free_index: 0, is_device });
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: bool) -> KResult<()> {
@@ -4564,7 +4430,7 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
             inv_tcb.pending_extra_caps_count = 0;
             c
         } else {
-            inv_tcb.cspace_root
+            inv_tcb.cspace_root()
         };
 
         let dest_res = crate::cspace::resolve_address_bits(s, &dest_root, dest_index, dest_depth)?;
@@ -4752,7 +4618,7 @@ fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) ->
             inv_tcb.pending_extra_caps_count = 0;
             c
         } else {
-            inv_tcb.cspace_root
+            inv_tcb.cspace_root()
         };
 
         // Resolve dest slot via the dest_root cap.
@@ -4875,8 +4741,7 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     // make that core switch off it before we free the slab entry —
     // otherwise the remote core keeps executing a freed TCB
     // (MULTICORE0005 remote-delete).
-    #[cfg(feature = "smp")]
-    crate::smp::remote_tcb_stall(id);
+    crate::smp::remote_tcb_stall(s, id);
     crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
     // YieldTo bookkeeping (SCHED0018 delete phases):
     //   * a yielder waiting on the dying thread's SC gets its
@@ -4900,9 +4765,13 @@ unsafe fn destroy_tcb(s: &mut crate::kernel::KernelState, id: TcbId) {
     // seL4 `fpuRelease`: drop any core's ownership of this thread's FPU
     // state before its save area vanishes, so a later `fpu_switch_to`
     // can't `fxsave` into a freed TCB.
-    #[cfg(all(feature = "smp", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::fpu_ctx::fpu_release(id);
-    s.scheduler.slab.entries[id.0 as usize] = None;
+    for slot in TcbSlot::ALL {
+        delete_cap_slot(s, MdbId::tcb(id, slot))
+            .expect("retiring TCB capability slots remain finalizable under BKL");
+    }
+    s.scheduler.slab.free(id);
 }
 
 unsafe fn cnode_has_only_self_refs(s: &crate::kernel::KernelState, cap: &Cap) -> bool {
@@ -4939,19 +4808,15 @@ unsafe fn reparent_direct_children(
     }
 
     let mut moved = 0u32;
-    for ci in 0..KernelState::cnode_pool_count() {
-        let slot_count = s.cnode_slots_at(ci).map_or(0, |slots| slots.len());
-        for si in 0..slot_count {
-            #[cfg(feature = "spec")]
-            REPARENT_SCAN_SLOTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if s.cnode_slot(ci, si).and_then(|slot| slot.parent()) != Some(old_parent) {
-                continue;
-            }
-            s.cnode_slot_mut(ci, si)
-                .expect("scanned CNode slot must remain registered under the BKL")
-                .set_parent(new_parent);
-            moved = moved.checked_add(1).expect("MDB child count overflow");
+    let mut cursor = CteCursor::new();
+    while let Some(id) = cursor.next(s) {
+        #[cfg(feature = "spec")]
+        REPARENT_SCAN_SLOTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if s.cte(id).and_then(|slot| slot.parent()) != Some(old_parent) {
+            continue;
         }
+        s.cte_mut(id).unwrap().set_parent(new_parent);
+        moved = moved.checked_add(1).expect("MDB child count overflow");
     }
     if moved != expected_children {
         crate::arch::log("MDB reparent mismatch: moved=");
@@ -4979,14 +4844,14 @@ unsafe fn splice_cte_out(
     removed: crate::cte::MdbId,
 ) -> Option<crate::cte::MdbId> {
     let removed_cte = s
-        .cnode_slot(removed.cnode_idx() as usize, removed.slot() as usize)
+        .cte(removed)
         .expect("removed CTE must remain registered while its MDB edge is spliced");
     let new_parent = removed_cte.parent();
     let recorded_children = removed_cte.child_count();
     reparent_direct_children(s, removed, new_parent, recorded_children);
     if let Some(parent) = new_parent {
         let parent = s
-            .cnode_slot_mut(parent.cnode_idx() as usize, parent.slot() as usize)
+            .cte_mut(parent)
             .expect("derived cap parent must remain live while its child is deleted");
         let adopted = parent
             .child_count()
@@ -4994,7 +4859,7 @@ unsafe fn splice_cte_out(
             .expect("MDB child count overflow while splicing a CTE");
         parent.set_child_count(adopted);
     }
-    s.cnode_slot_mut(removed.cnode_idx() as usize, removed.slot() as usize)
+    s.cte_mut(removed)
         .expect("finalized CNode slot must remain registered until it is cleared")
         .set_child_count(0);
     new_parent
@@ -5036,16 +4901,12 @@ unsafe fn assert_cnode_release_invariants(s: &crate::kernel::KernelState, vi: us
         0,
         "released CNode descriptor retains a live capability reference"
     );
-    for ci in 0..KernelState::cnode_pool_count() {
-        let slot_count = s.cnode_slots_at(ci).map_or(0, |inner| inner.len());
-        for si in 0..slot_count {
-            let parent = s.cnode_slot(ci, si).and_then(|slot| slot.parent());
-            assert_ne!(
-                parent.map(|id| id.cnode_idx() as usize),
-                Some(vi),
-                "released CNode descriptor retains an inbound MDB edge"
-            );
-        }
+    let mut cursor = CteCursor::new();
+    while let Some(id) = cursor.next(s) {
+        let parent = s.cte(id).and_then(|slot| slot.parent());
+        assert!(parent.is_none_or(|parent| parent.tcb_slot().is_some()
+            || parent.cnode_idx() as usize != vi),
+            "released CNode descriptor retains an inbound MDB edge");
     }
 }
 
@@ -5053,12 +4914,14 @@ unsafe fn assert_cnode_release_invariants(s: &crate::kernel::KernelState, vi: us
 /// clears its CTE before entering here, so refcounts already exclude that ownership edge. CNode
 /// contents are finalized with a registry-sized iterative worklist: arbitrary valid nesting is
 /// drained completely without recursive kernel-stack growth or a depth-truncation fallback.
+include!("invocation/object_finalization.rs");
+
 unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
     use crate::kernel::cap_refcount;
     match cap {
         Cap::Thread { tcb } => {
             if cap_refcount(cap) == 0 {
-                destroy_tcb(s, crate::tcb::TcbId(tcb.addr() as u16));
+                finalize_object(s, FinalizationObject::Thread(TcbId(tcb.addr() as u16)));
             }
         }
         Cap::Endpoint { ptr, .. } => {
@@ -5136,164 +4999,62 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
             let _ = (s, ptr, is_mapped, level, mapped_address, ioasid);
         }
         Cap::CNode { ptr, .. } => {
-            if !cnode_has_only_self_refs(s, cap) {
-                return;
-            }
-            let work = cnode_worklist();
-            assert!(
-                work.push(KernelState::cnode_index(*ptr)),
-                "tracked CNode identity must fit finalization worklist"
-            );
-
-            while let Some(vi) = work.pop() {
-                let slots = s
-                    .cnode_slots_at(vi)
-                    .expect("queued CNode must remain registered under the BKL");
-                let n = slots.len();
-                let current_ptr = KernelState::cnode_ptr(vi);
-                let current_cap = Cap::CNode {
-                    ptr: current_ptr,
-                    radix: n.trailing_zeros() as u8,
-                    guard_size: 0,
-                    guard: 0,
-                };
-                assert!(
-                    cnode_has_only_self_refs(s, &current_cap),
-                    "queued CNode cannot gain an external reference under the BKL"
-                );
-
-                for si in 0..n {
-                    let cte = s
-                        .cnode_slot(vi, si)
-                        .expect("queued CNode slot must remain registered under the BKL");
-                    let (inner_cap, inner_parent, inner_children) =
-                        (cte.cap(), cte.parent(), cte.child_count());
-                    if inner_cap.is_null() {
-                        assert_eq!(
-                            inner_children, 0,
-                            "empty CNode slot cannot own derivation children"
-                        );
-                        assert_eq!(
-                            inner_parent, None,
-                            "empty CNode slot cannot retain an MDB parent"
-                        );
-                        s.cnode_slot_mut(vi, si)
-                            .expect("queued CNode slot must remain registered until cleared")
-                            .set_revoke_epoch(0);
-                        continue;
-                    }
-                    let spliced_parent =
-                        splice_cte_out(s, crate::cte::MdbId::pack(vi as u32, si as u32));
-                    assert_eq!(spliced_parent, inner_parent);
-                    finalise_cap_mapping(s, &inner_cap);
-                    let slot = s
-                        .cnode_slot_mut(vi, si)
-                        .expect("queued CNode slot must remain registered until cleared");
-                    slot.set_cap(&Cap::Null);
-                    slot.set_parent(None);
-                    slot.set_child_count(0);
-                    slot.set_revoke_epoch(0);
-
-                    match inner_cap {
-                        Cap::CNode { ptr: inner_ptr, .. }
-                            if inner_ptr.addr() == current_ptr.addr() => {}
-                        Cap::CNode { ptr: inner_ptr, .. } => {
-                            if cnode_has_only_self_refs(s, &inner_cap) {
-                                assert!(
-                                    work.push(KernelState::cnode_index(inner_ptr)),
-                                    "tracked CNode identity must fit finalization worklist"
-                                );
-                            }
-                        }
-                        _ => maybe_free_object(s, &inner_cap),
-                    }
-                    release_parent_edge(inner_parent);
-                }
-                assert_cnode_release_invariants(s, vi);
-                s.free_cnode_virt(vi);
+            if cnode_has_only_self_refs(s, cap) {
+                finalize_object(s, FinalizationObject::CNode(KernelState::cnode_index(*ptr)));
             }
         }
         _ => {}
     }
 }
 
-fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
-    // Upstream `seL4_CNode_Delete` ABI:
-    //   target   = the CNode cap containing the slot to clear
-    //   a2 (mr0) = index (cptr to slot under `target`)
-    //   a3 (mr1) = depth (bits to walk for index)
-    // Microtest legacy callers pass depth=WORD_BITS implicitly; the
-    // resolve-with-depth path handles both.
-    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-    let depth = if info.length() >= 2 {
-        args.a3 as u32
-    } else {
-        crate::cspace::WORD_BITS
-    };
-    if INV_TRACE {
-        crate::arch::log("[del idx=0x");
-        log_hex_u64(args.a2);
-        crate::arch::log(" d=");
-        log_dec(depth as u64);
-        crate::arch::log("]\n");
+pub(crate) unsafe fn delete_cap_slot(s: &mut KernelState, id: MdbId) -> KResult<()> {
+    let slot = s.cte(id).ok_or_else(|| {
+        KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+    })?;
+    let cap = slot.cap();
+    if cap.is_null() {
+        assert_eq!(slot.parent(), None, "empty capability retains a derivation parent");
+        assert_eq!(slot.child_count(), 0, "empty capability retains derivation children");
+        s.cte_mut(id).unwrap().set_revoke_epoch(0);
+        return Ok(());
     }
+    if let Cap::CNode { ptr, .. } = cap {
+        let index = KernelState::cnode_index(ptr);
+        let self_reference = id.tcb_slot().is_none() && id.cnode_idx() as usize == index;
+        if !cnode_release_mappings_valid(s, &cap, 1, u32::from(self_reference)) {
+            return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
+        }
+    }
+    // Revoke can withdraw a live TCB's authority while independent aliases keep the
+    // underlying object alive. Stop its remote execution before clearing the owned slot.
+    if let Some((thread, _)) = id.tcb_slot() {
+        crate::smp::remote_tcb_stall(s, thread);
+    }
+    let parent = splice_cte_out(s, id);
+    finalise_cap_mapping(s, &cap);
+    assert!(s.write_cte_cap(id, &Cap::Null));
+    let slot = s.cte_mut(id).unwrap();
+    slot.set_parent(None);
+    slot.set_child_count(0);
+    slot.set_revoke_epoch(0);
+    // The parent may be inside an object released by this cap's finalizer.
+    release_parent_edge(s, parent);
+    maybe_free_object(s, &cap);
+    Ok(())
+}
+
+fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let depth = if info.length() >= 2 { args.a3 as u32 } else { crate::cspace::WORD_BITS };
     unsafe {
         let s = KERNEL.get();
-        let res = crate::cspace::resolve_address_bits(s, &target, args.a2, depth)?;
-        if res.bits_remaining != 0 {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_FailedLookup,
-            )));
+        let resolved = crate::cspace::resolve_address_bits(s, &target, args.a2, depth)?;
+        if resolved.bits_remaining != 0 {
+            return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_FailedLookup)));
         }
-        let cnode_idx = KernelState::cnode_index(res.slot_ptr);
-        if INV_TRACE {
-            crate::arch::log("[del -> cnode=");
-            log_dec(cnode_idx as u64);
-            crate::arch::log(" slot=");
-            log_dec(res.slot_index as u64);
-            crate::arch::log("]\n");
-        }
-
-        // Keep the cap live while its mappings and MDB edge are validated and spliced.
-        let removed_id = crate::cte::MdbId::pack(cnode_idx as u32, res.slot_index as u32);
-        let deleted_cap = s
-            .cnode_slot(cnode_idx, res.slot_index)
-            .expect("resolved delete slot must remain registered under the BKL")
-            .cap();
-
-        let valid = match deleted_cap {
-            Cap::CNode { ptr, .. } => {
-                let vi = KernelState::cnode_index(ptr);
-                cnode_release_mappings_valid(s, &deleted_cap, 1, u32::from(cnode_idx == vi))
-            }
-            _ => true,
-        };
-        if !valid {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_IllegalOperation,
-            )));
-        }
-
-        let parent_id = splice_cte_out(s, removed_id);
-        finalise_cap_mapping(s, &deleted_cap);
-
-        let slot = s
-            .cnode_slot_mut(cnode_idx, res.slot_index)
-            .expect("resolved delete slot must remain registered until cleared");
-        slot.set_cap(&Cap::Null);
-        slot.set_parent(None);
-        slot.set_child_count(0);
-        slot.set_revoke_epoch(0);
-
-        // The slot is already clear, so the exact object refcount excludes this ownership edge.
-        // Release the object only when no other capability refers to it.
-        maybe_free_object(s, &deleted_cap);
-
-        // Retire exactly this derivation edge. An Untyped becomes reusable when its last direct
-        // child disappears; ancestors remain allocated while their child Untyped still exists.
-        release_parent_edge(parent_id);
+        delete_cap_slot(s, MdbId::pack(KernelState::cnode_index(resolved.slot_ptr) as u32,
+            resolved.slot_index as u32))
     }
-    Ok(())
 }
 
 /// Per-parent live-child accounting lives in the parent CTE's MDB storage. This follows a CNode
@@ -5301,7 +5062,7 @@ fn cnode_delete(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
 pub unsafe fn child_count_inc(pid: crate::cte::MdbId, by: u32) {
     let s = KERNEL.get();
     let parent = s
-        .cnode_slot_mut(pid.cnode_idx() as usize, pid.slot() as usize)
+        .cte_mut(pid)
         .expect("MDB parent must resolve while adding a derivation edge");
     let count = parent
         .child_count()
@@ -5323,13 +5084,12 @@ pub unsafe fn child_counts_reset_page(vi: usize) {
 /// Remove exactly one live MDB ownership edge. An empty Untyped becomes reusable, but its own
 /// parent remains occupied until this CTE is itself deleted; emptiness never propagates authority
 /// upward through a still-live child cap.
-unsafe fn release_parent_edge(parent_id: Option<crate::cte::MdbId>) {
+unsafe fn release_parent_edge(s: &mut KernelState, parent_id: Option<crate::cte::MdbId>) {
     let Some(parent_id) = parent_id else {
         return;
     };
-    let s = KERNEL.get();
     let parent = s
-        .cnode_slot_mut(parent_id.cnode_idx() as usize, parent_id.slot() as usize)
+        .cte_mut(parent_id)
         .expect("MDB parent must resolve while removing a derivation edge");
     let remaining = parent
         .child_count()
@@ -5344,6 +5104,8 @@ unsafe fn release_parent_edge(parent_id: Option<crate::cte::MdbId>) {
             ..
         } = parent.cap()
         {
+            #[cfg(all(feature = "spec", target_arch = "x86_64"))]
+            spec::observe_untyped_release(parent_id);
             parent.set_cap(&Cap::Untyped {
                 ptr,
                 block_bits,
@@ -5357,6 +5119,8 @@ unsafe fn release_parent_edge(parent_id: Option<crate::cte::MdbId>) {
 // ---------------------------------------------------------------------------
 // TCB invocations.
 // ---------------------------------------------------------------------------
+
+include!("invocation/tcb_cap_ownership.rs");
 
 const TCB_DEBUG_STATE_WORDS: usize = 29;
 const TCB_DEBUG_NONE: Word = Word::MAX;
@@ -5431,18 +5195,20 @@ fn debug_tcb_fault_slot(s: &KernelState, cspace_idx: Word) -> [Word; 6] {
 }
 
 fn write_invocation_words(invoker_tcb: &mut crate::tcb::Tcb, ipc_paddr: Word, words: &[Word]) {
+    let count = words.len().min(if ipc_paddr == 0 { 4 } else { crate::types::seL4_MsgMaxLength });
+    let words = &words[..count];
     let in_regs = words.len().min(invoker_tcb.msg_regs.len());
     for (i, word) in words.iter().copied().enumerate().take(in_regs) {
         invoker_tcb.msg_regs[i] = word;
     }
     invoker_tcb.ipc_length = words.len() as u32;
-    if words.len() > invoker_tcb.msg_regs.len() && ipc_paddr != 0 {
+    if words.len() > 4 && ipc_paddr != 0 {
         let buf = (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
         for (i, word) in words
             .iter()
             .copied()
             .enumerate()
-            .skip(invoker_tcb.msg_regs.len())
+            .skip(4)
         {
             unsafe {
                 core::ptr::write_volatile(buf.add(i), word);
@@ -5485,19 +5251,7 @@ fn decode_tcb(
                 // seL4 `remoteTCBStall`: if the thread is running on a
                 // remote core, stall that core off it before suspending
                 // so the counter freezes immediately (MULTICORE0001).
-                #[cfg(feature = "smp")]
-                crate::smp::remote_tcb_stall(id);
-                crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
-                // Upstream suspend() also completes an outstanding
-                // YieldTo against this thread's SC — the yielder
-                // gets its consumed-report the moment the yielded-to
-                // thread stops running (SCHED0018 phase 1).
-                if let Some(sc_idx) = s.scheduler.slab.get(id).sc {
-                    if let Some(yielder) = s.sched_contexts[sc_idx as usize].yield_from {
-                        crate::sched_context::complete_yield_to(s, yielder, sc_idx as usize);
-                    }
-                }
-                s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
+                suspend_tcb(s, id);
                 Ok(())
             }
             InvocationLabel::TCBResume => {
@@ -5525,7 +5279,7 @@ fn decode_tcb(
             }
             InvocationLabel::TCBReadDebugState => {
                 let reply_bound = if args.a2 != 0 {
-                    let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
+                    let inv_cspace = s.scheduler.slab.get(invoker).cspace_root();
                     match lookup_cap(s, &inv_cspace, args.a2)? {
                         Cap::Reply { ptr, .. } => {
                             let reply_idx = KernelState::reply_index(ptr);
@@ -5545,7 +5299,7 @@ fn decode_tcb(
                     TCB_DEBUG_NONE
                 };
                 let t = s.scheduler.slab.get(id);
-                let cspace_idx = match t.cspace_root {
+                let cspace_idx = match t.cspace_root() {
                     Cap::CNode { ptr, .. } => KernelState::cnode_index(ptr) as Word,
                     _ => TCB_DEBUG_NONE,
                 };
@@ -5588,100 +5342,12 @@ fn decode_tcb(
                     queue_top_priority,
                     direct_handoff,
                 ];
-                let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_receive_paddr();
                 let inv = s.scheduler.slab.get_mut(invoker);
                 write_invocation_words(inv, ipc_paddr, &words);
                 Ok(())
             }
-            // `seL4_TCB_Configure` — one-shot TCB setup. Two ABI
-            // shapes coexist:
-            //
-            //   * Legacy (Phase 34b — extraCaps == 0):
-            //       a2 = fault_ep cptr
-            //       a3 = cspace_root cptr (looked up via CSpace)
-            //       a4 = vspace_root cptr
-            //       a5 = priority | (mcp << 8)
-            //
-            //   * Phase 37c — upstream (extraCaps > 0):
-            //       a2 = fault_ep cptr
-            //       a3 = cspace_root_data (guard config; ignored —
-            //            our flat-radix CNodes don't reconfigure
-            //            guards via Configure)
-            //       a4 = vspace_root_data (ignored)
-            //       a5 = ipc_buffer vaddr
-            //       extraCaps[0] = cspace_root cap
-            //       extraCaps[1] = vspace_root cap
-            //       extraCaps[2] = ipc_buffer frame cap
-            //
-            //  Distinguish by `info.extra_caps()`. The microtest
-            //  case (`tcb_configure`) and existing kernel spec use
-            //  the legacy form; sel4test will use the upstream
-            //  form via libsel4.
-            InvocationLabel::TCBConfigure => {
-                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-                let upstream = info.extra_caps() > 0;
-
-                let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let (cnode_cap, vspace_cap, ipcbuf_cap, ipc_buffer_vaddr) = if upstream {
-                    let staged = s.scheduler.slab.get(invoker).pending_extra_caps;
-                    let count = s.scheduler.slab.get(invoker).pending_extra_caps_count as usize;
-                    let cnode = if count > 0 { Some(staged[0]) } else { None };
-                    let vspace = if count > 1 { Some(staged[1]) } else { None };
-                    let ipcbuf = if count > 2 { Some(staged[2]) } else { None };
-                    (cnode, vspace, ipcbuf, args.a5)
-                } else {
-                    let cnode = if args.a3 != 0 {
-                        Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
-                    } else {
-                        None
-                    };
-                    let vspace = if args.a4 != 0 {
-                        Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
-                    } else {
-                        None
-                    };
-                    (cnode, vspace, None, 0)
-                };
-                if let Some(c) = cnode_cap {
-                    if !matches!(c, Cap::CNode { .. } | Cap::Null) {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                }
-                if let Some(c) = vspace_cap {
-                    if !matches!(c, Cap::Null) && !crate::asid::root_is_current(&c) {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                }
-                let t = s.scheduler.slab.get_mut(id);
-                t.fault_handler = args.a2;
-                if let Some(c) = cnode_cap.filter(|cap| !matches!(cap, Cap::Null)) {
-                    t.cspace_root = c;
-                }
-                if let Some(c) = vspace_cap.filter(|cap| !matches!(cap, Cap::Null)) {
-                    assert!(t.set_vspace_root(c), "VSpace preflight remains valid under BKL");
-                }
-                if upstream {
-                    if let Some(Cap::Frame { ptr, .. }) = ipcbuf_cap {
-                        t.ipc_buffer = ipc_buffer_vaddr;
-                        t.ipc_buffer_paddr = ptr.addr();
-                    }
-                } else {
-                    let prio = args.a5 as u8;
-                    let mcp = (args.a5 >> 8) as u8;
-                    t.priority = prio;
-                    if mcp != 0 {
-                        t.mcp = mcp;
-                    }
-                }
-                // Drain the staged caps regardless of which branch
-                // we took, so they don't leak into a future IPC.
-                s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
-                Ok(())
-            }
+            InvocationLabel::TCBConfigure => configure_tcb_caps(s, id, args, invoker),
             InvocationLabel::TCBSetPriority => {
                 let prio = args.a2 as u8;
                 // SCHED0005 — when the upstream form is used
@@ -5773,22 +5439,15 @@ fn decode_tcb(
                 // Two ABI shapes coexist:
                 //   * Legacy (msginfo.length == 0):
                 //       a2 = rip, a3 = rsp, a4 = arg0 (rdi).
-                //   * Phase 36g — upstream `seL4_TCB_WriteRegisters`
-                //     (msginfo.length > 0):
-                //       a2 = resume_target (bool, ignored)
-                //       a3 = arch_flags    (ignored)
-                //       a4 = count
-                //       msg_regs[3..3+count] = register values in
-                //       seL4_UserContext order: rip, rsp, rflags,
-                //       rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9,
-                //       r10, r11, r12, r13, r14, r15, fs_base,
-                //       gs_base. We honour the first 18 (skipping
-                //       fs/gs base — not modelled).
+                //   * Upstream (msginfo.length > 0): MR0 contains
+                //     resume/arch flags, MR1 the count, and MR2 onward
+                //     the architecture's seL4_UserContext words.
                 #[cfg(target_arch = "x86_64")]
                 {
                     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
                     let length = info.length();
                     if length == 0 {
+                        crate::smp::remote_tcb_stall(s, id);
                         let t = s.scheduler.slab.get_mut(id);
                         t.user_context.rcx = args.a2;
                         t.user_context.rsp = args.a3;
@@ -5807,35 +5466,15 @@ fn decode_tcb(
                         //                   r11, r12, r13, r14, r15,
                         //                   fs_base, gs_base.
                         // Mapping into our SyscallArgs (a1=info, a2=mr0,
-                        // a3=mr1, a4=mr2, a5=mr3) and msg_regs[4..].
+                        // a3=mr1, a4=mr2, a5=mr3); later words require
+                        // the invoker's readable retained IPC Frame.
                         let resume = (args.a2 & 1) != 0;
-                        let count = args.a3 as usize;
                         let inv = s.scheduler.slab.get(invoker);
-                        let mut regs: [u64; 20] = [0; 20];
-                        // First two registers ride in args.a4 / args.a5.
-                        if count > 0 {
-                            regs[0] = args.a4;
-                        } // rip
-                        if count > 1 {
-                            regs[1] = args.a5;
-                        } // rsp
-                          // Remaining registers come from msg word
-                          // index 4 onwards (where SetMR(i+2, ...) for
-                          // i=2 lands). Our msg_regs[4..] holds those
-                          // (for indices < SCRATCH_MSG_LEN); past that
-                          // we read from the IPC buffer at offset i+1
-                          // (the +1 skips the tag word).
-                        for i in 2..count.min(20) {
-                            let msg_idx = i + 2;
-                            if msg_idx < inv.msg_regs.len() {
-                                regs[i] = inv.msg_regs[msg_idx];
-                            } else if inv.ipc_buffer_paddr != 0 {
-                                let buf = (crate::arch::phys_to_virt(inv.ipc_buffer_paddr)
-                                    as *const u64)
-                                    .wrapping_add(1);
-                                regs[i] = core::ptr::read_volatile(buf.add(msg_idx));
-                            }
+                        let (regs, count) = read_tcb_register_request::<20>(inv, args)?;
+                        if id == invoker {
+                            return Err(tcb_cap_error(seL4_Error::seL4_IllegalOperation));
                         }
+                        crate::smp::remote_tcb_stall(s, id);
                         let t = s.scheduler.slab.get_mut(id);
                         let n = count;
                         // Upstream `seL4_UserContext` slot order:
@@ -5856,7 +5495,10 @@ fn decode_tcb(
                         // that the sysretq path would lose. For all
                         // OTHER cases, leave rcx/r11 = rip/rflags so
                         // sysretq's tail sees a valid resume RIP.
-                        let new_rip = if n > 0 { regs[0] } else { 0 };
+                        let old_iretq = t.use_iretq_resume;
+                        let new_rip = if n > 0 { regs[0] } else { crate::fault::reported_ip(t) };
+                        let old_user_rcx = if old_iretq { t.user_context.rcx } else { 0 };
+                        let old_user_r11 = if old_iretq { t.user_context.r11 } else { 0 };
                         // Sanitize RFLAGS the way upstream's
                         // Arch_sanitiseRegister does: keep only the
                         // user-legal arithmetic/direction bits
@@ -5872,7 +5514,7 @@ fn decode_tcb(
                         let new_rflags = if n > 2 {
                             (regs[2] & 0xDD5) | 0x202
                         } else {
-                            0x202
+                            crate::fault::resume_flags(t)
                         };
                         if n > 0 {
                             t.user_context.rip = new_rip;
@@ -5925,26 +5567,17 @@ fn decode_tcb(
                         // Decide on resume path BEFORE writing rcx
                         // and r11, since the choice affects what we
                         // store there.
-                        let user_rcx = if n > 5 { regs[5] } else { 0 };
-                        let user_r11 = if n > 13 { regs[13] } else { 0 };
-                        // If user-set RCX / R11 are independently
-                        // meaningful, we MUST use iretq — store the
-                        // user values in rcx/r11 and set the flag.
-                        let need_iretq =
-                            (n > 5 && user_rcx != new_rip) || (n > 13 && user_r11 != new_rflags);
-                        if need_iretq {
-                            t.user_context.rcx = user_rcx;
-                            t.user_context.r11 = user_r11;
-                            t.use_iretq_resume = true;
-                        } else {
-                            // sysretq path: rcx serves as RIP, r11
-                            // as RFLAGS. Store rip/rflags there so
-                            // the sysretq tail jumps to the right
-                            // place. Mark the context sysret-flavor so
-                            // resume_ip/reported_ip read rcx as the RIP.
-                            t.user_context.rcx = new_rip;
-                            t.user_context.r11 = new_rflags;
-                            t.use_iretq_resume = false;
+                        let user_rcx = if n > 5 { regs[5] } else { old_user_rcx };
+                        let user_r11 = if n > 13 { regs[13] } else { old_user_r11 };
+                        if n != 0 {
+                            // A partial write must preserve unsupplied GPRs and flags. Once RCX
+                            // is supplied independently, use iretq even when it equals RIP.
+                            let need_iretq = old_iretq || n > 5;
+                            t.user_context.rip = new_rip;
+                            t.user_context.rflags = new_rflags;
+                            t.user_context.rcx = if need_iretq { user_rcx } else { new_rip };
+                            t.user_context.r11 = if need_iretq { user_r11 } else { new_rflags };
+                            t.use_iretq_resume = need_iretq;
                         }
                         // fs_base / gs_base (slots 18, 19) ignored.
                         if resume {
@@ -5968,6 +5601,7 @@ fn decode_tcb(
                 {
                     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
                     if info.length() == 0 {
+                        crate::smp::remote_tcb_stall(s, id);
                         let t = s.scheduler.slab.get_mut(id);
                         t.user_context.fault_ip = args.a2;
                         t.user_context.elr_el1 = args.a2;
@@ -5976,26 +5610,12 @@ fn decode_tcb(
                         t.user_context.spsr_el1 = 1 << 6;
                     } else {
                         let resume = args.a2 & 1 != 0;
-                        let count = (args.a3 as usize).min(36);
                         let inv = s.scheduler.slab.get(invoker);
-                        let mut regs = [0u64; 36];
-                        if count > 0 {
-                            regs[0] = args.a4;
+                        let (regs, count) = read_tcb_register_request::<36>(inv, args)?;
+                        if id == invoker {
+                            return Err(tcb_cap_error(seL4_Error::seL4_IllegalOperation));
                         }
-                        if count > 1 {
-                            regs[1] = args.a5;
-                        }
-                        for i in 2..count {
-                            let msg_idx = i + 2;
-                            if msg_idx < inv.msg_regs.len() {
-                                regs[i] = inv.msg_regs[msg_idx];
-                            } else if inv.ipc_buffer_paddr != 0 {
-                                let buf = (crate::arch::phys_to_virt(inv.ipc_buffer_paddr)
-                                    as *const u64)
-                                    .wrapping_add(1);
-                                regs[i] = core::ptr::read_volatile(buf.add(msg_idx));
-                            }
-                        }
+                        crate::smp::remote_tcb_stall(s, id);
 
                         let t = s.scheduler.slab.get_mut(id);
                         if count > 0 {
@@ -6043,11 +5663,9 @@ fn decode_tcb(
                 // Two ABI shapes coexist (mirror of WriteRegisters):
                 //   * Legacy (msginfo.length == 0):
                 //       writes 3 words back: rcx (= rip), rsp, rax.
-                //   * Phase 37d — upstream `seL4_TCB_ReadRegisters`
-                //     (msginfo.length > 0):
-                //       a2 = suspend_source (bool, ignored)
-                //       a3 = arch_flags    (ignored)
-                //       a4 = count
+                //   * Upstream `seL4_TCB_ReadRegisters` (length > 0):
+                //       a2 = suspend_source | (arch_flags << 8)
+                //       a3 = count
                 //       writes `count` words back in seL4_UserContext
                 //       order: rip, rsp, rflags, rax, rbx, rcx, rdx,
                 //       rsi, rdi, rbp, r8..r15, fs_base, gs_base.
@@ -6055,6 +5673,30 @@ fn decode_tcb(
                 //       output (those user_context fields double as
                 //       our iretq RIP/RFLAGS holders); fs_base / gs
                 //       _base also zero (not modelled).
+                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+                #[cfg(target_arch = "x86_64")]
+                let max_registers = 20;
+                #[cfg(target_arch = "aarch64")]
+                let max_registers = 36;
+                let count = if info.length() == 0 {
+                    3
+                } else {
+                    if info.length() < 2 {
+                        return Err(tcb_cap_error(seL4_Error::seL4_TruncatedMessage));
+                    }
+                    if args.a3 == 0 || args.a3 > max_registers {
+                        return Err(tcb_cap_error(seL4_Error::seL4_RangeError));
+                    }
+                    if id == invoker {
+                        return Err(tcb_cap_error(seL4_Error::seL4_IllegalOperation));
+                    }
+                    args.a3 as usize
+                };
+                if info.length() != 0 && args.a2 & 1 != 0 {
+                    suspend_tcb(s, id);
+                } else {
+                    crate::smp::remote_tcb_stall(s, id);
+                }
                 #[cfg(target_arch = "x86_64")]
                 {
                     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
@@ -6108,55 +5750,13 @@ fn decode_tcb(
                         // We were reading it from mr2 (args.a4=0 here),
                         // which made `are_tcbs_distinct` see length=0
                         // and report "different TCBs".
-                        let count = (args.a3 as usize).min(regs.len());
-                        let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                        let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_receive_paddr();
                         let inv = s.scheduler.slab.get_mut(invoker);
-                        let in_regs = count.min(inv.msg_regs.len());
-                        for i in 0..in_regs {
-                            inv.msg_regs[i] = regs[i];
-                        }
-                        inv.ipc_length = count as u32;
-                        // Spill words past msg_regs[] into the
-                        // invoker's IPC buffer so userspace's
-                        // libsel4 stub can read the whole array.
-                        if count > inv.msg_regs.len() && ipc_paddr != 0 {
-                            let buf =
-                                (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
-                            for i in inv.msg_regs.len()..count {
-                                core::ptr::write_volatile(buf.add(i), regs[i]);
-                            }
-                        }
-                        // Phase 37d — fan the first 4 returned
-                        // words into the invoker's user_context so
-                        // the syscall return path delivers them
-                        // via r10/r8/r9/r15 (upstream seL4 IPC
-                        // return ABI) the way SysRecv does. SysSend
-                        // doesn't normally fan in (it's a sender-
-                        // side syscall), but ReadRegisters is one
-                        // of the few invocations that produce a
-                        // return message.
-                        if count > 0 {
-                            inv.user_context.r10 = regs[0];
-                        }
-                        if count > 1 {
-                            inv.user_context.r8 = regs[1];
-                        }
-                        if count > 2 {
-                            inv.user_context.r9 = regs[2];
-                        }
-                        if count > 3 {
-                            inv.user_context.r15 = regs[3];
-                        }
-                        // Also pack the returned msginfo (length=
-                        // count, label=0) into rsi so userspace
-                        // can decode it with seL4_MessageInfo_get_*.
-                        let mi = (count as u64) & 0x7F;
-                        inv.user_context.rsi = mi;
+                        write_invocation_words(inv, ipc_paddr, &regs[..count]);
                     }
                 }
                 #[cfg(target_arch = "aarch64")]
                 {
-                    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
                     let t = s.scheduler.slab.get(id);
                     let mut regs = [0u64; 36];
                     regs[0] = t.user_context.fault_ip;
@@ -6171,207 +5771,14 @@ fn decode_tcb(
                     regs[34] = t.user_context.tpidr_el0;
                     regs[35] = t.user_context.tpidrro_el0;
 
-                    let count = if info.length() == 0 {
-                        3
-                    } else {
-                        (args.a3 as usize).min(regs.len())
-                    };
-                    let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                    let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_receive_paddr();
                     let inv = s.scheduler.slab.get_mut(invoker);
                     write_invocation_words(inv, ipc_paddr, &regs[..count]);
                 }
                 Ok(())
             }
-            InvocationLabel::TCBSetSpace => {
-                // Two ABI shapes:
-                //   * Upstream (sel4test): cspace + vspace via extraCaps[0..2].
-                //     mr0=fault_ep, mr1=cspace_root_data, mr2=vspace_root_data.
-                //   * Legacy (microtest): a3=cnode_cptr, a4=vspace_cptr.
-                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-                let upstream = info.extra_caps() > 0;
-                let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                let (cnode_cap, vspace_cap, fault_update) = if upstream {
-                    // MCS variant of TCBSetSpace passes 3 extraCaps:
-                    //   [0] = fault handler endpoint
-                    //   [1] = cspace root
-                    //   [2] = vspace root
-                    // mr0 = cspace_root_data, mr1 = vspace_root_data
-                    // (no fault_ep cptr in message words). Recover the
-                    // fault EP cptr from the invoker's IPC buffer's
-                    // caps_or_badges[0] so deliver_fault has something
-                    // to look up later. FRAMEDIPC0003 needs this — its
-                    // helper page-faults on a deleted-frame access and
-                    // expects the kernel to send a fault to its fault
-                    // EP, not to silently suspend.
-                    let inv_tcb = s.scheduler.slab.get(invoker);
-                    let ipc_paddr = inv_tcb.ipc_buffer_paddr;
-                    let count = inv_tcb.pending_extra_caps_count as usize;
-                    let fault_cptr = if count > 0 && ipc_paddr != 0 {
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            let buf = crate::arch::phys_to_virt(ipc_paddr) as *const u64;
-                            core::ptr::read_volatile(
-                                buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET),
-                            )
-                        }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
-                    // MCS semantics: the fault EP cap is resolved
-                    // HERE, in the invoker's cspace (extraCaps[0]
-                    // was staged as a resolved Cap). Inter-AS fault
-                    // handling (PAGEFAULT1001+) depends on this —
-                    // the cptr is meaningless in the faulter's own
-                    // cspace.
-                    let fault_cap = if count > 0 {
-                        inv_tcb.pending_extra_caps[0]
-                    } else {
-                        Cap::Null
-                    };
-                    let cnode = if count > 1 {
-                        Some(inv_tcb.pending_extra_caps[1])
-                    } else {
-                        None
-                    };
-                    let vspace = if count > 2 {
-                        Some(inv_tcb.pending_extra_caps[2])
-                    } else {
-                        None
-                    };
-                    inv_tcb.pending_extra_caps_count = 0;
-                    (cnode, vspace, Some((fault_cptr, fault_cap)))
-                } else {
-                    let cnode = if args.a3 != 0 {
-                        Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?)
-                    } else {
-                        None
-                    };
-                    let vspace = if args.a4 != 0 {
-                        Some(crate::cspace::lookup_cap(s, &inv_cspace, args.a4)?)
-                    } else {
-                        None
-                    };
-                    (cnode, vspace, None)
-                };
-                let final_cnode = if let Some(c) = cnode_cap {
-                    if !matches!(c, Cap::CNode { .. }) {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                    // Apply cspace_root_data (mr0 in upstream MCS layout
-                    // = args.a2, mr1 in upstream non-MCS = args.a3,
-                    // none in legacy). Encoding mirrors libsel4's
-                    // `seL4_CNode_CapData`:
-                    //   bits 0..6  = guardSize
-                    //   bits 6..64 = guard
-                    // Mirrors upstream `updateCapData` for cnode caps.
-                    let cdata = if upstream { args.a2 } else { 0 };
-                    let final_cnode = if cdata != 0 {
-                        let new_guard_size = (cdata & 0x3F) as u8;
-                        let new_guard = cdata >> 6;
-                        if let Cap::CNode { ptr, radix, .. } = c {
-                            if (new_guard_size as u32) + (radix as u32) > 64 {
-                                return Err(KException::SyscallError(SyscallError::new(
-                                    seL4_Error::seL4_RangeError,
-                                )));
-                            }
-                            Cap::CNode {
-                                ptr,
-                                radix,
-                                guard_size: new_guard_size,
-                                guard: new_guard & ((1u64 << new_guard_size) - 1),
-                            }
-                        } else {
-                            c
-                        }
-                    } else {
-                        c
-                    };
-                    Some(final_cnode)
-                } else {
-                    None
-                };
-                if let Some(c) = vspace_cap {
-                    if !matches!(c, Cap::Null) && !crate::asid::root_is_current(&c) {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                }
-                let t = s.scheduler.slab.get_mut(id);
-                if let Some((pointer, capability)) = fault_update {
-                    t.fault_handler = pointer;
-                    t.fault_handler_cap = capability;
-                } else {
-                    t.fault_handler = args.a2;
-                }
-                if let Some(c) = final_cnode {
-                    t.cspace_root = c;
-                }
-                if let Some(c) = vspace_cap {
-                    assert!(t.set_vspace_root(c), "VSpace preflight remains valid under BKL");
-                }
-                Ok(())
-            }
-            // Phase 34c — set the user-mode IPC buffer. ABI:
-            //   a2 = vaddr the user mapped its IPC buffer at
-            //   a3 = Frame cap_ptr backing that mapping; the
-            //        kernel reads its paddr to access the buffer
-            //        directly through the kernel linear map.
-            InvocationLabel::TCBSetIPCBuffer => {
-                // Two ABI shapes:
-                //   * Upstream (sel4test): bufferFrame via extraCaps[0],
-                //     mr0 = buffer (vaddr).
-                //   * Legacy (microtest): a3 = frame_cptr.
-                let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-                let upstream = info.extra_caps() > 0;
-                let vaddr = args.a2;
-                // seL4 decodeSetIPCBuffer: a zero buffer address means "no
-                // IPC buffer" — bufferSlot is NULL and the frame cap is
-                // ignored entirely. sel4utils relies on this for
-                // no_ipc_buffer threads (e.g. SCHED_CONTEXT_0014), passing
-                // addr 0 + seL4_CapNull. Clear the buffer without requiring
-                // a Frame cap; drain any staged cap so it can't leak.
-                if vaddr == 0 {
-                    s.scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0;
-                    let t = s.scheduler.slab.get_mut(id);
-                    t.ipc_buffer = 0;
-                    t.ipc_buffer_paddr = 0;
-                    return Ok(());
-                }
-                let frame_cap = if upstream {
-                    let inv_tcb = s.scheduler.slab.get_mut(invoker);
-                    if inv_tcb.pending_extra_caps_count == 0 {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )));
-                    }
-                    let c = inv_tcb.pending_extra_caps[0];
-                    inv_tcb.pending_extra_caps_count = 0;
-                    c
-                } else {
-                    let inv_cspace = s.scheduler.slab.get(invoker).cspace_root;
-                    crate::cspace::lookup_cap(s, &inv_cspace, args.a3)?
-                };
-                let paddr = match frame_cap {
-                    Cap::Frame { ptr, .. } => ptr.addr(),
-                    _ => {
-                        return Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_InvalidCapability,
-                        )))
-                    }
-                };
-                let t = s.scheduler.slab.get_mut(id);
-                t.ipc_buffer = vaddr;
-                t.ipc_buffer_paddr = paddr;
-                Ok(())
-            }
+            InvocationLabel::TCBSetSpace => set_tcb_space(s, id, args, invoker),
+            InvocationLabel::TCBSetIPCBuffer => set_tcb_ipc_buffer(s, id, args, invoker),
             InvocationLabel::TCBBindNotification => {
                 // Two ABI shapes:
                 //   * legacy (microtest): a2 = ntfn_cptr in invoker's
@@ -6391,7 +5798,7 @@ fn decode_tcb(
                     inv_tcb_mut.pending_extra_caps_count = 0;
                     c
                 } else {
-                    let cspace_root = inv_tcb_mut.cspace_root;
+                    let cspace_root = inv_tcb_mut.cspace_root();
                     crate::cspace::lookup_cap(s, &cspace_root, args.a2)?
                 };
                 let ntfn_idx = match ntfn_cap {
@@ -6432,21 +5839,7 @@ fn decode_tcb(
             // (extraCaps[0]) on the target TCB so budget exhaustion
             // delivers a Timeout fault there (TIMEOUTFAULT). A Null
             // cap clears it (api_tcb_configure passes seL4_CapNull).
-            InvocationLabel::TCBSetTimeoutEndpoint => {
-                unsafe {
-                    let s = KERNEL.get();
-                    let inv = s.scheduler.slab.get_mut(invoker);
-                    let cap = if inv.pending_extra_caps_count > 0 {
-                        let c = inv.pending_extra_caps[0];
-                        inv.pending_extra_caps_count = 0;
-                        c
-                    } else {
-                        Cap::Null
-                    };
-                    s.scheduler.slab.get_mut(id).timeout_endpoint_cap = cap;
-                }
-                Ok(())
-            }
+            InvocationLabel::TCBSetTimeoutEndpoint => set_tcb_timeout(s, id, args, invoker),
             // SetMCPriority sets the maximum-controllable-priority
             // bound. mr0 = mcp; extraCaps[0] = authority TCB.
             // SCHED0005 — new MCP must not exceed authority's MCP.
@@ -6635,7 +6028,7 @@ fn decode_tcb(
                 // MR4 (rw) is in the invoker's IPC buffer (only 4 message
                 // registers ride in CPU regs).
                 let rw = {
-                    let paddr = s.scheduler.slab.get(invoker).ipc_buffer_paddr;
+                    let paddr = s.scheduler.slab.get(invoker).ipc_buffer_send_paddr();
                     if paddr == 0 {
                         0
                     } else {
@@ -6677,6 +6070,7 @@ fn decode_tcb(
                 if !dbg::valid_id_for_type(bp_num as usize, ty) {
                     return err(seL4_Error::seL4_InvalidArgument);
                 }
+                crate::smp::remote_tcb_stall(s, id);
                 dbg::set_breakpoint(
                     &mut s.scheduler.slab.get_mut(id).debug,
                     bp_num as usize,
@@ -6723,6 +6117,7 @@ fn decode_tcb(
                         seL4_Error::seL4_RangeError,
                     )));
                 }
+                crate::smp::remote_tcb_stall(s, id);
                 dbg::unset_breakpoint(&mut s.scheduler.slab.get_mut(id).debug, bp_num as usize);
                 Ok(())
             }
@@ -6733,6 +6128,7 @@ fn decode_tcb(
                 use crate::arch::x86_64::debug as dbg;
                 let _bp_num = args.a2; // ignored on x86 (TF-based)
                 let n_instr = args.a3;
+                crate::smp::remote_tcb_stall(s, id);
                 let consumed = dbg::configure_single_stepping(
                     &mut s.scheduler.slab.get_mut(id).debug,
                     n_instr,
@@ -6777,10 +6173,18 @@ pub mod spec {
     include!("invocation/frame_mapping_specs.rs");
     include!("invocation/paging_mapping_specs.rs");
     include!("invocation/mapping_catalog_specs.rs");
+    include!("invocation/tcb_capability_specs.rs");
+    include!("invocation/tcb_register_specs.rs");
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn observe_untyped_release(parent_id: crate::cte::MdbId) {
+        tcb_capability_specs::observe_untyped_release(parent_id);
+    }
 
     pub fn test_invocation() {
         let _guard = crate::spec::KernelGuard::acquire();
         unsafe { KERNEL.get().scheduler.reset_queues(); }
+        unsafe { INVOKER_CAP_OWNERS = Some(crate::asid::spec::RootOwners::new()); }
         arch::log("Running invocation tests...\n");
         untyped_retype_via_invocation();
         untyped_retype_upstream_abi_far_offset();
@@ -6814,6 +6218,8 @@ pub mod spec {
             paging_mapping_specs::run();
         }
         tcb_write_read_registers();
+        #[cfg(target_arch = "x86_64")]
+        tcb_register_specs::run();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
         tcb_write_registers_resume_cancels_reply_wait();
@@ -6821,11 +6227,22 @@ pub mod spec {
         tcb_set_space_pml4_pins_cr3();
         tcb_configure_one_shot_setup();
         asid_specs::run();
+        #[cfg(target_arch = "x86_64")]
+        tcb_capability_specs::run();
         sched_context_bind_unbind();
         sched_context_consumed_and_runtime_reports();
         sched_control_configure_sets_period_budget();
         unsupported_label_returns_illegal();
+        unsafe { drop((&mut *(&raw mut INVOKER_CAP_OWNERS)).take()); }
         arch::log("Invocation tests completed\n");
+    }
+
+    static mut INVOKER_CAP_OWNERS: Option<crate::asid::spec::RootOwners> = None;
+
+    unsafe fn bind_invoker_cap(s: &mut KernelState, id: TcbId, slot: crate::cte::TcbSlot, cap: Cap, data: u64) {
+        let owners = (&mut *(&raw mut INVOKER_CAP_OWNERS)).as_mut().expect("invocation fixture owners");
+        let source = owners.cap_source_in(s, cap);
+        derive_tcb_cap(s, id, slot, Some(source), data).expect("fixture capability derivation");
     }
 
     static mut POOL_EXHAUSTION_SCRATCH: [u16; crate::kernel::MAX_DYNAMIC_CNODES] =
@@ -6900,7 +6317,7 @@ pub mod spec {
             is_device: false,
         };
         unsafe {
-            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&source);
+            KERNEL.get().cnodes[0].0[0].set_cap(&source);
         }
 
         let baseline = pooled_available(object_type);
@@ -6984,7 +6401,7 @@ pub mod spec {
             assert_eq!(s.cnodes[0].0[0].child_count(), 2);
         }
 
-        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         for slot in 4..6 {
             let delete = SyscallArgs {
                 a1: (InvocationLabel::CNodeDelete as u64) << 12,
@@ -7035,7 +6452,7 @@ pub mod spec {
             is_device: false,
         };
         unsafe {
-            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+            KERNEL.get().cnodes[0].0[0].set_cap(&ut_cap);
         }
         // Retype 3 endpoints into slots 4..6.
         let args = SyscallArgs {
@@ -7073,7 +6490,7 @@ pub mod spec {
             is_device: false,
         };
         unsafe {
-            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+            KERNEL.get().cnodes[0].0[0].set_cap(&ut_cap);
         }
         // Retype Endpoint at slot 4.
         let args = SyscallArgs {
@@ -7086,7 +6503,7 @@ pub mod spec {
         decode_invocation(ut_cap, &args, invoker).expect("retype");
 
         // Copy the endpoint at slot 4 → slot 5.
-        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeCopy as u64) << 12,
             a2: 5,
@@ -7427,7 +6844,7 @@ pub mod spec {
                 asid: 0,
             };
             mapping_catalog_specs::root(ASID, pml4_paddr, 3);
-            KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&pt_cap);
+            KERNEL.get().cnodes[0].0[2].set_cap(&pt_cap);
 
             let map_args = SyscallArgs {
                 a0: 2,
@@ -7451,7 +6868,7 @@ pub mod spec {
                 } if v == vaddr
             ));
 
-            let root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
+            let root = KERNEL.get().scheduler.slab.get(invoker).cspace_root();
             let copy_args = SyscallArgs {
                 a1: (InvocationLabel::CNodeCopy as u64) << 12,
                 a2: 4,
@@ -7541,20 +6958,20 @@ pub mod spec {
             let mut t = crate::tcb::Tcb::default();
             t.priority = 50;
             t.state = crate::tcb::ThreadStateType::Running;
-            t.cspace_root = Cap::CNode {
+            let cspace = Cap::CNode {
                 ptr: KernelState::cnode_ptr(cnode_idx),
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
-            // Wipe the cnode in case earlier specs left state.
-            for slot in s.cnodes[cnode_idx].0.iter_mut() {
-                slot.set_cap(&Cap::Null);
-                slot.set_parent(None);
-                slot.set_child_count(0);
-                slot.set_revoke_epoch(0);
+            // Retire previous fixture ownership before reusing any source-slot identity.
+            for slot in 0..s.cnodes[cnode_idx].0.len() {
+                delete_cap_slot(s, crate::cte::MdbId::pack(cnode_idx as u32, slot as u32))
+                    .expect("previous fixture capabilities are finalizable");
             }
-            s.scheduler.admit(t)
+            let id = s.scheduler.admit(t);
+            bind_invoker_cap(s, id, crate::cte::TcbSlot::CSpace, cspace, 0);
+            id
         }
     }
 
@@ -7566,9 +6983,14 @@ pub mod spec {
     }
 
     fn teardown_thread_in(s: &mut KernelState, id: TcbId) {
+        let mut cursor = crate::kernel::CteCursor::new();
+        while let Some(slot) = cursor.next(s) {
+            if matches!(s.cte(slot).map(Cte::cap), Some(Cap::Thread { tcb }) if tcb.addr() == id.0 as u64) {
+                unsafe { delete_cap_slot(s, slot).expect("fixture Thread cap deletion"); }
+            }
+        }
         if s.scheduler.slab.try_get(id).is_some() {
-            s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
-            s.scheduler.slab.free(id);
+            unsafe { retire_tcb(s, id); }
         }
     }
 
@@ -7585,7 +7007,7 @@ pub mod spec {
         };
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+            s.cnodes[0].0[0].set_cap(&ut_cap);
         }
 
         // Invoke UntypedRetype to make 4 endpoints in slots 4..7.
@@ -7656,12 +7078,13 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             let cnode_ptr = KernelState::cnode_ptr(0);
-            s.scheduler.slab.get_mut(invoker).cspace_root = Cap::CNode {
+            let cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: crate::kernel::CNODE_RADIX,
                 guard_size: 64 - crate::kernel::CNODE_RADIX,
                 guard: 0,
             };
+            bind_invoker_cap(s, invoker, crate::cte::TcbSlot::CSpace, cspace, 0);
         }
         let untyped_base = 0x0090_0000u64;
         let ut_cap = Cap::Untyped {
@@ -7672,13 +7095,13 @@ pub mod spec {
         };
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+            s.cnodes[0].0[0].set_cap(&ut_cap);
         }
         // Stage the upstream ABI on the invoker's TCB: msg_regs[4] =
         // node_offset, msg_regs[5] = num_objects, pending_extra_caps[0]
         // = root cap. Mirrors what `handle_send` would have populated
         // from the IPC buffer + caps_or_badges[].
-        let root_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let root_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let target_slot = 0x57f;
         unsafe {
             let s = KERNEL.get();
@@ -7742,12 +7165,13 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             let cnode_ptr = KernelState::cnode_ptr(0);
-            s.scheduler.slab.get_mut(invoker).cspace_root = Cap::CNode {
+            let cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: crate::kernel::CNODE_RADIX,
                 guard_size: 64 - crate::kernel::CNODE_RADIX,
                 guard: 0,
             };
+            bind_invoker_cap(s, invoker, crate::cte::TcbSlot::CSpace, cspace, 0);
         }
         let parent_ut = Cap::Untyped {
             ptr: PAddr::<crate::cap::UntypedStorage>::new(0x00A0_0000),
@@ -7765,8 +7189,8 @@ pub mod spec {
         };
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[0] = Cte::with_cap(&parent_ut);
-            s.cnodes[0].0[0x57f] = Cte::with_cap(&unrelated_ut);
+            s.cnodes[0].0[0].set_cap(&parent_ut);
+            s.cnodes[0].0[0x57f].set_cap(&unrelated_ut);
             // Default parent for the unrelated cap is None (sentinel).
             assert!(
                 s.cnodes[0].0[0x57f].parent().is_none(),
@@ -7776,7 +7200,7 @@ pub mod spec {
         // Retype parent into a sub-Untyped at slot 100, then sub into
         // an Endpoint at slot 200 (chained derivation). Both should
         // be revoked when we revoke slot 0; slot 0x57f must NOT be.
-        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         // Legacy ABI: a3 = (size_bits << 32) | num_objects.
         let args = SyscallArgs {
             a1: (InvocationLabel::UntypedRetype as u64) << 12,
@@ -7875,9 +7299,9 @@ pub mod spec {
         };
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+            s.cnodes[0].0[0].set_cap(&ut_cap);
         }
-        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         for cycle in 0..500u32 {
             // Retype 1 endpoint at slot 4.
             let args = SyscallArgs {
@@ -7937,7 +7361,7 @@ pub mod spec {
         unsafe {
             let s = KERNEL.get();
             // Plant an endpoint cap at slot 1.
-            s.cnodes[0].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[0].0[1].set_cap(&Cap::Endpoint {
                 ptr: PPtr::<EndpointObj>::new(0x123).unwrap(),
                 badge: Badge(0xAA),
                 rights: EndpointRights {
@@ -7949,7 +7373,7 @@ pub mod spec {
             });
         }
 
-        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeCopy as u64) << 12,
             a2: 2, // dest slot
@@ -7973,12 +7397,12 @@ pub mod spec {
         let parent = crate::cte::MdbId::pack(0, 5);
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[5] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[0].0[5].set_cap(&Cap::Endpoint {
                 ptr: PPtr::<EndpointObj>::new(3).unwrap(),
                 badge: Badge(0),
                 rights: EndpointRights::default(),
             });
-            s.cnodes[0].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[0].0[1].set_cap(&Cap::Endpoint {
                 ptr: PPtr::<EndpointObj>::new(1).unwrap(),
                 badge: Badge(0),
                 rights: EndpointRights::default(),
@@ -7987,7 +7411,7 @@ pub mod spec {
             s.cnodes[0].0[3].set_parent(Some(crate::cte::MdbId::pack(0, 7)));
             child_count_inc(parent, 1);
         }
-        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let scan_before = REPARENT_SCAN_SLOTS.load(core::sync::atomic::Ordering::Relaxed);
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeMove as u64) << 12,
@@ -8051,7 +7475,7 @@ pub mod spec {
             s.cnodes[0].0[3].set_parent(Some(source_id));
         }
 
-        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let mut args = SyscallArgs {
             a1: (InvocationLabel::CNodeMove as u64) << 12,
             a2: 2,
@@ -8106,7 +7530,7 @@ pub mod spec {
             s.cnodes[0].0[3].set_parent(Some(middle_id));
         }
 
-        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let mut args = SyscallArgs {
             a1: (InvocationLabel::CNodeDelete as u64) << 12,
             a2: 2,
@@ -8153,7 +7577,7 @@ pub mod spec {
                 .set_cap(&stale_mapping);
         }
 
-        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let mut args = SyscallArgs {
             a1: (InvocationLabel::CNodeDelete as u64) << 12,
             a2: 1,
@@ -8213,7 +7637,7 @@ pub mod spec {
             });
         }
 
-        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeDelete as u64) << 12,
             a2: 1,
@@ -8274,7 +7698,7 @@ pub mod spec {
             });
         }
 
-        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let root = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let mut args = SyscallArgs {
             a1: (InvocationLabel::CNodeDelete as u64) << 12,
             a2: 1,
@@ -8315,7 +7739,7 @@ pub mod spec {
             is_device: false,
         };
         unsafe {
-            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&ut_cap);
+            KERNEL.get().cnodes[0].0[0].set_cap(&ut_cap);
         }
 
         // Retype 4 Endpoints into slots 4..7. Phase 30 — the MDB
@@ -8343,7 +7767,7 @@ pub mod spec {
 
         // Revoke the untyped at slot 0 — should zero all 4
         // descendants but leave the untyped intact.
-        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         let args = SyscallArgs {
             a1: (InvocationLabel::CNodeRevoke as u64) << 12,
             a2: 0, // src slot = the untyped
@@ -8408,7 +7832,7 @@ pub mod spec {
         // Stage a notification cap at slot 5 in CNode 0.
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[5] = Cte::with_cap(&Cap::Notification {
+            s.cnodes[0].0[5].set_cap(&Cap::Notification {
                 ptr: KernelState::ntfn_ptr(3),
                 badge: crate::cap::Badge(0),
                 rights: crate::cap::NotificationRights {
@@ -8527,8 +7951,8 @@ pub mod spec {
             map_type: crate::cap::FrameMapType::None,
         };
         unsafe {
-            KERNEL.get().cnodes[0].0[1] = Cte::with_cap(&frame_cap);
-            KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&frame_cap);
+            KERNEL.get().cnodes[0].0[1].set_cap(&frame_cap);
+            KERNEL.get().cnodes[0].0[2].set_cap(&frame_cap);
         }
 
         // Invoke X86PageGetAddress — kernel writes paddr into the
@@ -8668,7 +8092,7 @@ pub mod spec {
         let pml4_cap = unsafe { mapping_catalog_specs::root(live_asid, pml4_paddr, 3) };
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[2] = Cte::with_cap(&frame_cap);
+            s.cnodes[0].0[2].set_cap(&frame_cap);
             // Seed the intermediate page tables via the legacy live-PML4 mapper,
             // then clear only the leaf so the upstream path can install it.
             crate::arch::x86_64::usermode::map_user_4k_public(vaddr, seed_paddr, true, false);
@@ -8738,9 +8162,9 @@ pub mod spec {
             asid: 0,
         };
         unsafe {
-            KERNEL.get().cnodes[0].0[2] = Cte::with_cap(&frame_cap);
-            KERNEL.get().cnodes[0].0[3] = Cte::with_cap(&pml4_cap);
-            KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&page_table_cap);
+            KERNEL.get().cnodes[0].0[2].set_cap(&frame_cap);
+            KERNEL.get().cnodes[0].0[3].set_cap(&pml4_cap);
+            KERNEL.get().cnodes[0].0[4].set_cap(&page_table_cap);
         }
 
         let args = SyscallArgs {
@@ -8844,10 +8268,20 @@ pub mod spec {
 
     #[inline(never)]
     fn tcb_read_debug_state_reports_scheduler_and_reply_binding() {
+        #[repr(C, align(4096))]
+        struct ReplyBuffer([u64; 512]);
+        static mut BUFFER: ReplyBuffer = ReplyBuffer([0; 512]);
         let invoker = setup_invoker(0);
         let reply_idx = 9usize;
         let target = unsafe {
             let s = KERNEL.get();
+            bind_invoker_cap(s, invoker, TcbSlot::IpcBuffer, Cap::Frame {
+                ptr: PAddr::new(crate::arch::virt_to_phys(core::ptr::addr_of!(BUFFER) as u64)),
+                size: crate::cap::FrameSize::Small,
+                rights: crate::cap::FrameRights::ReadWrite,
+                mapped: None, asid: 0, is_device: false,
+                map_type: crate::cap::FrameMapType::None,
+            }, 0x4000);
             let mut t = crate::tcb::Tcb::default();
             t.priority = 88;
             t.state = crate::tcb::ThreadStateType::BlockedOnReply;
@@ -8862,7 +8296,7 @@ pub mod spec {
             t.pending_fault = 6;
             t.hosted_syscalls = true;
             let target = s.scheduler.admit(t);
-            s.cnodes[0].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[0].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -8908,7 +8342,11 @@ pub mod spec {
             assert_eq!(inv.msg_regs[16], target.0 as u64);
             assert_eq!(inv.msg_regs[17], TCB_DEBUG_NONE);
             assert_eq!(inv.msg_regs[18], 0);
-            s.cnodes[0].0[2] = Cte::null();
+            for index in 4..TCB_DEBUG_STATE_WORDS {
+                assert_eq!((core::ptr::addr_of!(BUFFER) as *const u64).add(index + 1).read_volatile(),
+                    inv.msg_regs[index]);
+            }
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(0, 2)).unwrap();
             s.replies[reply_idx] = crate::reply::Reply::new();
             teardown_thread_in(s, target);
             s.scheduler.set_current(None);
@@ -8927,7 +8365,7 @@ pub mod spec {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
             s.replies[reply_idx] = crate::reply::Reply::new();
-            s.cnodes[0].0[4] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[0].0[4].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -9031,7 +8469,7 @@ pub mod spec {
                 InvocationLabel::TCBWriteRegisters as u64,
                 0,
                 0,
-                3,
+                4,
             )
             .words[0],
             a2: 1, // resume target
@@ -9091,8 +8529,8 @@ pub mod spec {
                 guard_size: 59,
                 guard: 0,
             };
-            s.cnodes[0].0[1] = Cte::with_cap(&new_cnode_cap);
-            s.cnodes[0].0[2] = Cte::with_cap(&Cap::Notification {
+            s.cnodes[0].0[1].set_cap(&new_cnode_cap);
+            s.cnodes[0].0[2].set_cap(&Cap::Notification {
                 ptr: KernelState::ntfn_ptr(5),
                 badge: crate::cap::Badge(0),
                 rights: crate::cap::NotificationRights {
@@ -9113,7 +8551,7 @@ pub mod spec {
         decode_invocation(target_cap, &args, invoker).expect("set space");
         unsafe {
             let t = KERNEL.get().scheduler.slab.get(target);
-            match t.cspace_root {
+            match t.cspace_root() {
                 Cap::CNode { ptr, .. } if ptr == KernelState::cnode_ptr(1) => {}
                 other => panic!("expected new cspace, got {:?}", other),
             }
@@ -9194,7 +8632,7 @@ pub mod spec {
 
         // SetSpace with a non-PML4 vspace cap (a CNode) is rejected.
         unsafe {
-            KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&Cap::CNode {
+            KERNEL.get().cnodes[0].0[4].set_cap(&Cap::CNode {
                 ptr: KernelState::cnode_ptr(1),
                 radix: 5,
                 guard_size: 59,
@@ -9215,37 +8653,27 @@ pub mod spec {
                 code: seL4_Error::seL4_InvalidCapability
             }))
         ));
-        // A rejected upstream VSpace must not publish staged fault or CSpace changes either.
-        let (fault_endpoint, before_cspace, before_root) = unsafe {
+        // A rejected VSpace must not publish the proposed fault or CSpace changes either.
+        let (before_fault, before_cspace, before_root) = unsafe {
             let s = KERNEL.get();
             let endpoint = s.alloc_endpoint().unwrap();
-            let proposed_cspace = s.cnodes[0].0[4].cap();
-            let old_root = s.scheduler.slab.get(target).vspace_root();
-            let stale_root = if let Cap::PML4 { ptr, .. } = old_root {
-                Cap::PML4 { ptr, mapped: true, asid: 0 }
-            } else { unreachable!() };
-            let caller = s.scheduler.slab.get_mut(invoker);
-            caller.pending_extra_caps = [
-                Cap::Endpoint {
-                    ptr: KernelState::endpoint_ptr(endpoint),
-                    badge: Badge(0),
-                    rights: EndpointRights {
-                        can_send: true,
-                        can_receive: true,
-                        can_grant: true,
-                        can_grant_reply: true,
-                    },
+            let held_fault = Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(endpoint),
+                badge: Badge(0x1234),
+                rights: EndpointRights {
+                    can_send: true, can_receive: true,
+                    can_grant: true, can_grant_reply: true,
                 },
-                proposed_cspace,
-                stale_root,
-            ];
-            caller.pending_extra_caps_count = 3;
-            let target = s.scheduler.slab.get_mut(target);
-            target.fault_handler = 0x1234;
-            (endpoint, target.cspace_root, target.vspace_root())
+            };
+            bind_invoker_cap(s, target, TcbSlot::FaultHandler, held_fault, 0);
+            let target = s.scheduler.slab.get(target);
+            (held_fault, target.cspace_root(), target.vspace_root())
         };
         let rejected = SyscallArgs {
-            a1: ((InvocationLabel::TCBSetSpace as u64) << 12) | (3 << 7),
+            a1: (InvocationLabel::TCBSetSpace as u64) << 12,
+            a2: 0,
+            a3: 4,
+            a4: 4,
             ..Default::default()
         };
         assert!(matches!(decode_invocation(target_cap, &rejected, invoker),
@@ -9253,20 +8681,17 @@ pub mod spec {
         unsafe {
             let t = KERNEL.get().scheduler.slab.get(target);
             assert_eq!(t.cpu_context.cr3, pml4_paddr);
-            assert_eq!(t.fault_handler, 0x1234);
-            assert_eq!(t.fault_handler_cap, Cap::Null);
-            assert_eq!(t.cspace_root, before_cspace);
+            assert_eq!(t.fault_handler_cap(), before_fault);
+            assert_eq!(t.cspace_root(), before_cspace);
             assert_eq!(t.vspace_root(), before_root);
             assert_eq!(crate::asid::pml4_refcount(1), 2);
             teardown_invoker(target);
-            KERNEL.get().free_endpoint(fault_endpoint);
         }
         teardown_invoker(invoker);
         arch::log("  ✓ TCB::SetSpace pins CR3 from a Cap::PML4\n");
     }
 
-    /// Phase 34b — `seL4_TCB_Configure` packs SetSpace + priority
-    /// into one invocation. Verify all fields land on the target.
+    /// Compact Configure derives the fault handler from the authenticated supplied CSpace.
     #[inline(never)]
     fn tcb_configure_one_shot_setup() {
         let invoker = setup_invoker(0);
@@ -9286,14 +8711,21 @@ pub mod spec {
         };
         let pml4_paddr = 0x0000_0000_00DD_0000u64;
         unsafe {
-            KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&cnode_cap);
+            KERNEL.get().cnodes[0].0[4].set_cap(&cnode_cap);
             mapping_catalog_specs::root(1, pml4_paddr, 5);
+            let s = KERNEL.get();
+            let endpoint = s.alloc_endpoint().unwrap();
+            s.cnodes[2].0[6].set_cap(&Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(endpoint), badge: Badge(0xCAFE),
+                rights: EndpointRights { can_send: true, can_receive: false,
+                    can_grant: false, can_grant_reply: true },
+            });
         }
-        // Configure(target, fault_ep=0xCAFE, cspace=4, vspace=5,
+        // Configure(target, fault_ep=6, cspace=4, vspace=5,
         //           a5=prio 75 | mcp 200 << 8).
         let args = SyscallArgs {
             a1: (InvocationLabel::TCBConfigure as u64) << 12,
-            a2: 0xCAFE,
+            a2: 6,
             a3: 4,
             a4: 5,
             a5: 75 | (200u64 << 8),
@@ -9302,8 +8734,8 @@ pub mod spec {
         decode_invocation(target_cap, &args, invoker).expect("Configure");
         unsafe {
             let t = KERNEL.get().scheduler.slab.get(target);
-            assert_eq!(t.fault_handler, 0xCAFE);
-            assert!(matches!(t.cspace_root, Cap::CNode { .. }));
+            assert_eq!(t.fault_handler_cap(), KERNEL.get().cnodes[2].0[6].cap());
+            assert!(matches!(t.cspace_root(), Cap::CNode { .. }));
             assert_eq!(t.cpu_context.cr3, pml4_paddr);
             assert_eq!(t.priority, 75);
             assert_eq!(t.mcp, 200);
@@ -9311,7 +8743,7 @@ pub mod spec {
             teardown_invoker(target);
         }
         teardown_invoker(invoker);
-        arch::log("  ✓ TCB::Configure sets fault_ep + cspace + vspace + prio in one call\n");
+        arch::log("  ✓ compact Configure derives fault, CSpace and VSpace authority\n");
     }
 
     /// Phase 32c — bind a SchedContext to a TCB.
@@ -9331,7 +8763,7 @@ pub mod spec {
         // Plant an Untyped at slot 0 (radix-5 CNode covers ample
         // space for one SchedContext).
         unsafe {
-            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&Cap::Untyped {
+            KERNEL.get().cnodes[0].0[0].set_cap(&Cap::Untyped {
                 ptr: PAddr::<UntypedStorage>::new(0x0060_0000),
                 block_bits: 14,
                 free_index: 0,
@@ -9365,7 +8797,7 @@ pub mod spec {
             KERNEL.get().scheduler.admit(t)
         };
         unsafe {
-            KERNEL.get().cnodes[0].0[8] = Cte::with_cap(&Cap::Thread {
+            KERNEL.get().cnodes[0].0[8].set_cap(&Cap::Thread {
                 tcb: PPtr::<crate::cap::Tcb>::new(target_tcb.0 as u64).unwrap(),
             });
         }
@@ -9477,7 +8909,7 @@ pub mod spec {
 
         // Plant Untyped at slot 0 + retype to SchedContext at slot 7.
         unsafe {
-            KERNEL.get().cnodes[0].0[0] = Cte::with_cap(&Cap::Untyped {
+            KERNEL.get().cnodes[0].0[0].set_cap(&Cap::Untyped {
                 ptr: PAddr::<UntypedStorage>::new(0x0070_0000),
                 block_bits: 14,
                 free_index: 0,
@@ -9496,7 +8928,7 @@ pub mod spec {
 
         // Plant a SchedControl singleton cap at slot 9.
         unsafe {
-            KERNEL.get().cnodes[0].0[9] = Cte::with_cap(&Cap::SchedControl { core: 0 });
+            KERNEL.get().cnodes[0].0[9].set_cap(&Cap::SchedControl { core: 0 });
         }
         let sched_control = Cap::SchedControl { core: 0 };
 
@@ -9549,7 +8981,7 @@ pub mod spec {
     #[inline(never)]
     fn unsupported_label_returns_illegal() {
         let invoker = setup_invoker(0);
-        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root };
+        let cnode_cap = unsafe { KERNEL.get().scheduler.slab.get(invoker).cspace_root() };
         // Pick a cap-type-irrelevant label (UntypedRetype on a CNode).
         let args = SyscallArgs {
             a1: (InvocationLabel::UntypedRetype as u64) << 12,

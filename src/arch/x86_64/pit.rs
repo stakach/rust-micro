@@ -214,7 +214,7 @@ extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
     // wins arbitration; under SMP it can land on an AP while the
     // BSP holds the BKL. Spinning here is fine since IF=0 keeps
     // the CPU re-entrant only via NMI (which we don't take).
-    crate::smp::bkl_acquire();
+    let adopted = crate::smp::bkl_acquire_for_user_entry(super::interrupts::quiescence_entry(ctx));
     let _bkl = BklGuard;
 
     PIT_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -246,6 +246,10 @@ extern "C" fn pit_irq_dispatch(ctx: &mut IretqContext) {
     // Phase 33a — IRQ-driven preemption: if the woken IRQ thread
     // outranks the interrupted one, switch contexts here rather
     // than `iretq`-ing back.
+    if adopted {
+        core::mem::forget(_bkl);
+        unsafe { super::interrupts::dispatch_adopted_irq(); }
+    }
     super::interrupts::swap_iretq_context_if_preempted(ctx, from_user, interrupted);
 }
 

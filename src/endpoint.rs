@@ -698,11 +698,19 @@ pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: Tc
     // We need both TCBs mutable simultaneously. Borrow each entry
     // separately by index — the Slab guarantees they're distinct
     // memory because TcbIds are unique.
-    let (label, length, regs, snd_buf_paddr) = {
+    let (label, length, regs, snd_buf_paddr, kernel_fault) = {
         let s = sched.slab.get(sender);
-        (s.ipc_label, s.ipc_length, s.msg_regs, s.ipc_buffer_paddr)
+        (s.ipc_label, s.ipc_length, s.msg_regs, s.ipc_buffer_send_paddr(), s.pending_fault != 0)
     };
     let r = sched.slab.get_mut(receiver);
+    let recv_buf_paddr = r.ipc_buffer_receive_paddr();
+    // Fault payloads are kernel-staged, whereas ordinary words beyond the registers require
+    // sender frame authority. The receiver must independently authorize every buffer write.
+    let sender_words = if kernel_fault { regs.len() } else if snd_buf_paddr != 0 {
+        crate::types::seL4_MsgMaxLength
+    } else { 4 };
+    let receiver_words = if recv_buf_paddr != 0 { crate::types::seL4_MsgMaxLength } else { 4 };
+    let length = (length as usize).min(sender_words).min(receiver_words) as u32;
     r.ipc_label = label;
     r.ipc_length = length;
     r.ipc_badge = badge;
@@ -713,7 +721,6 @@ pub(crate) fn deliver_message(sched: &mut Scheduler, sender: TcbId, receiver: Tc
     // Phase 34c — fan words 4..length out to the receiver's IPC
     // buffer page so userspace can read them. Words 0..3 ride in
     // registers (rdx/r10/r8/r9 below) and don't need the buffer.
-    let recv_buf_paddr = r.ipc_buffer_paddr;
     if length > 4 && recv_buf_paddr != 0 {
         let buf = (crate::arch::phys_to_virt(recv_buf_paddr) as *mut u64).wrapping_add(1); // skip tag word
         let staged_max = (length as usize).min(regs.len());
@@ -769,7 +776,7 @@ pub fn transfer_extra_caps(
     if count == 0 {
         return;
     }
-    let recv_buf_paddr = sched.slab.get(receiver).ipc_buffer_paddr;
+    let recv_buf_paddr = sched.slab.get(receiver).ipc_buffer_receive_paddr();
     if recv_buf_paddr == 0 {
         // No buffer to consult — drop the staged caps.
         sched.slab.get_mut(sender).pending_extra_caps_count = 0;
@@ -786,7 +793,7 @@ pub fn transfer_extra_caps(
         )
     };
 
-    let recv_cspace = sched.slab.get(receiver).cspace_root;
+    let recv_cspace = sched.slab.get(receiver).cspace_root();
     let target_cnode_cap = if recv_cnode_cptr == 0 {
         recv_cspace
     } else {
@@ -938,6 +945,7 @@ pub mod spec {
         static mut SENDER_BUF: IpcPage = IpcPage([0; 512]);
         static mut RECEIVER_BUF: IpcPage = IpcPage([0; 512]);
 
+        let mut owners = crate::asid::spec::RootOwners::new();
         let s = unsafe { crate::kernel::KERNEL.get() };
         s.scheduler.reset_queues();
         s.scheduler.set_current(None);
@@ -947,13 +955,10 @@ pub mod spec {
         let receiver = s.scheduler.admit(runnable(50));
 
         unsafe {
-            // Spec buffers live in kernel image vaddrs; convert to
-            // paddr so the ipc-path's `phys_to_lin` round-trips back
-            // to the same kernel-virt address via the linear map.
-            s.scheduler.slab.get_mut(sender).ipc_buffer_paddr =
-                crate::arch::virt_to_phys((&raw mut SENDER_BUF) as u64);
-            s.scheduler.slab.get_mut(receiver).ipc_buffer_paddr =
-                crate::arch::virt_to_phys((&raw mut RECEIVER_BUF) as u64);
+            bind_ipc_buffer(s, &mut owners, sender, (&raw mut SENDER_BUF) as u64,
+                crate::cap::FrameRights::ReadOnly);
+            bind_ipc_buffer(s, &mut owners, receiver, (&raw mut RECEIVER_BUF) as u64,
+                crate::cap::FrameRights::ReadWrite);
         }
 
         // Receiver names slot 5 of its own CSpace as the receive
@@ -991,7 +996,11 @@ pub mod spec {
             guard_size: 59,
             guard: 0,
         };
-        s.scheduler.slab.get_mut(receiver).cspace_root = cspace;
+        let source = owners.cap_source_in(s, cspace);
+        unsafe {
+            crate::invocation::derive_tcb_cap(s, receiver, crate::cte::TcbSlot::CSpace,
+                Some(source), 0).unwrap();
+        }
         // Make sure slot 5 starts empty.
         s.cnodes[0].0[5].set_cap(&Cap::Null);
 
@@ -1014,16 +1023,30 @@ pub mod spec {
         );
 
         // Cleanup.
-        s.scheduler.slab.free(sender);
-        s.scheduler.slab.free(receiver);
+        unsafe { crate::invocation::retire_tcb(s, sender); }
+        unsafe { crate::invocation::retire_tcb(s, receiver); }
         s.scheduler.reset_queues();
         s.scheduler.set_current(None);
         arch::log("  ✓ extra cap transfers through IPC into receiver's CNode\n");
     }
 
-    /// Phase 34c — long-message IPC. With both TCBs sporting an
-    /// `ipc_buffer_paddr`, words 4..length should round-trip
-    /// through the buffer. Words 0..3 ride in `msg_regs[0..4]`.
+    unsafe fn bind_ipc_buffer(
+        state: &mut crate::kernel::KernelState,
+        owners: &mut crate::asid::spec::RootOwners,
+        id: TcbId,
+        address: u64,
+        rights: crate::cap::FrameRights,
+    ) {
+        let source = owners.cap_source_in(state, crate::cap::Cap::Frame {
+            ptr: crate::cap::PAddr::new(crate::arch::virt_to_phys(address)),
+            size: crate::cap::FrameSize::Small, rights, mapped: None, asid: 0,
+            is_device: false, map_type: crate::cap::FrameMapType::None,
+        });
+        crate::invocation::derive_tcb_cap(state, id, crate::cte::TcbSlot::IpcBuffer,
+            Some(source), 0x1000).unwrap();
+    }
+
+    /// Long messages require readable sender and writable receiver Frame authority.
     #[inline(never)]
     fn long_message_via_ipc_buffer() {
         // Two backing pages — one per TCB. They sit in BSS so
@@ -1036,17 +1059,20 @@ pub mod spec {
         static mut SENDER_BUF: IpcPage = IpcPage([0; 512]);
         static mut RECEIVER_BUF: IpcPage = IpcPage([0; 512]);
 
-        let mut sched = Scheduler::new();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let state = unsafe { crate::kernel::KERNEL.get() };
+        state.scheduler.reset_queues();
+        state.scheduler.set_current(None);
         let mut ep = Endpoint::new();
-
-        let sender = sched.admit(runnable(50));
-        let receiver = sched.admit(runnable(50));
+        let sender = state.scheduler.admit(runnable(50));
+        let receiver = state.scheduler.admit(runnable(50));
         unsafe {
-            sched.slab.get_mut(sender).ipc_buffer_paddr =
-                crate::arch::virt_to_phys((&raw mut SENDER_BUF) as u64);
-            sched.slab.get_mut(receiver).ipc_buffer_paddr =
-                crate::arch::virt_to_phys((&raw mut RECEIVER_BUF) as u64);
+            bind_ipc_buffer(state, &mut owners, sender, (&raw mut SENDER_BUF) as u64,
+                crate::cap::FrameRights::ReadOnly);
+            bind_ipc_buffer(state, &mut owners, receiver, (&raw mut RECEIVER_BUF) as u64,
+                crate::cap::FrameRights::ReadWrite);
         }
+        let sched = &mut state.scheduler;
 
         // Stage an 8-word message. Words 0..3 in msg_regs (the
         // syscall-stage path normally fills these from a2..a5);
@@ -1066,9 +1092,9 @@ pub mod spec {
             s.msg_regs[7] = 0x1007;
         }
         // Receiver waits.
-        receive_ipc(&mut ep, &mut sched, receiver, RecvOptions::blocking());
+        receive_ipc(&mut ep, sched, receiver, RecvOptions::blocking());
         // Sender sends.
-        send_ipc(&mut ep, &mut sched, sender, SendOptions::blocking(0));
+        send_ipc(&mut ep, sched, sender, SendOptions::blocking(0));
 
         // Receiver's msg_regs should mirror the sender for words
         // 0..7, AND the receiver's ipc_buffer should hold words
@@ -1099,7 +1125,22 @@ pub mod spec {
                 );
             }
         }
-        arch::log("  ✓ 8-word IPC routes 4..length through ipc_buffer\n");
+        // A read-only receive buffer cannot accept the long-message tail.
+        unsafe {
+            bind_ipc_buffer(state, &mut owners, receiver, (&raw mut RECEIVER_BUF) as u64,
+                crate::cap::FrameRights::ReadOnly);
+        }
+        state.scheduler.slab.get_mut(sender).ipc_length = 8;
+        receive_ipc(&mut ep, &mut state.scheduler, receiver, RecvOptions::blocking());
+        send_ipc(&mut ep, &mut state.scheduler, sender, SendOptions::blocking(0));
+        assert_eq!(state.scheduler.slab.get(receiver).ipc_length, 4);
+        unsafe {
+            crate::invocation::retire_tcb(state, sender);
+            crate::invocation::retire_tcb(state, receiver);
+        }
+        state.scheduler.reset_queues();
+        state.scheduler.set_current(None);
+        arch::log("  ✓ long IPC respects directional Frame authority\n");
     }
 
     #[inline(never)]

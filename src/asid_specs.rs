@@ -12,24 +12,31 @@ static mut FIXTURE_POOLS: [FixturePoolPage; MAX_ASID_POOLS] =
 /// the pre-user spec phase. Existing roots also retain their owning pool.
 pub struct RootOwners {
     cnode: usize,
-    base: u16,
-    pool: u64,
+    pool: Option<(u16, u64)>,
     next_slot: usize,
 }
 
 impl RootOwners {
     pub fn new() -> Self {
+        let cnode = unsafe { crate::kernel::KERNEL.get().alloc_small_cnode() }
+            .expect("fixture CNode capacity");
+        Self { cnode, pool: None, next_slot: 1 }
+    }
+
+    fn ensure_pool(&mut self) -> (u16, u64) {
+        if let Some(pool) = self.pool {
+            return pool;
+        }
         let base = first_free_pool_base().expect("fixture ASID pool capacity");
         let page = unsafe { &raw const FIXTURE_POOLS[base as usize / ASIDS_PER_POOL] } as u64;
         let physical = crate::arch::virt_to_phys(page);
-        let cnode = unsafe { crate::kernel::KERNEL.get().alloc_small_cnode() }
-            .expect("fixture CNode capacity");
         install_pool(base, physical).expect("fixture pool backing is exclusive");
         unsafe {
-            crate::kernel::KERNEL.get().cnode_slots_at_mut(cnode).unwrap()[0]
+            crate::kernel::KERNEL.get().cnode_slots_at_mut(self.cnode).unwrap()[0]
                 .set_cap(&pool(base, physical));
         }
-        Self { cnode, base, pool: physical, next_slot: 1 }
+        self.pool = Some((base, physical));
+        (base, physical)
     }
 
     pub fn root(&mut self, physical: u64) -> Cap {
@@ -49,8 +56,9 @@ impl RootOwners {
         let asid = match asid_for_pml4(physical) {
             Some(asid) => asid,
             None => {
-                let asid = first_free_asid(self.base, self.pool).unwrap();
-                install_root(self.base, self.pool, asid, physical).unwrap();
+                let (base, pool) = self.ensure_pool();
+                let asid = first_free_asid(base, pool).unwrap();
+                install_root(base, pool, asid, physical).unwrap();
                 asid
             }
         };
@@ -65,20 +73,77 @@ impl RootOwners {
         self.next_slot += 2;
         cap
     }
+
+    pub fn root_source(&mut self, physical: u64) -> crate::cte::MdbId {
+        let cap = self.root(physical);
+        unsafe {
+            let slots = crate::kernel::KERNEL.get().cnode_slots_at_mut(self.cnode).unwrap();
+            let slot = (2..self.next_slot).step_by(2)
+                .find(|&slot| slots[slot].cap() == cap)
+                .expect("owned root CTE");
+            crate::cte::MdbId::pack(self.cnode as u32, slot as u32)
+        }
+    }
+
+    pub fn pool_source(&self) -> crate::cte::MdbId {
+        crate::cte::MdbId::pack(self.cnode as u32, 0)
+    }
+
+    pub fn cap_source_in(&mut self, state: &mut crate::kernel::KernelState, cap: Cap) -> crate::cte::MdbId {
+        assert!(!cap.is_null(), "Null binding uses no source");
+        let slots = state.cnode_slots_at_mut(self.cnode).unwrap();
+        if let Some(slot) = (2..self.next_slot).step_by(2).find(|&slot| slots[slot].cap() == cap) {
+            return crate::cte::MdbId::pack(self.cnode as u32, slot as u32);
+        }
+        assert!(self.next_slot + 2 <= slots.len());
+        let slot = self.next_slot + 1;
+        slots[slot].set_cap(&cap);
+        self.next_slot += 2;
+        crate::cte::MdbId::pack(self.cnode as u32, slot as u32)
+    }
+
+    pub fn frame_source(
+        &mut self,
+        physical: u64,
+        size: crate::cap::FrameSize,
+        rights: crate::cap::FrameRights,
+    ) -> crate::cte::MdbId {
+        let cap = Cap::Frame {
+            ptr: crate::cap::PAddr::new(physical),
+            size,
+            rights,
+            mapped: None,
+            asid: 0,
+            is_device: false,
+            map_type: crate::cap::FrameMapType::None,
+        };
+        unsafe {
+            let slots = crate::kernel::KERNEL.get().cnode_slots_at_mut(self.cnode).unwrap();
+            if let Some(slot) = (2..self.next_slot).step_by(2).find(|&slot| slots[slot].cap() == cap) {
+                return crate::cte::MdbId::pack(self.cnode as u32, slot as u32);
+            }
+            assert!(self.next_slot + 2 <= slots.len());
+            let slot = self.next_slot + 1;
+            slots[slot].set_cap(&cap);
+            self.next_slot += 2;
+            crate::cte::MdbId::pack(self.cnode as u32, slot as u32)
+        }
+    }
 }
 
 impl Drop for RootOwners {
     fn drop(&mut self) {
         unsafe {
             let state = crate::kernel::KERNEL.get();
-            let slots = state.cnode_slots_at_mut(self.cnode).unwrap();
             for i in (2..self.next_slot).step_by(2) {
-                slots[i].set_cap(&Cap::Null);
+                let id = crate::cte::MdbId::pack(self.cnode as u32, i as u32);
+                crate::invocation::delete_cap_slot(state, id).unwrap();
             }
             for i in (1..self.next_slot).step_by(2) {
-                slots[i].set_cap(&Cap::Null);
+                let id = crate::cte::MdbId::pack(self.cnode as u32, i as u32);
+                crate::invocation::delete_cap_slot(state, id).unwrap();
             }
-            slots[0].set_cap(&Cap::Null);
+            crate::invocation::delete_cap_slot(state, self.pool_source()).unwrap();
             state.free_small_cnode(self.cnode);
         }
     }
@@ -159,13 +224,13 @@ fn exact_reference_lifetimes() {
     assert_eq!(pml4_refcount(1), 1);
     assert_eq!(pool_refcount(0), 1);
     note_cap_write(&Cap::Null, &r);
-    note_tcb_root_write(&Cap::Null, &r);
+    note_cap_write(&Cap::Null, &r);
     assert_eq!(pml4_refcount(1), 3);
     note_cap_write(&r, &Cap::Null);
     note_cap_write(&r, &Cap::Null);
     assert_eq!(pml4_refcount(1), 1, "TCB is an independent retained root copy");
     assert!(root_is_current(&r));
-    note_tcb_root_write(&r, &Cap::Null);
+    note_cap_write(&r, &Cap::Null);
     assert_eq!(pml4_paddr(1), 0);
     assert_eq!(pml4_refcount(1), 0);
     note_cap_write(&Cap::Null, &r);
@@ -180,7 +245,7 @@ fn pool_aliases_and_stale_references() {
     let p = own_pool(0, 0x1000);
     let r = own_root(0, 0x1000, 1, 0x2000);
     note_cap_write(&Cap::Null, &p);
-    note_tcb_root_write(&Cap::Null, &r);
+    note_cap_write(&Cap::Null, &r);
     note_cap_write(&p, &Cap::Null);
     assert_eq!(pool_refcount(0), 1);
     assert_eq!(pml4_refcount(1), 2);
@@ -195,7 +260,7 @@ fn pool_aliases_and_stale_references() {
     note_cap_write(&p, &Cap::Null);
     note_cap_write(&Cap::Null, &r);
     note_cap_write(&r, &Cap::Null);
-    note_tcb_root_write(&r, &Cap::Null);
+    note_cap_write(&r, &Cap::Null);
     assert_eq!(pool_refcount(0), 1, "stale pool cannot subtract replacement references");
     assert_eq!(pml4_refcount(1), 1, "stale root cannot subtract replacement references");
     assert!(root_is_current(&replacement_root));

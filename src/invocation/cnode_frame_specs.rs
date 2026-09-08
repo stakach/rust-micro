@@ -48,7 +48,7 @@ mod cnode_frame_specs {
                         let root = unsafe {
                             let s = KERNEL.get();
                             s.cnodes[0].0[1].set_cap(&source);
-                            s.scheduler.slab.get(invoker).cspace_root
+                            s.scheduler.slab.get(invoker).cspace_root()
                         };
                         stage(invoker, root, mask);
                         decode_invocation(root, &args(mint, if mint { 6 } else { 5 }), invoker)
@@ -94,7 +94,7 @@ mod cnode_frame_specs {
                 let root = unsafe {
                     let s = KERNEL.get();
                     s.cnodes[0].0[1].set_cap(&source);
-                    s.scheduler.slab.get(invoker).cspace_root
+                    s.scheduler.slab.get(invoker).cspace_root()
                 };
                 stage(invoker, root, 3);
                 assert_eq!(decode_invocation(root, &args(mint, length), invoker),
@@ -109,7 +109,7 @@ mod cnode_frame_specs {
                 let root = unsafe {
                     let s = KERNEL.get();
                     s.cnodes[0].0[1].set_cap(&source);
-                    s.scheduler.slab.get(invoker).cspace_root
+                    s.scheduler.slab.get(invoker).cspace_root()
                 };
                 stage(invoker, Cap::Null, 3);
                 if !supplied {
@@ -148,7 +148,7 @@ mod cnode_frame_specs {
             let root = unsafe {
                 let s = KERNEL.get();
                 s.cnodes[0].0[1].set_cap(&source);
-                s.scheduler.slab.get(invoker).cspace_root
+                s.scheduler.slab.get(invoker).cspace_root()
             };
             let request = SyscallArgs {
                 a1: ((if mint { InvocationLabel::CNodeMint } else {
@@ -179,7 +179,7 @@ mod cnode_frame_specs {
             let root = unsafe {
                 let s = KERNEL.get();
                 s.cnodes[0].0[1].set_cap(&source);
-                s.scheduler.slab.get(invoker).cspace_root
+                s.scheduler.slab.get(invoker).cspace_root()
             };
             stage(invoker, root, 2);
             decode_invocation(root, &args(mint, if mint { 6 } else { 5 }), invoker)
@@ -217,7 +217,7 @@ mod cnode_frame_specs {
                 let s = KERNEL.get();
                 s.cnodes[0].0[1].set_cap(&source);
                 s.cnodes[0].0[2].set_cap(&destination);
-                s.scheduler.slab.get(invoker).cspace_root
+                s.scheduler.slab.get(invoker).cspace_root()
             };
             stage(invoker, root, 0);
             assert_eq!(decode_invocation(root, &args(mint, if mint { 6 } else { 5 }), invoker),

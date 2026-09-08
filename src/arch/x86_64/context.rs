@@ -116,7 +116,10 @@ pub unsafe extern "C" fn thread_trampoline() {
         // rbx contains the args pointer set up by prime_stack.
         "mov rdi, [rbx + 8]", // arg
         "mov rax, [rbx]",     // entry function
-        "jmp rax",
+        // The primed restore leaves RSP at the 16-byte-aligned argument
+        // pair. CALL supplies the ordinary Rust/C callee's return slot.
+        "call rax",
+        "ud2",
     );
 }
 
@@ -140,6 +143,19 @@ pub mod spec {
     /// Counter the secondary thread bumps so the primary spec can
     /// verify it ran.
     static SECONDARY_RAN: AtomicU64 = AtomicU64::new(0);
+    static SECONDARY_ENTRY_ALIGNMENT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    #[unsafe(naked)]
+    extern "C" fn measured_secondary_entry(_arg: u64) -> ! {
+        core::arch::naked_asm!(
+            "mov rax, rsp",
+            "and rax, 15",
+            "mov qword ptr [rip + {alignment}], rax",
+            "jmp {entry}",
+            alignment = sym SECONDARY_ENTRY_ALIGNMENT,
+            entry = sym secondary_entry,
+        );
+    }
 
     /// Per-secondary-thread context + 16 KiB kernel stack.
     #[repr(C, align(16))]
@@ -173,7 +189,8 @@ pub mod spec {
         unsafe {
             let stack_top =
                 (&raw const SECONDARY_STACK) as u64 + core::mem::size_of::<StackPage>() as u64;
-            prime_stack(&mut SECONDARY_CTX, stack_top, secondary_entry, 7);
+            SECONDARY_ENTRY_ALIGNMENT.store(u64::MAX, Ordering::Relaxed);
+            prime_stack(&mut SECONDARY_CTX, stack_top, measured_secondary_entry, 7);
 
             // First switch — primary saves its state into PRIMARY_CTX,
             // then jumps into the secondary's primed stack and runs
@@ -183,6 +200,8 @@ pub mod spec {
         // After the secondary yields back, control returns here.
         let n = SECONDARY_RAN.load(Ordering::Relaxed);
         assert_eq!(n, 7, "secondary should have bumped the counter by 7");
+        assert_eq!(SECONDARY_ENTRY_ALIGNMENT.load(Ordering::Acquire), 8,
+            "actual C entry must include the SysV return-address slot");
         arch::log("  ✓ switch_context dispatches into a primed thread\n");
     }
 
@@ -196,11 +215,13 @@ pub mod spec {
         unsafe {
             let stack_top =
                 (&raw const SECONDARY_STACK) as u64 + core::mem::size_of::<StackPage>() as u64;
-            prime_stack(&mut SECONDARY_CTX, stack_top, secondary_entry, 100);
+            SECONDARY_ENTRY_ALIGNMENT.store(u64::MAX, Ordering::Relaxed);
+            prime_stack(&mut SECONDARY_CTX, stack_top, measured_secondary_entry, 100);
             switch_context(&raw mut PRIMARY_CTX, &raw const SECONDARY_CTX);
         }
         let n = SECONDARY_RAN.load(Ordering::Relaxed);
         assert_eq!(n, 107, "second round-trip should accumulate (+100)");
+        assert_eq!(SECONDARY_ENTRY_ALIGNMENT.load(Ordering::Acquire), 8);
         arch::log("  ✓ switch_context round-trips a second time\n");
     }
 }

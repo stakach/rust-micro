@@ -3,7 +3,7 @@
 //! Mirrors libsel4's `seL4_IPCBuffer` struct layout in u64 word
 //! offsets so the kernel can index directly into a user-mode IPC
 //! buffer page (accessed by paddr through the kernel linear map; see
-//! `tcb.ipc_buffer_paddr`).
+//! the TCB's directional IPC-buffer accessors).
 //!
 //! Layout:
 //! ```text
@@ -32,3 +32,6 @@ pub const RECEIVE_CNODE_OFFSET: usize = 125;
 pub const RECEIVE_INDEX_OFFSET: usize = 126;
 /// Word offset of `receiveDepth`.
 pub const RECEIVE_DEPTH_OFFSET: usize = 127;
+
+pub const SIZE_BYTES: usize = (RECEIVE_DEPTH_OFFSET + 1) * core::mem::size_of::<u64>();
+const _: () = assert!(SIZE_BYTES.is_power_of_two());

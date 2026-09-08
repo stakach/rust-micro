@@ -183,7 +183,7 @@ fn remove_reference(assignment: &Assignment, physical: u64) -> bool {
 fn invalidate_root(asid: u16, root: u64) {
     // Invalidate while the canonical assignment is still available to architecture code.
     #[cfg(target_arch = "x86_64")]
-    crate::smp::retire_vspace_assignment(root);
+    crate::smp::retire_vspace_translations(root);
     #[cfg(target_arch = "aarch64")]
     unsafe { crate::arch::aarch64::vspace::flush_vspace(); }
     assert_eq!(pml4_paddr(asid), root);
@@ -239,13 +239,6 @@ pub fn note_cap_write(old: &Cap, new: &Cap) {
     if old_pool != new_pool {
         if let Some((base, pool)) = old_pool { release_pool(base, pool); }
     }
-}
-
-/// Real retained TCB root copies participate in the same reference count as CSpace copies.
-pub fn note_tcb_root_write(old: &Cap, new: &Cap) {
-    assert!(matches!(old, Cap::Null | Cap::PML4 { .. }));
-    assert!(matches!(new, Cap::Null | Cap::PML4 { .. }));
-    note_cap_write(old, new);
 }
 
 /// Bootstrap/spec reset only, while no old assignment can execute or be published again.

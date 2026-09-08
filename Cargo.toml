@@ -19,7 +19,8 @@ arch-aarch64 = []
 # `--features mcs` invocations don't break; nothing is gated on
 # it any more.
 mcs = []
-# Multi-CPU support — per-CPU state, IPI dispatch. Phase 10b.
+# Compatibility alias. CPU count is discovered at boot; ownership, IPI and
+# FPU safeguards must remain active even when callers omit this feature.
 smp = []
 # Hot-path IPC bypassing the slowpath. Phase 10c.
 fastpath = []

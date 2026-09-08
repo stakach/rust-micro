@@ -389,7 +389,7 @@ pub fn dispatch_budget_check(tcb_id: TcbId) -> bool {
         // SC (e.g. the client re-receiving its over-spent SC) would run
         // and immediately re-trigger the fault cascade.
         if matches!(
-            s.scheduler.slab.get(tcb_id).timeout_endpoint_cap,
+            s.scheduler.slab.get(tcb_id).timeout_endpoint_cap(),
             crate::cap::Cap::Endpoint { .. }
         ) {
             let _ = crate::fault::deliver_timeout_fault(tcb_id);

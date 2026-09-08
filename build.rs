@@ -29,6 +29,8 @@ fn main() {
     );
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=link.ld");
+    println!("cargo:rerun-if-changed=link-aarch64.ld");
     println!("cargo:rerun-if-changed=build_support/bf.rs");
     println!("cargo:rerun-if-changed=build_support/xml.rs");
     for entry in fs::read_dir(&codegen_dir).expect("codegen/ missing") {

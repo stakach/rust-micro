@@ -1,6 +1,6 @@
 mod asid_specs {
     use super::*;
-    use crate::cap::{AsidPoolStorage, Pml4Storage, UntypedStorage};
+    use crate::cap::{AsidPoolStorage, FrameSize, Pml4Storage, UntypedStorage};
 
     #[repr(C, align(4096))]
     struct Page([u64; 512]);
@@ -34,9 +34,14 @@ mod asid_specs {
                 core::ptr::addr_of_mut!(OTHER_ROOT), core::ptr::addr_of_mut!(IPC)] {
                 core::ptr::write_bytes(page as *mut u8, 0, 4096);
             }
-            let cspace = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
-            KERNEL.get().scheduler.slab.get_mut(invoker).ipc_buffer_paddr =
-                arch::virt_to_phys(core::ptr::addr_of!(IPC) as u64);
+            let cspace = KERNEL.get().scheduler.slab.get(invoker).cspace_root();
+            let physical = arch::virt_to_phys(core::ptr::addr_of!(IPC) as u64);
+            bind_invoker_cap(KERNEL.get(), invoker, crate::cte::TcbSlot::IpcBuffer,
+                Cap::Frame {
+                    ptr: PAddr::new(physical), size: FrameSize::Small,
+                    rights: crate::cap::FrameRights::ReadWrite, mapped: None, asid: 0,
+                    is_device: false, map_type: crate::cap::FrameMapType::None,
+                }, 0x1000);
             let f = Self { invoker, pool_pa, root_pa };
             f.put(0, cspace);
             f.put(1, Cap::AsidControl);

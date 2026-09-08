@@ -266,7 +266,10 @@ fn bsp_main() -> ! {
         let top = (&raw const BSP_BIG_STACK as u64) + core::mem::size_of::<BspStack>() as u64;
         core::arch::asm!(
             "mov rsp, {top}",
-            "jmp {cont}",
+            // CALL supplies the return-address slot required by the SysV
+            // callee-entry alignment, even though this function never returns.
+            "call {cont}",
+            "ud2",
             top = in(reg) top & !0xF,
             cont = sym bsp_main_big_stack,
             options(noreturn),
@@ -294,7 +297,7 @@ fn bsp_main_big_stack() -> ! {
 
     // SMP FPU save/restore: ensure CR4.OSFXSR and capture the canonical
     // FINIT FXSAVE image so every new TCB starts from valid FPU state.
-    #[cfg(all(target_arch = "x86_64", feature = "smp"))]
+    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::fpu_ctx::init_fpu_template();
 
     // Phase 28d — install kernel page tables (so the LAPIC is
@@ -406,7 +409,8 @@ fn ap_main(apic_id: arch::CpuId) -> ! {
         core::arch::asm!(
             "mov rsp, {top}",
             "mov rdi, {apic}",
-            "jmp {cont}",
+            "call {cont}",
+            "ud2",
             top = in(reg) top & !0xF,
             apic = in(reg) apic_id as u64,
             cont = sym ap_main_big_stack,
@@ -444,7 +448,7 @@ fn ap_main_big_stack(apic_id: arch::CpuId) -> ! {
 
     // Each AP needs its own FPU/CR4 set up to match the BSP, or migrated
     // threads run with a different FPU config across cores (FPU0002).
-    #[cfg(all(target_arch = "x86_64", feature = "smp"))]
+    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::fpu_ctx::init_fpu_ap();
 
     smp::mark_ap_alive();
@@ -498,7 +502,7 @@ fn ap_scheduler_loop() -> ! {
             // per-CPU timer threads.
             let next = unsafe {
                 let s = crate::kernel::KERNEL.get();
-                match s.scheduler.current_for_cpu(my_cpu) {
+                let candidate = match s.scheduler.current_for_cpu(my_cpu) {
                     Some(t) => Some(t),
                     None => {
                         let picked = s.scheduler.choose_thread();
@@ -507,7 +511,10 @@ fn ap_scheduler_loop() -> ! {
                         }
                         picked
                     }
-                }
+                };
+                let selected = crate::arch::x86_64::exceptions::debug_ready_thread(s, candidate);
+                s.scheduler.set_current(selected);
+                selected
             };
             if let Some(tcb_id) = next {
                 // Scheduler-only TCBs have no assigned VSpace. A cached CR3 does not grant user
@@ -538,10 +545,7 @@ fn ap_scheduler_loop() -> ! {
                         // this flush — MULTICORE0002). Otherwise only
                         // reload on a vspace change so the yield-stress
                         // test doesn't crawl (MULTICORE0004).
-                        #[cfg(feature = "smp")]
                         let was_idle = crate::smp::take_went_idle();
-                        #[cfg(not(feature = "smp"))]
-                        let was_idle = false;
                         let cur_cr3: u64;
                         core::arch::asm!(
                             "mov {}, cr3",
@@ -577,8 +581,9 @@ fn ap_scheduler_loop() -> ! {
                         // this AP before resuming it (fxsave outgoing
                         // owner, fxrstor this thread). Critical for
                         // FPU0002 round-robin migration.
-                        #[cfg(feature = "smp")]
                         crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, tcb_id);
+                        crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(s.scheduler.slab.get(tcb_id));
+                        crate::arch::x86_64::syscall_entry::apply_debug_state_for(s.scheduler.slab.get(tcb_id));
 
                         let pcc = crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
                         *pcc = next_user_ctx;
@@ -616,10 +621,11 @@ fn ap_scheduler_loop() -> ! {
             let my_cpu = arch::get_cpu_id();
             let next = unsafe {
                 let state = crate::kernel::KERNEL.get();
-                state
+                let candidate = state
                     .scheduler
                     .current_for_cpu(my_cpu)
-                    .or_else(|| state.scheduler.choose_thread())
+                    .or_else(|| state.scheduler.choose_thread());
+                crate::arch::aarch64::exceptions::debug_ready_thread(state, candidate)
             };
             if let Some(tcb_id) = next {
                 let dispatchable = unsafe {
@@ -649,11 +655,9 @@ fn ap_scheduler_loop() -> ! {
             }
         }
 
-        // SMP: this AP is about to idle — flush its live FPU state back
-        // to the owner TCB so a thread migrated off this idle core (which
-        // `remote_tcb_stall` won't stall/flush) restores fresh state.
-        // Critical for FPU0002 reliability across 400 migrations.
-        #[cfg(all(target_arch = "x86_64", feature = "smp"))]
+        // Flush before idle so migration need not wake this AP to capture
+        // its last resident FPU owner's hardware state.
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             crate::arch::x86_64::fpu_ctx::flush_local_fpu(
                 &mut crate::kernel::KERNEL.get().scheduler.slab,
@@ -666,7 +670,7 @@ fn ap_scheduler_loop() -> ! {
         // vspace left in CR3 can be freed by another core's process
         // teardown, after which our next interrupt reads an unmapped
         // IDT and triple-faults (MULTICORE0003 cross-AS teardown).
-        #[cfg(all(target_arch = "x86_64", feature = "smp"))]
+        #[cfg(target_arch = "x86_64")]
         crate::arch::x86_64::paging::park_on_kernel_root();
         #[cfg(target_arch = "aarch64")]
         crate::arch::aarch64::vspace::park_on_kernel_root();

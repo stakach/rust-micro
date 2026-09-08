@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 missing=()
-for tool in cc curl cp dd find mkdir mv rm tar wc; do
+for tool in cc curl cp dd find mkdir mv python3 rm tar wc; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -145,6 +145,8 @@ if [ "$BOOT_PARTITION_MIB" -lt 33 ] || [ "$BOOT_PARTITION_MIB" -ge "$IMAGE_MIB" 
   exit 1
 fi
 
+python3 scripts/verify_elf_layout.py validate "$KERNEL" "$ROOTSERVER"
+
 rm -rf "$INITRD_STAGE" "$ESP_STAGE"
 mkdir -p "$INITRD_STAGE/boot" "$ESP_STAGE"
 cp "$KERNEL" "$ESP_STAGE/kernel"
@@ -156,6 +158,9 @@ if STRIP_TOOL="$(find_elf_strip)"; then
 else
   echo "warning: no ELF strip tool found; boot payloads will be larger" >&2
 fi
+
+python3 scripts/verify_elf_layout.py compare "$KERNEL" "$ESP_STAGE/kernel"
+python3 scripts/verify_elf_layout.py compare "$ROOTSERVER" "$INITRD_STAGE/boot/rootserver"
 
 tar --format=ustar \
     -C "$INITRD_STAGE" \

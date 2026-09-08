@@ -29,7 +29,9 @@
 
 ENTRY(_start)
 
-KERNEL_OFFSET = 0xfffffffffe002000;
+/* The FILEHDR segment starts at file offset zero. Keep its virtual origin
+ * congruent even when large-page fixtures raise p_align to 2 MiB. */
+KERNEL_OFFSET = 0xfffffffffe000000;
 
 PHDRS
 {
@@ -37,8 +39,8 @@ PHDRS
 }
 SECTIONS
 {
-    . = 0xfffffffffe002000;
-    .text . + SIZEOF_HEADERS : AT(ADDR(.text) - KERNEL_OFFSET + SIZEOF_HEADERS) {
+    . = KERNEL_OFFSET;
+    .text ALIGN(. + SIZEOF_HEADERS, 4096) : AT(ADDR(.text) - KERNEL_OFFSET) {
         __text_start = .;
         KEEP(*(.text.boot)) *(.text .text.* .gnu.linkonce.t*)   /* code */
         . = ALIGN(4096);

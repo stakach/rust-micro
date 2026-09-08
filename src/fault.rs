@@ -2,13 +2,12 @@
 //!
 //! When a user thread faults, the kernel sends a fault message to
 //! the thread's fault handler (the endpoint cap stored in
-//! `Tcb::fault_handler`). The faulter blocks `BlockedOnReply`; the
+//! the owned `TcbSlot::FaultHandler`). The faulter blocks `BlockedOnReply`; the
 //! handler's `reply_to` is stamped with the faulter so a
 //! `SysReply` resumes them. This mirrors `seL4/src/api/faults.c::
 //! handleFault`.
 
 use crate::cap::{Cap, EndpointObj, PPtr};
-use crate::cspace::lookup_cap;
 use crate::endpoint::{send_ipc, SendOptions};
 use crate::error::{KException, KResult, SyscallError};
 use crate::kernel::{KernelState, KERNEL};
@@ -81,11 +80,9 @@ pub fn log_fault_handler_state(faulter: TcbId) {
         let t = s.scheduler.slab.get(faulter);
         crate::arch::log("[fault-delivery] tcb=");
         log_dec_u64(faulter.0 as u64);
-        crate::arch::log(" fault_cptr=0x");
-        log_hex64(t.fault_handler);
         crate::arch::log(" stored=");
-        crate::arch::log(cap_name(&t.fault_handler_cap));
-        if let Cap::Endpoint { ptr, badge, rights } = t.fault_handler_cap {
+        crate::arch::log(cap_name(&t.fault_handler_cap()));
+        if let Cap::Endpoint { ptr, badge, rights } = t.fault_handler_cap() {
             crate::arch::log(" ep=");
             log_dec_u64(KernelState::endpoint_index(ptr) as u64);
             crate::arch::log(" badge=0x");
@@ -96,29 +93,9 @@ pub fn log_fault_handler_state(faulter: TcbId) {
             crate::arch::log(if rights.can_grant { "G" } else { "-" });
             crate::arch::log(if rights.can_grant_reply { "P" } else { "-" });
         }
-        let root = t.cspace_root;
+        let root = t.cspace_root();
         crate::arch::log(" cspace=");
         crate::arch::log(cap_name(&root));
-        if t.fault_handler != 0 {
-            match lookup_cap(s, &root, t.fault_handler) {
-                Ok(cap) => {
-                    crate::arch::log(" lookup=");
-                    crate::arch::log(cap_name(&cap));
-                    if let Cap::Endpoint { ptr, badge, rights } = cap {
-                        crate::arch::log(" ep=");
-                        log_dec_u64(KernelState::endpoint_index(ptr) as u64);
-                        crate::arch::log(" badge=0x");
-                        log_hex64(badge.0);
-                        crate::arch::log(" rights=");
-                        crate::arch::log(if rights.can_send { "S" } else { "-" });
-                        crate::arch::log(if rights.can_receive { "R" } else { "-" });
-                        crate::arch::log(if rights.can_grant { "G" } else { "-" });
-                        crate::arch::log(if rights.can_grant_reply { "P" } else { "-" });
-                    }
-                }
-                Err(_) => crate::arch::log(" lookup=err"),
-            }
-        }
         crate::arch::log(" pending_fault=");
         log_dec_u64(t.pending_fault as u64);
         crate::arch::log("\n");
@@ -239,31 +216,19 @@ impl FaultMessage {
     }
 }
 
-/// Deliver `fault` to the handler endpoint named by
-/// `faulter.fault_handler`. Returns `Ok(())` if delivery
+/// Deliver `fault` through the faulter's owned fault-handler endpoint. Returns `Ok(())` if delivery
 /// succeeded (faulter is now blocked, handler will be woken with
 /// the message); returns an error if there's no handler or the
 /// cap isn't a usable Endpoint.
 pub fn deliver_fault(faulter: TcbId, fault: FaultMessage) -> KResult<()> {
+    unsafe { deliver_fault_in(KERNEL.get(), faulter, fault) }
+}
+
+pub(crate) fn deliver_fault_in(s: &mut KernelState, faulter: TcbId, fault: FaultMessage) -> KResult<()> {
     unsafe {
-        let s = KERNEL.get();
-        // MCS path: TCB_SetSpace resolved the fault EP cap in the
-        // SETTER's cspace and stored it on the TCB — required for
-        // inter-AS fault handling, where the cptr below would name
-        // nothing (or the wrong thing) in the faulter's own cspace.
-        let stored = s.scheduler.slab.get(faulter).fault_handler_cap;
-        let target = if matches!(stored, Cap::Endpoint { .. }) {
-            stored
-        } else {
-            let cspace_root = s.scheduler.slab.get(faulter).cspace_root;
-            let cptr = s.scheduler.slab.get(faulter).fault_handler;
-            if cptr == 0 {
-                // No handler. Return the fault so the caller can
-                // decide what to do (kernel typically suspends).
-                return Err(KException::Fault(crate::error::FaultKind::CapFault));
-            }
-            lookup_cap(s, &cspace_root, cptr)?
-        };
+        // Configuration owns a derived endpoint. Revocation cannot recover authority from
+        // a stale numeric cptr which may now name an unrelated endpoint in the same CSpace.
+        let target = s.scheduler.slab.get(faulter).fault_handler_cap();
         let (ep_ptr, badge) = match target {
             Cap::Endpoint { ptr, badge, rights } => {
                 if !rights.can_send {
@@ -337,7 +302,7 @@ pub fn deliver_timeout_fault(faulter: TcbId) -> bool {
         if s.scheduler.slab.get(faulter).pending_fault != 0 {
             return false;
         }
-        let target = s.scheduler.slab.get(faulter).timeout_endpoint_cap;
+        let target = s.scheduler.slab.get(faulter).timeout_endpoint_cap();
         let (ep_ptr, badge) = match target {
             Cap::Endpoint { ptr, badge, rights } if rights.can_send => (ptr, badge.0),
             _ => return false,
@@ -910,7 +875,7 @@ pub mod spec {
     pub fn test_fault() {
         arch::log("Running fault delivery tests...\n");
         fault_to_handler_round_trip();
-        no_handler_returns_fault();
+        no_handler_returns_invalid_capability();
         // Restore the boot thread as current so downstream specs
         // (and the boot continuation in main.rs) keep working.
         unsafe {
@@ -959,6 +924,7 @@ pub mod spec {
 
     #[inline(never)]
     fn fault_to_handler_round_trip() {
+        let mut owners = crate::asid::spec::RootOwners::new();
         reset_scheduler_queues();
         // Build: handler thread + faulter thread sharing CNode 0,
         // an endpoint at slot 7.
@@ -989,13 +955,18 @@ pub mod spec {
         };
         unsafe {
             let s = KERNEL.get();
-            s.cnodes[0].0[7] = Cte::with_cap(&ep_cap);
+            s.cnodes[0].0[7].set_cap(&ep_cap);
             // Faulter routes faults to slot 7.
-            s.scheduler.slab.get_mut(faulter).cspace_root = cnode_cap;
-            s.scheduler.slab.get_mut(faulter).fault_handler = 7;
+            let cspace_source = owners.cap_source_in(s, cnode_cap);
+            crate::invocation::derive_tcb_cap(s, faulter, crate::cte::TcbSlot::CSpace,
+                Some(cspace_source), 0).unwrap();
+            let fault_source = owners.cap_source_in(s, ep_cap);
+            crate::invocation::derive_tcb_cap(s, faulter, crate::cte::TcbSlot::FaultHandler,
+                Some(fault_source), 0).unwrap();
             // Handler also has the endpoint visible at slot 7 so
             // it can SysRecv on it.
-            s.scheduler.slab.get_mut(handler).cspace_root = cnode_cap;
+            crate::invocation::derive_tcb_cap(s, handler, crate::cte::TcbSlot::CSpace,
+                Some(cspace_source), 0).unwrap();
             // Handler waits on the endpoint first.
             s.scheduler.set_current(Some(handler));
         }
@@ -1059,28 +1030,29 @@ pub mod spec {
             // Cleanup.
             s.scheduler.block(handler, ThreadStateType::Inactive);
             s.scheduler.block(faulter, ThreadStateType::Inactive);
-            s.scheduler.slab.free(handler);
-            s.scheduler.slab.free(faulter);
+            crate::invocation::retire_tcb(s, handler);
+            crate::invocation::retire_tcb(s, faulter);
         }
         arch::log("  ✓ fault → handler → SysReply → faulter resumes\n");
     }
 
     #[inline(never)]
-    fn no_handler_returns_fault() {
+    fn no_handler_returns_invalid_capability() {
         reset_scheduler_queues();
         let faulter = make_tcb(50);
-        // No fault_handler set (default 0).
+        // The default TCB owns no fault-handler endpoint.
         let r = deliver_fault(faulter, FaultMessage::UnknownSyscall { number: 99 });
-        match r {
-            Err(KException::Fault(_)) => {}
-            other => panic!("expected Fault, got {:?}", other),
-        }
+        assert!(matches!(r, Err(KException::SyscallError(SyscallError {
+            code: seL4_Error::seL4_InvalidCapability,
+        }))));
         unsafe {
             let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(faulter).state, ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(faulter).pending_fault, 0);
             s.scheduler.block(faulter, ThreadStateType::Inactive);
             s.scheduler.slab.free(faulter);
         }
-        arch::log("  ✓ deliver_fault with no handler returns Err(Fault)\n");
+        arch::log("  deliver_fault without an owned handler rejects without changing thread state\n");
     }
 
     struct SinkVoid;

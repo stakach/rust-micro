@@ -322,7 +322,7 @@ pub fn handle_syscall(
             unsafe {
                 use crate::kernel::KERNEL;
                 if let Some(cur) = KERNEL.get().scheduler.current() {
-                    let cspace_root = KERNEL.get().scheduler.slab.get(cur).cspace_root;
+                    let cspace_root = KERNEL.get().scheduler.slab.get(cur).cspace_root();
                     let tag = match crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a0) {
                         Ok(cap) => debug_cap_type_tag(&cap),
                         Err(_) => 0,
@@ -509,9 +509,10 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             me.msg_regs[2] = args.a4;
             me.msg_regs[3] = args.a5;
             me.reply_to = None; // consume the reply slot
-            if length > 4 && me.ipc_buffer_paddr != 0 {
+            let ipc_paddr = me.ipc_buffer_send_paddr();
+            if length > 4 && ipc_paddr != 0 {
                 unsafe {
-                    let buf = (crate::arch::phys_to_virt(me.ipc_buffer_paddr) as *const u64)
+                    let buf = (crate::arch::phys_to_virt(ipc_paddr) as *const u64)
                         .wrapping_add(1);
                     let max = (length as usize).min(me.msg_regs.len());
                     for i in 4..max {
@@ -593,7 +594,7 @@ fn handle_send(
         let current = s.scheduler.current().ok_or_else(|| {
             KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
         })?;
-        let cspace_root = s.scheduler.slab.get(current).cspace_root;
+        let cspace_root = s.scheduler.slab.get(current).cspace_root();
 
         // Phase 42 — log every Send/Call entry so we can see the
         // failing invocation even when target lookup itself errors
@@ -653,8 +654,8 @@ fn handle_send(
             // Phase 34c — long messages: words 4..length come from
             // the sender's IPC buffer page (tag word at offset 0,
             // msg[] starts at offset 1).
-            if length > 4 && snd.ipc_buffer_paddr != 0 {
-                let buf_paddr = snd.ipc_buffer_paddr;
+            let buf_paddr = snd.ipc_buffer_send_paddr();
+            if length > 4 && buf_paddr != 0 {
                 let buf = (crate::arch::phys_to_virt(buf_paddr) as *const u64).wrapping_add(1);
                 let max = (length as usize).min(snd.msg_regs.len());
                 for i in 4..max {
@@ -668,7 +669,7 @@ fn handle_send(
         if n_caps > 0 {
             let (buf_paddr, snd_cspace) = {
                 let snd = s.scheduler.slab.get(current);
-                (snd.ipc_buffer_paddr, snd.cspace_root)
+                (snd.ipc_buffer_send_paddr(), snd.cspace_root())
             };
             if buf_paddr != 0 {
                 let buf = crate::arch::phys_to_virt(buf_paddr) as *const u64;
@@ -783,7 +784,7 @@ fn handle_send(
                     // libsel4's seL4_GetMR(i) reads from the IPC
                     // buffer (not registers), so also stage there.
                     // Buffer layout: word 0 = tag, words 1..N = msg.
-                    let ipc_paddr = inv_tcb.ipc_buffer_paddr;
+                    let ipc_paddr = inv_tcb.ipc_buffer_receive_paddr();
                     if ipc_paddr != 0 {
                         let buf =
                             (crate::arch::phys_to_virt(ipc_paddr) as *mut u64).wrapping_add(1);
@@ -837,7 +838,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         // receive slots so it reflects only THIS receive (a sender's
         // transfer_extra_caps sets it before we return).
         s.scheduler.slab.get_mut(current).received_extra_caps = 0;
-        let cspace_root = s.scheduler.slab.get(current).cspace_root;
+        let cspace_root = s.scheduler.slab.get(current).cspace_root();
         let target = lookup_cap(s, &cspace_root, args.a0)?;
         // A running thread must not carry a stale receive-side reply
         // offer from an earlier syscall. A valid endpoint receive
@@ -1012,6 +1013,22 @@ pub fn handle_unknown_syscall(
 pub mod spec {
     use super::*;
     use crate::arch;
+    use crate::asid::spec::RootOwners;
+    use crate::cap::Cap;
+
+    unsafe fn bind_cspace(state: &mut crate::kernel::KernelState, owners: &mut RootOwners,
+        thread: crate::tcb::TcbId, cap: Cap) {
+        let source = owners.cap_source_in(state, cap);
+        crate::invocation::derive_tcb_cap(state, thread, crate::cte::TcbSlot::CSpace,
+            Some(source), 0).unwrap();
+    }
+
+    unsafe fn admit_with_cspace(state: &mut crate::kernel::KernelState, owners: &mut RootOwners,
+        thread: crate::tcb::Tcb, cap: Cap) -> crate::tcb::TcbId {
+        let id = state.scheduler.admit(thread);
+        bind_cspace(state, owners, id, cap);
+        id
+    }
 
     /// In-memory sink that captures every byte emitted by a syscall
     /// for spec assertion.
@@ -1040,6 +1057,7 @@ pub mod spec {
     }
 
     pub fn test_syscall_handler() {
+        let mut owners = RootOwners::new();
         arch::log("Running syscall dispatcher tests...\n");
         debug_putchar_emits_byte();
         unknown_syscall_becomes_fault();
@@ -1049,23 +1067,23 @@ pub mod spec {
         sys_yield_rotates_equal_priority_threads();
         sys_yield_requeues_nonqueued_current_before_choosing_peer();
         debug_dump_scheduler_writes_placeholder();
-        sys_send_through_cspace_to_endpoint();
-        sys_call_then_reply_round_trip();
-        marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller();
-        marked_reply_cap_call_hands_off_independent_sc_to_lower_priority_caller();
-        reply_cap_fault_reply_restores_unknown_syscall_context();
-        nbsendrecv_fault_reply_rearms_endpoint_receive();
-        recv_bound_notification_does_not_stage_reply_cap();
-        recv_bound_notification_rotates_behind_ready_peer();
-        blocked_recv_bound_notification_clears_reply_offer();
-        irq_bound_notification_wakes_blocked_endpoint_recv();
-        recv_prefers_queued_endpoint_over_bound_notification();
-        replyrecv_reply_wake_hands_off_after_bound_notification();
-        nbsendrecv_reply_wake_yields_after_bound_notification();
-        nbsendrecv_deferred_reply_wake_survives_later_bound_notification();
-        nbsendrecv_stale_reply_handoff_does_not_starve_bound_receiver();
-        nbrecv_with_reply_cap_does_not_leave_pending_offer();
-        plain_send_recv_with_reply_cap_does_not_leave_pending_offer();
+        sys_send_through_cspace_to_endpoint(&mut owners);
+        sys_call_then_reply_round_trip(&mut owners);
+        marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller(&mut owners);
+        marked_reply_cap_call_hands_off_independent_sc_to_lower_priority_caller(&mut owners);
+        reply_cap_fault_reply_restores_unknown_syscall_context(&mut owners);
+        nbsendrecv_fault_reply_rearms_endpoint_receive(&mut owners);
+        recv_bound_notification_does_not_stage_reply_cap(&mut owners);
+        recv_bound_notification_rotates_behind_ready_peer(&mut owners);
+        blocked_recv_bound_notification_clears_reply_offer(&mut owners);
+        irq_bound_notification_wakes_blocked_endpoint_recv(&mut owners);
+        recv_prefers_queued_endpoint_over_bound_notification(&mut owners);
+        replyrecv_reply_wake_hands_off_after_bound_notification(&mut owners);
+        nbsendrecv_reply_wake_yields_after_bound_notification(&mut owners);
+        nbsendrecv_deferred_reply_wake_survives_later_bound_notification(&mut owners);
+        nbsendrecv_stale_reply_handoff_does_not_starve_bound_receiver(&mut owners);
+        nbrecv_with_reply_cap_does_not_leave_pending_offer(&mut owners);
+        plain_send_recv_with_reply_cap_does_not_leave_pending_offer(&mut owners);
         arch::log("Syscall dispatcher tests completed\n");
     }
 
@@ -1227,9 +1245,8 @@ pub mod spec {
     /// looks the cap up, finds an Endpoint with no waiter, and
     /// blocks the sender.
     #[inline(never)]
-    fn sys_send_through_cspace_to_endpoint() {
+    fn sys_send_through_cspace_to_endpoint(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::kernel::{KernelState, KERNEL};
         use crate::tcb::ThreadStateType;
 
@@ -1250,7 +1267,7 @@ pub mod spec {
                     can_grant_reply: false,
                 },
             };
-            s.cnodes[0].0[1] = Cte::with_cap(&ep_cap);
+            s.cnodes[0].0[1].set_cap(&ep_cap);
 
             // Wire the current TCB's CSpace to that CNode (radix 5,
             // guard_size = 64 - 5 = 59, guard 0).
@@ -1260,7 +1277,7 @@ pub mod spec {
                 guard_size: 59,
                 guard: 0,
             };
-            s.scheduler.slab.get_mut(current).cspace_root = cnode_cap;
+            bind_cspace(s, owners, current, cnode_cap);
         }
 
         // Capture the boot thread id before SysSend (which blocks
@@ -1290,7 +1307,8 @@ pub mod spec {
             crate::endpoint::cancel_ipc(&mut s.endpoints[0], &mut s.scheduler, boot_tcb);
             s.scheduler.slab.get_mut(boot_tcb).state = ThreadStateType::Running;
             s.scheduler.set_current(Some(boot_tcb));
-            s.scheduler.slab.get_mut(boot_tcb).cspace_root = Cap::Null;
+            crate::invocation::derive_tcb_cap(s, boot_tcb, crate::cte::TcbSlot::CSpace,
+                None, 0).unwrap();
         }
         arch::log("  ✓ SysSend looks up endpoint via CSpace + blocks sender\n");
     }
@@ -1300,9 +1318,8 @@ pub mod spec {
     /// endpoint, and walks the dispatcher through SysCall on
     /// caller, then SysRecv + SysReply impersonating the server.
     #[inline(never)]
-    fn sys_call_then_reply_round_trip() {
+    fn sys_call_then_reply_round_trip(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::EpState;
         use crate::kernel::{KernelState, KERNEL};
         use crate::tcb::{Tcb, ThreadStateType};
@@ -1327,23 +1344,18 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             };
-            s.cnodes[cn].0[1] = Cte::with_cap(&ep_cap);
+            s.cnodes[cn].0[1].set_cap(&ep_cap);
             s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
 
             let mk_tcb = || {
                 let mut t = Tcb::default();
                 t.priority = 50;
                 t.state = ThreadStateType::Running;
-                t.cspace_root = Cap::CNode {
-                    ptr: cnode_ptr,
-                    radix: 5,
-                    guard_size: 59,
-                    guard: 0,
-                };
                 t
             };
-            let caller = s.scheduler.admit(mk_tcb());
-            let server = s.scheduler.admit(mk_tcb());
+            let cspace = Cap::CNode { ptr: cnode_ptr, radix: 5, guard_size: 59, guard: 0 };
+            let caller = admit_with_cspace(s, owners, mk_tcb(), cspace);
+            let server = admit_with_cspace(s, owners, mk_tcb(), cspace);
             (caller, server, ep_idx)
         };
 
@@ -1432,9 +1444,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller() {
+    fn marked_reply_cap_call_hands_off_active_sc_to_lower_priority_caller(owners: &mut RootOwners) {
         use crate::cap::Cap;
-        use crate::cte::Cte;
         use crate::invocation::REPLY_HANDOFF_MAGIC;
         use crate::kernel::{KernelState, KERNEL};
         use crate::reply::Reply;
@@ -1447,7 +1458,7 @@ pub mod spec {
             let cn = 10;
             let reply_idx = 8;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -1469,13 +1480,13 @@ pub mod spec {
                 false,
                 REPLY_HANDOFF_MAGIC,
             );
-            server_t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
 
             s.replies[reply_idx] = Reply {
                 bound_tcb: Some(caller),
@@ -1503,7 +1514,7 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(server).active_sc, None);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             assert_eq!(s.scheduler.current(), Some(caller));
-            s.cnodes[10].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(10, 2)).unwrap();
             s.replies[reply_idx] = Reply::new();
             free_temp_tcb(caller);
             free_temp_tcb(server);
@@ -1513,9 +1524,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn reply_cap_fault_reply_restores_unknown_syscall_context() {
+    fn reply_cap_fault_reply_restores_unknown_syscall_context(owners: &mut RootOwners) {
         use crate::cap::Cap;
-        use crate::cte::Cte;
         use crate::kernel::{KernelState, KERNEL};
         use crate::reply::Reply;
         use crate::tcb::{Tcb, ThreadStateType};
@@ -1544,7 +1554,7 @@ pub mod spec {
             for slot in s.cnodes[cn].0.iter_mut() {
                 slot.set_cap(&Cap::Null);
             }
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -1560,14 +1570,21 @@ pub mod spec {
             let mut server_t = Tcb::default();
             server_t.priority = 255;
             server_t.state = ThreadStateType::Running;
-            server_t.ipc_buffer_paddr = crate::arch::virt_to_phys((&raw mut SERVER_BUF) as u64);
-            server_t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: KernelState::cnode_ptr(cn),
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
+
+            let source = owners.cap_source_in(s, Cap::Frame {
+                ptr: crate::cap::PAddr::new(crate::arch::virt_to_phys((&raw mut SERVER_BUF) as u64)),
+                size: crate::cap::FrameSize::Small, rights: crate::cap::FrameRights::ReadOnly,
+                mapped: None, asid: 0, is_device: false, map_type: crate::cap::FrameMapType::None,
+            });
+            crate::invocation::derive_tcb_cap(s, server, crate::cte::TcbSlot::IpcBuffer,
+                Some(source), 0x1000).unwrap();
 
             s.replies[reply_idx] = Reply {
                 bound_tcb: Some(caller),
@@ -1623,7 +1640,7 @@ pub mod spec {
             assert_eq!(crate::fault::resume_ip(caller_t), resume_ip);
             assert_eq!(crate::fault::resume_flags(caller_t), resume_flags);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
-            s.cnodes[10].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(10, 2)).unwrap();
             s.replies[reply_idx] = Reply::new();
             free_temp_tcb(caller);
             free_temp_tcb(server);
@@ -1633,9 +1650,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn nbsendrecv_fault_reply_rearms_endpoint_receive() {
+    fn nbsendrecv_fault_reply_rearms_endpoint_receive(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::EpState;
         use crate::kernel::{KernelState, KERNEL};
         use crate::reply::Reply;
@@ -1662,7 +1678,7 @@ pub mod spec {
             for slot in s.cnodes[cn].0.iter_mut() {
                 slot.set_cap(&Cap::Null);
             }
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xF1),
                 rights: EndpointRights {
@@ -1672,7 +1688,7 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             });
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -1688,21 +1704,23 @@ pub mod spec {
             crate::fault::set_resume_ip(&mut caller_t, resume_ip);
             crate::fault::set_resume_flags(&mut caller_t, resume_flags);
             caller_t.sc = Some(1);
-            caller_t.cspace_root = Cap::CNode {
+            let caller_cspace = Cap::CNode {
                 ptr: KernelState::cnode_ptr(cn),
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
-            caller_t.fault_handler = 1;
-            let caller = s.scheduler.admit(caller_t);
+            let caller = admit_with_cspace(s, owners, caller_t, caller_cspace);
+            let fault_cap = s.cnodes[cn].0[1].cap();
+            let fault_source = owners.cap_source_in(s, fault_cap);
+            crate::invocation::derive_tcb_cap(s, caller, crate::cte::TcbSlot::FaultHandler,
+                Some(fault_source), 0).unwrap();
 
             let mut server_t = Tcb::default();
             server_t.priority = 255;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.ipc_buffer_paddr = crate::arch::virt_to_phys((&raw mut SERVER_BUF) as u64);
-            server_t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: KernelState::cnode_ptr(cn),
                 radix: 5,
                 guard_size: 59,
@@ -1710,7 +1728,15 @@ pub mod spec {
             };
             crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, false, 2);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
+
+            let source = owners.cap_source_in(s, Cap::Frame {
+                ptr: crate::cap::PAddr::new(crate::arch::virt_to_phys((&raw mut SERVER_BUF) as u64)),
+                size: crate::cap::FrameSize::Small, rights: crate::cap::FrameRights::ReadOnly,
+                mapped: None, asid: 0, is_device: false, map_type: crate::cap::FrameMapType::None,
+            });
+            crate::invocation::derive_tcb_cap(s, server, crate::cte::TcbSlot::IpcBuffer,
+                Some(source), 0x1000).unwrap();
 
             s.replies[reply_idx] = Reply {
                 bound_tcb: Some(caller),
@@ -1807,8 +1833,8 @@ pub mod spec {
             assert!(matches!(s.endpoints[ep_idx].state, EpState::Idle));
 
             s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
-            s.cnodes[13].0[1] = Cte::null();
-            s.cnodes[13].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(13, 1)).unwrap();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(13, 2)).unwrap();
             s.replies[reply_idx] = Reply::new();
             free_temp_tcb(caller);
             free_temp_tcb(server);
@@ -1818,9 +1844,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn marked_reply_cap_call_hands_off_independent_sc_to_lower_priority_caller() {
+    fn marked_reply_cap_call_hands_off_independent_sc_to_lower_priority_caller(owners: &mut RootOwners) {
         use crate::cap::Cap;
-        use crate::cte::Cte;
         use crate::invocation::REPLY_HANDOFF_MAGIC;
         use crate::kernel::{KernelState, KERNEL};
         use crate::reply::Reply;
@@ -1833,7 +1858,7 @@ pub mod spec {
             let cn = 11;
             let reply_idx = 9;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -1854,13 +1879,13 @@ pub mod spec {
                 false,
                 REPLY_HANDOFF_MAGIC,
             );
-            server_t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
 
             s.replies[reply_idx] = Reply {
                 bound_tcb: Some(caller),
@@ -1888,7 +1913,7 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(server).active_sc, None);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             assert_eq!(s.scheduler.current(), Some(caller));
-            s.cnodes[11].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(11, 2)).unwrap();
             s.replies[reply_idx] = Reply::new();
             free_temp_tcb(caller);
             free_temp_tcb(server);
@@ -1898,9 +1923,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn recv_bound_notification_does_not_stage_reply_cap() {
+    fn recv_bound_notification_does_not_stage_reply_cap(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::EpState;
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
@@ -1928,8 +1952,8 @@ pub mod spec {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             };
-            s.cnodes[cn].0[1] = Cte::with_cap(&ep_cap);
-            s.cnodes[cn].0[2] = Cte::with_cap(&reply_cap);
+            s.cnodes[cn].0[1].set_cap(&ep_cap);
+            s.cnodes[cn].0[2].set_cap(&reply_cap);
             s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
             s.notifications[ntfn_idx] = Notification {
                 state: NtfnState::Active,
@@ -1941,7 +1965,7 @@ pub mod spec {
             let mut t = Tcb::default();
             t.priority = 50;
             t.state = ThreadStateType::Running;
-            t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
                 guard_size: 59,
@@ -1949,7 +1973,7 @@ pub mod spec {
             };
             t.bound_notification = Some(ntfn_idx as u16);
             crate::arch::set_composite_send_destination(&mut t.user_context, true, 2);
-            let server = s.scheduler.admit(t);
+            let server = admit_with_cspace(s, owners, t, server_cspace);
             s.scheduler.set_current(Some(server));
             (server, ep_idx, ntfn_idx, reply_idx)
         };
@@ -1973,8 +1997,8 @@ pub mod spec {
             #[cfg(target_arch = "x86_64")]
             assert_eq!(t.user_context.rdi, 0xBAD0);
             s.notifications[ntfn_idx] = Notification::new();
-            s.cnodes[4].0[1] = Cte::null();
-            s.cnodes[4].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(4, 1)).unwrap();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(4, 2)).unwrap();
             free_temp_tcb(server);
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
@@ -1982,9 +2006,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn recv_bound_notification_rotates_behind_ready_peer() {
+    fn recv_bound_notification_rotates_behind_ready_peer(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::EpState;
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
@@ -1998,7 +2021,7 @@ pub mod spec {
             let ep_idx = 8;
             let ntfn_idx = 8;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE8),
                 rights: EndpointRights {
@@ -2021,14 +2044,14 @@ pub mod spec {
             server_t.priority = 100;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
             server_t.bound_notification = Some(ntfn_idx as u16);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
             s.sched_contexts[0].bound_tcb = Some(server);
 
@@ -2070,7 +2093,7 @@ pub mod spec {
                 assert_eq!(server_rsi, 0);
             }
             s.notifications[ntfn_idx] = Notification::new();
-            s.cnodes[11].0[1] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(11, 1)).unwrap();
             s.sched_contexts[0] = SchedContext::new(0, 0);
             s.sched_contexts[1] = SchedContext::new(0, 0);
             free_temp_tcb(peer);
@@ -2081,9 +2104,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn blocked_recv_bound_notification_clears_reply_offer() {
+    fn blocked_recv_bound_notification_clears_reply_offer(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::EpState;
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
@@ -2097,7 +2119,7 @@ pub mod spec {
             let ntfn_idx = 5;
             let reply_idx = 6;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE6),
                 rights: EndpointRights {
@@ -2107,7 +2129,7 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             });
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -2119,7 +2141,7 @@ pub mod spec {
             server_t.priority = 50;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
                 guard_size: 59,
@@ -2127,7 +2149,7 @@ pub mod spec {
             };
             server_t.bound_notification = Some(ntfn_idx as u16);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
             s.notifications[ntfn_idx] = Notification {
                 bound_tcb: Some(server),
                 ..Notification::new()
@@ -2176,8 +2198,8 @@ pub mod spec {
                 assert_eq!(server_t.user_context.rsi, 0);
             }
             s.notifications[ntfn_idx] = Notification::new();
-            s.cnodes[8].0[1] = Cte::null();
-            s.cnodes[8].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(8, 1)).unwrap();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(8, 2)).unwrap();
             free_temp_tcb(server);
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
@@ -2185,9 +2207,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn irq_bound_notification_wakes_blocked_endpoint_recv() {
+    fn irq_bound_notification_wakes_blocked_endpoint_recv(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::EpState;
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
@@ -2206,7 +2227,7 @@ pub mod spec {
             let cnode_ptr = KernelState::cnode_ptr(cn);
             s.scheduler.reset_queues();
             s.irqs = crate::interrupt::IrqTable::new();
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE1F0),
                 rights: EndpointRights {
@@ -2216,7 +2237,7 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             });
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -2228,7 +2249,7 @@ pub mod spec {
             server_t.priority = 100;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
                 guard_size: 59,
@@ -2236,7 +2257,7 @@ pub mod spec {
             };
             server_t.bound_notification = Some(ntfn_idx as u16);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
             s.notifications[ntfn_idx] = Notification {
                 bound_tcb: Some(server),
                 ..Notification::new()
@@ -2293,8 +2314,8 @@ pub mod spec {
             (*s_ptr).notifications[ntfn_idx] = Notification::new();
             (*s_ptr).replies[reply_idx] = Reply::new();
             (*s_ptr).endpoints[ep_idx] = crate::endpoint::Endpoint::new();
-            (*s_ptr).cnodes[13].0[1] = Cte::null();
-            (*s_ptr).cnodes[13].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(&mut *s_ptr, crate::cte::MdbId::pack(13, 1)).unwrap();
+            crate::invocation::delete_cap_slot(&mut *s_ptr, crate::cte::MdbId::pack(13, 2)).unwrap();
             (*s_ptr).irqs = crate::interrupt::IrqTable::new();
             free_temp_tcb(server);
             (*s_ptr).scheduler.set_current(Some(crate::tcb::TcbId(0)));
@@ -2303,9 +2324,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn recv_prefers_queued_endpoint_over_bound_notification() {
+    fn recv_prefers_queued_endpoint_over_bound_notification(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::{send_ipc, EpState, IpcOutcome, SendOptions};
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
@@ -2333,8 +2353,8 @@ pub mod spec {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             };
-            s.cnodes[cn].0[1] = Cte::with_cap(&ep_cap);
-            s.cnodes[cn].0[2] = Cte::with_cap(&reply_cap);
+            s.cnodes[cn].0[1].set_cap(&ep_cap);
+            s.cnodes[cn].0[2].set_cap(&reply_cap);
             s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
             s.notifications[ntfn_idx] = Notification {
                 state: NtfnState::Active,
@@ -2346,7 +2366,7 @@ pub mod spec {
             let mut server_t = Tcb::default();
             server_t.priority = 50;
             server_t.state = ThreadStateType::Running;
-            server_t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
                 guard_size: 59,
@@ -2354,7 +2374,7 @@ pub mod spec {
             };
             server_t.bound_notification = Some(ntfn_idx as u16);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
             let mut caller_t = Tcb::default();
@@ -2412,8 +2432,8 @@ pub mod spec {
             }
             s.notifications[ntfn_idx] = Notification::new();
             s.replies[reply_idx] = Reply::new();
-            s.cnodes[7].0[1] = Cte::null();
-            s.cnodes[7].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(7, 1)).unwrap();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(7, 2)).unwrap();
             free_temp_tcb(caller);
             free_temp_tcb(server);
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
@@ -2422,9 +2442,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn replyrecv_reply_wake_hands_off_after_bound_notification() {
+    fn replyrecv_reply_wake_hands_off_after_bound_notification(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
         use crate::tcb::{Tcb, ThreadStateType};
@@ -2436,7 +2455,7 @@ pub mod spec {
             let ep_idx = 9;
             let ntfn_idx = 9;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE9),
                 rights: EndpointRights {
@@ -2469,10 +2488,10 @@ pub mod spec {
             server_t.priority = 120;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.cspace_root = cspace;
+            let server_cspace = cspace;
             server_t.bound_notification = Some(ntfn_idx as u16);
             server_t.reply_to = Some(caller);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
             s.scheduler.set_current(Some(server));
             (server, caller, ntfn_idx, ep_idx)
@@ -2502,7 +2521,7 @@ pub mod spec {
             assert_eq!(s.scheduler.current(), Some(caller));
             s.notifications[ntfn_idx] = Notification::new();
             s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
-            s.cnodes[12].0[1] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(12, 1)).unwrap();
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
             free_temp_tcb(caller);
             free_temp_tcb(server);
@@ -2511,9 +2530,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn nbsendrecv_reply_wake_yields_after_bound_notification() {
+    fn nbsendrecv_reply_wake_yields_after_bound_notification(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
         use crate::reply::Reply;
@@ -2527,7 +2545,7 @@ pub mod spec {
             let ntfn_idx = 7;
             let reply_idx = 7;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE7),
                 rights: EndpointRights {
@@ -2537,7 +2555,7 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             });
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -2558,11 +2576,11 @@ pub mod spec {
             server_t.priority = 120;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.cspace_root = cspace;
+            let server_cspace = cspace;
             server_t.bound_notification = Some(ntfn_idx as u16);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, false, 2);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
             let mut caller_t = Tcb::default();
@@ -2602,8 +2620,8 @@ pub mod spec {
             assert_eq!(s.scheduler.take_direct_handoff(), Some(caller));
             s.notifications[ntfn_idx] = Notification::new();
             s.replies[reply_idx] = Reply::new();
-            s.cnodes[9].0[1] = Cte::null();
-            s.cnodes[9].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(9, 1)).unwrap();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(9, 2)).unwrap();
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
             free_temp_tcb(caller);
             free_temp_tcb(server);
@@ -2612,9 +2630,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn nbsendrecv_deferred_reply_wake_survives_later_bound_notification() {
+    fn nbsendrecv_deferred_reply_wake_survives_later_bound_notification(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
         use crate::reply::Reply;
@@ -2628,7 +2645,7 @@ pub mod spec {
             let ntfn_idx = 8;
             let reply_idx = 9;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE8),
                 rights: EndpointRights {
@@ -2638,7 +2655,7 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             });
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -2658,11 +2675,11 @@ pub mod spec {
             server_t.priority = 100;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.cspace_root = cspace;
+            let server_cspace = cspace;
             server_t.bound_notification = Some(ntfn_idx as u16);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, false, 2);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
             let mut caller_t = Tcb::default();
@@ -2723,8 +2740,8 @@ pub mod spec {
             (*s_ptr).notifications[ntfn_idx] = Notification::new();
             (*s_ptr).replies[reply_idx] = Reply::new();
             (*s_ptr).endpoints[ep_idx] = crate::endpoint::Endpoint::new();
-            (*s_ptr).cnodes[11].0[1] = Cte::null();
-            (*s_ptr).cnodes[11].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(&mut *s_ptr, crate::cte::MdbId::pack(11, 1)).unwrap();
+            crate::invocation::delete_cap_slot(&mut *s_ptr, crate::cte::MdbId::pack(11, 2)).unwrap();
             (*s_ptr).scheduler.set_current(Some(crate::tcb::TcbId(0)));
             free_temp_tcb(caller);
             free_temp_tcb(server);
@@ -2733,9 +2750,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn nbsendrecv_stale_reply_handoff_does_not_starve_bound_receiver() {
+    fn nbsendrecv_stale_reply_handoff_does_not_starve_bound_receiver(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::kernel::{KernelState, KERNEL};
         use crate::notification::{Notification, NtfnState};
         use crate::reply::Reply;
@@ -2749,7 +2765,7 @@ pub mod spec {
             let ntfn_idx = 9;
             let reply_idx = 10;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE9),
                 rights: EndpointRights {
@@ -2759,7 +2775,7 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             });
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -2779,11 +2795,11 @@ pub mod spec {
             server_t.priority = 255;
             server_t.state = ThreadStateType::Running;
             server_t.sc = Some(0);
-            server_t.cspace_root = cspace;
+            let server_cspace = cspace;
             server_t.bound_notification = Some(ntfn_idx as u16);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, true, 2);
             crate::arch::set_composite_send_destination(&mut server_t.user_context, false, 2);
-            let server = s.scheduler.admit(server_t);
+            let server = admit_with_cspace(s, owners, server_t, server_cspace);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
 
             let mut caller_t = Tcb::default();
@@ -2848,8 +2864,8 @@ pub mod spec {
             (*s_ptr).notifications[ntfn_idx] = Notification::new();
             (*s_ptr).replies[reply_idx] = Reply::new();
             (*s_ptr).endpoints[ep_idx] = crate::endpoint::Endpoint::new();
-            (*s_ptr).cnodes[12].0[1] = Cte::null();
-            (*s_ptr).cnodes[12].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(&mut *s_ptr, crate::cte::MdbId::pack(12, 1)).unwrap();
+            crate::invocation::delete_cap_slot(&mut *s_ptr, crate::cte::MdbId::pack(12, 2)).unwrap();
             (*s_ptr).scheduler.set_current(Some(crate::tcb::TcbId(0)));
             free_temp_tcb(caller);
             free_temp_tcb(server);
@@ -2858,9 +2874,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn nbrecv_with_reply_cap_does_not_leave_pending_offer() {
+    fn nbrecv_with_reply_cap_does_not_leave_pending_offer(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::EpState;
         use crate::kernel::{KernelState, KERNEL};
         use crate::reply::Reply;
@@ -2872,7 +2887,7 @@ pub mod spec {
             let ep_idx = 3;
             let reply_idx = 3;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE1),
                 rights: EndpointRights {
@@ -2882,7 +2897,7 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             });
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -2892,14 +2907,14 @@ pub mod spec {
             let mut t = Tcb::default();
             t.priority = 50;
             t.state = ThreadStateType::Running;
-            t.cspace_root = Cap::CNode {
+            let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
             crate::arch::set_composite_send_destination(&mut t.user_context, true, 2);
-            let server = s.scheduler.admit(t);
+            let server = admit_with_cspace(s, owners, t, server_cspace);
             s.scheduler.set_current(Some(server));
             (server, ep_idx, reply_idx)
         };
@@ -2925,8 +2940,8 @@ pub mod spec {
                 assert_eq!(t.user_context.rdi, 0);
                 assert_eq!(t.user_context.rsi, 0);
             }
-            s.cnodes[5].0[1] = Cte::null();
-            s.cnodes[5].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(5, 1)).unwrap();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(5, 2)).unwrap();
             free_temp_tcb(server);
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
@@ -2934,9 +2949,8 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn plain_send_recv_with_reply_cap_does_not_leave_pending_offer() {
+    fn plain_send_recv_with_reply_cap_does_not_leave_pending_offer(owners: &mut RootOwners) {
         use crate::cap::{Badge, Cap, EndpointRights};
-        use crate::cte::Cte;
         use crate::endpoint::EpState;
         use crate::kernel::{KernelState, KERNEL};
         use crate::reply::Reply;
@@ -2949,7 +2963,7 @@ pub mod spec {
             let ep_idx = 4;
             let reply_idx = 4;
             let cnode_ptr = KernelState::cnode_ptr(cn);
-            s.cnodes[cn].0[1] = Cte::with_cap(&Cap::Endpoint {
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
                 ptr: KernelState::endpoint_ptr(ep_idx),
                 badge: Badge(0xE2),
                 rights: EndpointRights {
@@ -2959,7 +2973,7 @@ pub mod spec {
                     can_grant_reply: true,
                 },
             });
-            s.cnodes[cn].0[2] = Cte::with_cap(&Cap::Reply {
+            s.cnodes[cn].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -2970,18 +2984,13 @@ pub mod spec {
                 let mut t = Tcb::default();
                 t.priority = 50;
                 t.state = ThreadStateType::Running;
-                t.cspace_root = Cap::CNode {
-                    ptr: cnode_ptr,
-                    radix: 5,
-                    guard_size: 59,
-                    guard: 0,
-                };
                 t
             };
-            let sender = s.scheduler.admit(mk_tcb());
+            let cspace = Cap::CNode { ptr: cnode_ptr, radix: 5, guard_size: 59, guard: 0 };
+            let sender = admit_with_cspace(s, owners, mk_tcb(), cspace);
             let mut server_tcb = mk_tcb();
             crate::arch::set_composite_send_destination(&mut server_tcb.user_context, true, 2);
-            let server = s.scheduler.admit(server_tcb);
+            let server = admit_with_cspace(s, owners, server_tcb, cspace);
             (sender, server, ep_idx, reply_idx)
         };
 
@@ -3019,8 +3028,8 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(sender).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.slab.get(server).msg_regs[0], b'P' as Word);
             assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
-            s.cnodes[6].0[1] = Cte::null();
-            s.cnodes[6].0[2] = Cte::null();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(6, 1)).unwrap();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(6, 2)).unwrap();
             free_temp_tcb(sender);
             free_temp_tcb(server);
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
@@ -3035,7 +3044,7 @@ pub mod spec {
         }
         crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
         s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
-        s.scheduler.slab.free(id);
+        crate::invocation::retire_tcb(s, id);
         s.scheduler.reset_queues();
     }
 

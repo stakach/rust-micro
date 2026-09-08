@@ -181,7 +181,10 @@ pub unsafe extern "C" fn device_not_available_entry() {
         // user-mode entry). Plenty of room for one C call.
         "mov rdi, [rsp + 0]",
         "mov rsi, [rsp + 8]",
+        // The five-word hardware frame leaves RSP eight bytes short of call alignment.
+        "sub rsp, 8",
         "call {handler}",
+        "add rsp, 8",
         // Handler returns only on the spurious-TS / kernel-mode
         // path. Restore GPRs from the per-CPU snapshot, swapgs
         // back, and iretq.
@@ -219,8 +222,8 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
         return;
     }
 
-    // User-mode #NM: BKL on, look up current thread's flags.
-    crate::smp::bkl_acquire();
+    // User-mode #NM: retain the exact entry before waiting for BKL.
+    acquire_user_fault_entry();
     let _bkl = BklGuard;
 
     let current = match crate::arch::x86_64::syscall_entry::resolve_live_user_thread() {
@@ -265,7 +268,8 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
         // instruction. Context-switch to the next runnable thread
         // by sysretq'ing into it directly — same pattern the page
         // fault handler uses. Drop the BKL just before sysretq.
-        let next = s.scheduler.choose_thread();
+        let candidate = s.scheduler.choose_thread();
+        let next = debug_ready_thread(s, candidate);
         if let Some(next_id) = next {
             s.scheduler.set_current(Some(next_id));
             s.scheduler.set_active_user(Some(next_id));
@@ -288,7 +292,6 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
                 crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
                 next_gs_base,
             );
-            #[cfg(feature = "smp")]
             crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next_id);
             crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(s.scheduler.slab.get(next_id));
             crate::arch::x86_64::syscall_entry::apply_debug_state_for(
@@ -311,7 +314,6 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
         crate::arch::log("[#NM: no next thread, idling CPU]\n");
         // SMP: flush live FPU state to its owner TCB before idling so a
         // migration off this idle core restores fresh state.
-        #[cfg(feature = "smp")]
         crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
         s.scheduler.set_active_user(None);
         drop(_bkl);
@@ -337,7 +339,8 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
     // thread once the schedule rotated away from a non-empty domain).
     let mut logged = false;
     loop {
-        if let Some(next_id) = s.scheduler.choose_thread() {
+        let candidate = s.scheduler.choose_thread();
+        if let Some(next_id) = debug_ready_thread(s, candidate) {
             s.scheduler.set_current(Some(next_id));
             s.scheduler.set_active_user(Some(next_id));
             crate::sched_context::complete_yield_if_pending(next_id);
@@ -355,15 +358,7 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
                 // pages and ran wild). When NOT coming from idle, only reload
                 // on an actual vspace change — flushing every dispatch makes
                 // the yield-stress test crawl (MULTICORE0004).
-                // The from-idle CR3 reload is only needed under real SMP (a
-                // core that idled on a vspace can miss a cross-core
-                // shootdown). In the default single-node build it's pure
-                // overhead AND perturbs the flaky suspend/resume timing
-                // (SCHED0000), so gate it behind `smp`.
-                #[cfg(feature = "smp")]
                 let was_idle = crate::smp::take_went_idle();
-                #[cfg(not(feature = "smp"))]
-                let was_idle = false;
                 let cur_cr3: u64;
                 core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                 options(nomem, nostack, preserves_flags));
@@ -380,7 +375,6 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
                 crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
                 next_gs_base,
             );
-            #[cfg(feature = "smp")]
             crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next_id);
             crate::arch::x86_64::syscall_entry::apply_fpu_gate_for(s.scheduler.slab.get(next_id));
             crate::arch::x86_64::syscall_entry::apply_debug_state_for(
@@ -399,12 +393,8 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
             crate::arch::log(idle_tag);
             logged = true;
         }
-        // SMP: about to idle with no runnable thread — flush this core's
-        // live FPU state back to its owner TCB. A thread can be migrated
-        // off an *idle* core (where `remote_tcb_stall` finds current==None
-        // and does no stall/flush); without this, the destination core
-        // would restore stale TCB state and FPU0002 corrupts (flaky).
-        #[cfg(feature = "smp")]
+        // Flush before idle so migration need not wake this CPU to capture
+        // its last resident FPU owner's hardware state.
         crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
         s.scheduler.set_active_user(None);
         // Idle: drop the lock so the timer ISR can run, halt until an
@@ -412,10 +402,7 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         // Mark went-idle so the next dispatch flushes a possibly-stale TLB.
         // Park on the kernel root page table first — a user vspace left in
         // CR3 here can be freed by another core's teardown, after which our
-        // next interrupt would read an unmapped IDT and triple-fault. Only a
-        // concern under real SMP; the default single-node build can't have a
-        // peer free the vspace under an idling core.
-        #[cfg(feature = "smp")]
+        // next interrupt would read an unmapped IDT and triple-fault.
         crate::arch::x86_64::paging::park_on_kernel_root();
         crate::smp::mark_went_idle();
         crate::smp::bkl_release();
@@ -507,7 +494,9 @@ pub unsafe extern "C" fn invalid_opcode_entry() {
         "mov gs:[16 + 120], rax",   // user_ctx.rsp    = saved RSP
         "mov rdi, [rsp + 0]",
         "mov rsi, [rsp + 8]",
+        "sub rsp, 8",
         "call {handler}",
+        "add rsp, 8",
         // Unreachable for user faults; defensive restore + return.
         "mov rax, gs:[16 + 0]",
         "mov rbx, gs:[16 + 8]",
@@ -530,7 +519,9 @@ pub unsafe extern "C" fn invalid_opcode_entry() {
         "2:",
         "mov rdi, [rsp + 0]",
         "mov rsi, [rsp + 8]",
+        "sub rsp, 8",
         "call {handler}",
+        "add rsp, 8",
         "iretq",
         handler = sym handle_invalid_opcode_typed,
     );
@@ -544,7 +535,7 @@ extern "C" fn handle_invalid_opcode_typed(saved_rip: u64, saved_cs: u64) {
         crate::arch::log("\n");
         fatal_exception(6, 0);
     }
-    crate::smp::bkl_acquire();
+    acquire_user_fault_entry();
     let current = crate::arch::x86_64::syscall_entry::resolve_live_user_thread();
     let Some(faulter) = current else {
         // Same race as the #PF no-current path: another CPU blocked
@@ -640,6 +631,8 @@ pub unsafe extern "C" fn general_protection_fault_handler() {
         "mov gs:[16 + 120], rax",   // user_ctx.rsp    = saved RSP
         "mov rdi, [rsp + 0]",       // error_code
         "mov rsi, [rsp + 16]",      // saved CS
+        "mov rdx, [rsp + 8]",       // saved RIP
+        "mov rcx, [rsp + 32]",      // saved RSP
         "call {handler}",
         // Unreachable for user faults; defensive restore + return.
         "mov rax, gs:[16 + 0]",
@@ -664,6 +657,8 @@ pub unsafe extern "C" fn general_protection_fault_handler() {
         "2:",
         "mov rdi, [rsp + 0]",       // error_code
         "mov rsi, [rsp + 16]",      // saved CS
+        "mov rdx, [rsp + 8]",       // saved RIP
+        "mov rcx, [rsp + 32]",      // saved RSP
         "call {handler}",
         "add rsp, 8",
         "iretq",
@@ -671,15 +666,26 @@ pub unsafe extern "C" fn general_protection_fault_handler() {
     );
 }
 
-extern "C" fn handle_general_protection_fault_typed(error_code: u64, saved_cs: u64) {
+extern "C" fn handle_general_protection_fault_typed(
+    error_code: u64,
+    saved_cs: u64,
+    saved_rip: u64,
+    saved_rsp: u64,
+) {
     let from_user = (saved_cs & 3) == 3;
     if !from_user {
         crate::arch::log("EXCEPTION: kernel general protection fault, err=0x");
         log_hex64(error_code);
+        crate::arch::log(" rip=0x");
+        log_hex64(saved_rip);
+        crate::arch::log(" rsp=0x");
+        log_hex64(saved_rsp);
+        crate::arch::log(" cpu=0x");
+        log_hex64(crate::arch::get_cpu_id() as u64);
         crate::arch::log("\n");
         fatal_exception(13, error_code);
     }
-    crate::smp::bkl_acquire();
+    acquire_user_fault_entry();
     let current = crate::arch::x86_64::syscall_entry::resolve_live_user_thread();
     let Some(faulter) = current else {
         unsafe { dispatch_next_or_idle("[#GP: no current, idling CPU]\n") }
@@ -907,9 +913,8 @@ extern "C" fn handle_page_fault_typed(cr2: u64, error_code: u64, saved_cs: u64, 
     // RAII guard's Drop never fires on those — leaving the BKL
     // held forever and deadlocking peer CPUs in `bkl_acquire`.
     // Each early-exit path calls `bkl_release()` explicitly below.
-    crate::smp::bkl_acquire();
-
     let user_mode = (saved_cs & 3) == 3;
+    if user_mode { acquire_user_fault_entry(); } else { crate::smp::bkl_acquire(); }
     if !user_mode {
         crate::arch::log("KERNEL PAGE FAULT @ rip=0x");
         log_hex64(saved_rip);
@@ -1040,6 +1045,8 @@ extern "C" fn handle_page_fault_typed(cr2: u64, error_code: u64, saved_cs: u64, 
 // handler can ReadRegisters and the thread is resumable.
 // ---------------------------------------------------------------------------
 
+include!("exceptions/deferred_debug.rs");
+
 macro_rules! debug_entry_asm {
     ($handler:path) => {
         core::arch::naked_asm!(
@@ -1071,7 +1078,9 @@ macro_rules! debug_entry_asm {
             "mov gs:[16 + 120], rax",   // rsp
             "mov rdi, [rsp + 8]",       // saved CS
             "mov rsi, [rsp + 0]",       // saved RIP
+            "sub rsp, 8",
             "call {handler}",
+            "add rsp, 8",
             // Defensive tail (handler normally dispatches away).
             "mov rax, gs:[16 + 0]",
             "mov rbx, gs:[16 + 8]",
@@ -1095,7 +1104,9 @@ macro_rules! debug_entry_asm {
             "2:",
             "mov rdi, [rsp + 8]",
             "mov rsi, [rsp + 0]",
+            "sub rsp, 8",
             "call {handler}",
+            "add rsp, 8",
             "iretq",
             handler = sym $handler,
         )
@@ -1124,28 +1135,23 @@ unsafe fn snapshot_into_tcb(faulter: crate::tcb::TcbId) {
     t.use_iretq_resume = true;
 }
 
-/// Deliver a debug fault; suspend the thread if it has no handler.
-unsafe fn deliver_debug_fault(faulter: crate::tcb::TcbId, fault: crate::fault::FaultMessage) {
-    if crate::fault::deliver_fault(faulter, fault).is_err() {
-        crate::arch::log("[debug fault — no handler, suspending]\n");
-        crate::kernel::KERNEL
-            .get()
-            .scheduler
-            .block(faulter, crate::tcb::ThreadStateType::Inactive);
-    }
-}
-
 #[no_mangle]
 extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
     use crate::arch::x86_64::debug;
-    crate::smp::bkl_acquire();
     if (saved_cs & 3) != 3 {
         // Kernel-mode #DB — clear status and resume.
         unsafe {
             debug::write_dr6(0xFFFF_0FF0);
         }
-        crate::smp::bkl_release();
         return;
+    }
+    let status = unsafe { debug::read_dr6() };
+    unsafe { debug::write_dr6(0xFFFF_0FF0); }
+    let context = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
+    assert_eq!(context.rip, saved_rip);
+    let kind = crate::smp::UserEntryKind::Debug { status };
+    if crate::smp::bkl_acquire_for_user_entry(Some(crate::smp::UserEntrySnapshot { context, kind })) {
+        unsafe { dispatch_next_or_idle("[#DB quiesced]\n") }
     }
     let faulter = match crate::arch::x86_64::syscall_entry::resolve_live_user_thread() {
         Some(t) => t,
@@ -1154,73 +1160,23 @@ extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
     unsafe {
         snapshot_into_tcb(faulter);
     }
-    let dr6 = unsafe { debug::read_dr6() };
     let s = unsafe { crate::kernel::KERNEL.get() };
-
-    // Active hardware breakpoint? (B0..B3 = DR6 bits 0..3)
-    let active = (0..4).find(|&b| dr6 & (1 << b) != 0);
-    if let Some(bp) = active {
-        unsafe {
-            debug::write_dr6(dr6 & !(1u64 << bp));
-        }
-        let (vaddr, reason) = {
-            let st = &s.scheduler.slab.get(faulter).debug;
-            (st.dr[bp], debug::breakpoint_reason(st, bp))
-        };
-        unsafe {
-            deliver_debug_fault(
-                faulter,
-                crate::fault::FaultMessage::DebugException {
-                    fault_ip: saved_rip,
-                    reason,
-                    trigger_addr: vaddr,
-                    bp_num: bp as u64,
-                },
-            );
-            dispatch_next_or_idle("[#DB hw bp]\n")
-        }
-    } else if dr6 & debug::DR6_SINGLE_STEP != 0 {
-        unsafe {
-            debug::write_dr6(dr6 & !debug::DR6_SINGLE_STEP);
-        }
-        // Set RF so an instruction breakpoint at the resume IP isn't
-        // re-raised (auto-cleared by the CPU after one instruction).
-        s.scheduler.slab.get_mut(faulter).user_context.rflags |= debug::FLAGS_RF;
-        let ready = debug::single_step_counter_ready(&mut s.scheduler.slab.get_mut(faulter).debug);
-        if ready {
-            unsafe {
-                deliver_debug_fault(
-                    faulter,
-                    crate::fault::FaultMessage::DebugException {
-                        fault_ip: saved_rip,
-                        reason: debug::SEL4_SINGLE_STEP,
-                        trigger_addr: 0,
-                        bp_num: 0,
-                    },
-                );
-                dispatch_next_or_idle("[#DB single-step]\n")
-            }
-        } else {
-            // Counter not yet zero — keep stepping (TF stays set).
-            unsafe { dispatch_next_or_idle("[#DB step]\n") }
-        }
-    } else {
-        // Spurious — clear and resume.
-        unsafe {
-            debug::write_dr6(0xFFFF_0FF0);
-        }
-        unsafe { dispatch_next_or_idle("[#DB spurious]\n") }
-    }
+    defer_quiesced_debug(s.scheduler.slab.get_mut(faulter), kind);
+    deliver_deferred_debug(s, faulter);
+    unsafe { dispatch_next_or_idle("[#DB]\n") }
 }
 
 #[no_mangle]
 extern "C" fn handle_int3_typed(saved_cs: u64, saved_rip: u64) {
-    use crate::arch::x86_64::debug;
-    crate::smp::bkl_acquire();
     if (saved_cs & 3) != 3 {
         crate::arch::log("KERNEL INT3\n");
-        crate::smp::bkl_release();
         return;
+    }
+    let context = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
+    assert_eq!(context.rip, saved_rip);
+    let kind = crate::smp::UserEntryKind::Breakpoint;
+    if crate::smp::bkl_acquire_for_user_entry(Some(crate::smp::UserEntrySnapshot { context, kind })) {
+        unsafe { dispatch_next_or_idle("[INT3 quiesced]\n") }
     }
     let faulter = match crate::arch::x86_64::syscall_entry::resolve_live_user_thread() {
         Some(t) => t,
@@ -1230,15 +1186,9 @@ extern "C" fn handle_int3_typed(saved_cs: u64, saved_rip: u64) {
         snapshot_into_tcb(faulter);
     }
     unsafe {
-        deliver_debug_fault(
-            faulter,
-            crate::fault::FaultMessage::DebugException {
-                fault_ip: saved_rip,
-                reason: debug::SEL4_SOFTWARE_BREAK_REQUEST,
-                trigger_addr: 0,
-                bp_num: 0,
-            },
-        );
+        let s = crate::kernel::KERNEL.get();
+        defer_quiesced_debug(s.scheduler.slab.get_mut(faulter), kind);
+        deliver_deferred_debug(s, faulter);
         dispatch_next_or_idle("[INT3]\n")
     }
 }
@@ -1282,6 +1232,7 @@ pub mod spec {
     pub fn test_exceptions() {
         crate::arch::log("Running exception tests...\n");
         debug_service_gp_is_recognized_and_skips_trap_bundle();
+        test_deferred_debug();
         crate::arch::log("Exception tests completed\n");
     }
 

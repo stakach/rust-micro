@@ -79,7 +79,9 @@ macro_rules! interrupt {
             core::arch::naked_asm!(
                 "push 0",            // Push error code (0 for exceptions without it)
                 "push 0",            // Dummy IRQ number or vector
+                "sub rsp, 8",        // Align before entering the System V Rust handler
                 "call {handler}",    // Call actual handler function
+                "add rsp, 8",        // Restore the exception frame
                 "add rsp, 16",       // Clean up stack
                 "iretq",             // Return from interrupt
                 handler = sym $handler
@@ -95,7 +97,9 @@ macro_rules! interrupt_with_error {
         pub unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
                 "push {vector}",     // Push vector number
+                "sub rsp, 8",        // Hardware error code + vector leave RSP misaligned
                 "call {handler}",    // Call actual handler function
+                "add rsp, 8",        // Restore the exception frame
                 "add rsp, 16",       // Clean up stack (error code + vector)
                 "iretq",             // Return from interrupt
                 vector = const $vector,
@@ -264,7 +268,7 @@ impl Drop for IrqBklGuard {
 
 #[no_mangle]
 extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
-    crate::smp::bkl_acquire();
+    let adopted = crate::smp::bkl_acquire_for_user_entry(quiescence_entry(ctx));
     let _bkl = IrqBklGuard;
 
     let from_user = (ctx.cs & 3) == 3;
@@ -328,7 +332,31 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
     // Same context-switch tail as `pit_irq_dispatch`. Factored
     // here so PIT and generic IRQs use one path; PIT keeps its own
     // entry only because of the extra `mcs_tick` work it does.
+    if adopted {
+        core::mem::forget(_bkl);
+        unsafe { dispatch_adopted_irq(); }
+    }
     swap_iretq_context_if_preempted(ctx, from_user, interrupted);
+}
+
+pub(crate) fn quiescence_entry(ctx: &IretqContext) -> Option<crate::smp::UserEntrySnapshot> {
+    if ctx.cs & 3 != 3 { return None; }
+    Some(crate::smp::UserEntrySnapshot {
+        context: crate::arch::UserContext {
+            rax: ctx.rax, rbx: ctx.rbx, rcx: ctx.rcx, rdx: ctx.rdx,
+            rsi: ctx.rsi, rdi: ctx.rdi, rbp: ctx.rbp, rsp: ctx.rsp,
+            r8: ctx.r8, r9: ctx.r9, r10: ctx.r10, r11: ctx.r11,
+            r12: ctx.r12, r13: ctx.r13, r14: ctx.r14, r15: ctx.r15,
+            rip: ctx.rip, rflags: ctx.rflags,
+        },
+        kind: crate::smp::UserEntryKind::Interrupt,
+    })
+}
+
+pub(crate) unsafe fn dispatch_adopted_irq() -> ! {
+    // IRQ entry leaves user GS installed, unlike SYSCALL/exception entry.
+    core::arch::asm!("swapgs", options(nostack, preserves_flags));
+    super::exceptions::dispatch_next_or_idle("")
 }
 
 unsafe fn restore_irq_thread_root(tcb: &crate::tcb::Tcb) {
@@ -361,6 +389,7 @@ pub(crate) fn swap_iretq_context_if_preempted(
             Some(t) => Some(t),
             None => s.scheduler.choose_thread(),
         };
+        let next = super::exceptions::debug_ready_thread(s, next);
         let next = match next {
             Some(t) => t,
             None => {
@@ -405,22 +434,8 @@ pub(crate) fn swap_iretq_context_if_preempted(
                 crate::arch::x86_64::exceptions::dispatch_next_or_idle("");
             }
         };
-        // Same thread resumes on this core: it resumes via the IRQ frame's
-        // iretq (registers intact). The default (single-node) build skips
-        // the save entirely here — writing the TCB context corrupts threads
-        // this core re-enters without a full round-trip (it broke DOMAINS
-        // rotation). The smp build instead saves FIRST (below) so a later
-        // MIGRATION dispatches the thread from a current context (FPU0002),
-        // then takes the same early return after the save.
-        #[cfg(not(feature = "smp"))]
-        if Some(next) == interrupted {
-            s.scheduler.set_current(Some(next));
-            s.scheduler.set_active_user(Some(next));
-            // A retirement IPI may have withdrawn this same thread's ASID while it waited for
-            // BKL. Keeping its register frame does not authorize retaining its old hardware root.
-            restore_irq_thread_root(s.scheduler.slab.get(next));
-            return;
-        }
+        // Save even when the same thread resumes: another CPU may subsequently
+        // migrate it and must see the exact interrupted register state.
         if let Some(prev) = interrupted {
             let prev_tcb = s.scheduler.slab.get_mut(prev);
             // FULL context save. An IRQ can preempt any user
@@ -451,9 +466,8 @@ pub(crate) fn swap_iretq_context_if_preempted(
             prev_tcb.user_context.rflags = ctx.rflags;
             prev_tcb.use_iretq_resume = true;
         }
-        // smp: now take the same-core early return, AFTER having saved the
+        // Now take the same-core early return, AFTER having saved the
         // interrupted thread's context above (so a migration sees it).
-        #[cfg(feature = "smp")]
         if Some(next) == interrupted {
             s.scheduler.set_current(Some(next));
             s.scheduler.set_active_user(Some(next));
@@ -530,7 +544,6 @@ pub(crate) fn swap_iretq_context_if_preempted(
         );
         // SMP: the running thread changed under this IRQ — make the
         // incoming thread's FPU state resident on this core.
-        #[cfg(feature = "smp")]
         crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next);
         s.scheduler.set_current(Some(next));
         s.scheduler.set_active_user(Some(next));

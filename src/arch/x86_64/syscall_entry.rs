@@ -431,6 +431,8 @@ pub static mut PER_CPU_SYSCALL: [PerCpuSyscallArea; crate::smp::MAX_CPUS] =
 /// Set the kernel rsp the SYSCALL entry will switch to. Targets
 /// the calling CPU's per-CPU slot.
 pub fn set_syscall_kernel_rsp(rsp: u64) {
+    assert_ne!(rsp, 0, "SYSCALL requires a real kernel stack");
+    assert_eq!(rsp & 0xf, 0, "SYSCALL kernel stack must have SysV call-site alignment");
     unsafe {
         let cpu = crate::arch::get_cpu_id() as usize;
         PER_CPU_SYSCALL[cpu].kernel_rsp = rsp;
@@ -758,7 +760,13 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // save area; the asm stub's sysretq tail only reads from that
     // save area after that, and the read is single-CPU since each
     // CPU has its own slot indexed via gs:.
-    crate::smp::bkl_acquire();
+    let entry = (from_user != 0).then(|| crate::smp::UserEntrySnapshot {
+        context: *current_cpu_user_ctx_mut(),
+        kind: crate::smp::UserEntryKind::Syscall,
+    });
+    if crate::smp::bkl_acquire_for_user_entry(entry) {
+        unsafe { super::exceptions::dispatch_next_or_idle(""); }
+    }
     let _bkl = BklGuard;
 
     // Phase 28h — bump the per-CPU syscall counter so the SMP
@@ -1124,6 +1132,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     }),
             };
             match next {
+                Some(t) if super::exceptions::deliver_deferred_debug(s, t) => continue,
                 Some(t) if transparent_debug_return && Some(t) == resumable_entry_invoker => break,
                 Some(t) if !crate::sched_context::dispatch_budget_check(t) => continue,
                 _ => break,
@@ -1204,7 +1213,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 // receiver-blocked-first path in endpoint::transfer_msg) so a handler dispatched via
                 // the syscall tail — e.g. a syscall-servicing fault loop — sees the full message
                 // (all saved registers of an UnknownSyscall fault), not just the 4 register words.
-                let recv_buf_paddr = tcb.ipc_buffer_paddr;
+                let recv_buf_paddr = tcb.ipc_buffer_receive_paddr();
                 let length = tcb.ipc_length as usize;
                 if length > 4 && recv_buf_paddr != 0 {
                     let buf = (crate::arch::x86_64::paging::phys_to_lin(recv_buf_paddr)
@@ -1239,7 +1248,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // core (fxsave outgoing owner, fxrstor `next`) BEFORE the TS
             // gate — fpu_switch_to clears TS to fxrstor, so the gate must
             // run after it to set the final CR0.TS for `next`.
-            #[cfg(feature = "smp")]
             crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next);
             apply_fpu_gate_for(s.scheduler.slab.get(next));
             apply_debug_state_for(s.scheduler.slab.get(next));
@@ -1283,7 +1291,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // if it is later migrated off this (now idle) core,
             // `remote_tcb_stall` won't stall/flush it, so its state must
             // already be in its TCB (FPU0002 flakiness fix).
-            #[cfg(feature = "smp")]
             crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
             s.scheduler.set_active_user(None);
             loop {
@@ -1298,7 +1305,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 // user vspace can be freed by another core's teardown,
                 // and our next interrupt would then read an unmapped IDT
                 // and triple-fault (MULTICORE0003). SMP-only concern.
-                #[cfg(feature = "smp")]
                 crate::arch::x86_64::paging::park_on_kernel_root();
                 crate::smp::mark_went_idle();
                 // Release the BKL BEFORE idling on EVERY iteration. The
@@ -1314,12 +1320,13 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 core::arch::asm!("sti", "hlt", "cli", options(nostack, preserves_flags));
                 // After waking, re-evaluate. If something is now
                 // runnable, dispatch it via enter_user_via_sysret.
-                let s = KERNEL.get();
                 crate::smp::bkl_acquire();
+                let s = KERNEL.get();
                 let next = match s.scheduler.current() {
                     Some(t) => Some(t),
                     None => s.scheduler.choose_thread(),
                 };
+                let next = super::exceptions::debug_ready_thread(s, next);
                 if let Some(next_id) = next {
                     s.scheduler.set_current(Some(next_id));
                     s.scheduler.set_active_user(Some(next_id));
@@ -1331,12 +1338,8 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     let next_ctx = tcb.user_context;
                     // Reload CR3 if we went idle since the last dispatch
                     // (missed shootdowns — MULTICORE0003) OR the vspace
-                    // changed. Gated on the `smp` feature so single-node
-                    // builds keep the cheap vspace-change-only check.
-                    #[cfg(feature = "smp")]
+                    // changed. CPU availability is a runtime boot property.
                     let was_idle = crate::smp::take_went_idle();
-                    #[cfg(not(feature = "smp"))]
-                    let was_idle = false;
                     {
                         let cur_cr3: u64;
                         core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
@@ -1358,7 +1361,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                         crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE,
                         next_gs_base,
                     );
-                    #[cfg(feature = "smp")]
                     crate::arch::x86_64::fpu_ctx::fpu_switch_to(&mut s.scheduler.slab, next_id);
                     apply_fpu_gate_for(s.scheduler.slab.get(next_id));
                     apply_debug_state_for(s.scheduler.slab.get(next_id));
@@ -1426,8 +1428,8 @@ pub mod spec {
         let _guard = crate::spec::KernelGuard::acquire();
         let mut owners = crate::asid::spec::RootOwners::new();
         let physical = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
-        let actual_root = owners.root(physical);
-        let stale_root = owners.root(physical.checked_add(0x1000).unwrap());
+        let actual_root = owners.root_source(physical);
+        let stale_root = owners.root_source(physical.checked_add(0x1000).unwrap());
         let (actual, duplicate, stale, identity) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -1443,27 +1445,30 @@ pub mod spec {
             actual_tcb.state = ThreadStateType::Running;
             actual_tcb.sc = Some(0);
             actual_tcb.affinity = identity.cpu;
-            assert!(actual_tcb.set_vspace_root(actual_root));
             actual_tcb.cpu_context.fs_base = identity.fs_base;
             actual_tcb.cpu_context.gs_base = identity.gs_base;
             let actual = s.scheduler.admit(actual_tcb);
+            crate::invocation::derive_tcb_cap(s, actual, crate::cte::TcbSlot::VSpace,
+                Some(actual_root), 0).unwrap();
 
             let mut duplicate_tcb = Tcb::default();
             duplicate_tcb.state = ThreadStateType::Running;
             duplicate_tcb.sc = Some(1);
             duplicate_tcb.affinity = identity.cpu;
-            assert!(duplicate_tcb.set_vspace_root(actual_root));
             duplicate_tcb.cpu_context.fs_base = identity.fs_base;
             duplicate_tcb.cpu_context.gs_base = identity.gs_base;
             let duplicate = s.scheduler.admit(duplicate_tcb);
+            crate::invocation::derive_tcb_cap(s, duplicate, crate::cte::TcbSlot::VSpace,
+                Some(actual_root), 0).unwrap();
 
             let mut stale_tcb = Tcb::default();
             stale_tcb.state = ThreadStateType::Running;
             stale_tcb.sc = Some(2);
             stale_tcb.affinity = identity.cpu;
-            assert!(stale_tcb.set_vspace_root(stale_root));
             stale_tcb.user_context.rax = 0xfeed_face;
             let stale = s.scheduler.admit(stale_tcb);
+            crate::invocation::derive_tcb_cap(s, stale, crate::cte::TcbSlot::VSpace,
+                Some(stale_root), 0).unwrap();
 
             s.scheduler.set_current(Some(stale));
             s.scheduler.set_active_user(None);
@@ -1500,9 +1505,9 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(stale).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.slab.get(stale).user_context.rax, 0xfeed_face);
             s.scheduler.block(stale, ThreadStateType::Inactive);
-            s.scheduler.slab.free(actual);
-            s.scheduler.slab.free(duplicate);
-            s.scheduler.slab.free(stale);
+            crate::invocation::retire_tcb(s, actual);
+            crate::invocation::retire_tcb(s, duplicate);
+            crate::invocation::retire_tcb(s, stale);
             s.scheduler.reset_queues();
         }
         arch::log("  ✓ live user identity rejects stale and ambiguous owners\n");
@@ -1896,8 +1901,8 @@ pub mod spec {
         let preparation = crate::spec::KernelGuard::acquire();
         let mut owners = crate::asid::spec::RootOwners::new();
         let physical = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
-        let actual_root = owners.root(physical);
-        let stale_root = owners.root(physical.checked_add(0x1000).unwrap());
+        let actual_root = owners.root_source(physical);
+        let stale_root = owners.root_source(physical.checked_add(0x1000).unwrap());
         let (actual, stale) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -1909,19 +1914,21 @@ pub mod spec {
             actual_tcb.priority = 100;
             actual_tcb.state = ThreadStateType::Running;
             actual_tcb.sc = Some(0);
-            assert!(actual_tcb.set_vspace_root(actual_root));
             actual_tcb.cpu_context.fs_base = live_fs;
             actual_tcb.cpu_context.gs_base = live_gs;
             actual_tcb.user_context.rax = 0x4444;
             let actual = s.scheduler.admit(actual_tcb);
+            crate::invocation::derive_tcb_cap(s, actual, crate::cte::TcbSlot::VSpace,
+                Some(actual_root), 0).unwrap();
 
             let mut stale_tcb = Tcb::default();
             stale_tcb.priority = 90;
             stale_tcb.state = ThreadStateType::BlockedOnReceive;
             stale_tcb.sc = Some(1);
-            assert!(stale_tcb.set_vspace_root(stale_root));
             stale_tcb.user_context.rax = 0x5555;
             let stale = s.scheduler.admit(stale_tcb);
+            crate::invocation::derive_tcb_cap(s, stale, crate::cte::TcbSlot::VSpace,
+                Some(stale_root), 0).unwrap();
 
             s.scheduler.set_current(Some(stale));
             let ctx = super::current_cpu_user_ctx_mut();
@@ -1944,8 +1951,8 @@ pub mod spec {
                 ThreadStateType::BlockedOnReceive
             );
             s.scheduler.block(actual, ThreadStateType::Inactive);
-            s.scheduler.slab.free(actual);
-            s.scheduler.slab.free(stale);
+            crate::invocation::retire_tcb(s, actual);
+            crate::invocation::retire_tcb(s, stale);
             s.scheduler.reset_queues();
             drop(owners);
         }
@@ -1959,7 +1966,7 @@ pub mod spec {
 
         let preparation = crate::spec::KernelGuard::acquire();
         let mut owners = crate::asid::spec::RootOwners::new();
-        let actual_root = owners.root(super::super::paging::read_cr3() & super::CR3_PADDR_MASK);
+        let actual_root = owners.root_source(super::super::paging::read_cr3() & super::CR3_PADDR_MASK);
         let (actual, stale) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -1971,21 +1978,23 @@ pub mod spec {
             stale_tcb.priority = 90;
             stale_tcb.state = ThreadStateType::Running;
             stale_tcb.sc = Some(1);
-            assert!(stale_tcb.set_vspace_root(actual_root));
             stale_tcb.cpu_context.fs_base = live_fs;
             stale_tcb.cpu_context.gs_base = live_gs;
             stale_tcb.user_context.rax = 0x5555;
             let stale = s.scheduler.admit(stale_tcb);
+            crate::invocation::derive_tcb_cap(s, stale, crate::cte::TcbSlot::VSpace,
+                Some(actual_root), 0).unwrap();
 
             let mut actual_tcb = Tcb::default();
             actual_tcb.priority = 100;
             actual_tcb.state = ThreadStateType::Running;
             actual_tcb.sc = Some(0);
-            assert!(actual_tcb.set_vspace_root(actual_root));
             actual_tcb.cpu_context.fs_base = live_fs;
             actual_tcb.cpu_context.gs_base = live_gs;
             actual_tcb.user_context.rax = 0x6666;
             let actual = s.scheduler.admit(actual_tcb);
+            crate::invocation::derive_tcb_cap(s, actual, crate::cte::TcbSlot::VSpace,
+                Some(actual_root), 0).unwrap();
 
             s.scheduler.set_current(Some(stale));
             s.scheduler.set_active_user(Some(actual));
@@ -2012,8 +2021,8 @@ pub mod spec {
             );
             s.scheduler.block(actual, ThreadStateType::Inactive);
             s.scheduler.block(stale, ThreadStateType::Inactive);
-            s.scheduler.slab.free(actual);
-            s.scheduler.slab.free(stale);
+            crate::invocation::retire_tcb(s, actual);
+            crate::invocation::retire_tcb(s, stale);
             s.scheduler.reset_queues();
             drop(owners);
         }
@@ -2027,7 +2036,7 @@ pub mod spec {
 
         let preparation = crate::spec::KernelGuard::acquire();
         let mut owners = crate::asid::spec::RootOwners::new();
-        let actual_root = owners.root(super::super::paging::read_cr3() & super::CR3_PADDR_MASK);
+        let actual_root = owners.root_source(super::super::paging::read_cr3() & super::CR3_PADDR_MASK);
         let actual = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -2040,11 +2049,12 @@ pub mod spec {
             actual_tcb.state = ThreadStateType::Running;
             actual_tcb.sc = Some(0);
             actual_tcb.domain = 3;
-            assert!(actual_tcb.set_vspace_root(actual_root));
             actual_tcb.cpu_context.fs_base = live_fs;
             actual_tcb.cpu_context.gs_base = live_gs;
             actual_tcb.user_context.rax = 0x7777;
             let actual = s.scheduler.admit(actual_tcb);
+            crate::invocation::derive_tcb_cap(s, actual, crate::cte::TcbSlot::VSpace,
+                Some(actual_root), 0).unwrap();
 
             s.scheduler.cur_domain = 0;
             s.scheduler.set_current(None);
@@ -2066,7 +2076,7 @@ pub mod spec {
             assert_eq!(s.scheduler.active_user(), Some(actual));
             assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x7777);
             s.scheduler.block(actual, ThreadStateType::Inactive);
-            s.scheduler.slab.free(actual);
+            crate::invocation::retire_tcb(s, actual);
             s.scheduler.cur_domain = 0;
             s.scheduler.reset_queues();
             drop(owners);
@@ -2110,7 +2120,7 @@ pub mod spec {
         let preparation = crate::spec::KernelGuard::acquire();
         let mut owners = crate::asid::spec::RootOwners::new();
         let physical = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
-        let stale_root = owners.root(physical.checked_add(0x1000).unwrap());
+        let stale_root = owners.root_source(physical.checked_add(0x1000).unwrap());
         let stale = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -2119,9 +2129,10 @@ pub mod spec {
             stale_tcb.priority = 100;
             stale_tcb.state = ThreadStateType::Running;
             stale_tcb.sc = Some(0);
-            assert!(stale_tcb.set_vspace_root(stale_root));
             stale_tcb.hosted_syscalls = true;
             let stale = s.scheduler.admit(stale_tcb);
+            crate::invocation::derive_tcb_cap(s, stale, crate::cte::TcbSlot::VSpace,
+                Some(stale_root), 0).unwrap();
             s.scheduler.set_current(Some(stale));
             s.scheduler.set_active_user(None);
 
@@ -2142,7 +2153,7 @@ pub mod spec {
             assert_eq!(s.scheduler.current(), Some(stale));
             assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x9999);
             s.scheduler.block(stale, ThreadStateType::Inactive);
-            s.scheduler.slab.free(stale);
+            crate::invocation::retire_tcb(s, stale);
             s.scheduler.reset_queues();
             drop(owners);
         }
@@ -2157,7 +2168,7 @@ pub mod spec {
         let preparation = crate::spec::KernelGuard::acquire();
         let mut owners = crate::asid::spec::RootOwners::new();
         let physical = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
-        let stale_root = owners.root(physical.checked_add(0x1000).unwrap());
+        let stale_root = owners.root_source(physical.checked_add(0x1000).unwrap());
         let (stale, peer) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -2166,9 +2177,10 @@ pub mod spec {
             stale_tcb.priority = 100;
             stale_tcb.state = ThreadStateType::Running;
             stale_tcb.sc = Some(0);
-            assert!(stale_tcb.set_vspace_root(stale_root));
             stale_tcb.hosted_syscalls = true;
             let stale = s.scheduler.admit(stale_tcb);
+            crate::invocation::derive_tcb_cap(s, stale, crate::cte::TcbSlot::VSpace,
+                Some(stale_root), 0).unwrap();
 
             let mut peer_tcb = Tcb::default();
             peer_tcb.priority = 90;
@@ -2205,7 +2217,7 @@ pub mod spec {
             s.scheduler.block(peer, ThreadStateType::Inactive);
             s.scheduler.block(stale, ThreadStateType::Inactive);
             s.scheduler.slab.free(peer);
-            s.scheduler.slab.free(stale);
+            crate::invocation::retire_tcb(s, stale);
             s.scheduler.reset_queues();
             drop(owners);
         }
@@ -2215,24 +2227,26 @@ pub mod spec {
     #[inline(never)]
     fn preferred_invoker_budget_failure_falls_back_to_ready_thread() {
         use crate::cap::{Cap, PPtr};
-        use crate::cte::Cte;
+        use crate::cte::{MdbId, TcbSlot};
         use crate::kernel::{KernelState, KERNEL};
         use crate::sched_context::SchedContext;
         use crate::syscalls::InvocationLabel;
         use crate::tcb::{Tcb, ThreadStateType};
 
-        let (invoker, target, peer) = unsafe {
+        let preparation = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let (invoker, target, peer, cnode_idx) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
 
-            let cnode_idx = 13;
+            let cnode_idx = s.alloc_cnode().expect("invoker CSpace backing");
             let target_slot = 3;
 
             let mut invoker_tcb = Tcb::default();
             invoker_tcb.priority = 50;
             invoker_tcb.state = ThreadStateType::Running;
             invoker_tcb.sc = Some(0);
-            let invoker = s.scheduler.admit(invoker_tcb);
+            let invoker = s.scheduler.try_admit_cap(invoker_tcb).expect("invoker TCB");
             s.sched_contexts[0] = SchedContext::new(100, 1);
             s.sched_contexts[0].bound_tcb = Some(invoker);
 
@@ -2240,7 +2254,7 @@ pub mod spec {
             target_tcb.priority = 40;
             target_tcb.state = ThreadStateType::Inactive;
             target_tcb.sc = Some(1);
-            let target = s.scheduler.admit(target_tcb);
+            let target = s.scheduler.try_admit_cap(target_tcb).expect("target TCB");
             s.sched_contexts[1] = SchedContext::new(10, 10);
             s.sched_contexts[1].bound_tcb = Some(target);
 
@@ -2248,7 +2262,7 @@ pub mod spec {
             peer_tcb.priority = 100;
             peer_tcb.state = ThreadStateType::Running;
             peer_tcb.sc = Some(2);
-            let peer = s.scheduler.admit(peer_tcb);
+            let peer = s.scheduler.try_admit_cap(peer_tcb).expect("peer TCB");
             s.sched_contexts[2] = SchedContext::new(10, 10);
             s.sched_contexts[2].bound_tcb = Some(peer);
 
@@ -2258,22 +2272,25 @@ pub mod spec {
                 guard_size: 59,
                 guard: 0,
             };
-            s.cnodes[cnode_idx].0[target_slot] = Cte::with_cap(&Cap::Thread {
+            s.cnodes[cnode_idx].0[target_slot].set_cap(&Cap::Thread {
                 tcb: PPtr::<crate::cap::Tcb>::new(target.0 as u64).expect("nonzero tcb id"),
             });
-            s.scheduler.slab.get_mut(invoker).cspace_root = cnode_cap;
+            let source = owners.cap_source_in(s, cnode_cap);
+            crate::invocation::derive_tcb_cap(s, invoker, TcbSlot::CSpace, Some(source), 0).unwrap();
             s.scheduler.set_current(Some(invoker));
 
             let ctx = super::current_cpu_user_ctx_mut();
             *ctx = s.scheduler.slab.get(invoker).user_context;
             ctx.rdi = target_slot as u64;
             ctx.rsi = (InvocationLabel::TCBResume as u64) << 12;
-            (invoker, target, peer)
+            (invoker, target, peer, cnode_idx)
         };
 
+        drop(preparation);
         super::rust_syscall_dispatch(-1i64 as u64, 0);
 
         unsafe {
+            let _guard = crate::spec::KernelGuard::acquire();
             let s = KERNEL.get();
             assert_ne!(s.scheduler.current(), Some(invoker));
             assert_eq!(
@@ -2282,7 +2299,6 @@ pub mod spec {
             );
             assert_eq!(s.scheduler.slab.get(target).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.slab.get(peer).state, ThreadStateType::Running);
-            s.cnodes[13].0[3] = Cte::null();
             s.sched_contexts[0] = SchedContext::new(0, 0);
             s.sched_contexts[1] = SchedContext::new(0, 0);
             s.sched_contexts[2] = SchedContext::new(0, 0);
@@ -2290,9 +2306,11 @@ pub mod spec {
             s.scheduler.block(target, ThreadStateType::Inactive);
             s.scheduler.block(invoker, ThreadStateType::Inactive);
             s.scheduler.slab.free(peer);
-            s.scheduler.slab.free(target);
-            s.scheduler.slab.free(invoker);
+            crate::invocation::delete_cap_slot(s, MdbId::pack(cnode_idx as u32, 3)).unwrap();
+            assert!(s.scheduler.slab.try_get(target).is_none());
+            crate::invocation::retire_tcb(s, invoker);
             s.scheduler.reset_queues();
+            drop(owners);
         }
         arch::log("  ✓ preferred invoker budget miss falls back once\n");
     }
@@ -2300,12 +2318,14 @@ pub mod spec {
     #[inline(never)]
     fn tcb_resume_syscall_returns_to_invoker() {
         use crate::cap::{Cap, PPtr};
-        use crate::cte::Cte;
+        use crate::cte::{MdbId, TcbSlot};
         use crate::kernel::{KernelState, KERNEL};
         use crate::syscalls::InvocationLabel;
         use crate::tcb::{Tcb, ThreadStateType};
 
-        let (invoker, target) = unsafe {
+        let preparation = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let (invoker, target, cnode_idx) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
 
@@ -2313,45 +2333,50 @@ pub mod spec {
             invoker_tcb.priority = 50;
             invoker_tcb.state = ThreadStateType::Running;
             invoker_tcb.sc = Some(0);
-            let invoker = s.scheduler.admit(invoker_tcb);
+            let invoker = s.scheduler.try_admit_cap(invoker_tcb).expect("invoker TCB");
 
             let mut target_tcb = Tcb::default();
             target_tcb.priority = 40;
             target_tcb.state = ThreadStateType::Inactive;
             target_tcb.sc = Some(1);
-            let target = s.scheduler.admit(target_tcb);
+            let target = s.scheduler.try_admit_cap(target_tcb).expect("target TCB");
 
+            let cnode_idx = s.alloc_cnode().expect("invoker CSpace backing");
             let cnode_cap = Cap::CNode {
-                ptr: KernelState::cnode_ptr(0),
+                ptr: KernelState::cnode_ptr(cnode_idx),
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
-            s.cnodes[0].0[1] = Cte::with_cap(&Cap::Thread {
+            s.cnodes[cnode_idx].0[1].set_cap(&Cap::Thread {
                 tcb: PPtr::<crate::cap::Tcb>::new(target.0 as u64).expect("nonzero tcb id"),
             });
-            s.scheduler.slab.get_mut(invoker).cspace_root = cnode_cap;
+            let source = owners.cap_source_in(s, cnode_cap);
+            crate::invocation::derive_tcb_cap(s, invoker, TcbSlot::CSpace, Some(source), 0).unwrap();
             s.scheduler.set_current(Some(invoker));
 
             let ctx = super::current_cpu_user_ctx_mut();
             *ctx = s.scheduler.slab.get(invoker).user_context;
             ctx.rdi = 1;
             ctx.rsi = (InvocationLabel::TCBResume as u64) << 12;
-            (invoker, target)
+            (invoker, target, cnode_idx)
         };
 
+        drop(preparation);
         super::rust_syscall_dispatch(-1i64 as u64, 0);
 
         unsafe {
+            let _guard = crate::spec::KernelGuard::acquire();
             let s = KERNEL.get();
             assert_eq!(s.scheduler.current(), Some(invoker));
             assert_eq!(s.scheduler.slab.get(target).state, ThreadStateType::Running);
-            s.cnodes[0].0[1] = Cte::null();
             s.scheduler.block(target, ThreadStateType::Inactive);
             s.scheduler.block(invoker, ThreadStateType::Inactive);
-            s.scheduler.slab.free(target);
-            s.scheduler.slab.free(invoker);
+            crate::invocation::delete_cap_slot(s, MdbId::pack(cnode_idx as u32, 1)).unwrap();
+            assert!(s.scheduler.slab.try_get(target).is_none());
+            crate::invocation::retire_tcb(s, invoker);
             s.scheduler.reset_queues();
+            drop(owners);
         }
         arch::log("  ✓ TCBResume syscall return keeps the invoker\n");
     }
@@ -2359,18 +2384,20 @@ pub mod spec {
     #[inline(never)]
     fn marked_reply_cap_syscall_hands_off_to_caller() {
         use crate::cap::Cap;
-        use crate::cte::Cte;
+        use crate::cte::{MdbId, TcbSlot};
         use crate::kernel::{KernelState, KERNEL};
         use crate::reply::Reply;
         use crate::tcb::{Tcb, ThreadStateType};
 
-        let (server, caller, reply_idx) = unsafe {
+        let preparation = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let (server, caller, reply_idx, cnode_idx) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
 
-            let cnode_idx = 12;
-            let reply_idx = 10;
-            s.cnodes[cnode_idx].0[2] = Cte::with_cap(&Cap::Reply {
+            let cnode_idx = s.alloc_cnode().expect("server CSpace backing");
+            let reply_idx = s.alloc_reply().expect("reply object");
+            s.cnodes[cnode_idx].0[2].set_cap(&Cap::Reply {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
@@ -2379,20 +2406,22 @@ pub mod spec {
             caller_tcb.priority = 40;
             caller_tcb.state = ThreadStateType::BlockedOnReply;
             caller_tcb.sc = Some(1);
-            let caller = s.scheduler.admit(caller_tcb);
+            let caller = s.scheduler.try_admit_cap(caller_tcb).expect("caller TCB");
 
             let mut server_tcb = Tcb::default();
             server_tcb.priority = 255;
             server_tcb.state = ThreadStateType::Running;
             server_tcb.sc = Some(0);
             server_tcb.active_sc = Some(1);
-            server_tcb.cspace_root = Cap::CNode {
+            let cnode_cap = Cap::CNode {
                 ptr: KernelState::cnode_ptr(cnode_idx),
                 radix: 5,
                 guard_size: 59,
                 guard: 0,
             };
-            let server = s.scheduler.admit(server_tcb);
+            let server = s.scheduler.try_admit_cap(server_tcb).expect("server TCB");
+            let source = owners.cap_source_in(s, cnode_cap);
+            crate::invocation::derive_tcb_cap(s, server, TcbSlot::CSpace, Some(source), 0).unwrap();
 
             s.replies[reply_idx] = Reply {
                 bound_tcb: Some(caller),
@@ -2405,25 +2434,27 @@ pub mod spec {
             ctx.rsi = 1;
             ctx.r10 = 0x5250;
             ctx.r13 = crate::invocation::REPLY_HANDOFF_MAGIC;
-            (server, caller, reply_idx)
+            (server, caller, reply_idx, cnode_idx)
         };
 
+        drop(preparation);
         super::rust_syscall_dispatch(-1i64 as u64, 0);
 
         unsafe {
+            let _guard = crate::spec::KernelGuard::acquire();
             let s = KERNEL.get();
             assert_eq!(s.scheduler.current(), Some(caller));
             assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0x5250);
             assert_eq!(s.scheduler.slab.get(server).active_sc, None);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
-            s.cnodes[12].0[2] = Cte::null();
-            s.replies[reply_idx] = Reply::new();
             s.scheduler.block(caller, ThreadStateType::Inactive);
             s.scheduler.block(server, ThreadStateType::Inactive);
             s.scheduler.slab.free(caller);
-            s.scheduler.slab.free(server);
+            crate::invocation::delete_cap_slot(s, MdbId::pack(cnode_idx as u32, 2)).unwrap();
+            crate::invocation::retire_tcb(s, server);
             s.scheduler.reset_queues();
+            drop(owners);
         }
         arch::log("  ✓ marked Reply-cap SysCall dispatch hands off to the caller\n");
     }

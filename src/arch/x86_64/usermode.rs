@@ -8,6 +8,8 @@ use super::paging::{kernel_virt_to_phys, read_cr3, PTE_PRESENT, PTE_RW, PTE_USER
 mod ping_spec;
 #[cfg(feature = "spec")]
 pub use ping_spec::launch_smp_ping_thread;
+#[cfg(all(feature = "spec", target_arch = "x86_64"))]
+pub(crate) use ping_spec::{PING_REGISTER_SENTINEL, PING_SYSCALL_PC};
 
 /// Seed the real current-root hierarchy for legacy invocation fixtures. Public Frame::Map
 /// never allocates intermediate tables; only kernel bootstrap and fixture setup may do that.

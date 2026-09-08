@@ -1,6 +1,7 @@
 //! Actual CTE and TCB ownership, without manually seeded reference counts.
-use super::{Tcb, TcbSlab, MAX_TCBS};
+use super::{Tcb, TcbId, MAX_TCBS};
 use crate::cap::{AsidPoolStorage, Cap, PPtr, Pml4Storage};
+use crate::cte::{MdbId, TcbSlot};
 use crate::kernel::KERNEL;
 
 #[repr(C, align(4096))]
@@ -89,9 +90,32 @@ impl Fixture {
 
     fn clear(&mut self, slot: usize) {
         unsafe {
-            KERNEL.get().cnodes[self.cnode].0[slot].set_cap(&Cap::Null);
+            crate::invocation::delete_cap_slot(KERNEL.get(), self.source(slot)).unwrap();
         }
     }
+
+    fn source(&self, slot: usize) -> MdbId {
+        MdbId::pack(self.cnode as u32, slot as u32)
+    }
+
+    fn bind(&self, thread: TcbId, slot: Option<usize>) -> crate::error::KResult<()> {
+        unsafe {
+            crate::invocation::derive_tcb_cap(KERNEL.get(), thread, TcbSlot::VSpace,
+                slot.map(|slot| self.source(slot)), 0)
+        }
+    }
+}
+
+fn admit() -> TcbId {
+    unsafe { KERNEL.get().scheduler.admit(Tcb::default()) }
+}
+
+fn retire(thread: TcbId) {
+    unsafe { crate::invocation::retire_tcb(KERNEL.get(), thread); }
+}
+
+fn thread_root(thread: TcbId) -> Cap {
+    unsafe { KERNEL.get().scheduler.slab.get(thread).vspace_root() }
 }
 
 impl Drop for Fixture {
@@ -106,10 +130,10 @@ impl Drop for Fixture {
 }
 
 pub(super) fn run() {
-    held_root_survives_last_cte_and_drains_on_slab_free();
+    held_root_survives_source_delete_and_drains_on_retirement();
     replacement_and_rejected_root_are_failure_atomic();
-    failed_slab_admission_releases_owned_input();
-    whole_tcb_replacement_releases_root();
+    failed_slab_admission_cannot_acquire_root();
+    owned_tcb_retirement_unlinks_root();
     pool_retirement_invalidates_held_root_without_reviving_it();
     #[cfg(target_arch = "x86_64")]
     cached_cr3_is_never_vspace_authority();
@@ -117,92 +141,92 @@ pub(super) fn run() {
 }
 
 #[inline(never)]
-fn held_root_survives_last_cte_and_drains_on_slab_free() {
+fn held_root_survives_source_delete_and_drains_on_retirement() {
     let mut fixture = Fixture::new();
     let root = fixture.cap(1);
-    let mut thread = Tcb::default();
-    assert!(thread.set_vspace_root(root));
-    assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 2);
-    let mut slab = TcbSlab::new();
-    let id = slab.alloc(thread).unwrap();
+    let thread = admit();
+    fixture.bind(thread, Some(1)).unwrap();
     assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 2);
     fixture.clear(1);
     assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 1);
-    assert!(crate::asid::root_is_current(&slab.get(id).vspace_root()));
-    slab.free(id);
+    assert!(crate::asid::root_is_current(&thread_root(thread)));
+    retire(thread);
     assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 0);
     assert!(!crate::asid::root_is_current(&root));
 }
 
 fn replacement_and_rejected_root_are_failure_atomic() {
     let fixture = Fixture::new();
-    let mut thread = Tcb::default();
-    assert!(thread.set_vspace_root(fixture.cap(1)));
-    assert!(thread.set_vspace_root(fixture.cap(1)));
+    let thread = admit();
+    fixture.bind(thread, Some(1)).unwrap();
+    fixture.bind(thread, Some(1)).unwrap();
     assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 2);
-    let old_address = thread.cpu_context.cr3;
-    assert!(!thread.set_vspace_root(fixture.cap(0)));
-    let invalid = Cap::PML4 {
-        ptr: PPtr::<Pml4Storage>::new(physical(&FIRST_ROOT)).unwrap(),
-        mapped: false,
-        asid: fixture.first_asid,
-    };
-    assert!(!thread.set_vspace_root(invalid));
-    assert_eq!(thread.cpu_context.cr3, old_address);
+    let old_root = thread_root(thread);
+    assert!(fixture.bind(thread, Some(0)).is_err());
+    assert_eq!(thread_root(thread), old_root);
     assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 2);
     assert_eq!(crate::asid::pml4_refcount(fixture.second_asid), 1);
-    assert!(thread.set_vspace_root(fixture.cap(2)));
+    fixture.bind(thread, Some(2)).unwrap();
     assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 1);
     assert_eq!(crate::asid::pml4_refcount(fixture.second_asid), 2);
-    assert!(thread.set_vspace_root(Cap::Null));
+    fixture.bind(thread, None).unwrap();
     assert_eq!(crate::asid::pml4_refcount(fixture.second_asid), 1);
     #[cfg(target_arch = "x86_64")]
     assert_eq!(
-        thread.vm_root_cr3(),
+        unsafe { KERNEL.get().scheduler.slab.get(thread).vm_root_cr3() },
         crate::arch::x86_64::paging::kernel_root_cr3()
     );
+    retire(thread);
 }
 
 #[inline(never)]
-fn failed_slab_admission_releases_owned_input() {
+fn failed_slab_admission_cannot_acquire_root() {
     let fixture = Fixture::new();
-    let mut slab = TcbSlab::new();
-    for _ in 0..MAX_TCBS {
-        assert!(slab.alloc(Tcb::default()).is_some());
+    let mut admitted = [None; MAX_TCBS];
+    unsafe {
+        let state = KERNEL.get();
+        for slot in admitted.iter_mut() {
+            *slot = state.scheduler.try_admit_cap(Tcb::default());
+            if slot.is_none() {
+                break;
+            }
+        }
+        assert!(state.scheduler.try_admit_cap(Tcb::default()).is_none());
+        assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 1);
+        for thread in admitted.into_iter().flatten() {
+            crate::invocation::retire_tcb(state, thread);
+        }
     }
-    let mut thread = Tcb::default();
-    assert!(thread.set_vspace_root(fixture.cap(1)));
-    assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 2);
-    assert!(slab.alloc(thread).is_none());
     assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 1);
 }
 
 #[inline(never)]
-fn whole_tcb_replacement_releases_root() {
+fn owned_tcb_retirement_unlinks_root() {
     let fixture = Fixture::new();
-    let mut thread = Tcb::default();
-    assert!(thread.set_vspace_root(fixture.cap(1)));
-    let mut slab = TcbSlab::new();
-    let id = slab.alloc(thread).unwrap();
-    *slab.get_mut(id) = Tcb::default();
+    let thread = admit();
+    fixture.bind(thread, Some(1)).unwrap();
+    assert_eq!(unsafe { KERNEL.get().cnodes[fixture.cnode].0[1].child_count() }, 1);
+    retire(thread);
+    assert!(unsafe { KERNEL.get().scheduler.slab.entries[thread.0 as usize].is_none() });
+    assert_eq!(unsafe { KERNEL.get().cnodes[fixture.cnode].0[1].child_count() }, 0);
     assert_eq!(crate::asid::pml4_refcount(fixture.first_asid), 1);
 }
 
 fn pool_retirement_invalidates_held_root_without_reviving_it() {
     let mut fixture = Fixture::new();
     let root = fixture.cap(1);
-    let mut thread = Tcb::default();
-    assert!(thread.set_vspace_root(root));
+    let thread = admit();
+    fixture.bind(thread, Some(1)).unwrap();
     fixture.clear(0);
     assert!(!crate::asid::root_is_current(&root));
     assert_eq!(crate::asid::pml4_paddr(fixture.first_asid), 0);
-    assert!(!thread.set_vspace_root(root));
+    assert!(fixture.bind(thread, Some(1)).is_err());
     #[cfg(target_arch = "x86_64")]
     assert_eq!(
-        thread.vm_root_cr3(),
+        unsafe { KERNEL.get().scheduler.slab.get(thread).vm_root_cr3() },
         crate::arch::x86_64::paging::kernel_root_cr3()
     );
-    drop(thread);
+    retire(thread);
     assert_eq!(crate::asid::pml4_paddr(fixture.first_asid), 0);
 }
 
@@ -216,9 +240,13 @@ fn cached_cr3_is_never_vspace_authority() {
         unconfigured.vm_root_cr3(),
         crate::arch::x86_64::paging::kernel_root_cr3()
     );
-    let mut configured = Tcb::default();
-    assert!(configured.set_vspace_root(fixture.cap(1)));
-    configured.cpu_context.cr3 = physical(&SECOND_ROOT);
-    assert!(configured.has_current_vspace());
-    assert_eq!(configured.vm_root_cr3(), physical(&FIRST_ROOT));
+    let configured = admit();
+    fixture.bind(configured, Some(1)).unwrap();
+    unsafe {
+        let thread = KERNEL.get().scheduler.slab.get_mut(configured);
+        thread.cpu_context.cr3 = physical(&SECOND_ROOT);
+        assert!(thread.has_current_vspace());
+        assert_eq!(thread.vm_root_cr3(), physical(&FIRST_ROOT));
+    }
+    retire(configured);
 }

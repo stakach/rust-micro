@@ -62,7 +62,8 @@ fn invalidate_local_tlb() {
 fn handle_ipi(context: *mut crate::arch::UserContext, acknowledge: u32) {
     use crate::smp::IpiKind;
 
-    crate::smp::bkl_acquire();
+    let entry = unsafe { crate::smp::arm_user_entry(context, crate::smp::UserEntryKind::Interrupt) };
+    let adopted = crate::smp::bkl_acquire_for_user_entry(entry);
     let context = unsafe { &mut *context };
     let from_user = context.spsr_el1 & 0xf == 0;
     let me = crate::arch::get_cpu_id();
@@ -87,7 +88,7 @@ fn handle_ipi(context: *mut crate::arch::UserContext, acknowledge: u32) {
     });
     crate::smp::IPI_HANDLED_COUNT.fetch_add(1, Ordering::SeqCst);
 
-    if from_user {
+    if from_user && !adopted {
         if let Some(thread) = interrupted {
             unsafe {
                 let tcb = crate::kernel::KERNEL.get().scheduler.slab.get_mut(thread);
@@ -100,26 +101,10 @@ fn handle_ipi(context: *mut crate::arch::UserContext, acknowledge: u32) {
         }
     }
 
-    if crate::smp::STALL_REQUESTED[me as usize].load(Ordering::Acquire) {
-        unsafe {
-            let scheduler = &mut crate::kernel::KERNEL.get().scheduler;
-            scheduler.set_current(None);
-            scheduler.set_active_user(None);
-        }
-        crate::arch::aarch64::vspace::park_on_kernel_root();
+    if adopted {
         super::gic::end_interrupt(acknowledge);
-        crate::smp::STALL_ACK[me as usize].store(true, Ordering::Release);
-        crate::smp::bkl_release();
-        while crate::smp::STALL_REQUESTED[me as usize].load(Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
-        crate::smp::bkl_acquire();
         crate::arch::aarch64::syscall_entry::dispatch_selected(
-            context,
-            interrupted,
-            crate::syscalls::Syscall::SysYield,
-            false,
-            false,
+            context, None, crate::syscalls::Syscall::SysYield, false, false,
         );
         crate::smp::bkl_release();
         return;
@@ -147,7 +132,8 @@ fn handle_ipi(context: *mut crate::arch::UserContext, acknowledge: u32) {
 }
 
 fn handle_userspace_irq(context: *mut crate::arch::UserContext, irq: u32, acknowledge: u32) {
-    crate::smp::bkl_acquire();
+    let entry = unsafe { crate::smp::arm_user_entry(context, crate::smp::UserEntryKind::Interrupt) };
+    let adopted = crate::smp::bkl_acquire_for_user_entry(entry);
     let context = unsafe { &mut *context };
     let from_user = context.spsr_el1 & 0xf == 0;
     let interrupted = unsafe {
@@ -186,6 +172,14 @@ fn handle_userspace_irq(context: *mut crate::arch::UserContext, irq: u32, acknow
     // Drop the GIC active state before a possible scheduler wait.
     super::gic::end_interrupt(acknowledge);
 
+    if adopted {
+        crate::arch::aarch64::syscall_entry::dispatch_selected(
+            context, None, crate::syscalls::Syscall::SysYield, false, false,
+        );
+        crate::smp::bkl_release();
+        return;
+    }
+
     if from_user {
         if let Some(thread) = interrupted {
             unsafe {
@@ -222,7 +216,17 @@ fn handle_idle_tick(elapsed: u64) {
 }
 
 fn handle_kernel_tick(context: *mut crate::arch::UserContext, elapsed: u64) {
-    crate::smp::bkl_acquire();
+    let entry = unsafe { crate::smp::arm_user_entry(context, crate::smp::UserEntryKind::Interrupt) };
+    let adopted = crate::smp::bkl_acquire_for_user_entry(entry);
+    if adopted {
+        super::timer::TICK_COUNT.fetch_add(elapsed, Ordering::Relaxed);
+        crate::sched_context::mcs_tick(elapsed);
+        crate::arch::aarch64::syscall_entry::dispatch_selected(
+            unsafe { &mut *context }, None, crate::syscalls::Syscall::SysYield, false, false,
+        );
+        crate::smp::bkl_release();
+        return;
+    }
     let interrupted = unsafe {
         crate::kernel::KERNEL
             .get()
