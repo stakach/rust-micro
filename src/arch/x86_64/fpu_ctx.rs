@@ -59,6 +59,14 @@ pub static FPU_OWNER: [AtomicU32; MAX_CPUS] = [
 struct Template([u8; 512]);
 
 static mut FX_TEMPLATE: Template = Template(FxArea::FINIT.0);
+static MXCSR_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Effective hardware mask established before any user thread can run.
+pub(crate) fn mxcsr_mask() -> u32 {
+    let mask = MXCSR_MASK.load(Ordering::Acquire);
+    assert!(mask != 0, "FPU context invocation precedes hardware initialization");
+    mask
+}
 
 /// Capture the canonical FINIT FPU state into `FX_TEMPLATE`. Also
 /// ensures CR4.OSFXSR (+OSXMMEXCPT) so `fxsave`/`fxrstor` and user SSE
@@ -76,6 +84,11 @@ pub fn init_fpu_template() {
         let p = core::ptr::addr_of_mut!(FX_TEMPLATE.0) as *mut u8;
         core::arch::asm!("fninit", options(nostack, preserves_flags));
         fxsave64(p);
+        let reported = core::ptr::read_unaligned(p.add(28).cast::<u32>());
+        MXCSR_MASK.store(
+            crate::invocation::legacy_context_protocol::effective_mxcsr_mask(reported),
+            Ordering::Release,
+        );
     }
 }
 
@@ -93,6 +106,12 @@ pub fn init_fpu_ap() {
         core::arch::asm!("mov cr4, {}", in(reg) cr4,
             options(nomem, nostack, preserves_flags));
         core::arch::asm!("fninit", options(nostack, preserves_flags));
+        let mut state = FxArea::FINIT;
+        fxsave64(state.0.as_mut_ptr());
+        let reported = u32::from_le_bytes(state.0[28..32].try_into().unwrap());
+        let supported = crate::invocation::legacy_context_protocol::effective_mxcsr_mask(reported);
+        assert_eq!(mxcsr_mask() & !supported, 0,
+            "AP cannot restore the BSP-admitted MXCSR feature set");
     }
 }
 

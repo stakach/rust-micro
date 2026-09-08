@@ -25,6 +25,11 @@ use crate::syscalls::InvocationLabel;
 use crate::tcb::TcbId;
 use crate::types::{seL4_Error, seL4_Word as Word};
 
+#[path = "../crates/sel4-rt/src/legacy_context.rs"]
+pub(crate) mod legacy_context_protocol;
+#[path = "invocation/legacy_context.rs"]
+mod legacy_context;
+
 /// Single-letter tag for the cap kind — used by `inv_log` so the
 /// trace fits on one line and is easy to grep for. Keep in sync
 /// with the `decode_invocation` match arms.
@@ -2249,16 +2254,37 @@ fn clear_receiver_call_state_for_reply_caller(s: &mut KernelState, caller: TcbId
 }
 
 fn cancel_reply_wait_for_caller(s: &mut KernelState, caller: TcbId) {
+    // The caller can be stopped while its donated SC still runs a different, remote receiver.
+    // Stop that actual owner before withdrawing its execution authority, retaining the BKL.
+    let return_donation = match s.scheduler.slab.try_get(caller) {
+        Some(t) if t.state == crate::tcb::ThreadStateType::BlockedOnReply => {
+            if t.sc.is_some() {
+                // An independently acquired SC leaves the old donation with its receiver.
+                true
+            } else if let Some(sc) = t.donated_sc {
+                let owner = s.sched_contexts.get(sc as usize).and_then(|sc| sc.bound_tcb);
+                match owner {
+                    Some(owner)
+                        if s.scheduler.slab.try_get(owner).map(|t| t.sc) == Some(Some(sc)) =>
+                    {
+                        unsafe { crate::smp::remote_tcb_stall(s, owner); }
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
     clear_receiver_call_state_for_reply_caller(s, caller);
     for reply in s.replies.iter_mut() {
         if reply.bound_tcb == Some(caller) {
             reply.bound_tcb = None;
         }
     }
-    if matches!(
-        s.scheduler.slab.try_get(caller).map(|t| t.state),
-        Some(crate::tcb::ThreadStateType::BlockedOnReply)
-    ) {
+    if return_donation {
         crate::sched_context::return_donated_sc(s, caller);
     }
 }
@@ -5240,6 +5266,9 @@ fn decode_tcb(
     unsafe {
         let s = KERNEL.get();
         match label {
+            InvocationLabel::TCBReadLegacyContext | InvocationLabel::TCBWriteLegacyContext => {
+                legacy_context::invoke(s, tcb_ptr.addr(), label, args, invoker)
+            }
             InvocationLabel::TCBSuspend => {
                 // Upstream `suspend()` = cancelIPC + Inactive. A
                 // server blocked in an endpoint recv queue must be
@@ -5476,110 +5505,7 @@ fn decode_tcb(
                         }
                         crate::smp::remote_tcb_stall(s, id);
                         let t = s.scheduler.slab.get_mut(id);
-                        let n = count;
-                        // Upstream `seL4_UserContext` slot order:
-                        //   0=rip, 1=rsp, 2=rflags, 3=rax, 4=rbx,
-                        //   5=rcx, 6=rdx, 7=rsi, 8=rdi, 9=rbp,
-                        //   10=r8, 11=r9, 12=r10, 13=r11, 14=r12,
-                        //   15=r13, 16=r14, 17=r15, 18=fs_base,
-                        //   19=gs_base.
-                        //
-                        // Two independent contexts:
-                        //   * `user_context.rcx` / `.r11` —
-                        //     the sysretq path's RIP / RFLAGS slots
-                        //     (sysretq destroys those registers).
-                        //   * `user_context.rip` / `.rflags` —
-                        //     the iretq resume path's RIP / RFLAGS.
-                        // sysretq is the default; iretq fires only
-                        // when the user wrote an RCX or R11 value
-                        // that the sysretq path would lose. For all
-                        // OTHER cases, leave rcx/r11 = rip/rflags so
-                        // sysretq's tail sees a valid resume RIP.
-                        let old_iretq = t.use_iretq_resume;
-                        let new_rip = if n > 0 { regs[0] } else { crate::fault::reported_ip(t) };
-                        let old_user_rcx = if old_iretq { t.user_context.rcx } else { 0 };
-                        let old_user_r11 = if old_iretq { t.user_context.r11 } else { 0 };
-                        // Sanitize RFLAGS the way upstream's
-                        // Arch_sanitiseRegister does: keep only the
-                        // user-legal arithmetic/direction bits
-                        // (CF PF AF ZF SF TF DF OF = 0xDD5), force
-                        // bit 1 (always-one) and IF (bit 9).
-                        // sel4utils passes rflags=0 when starting
-                        // threads — storing that verbatim produced
-                        // user threads running with IF=0, which
-                        // starves the kernel of timer + device IRQs
-                        // whenever such a thread spins (SCHED0000's
-                        // hang; ticks died after the first
-                        // WriteRegisters-started thread ran).
-                        let new_rflags = if n > 2 {
-                            (regs[2] & 0xDD5) | 0x202
-                        } else {
-                            crate::fault::resume_flags(t)
-                        };
-                        if n > 0 {
-                            t.user_context.rip = new_rip;
-                        }
-                        if n > 1 {
-                            t.user_context.rsp = regs[1];
-                        }
-                        if n > 2 {
-                            t.user_context.rflags = new_rflags;
-                        }
-                        if n > 3 {
-                            t.user_context.rax = regs[3];
-                        }
-                        if n > 4 {
-                            t.user_context.rbx = regs[4];
-                        }
-                        if n > 6 {
-                            t.user_context.rdx = regs[6];
-                        }
-                        if n > 7 {
-                            t.user_context.rsi = regs[7];
-                        }
-                        if n > 8 {
-                            t.user_context.rdi = regs[8];
-                        }
-                        if n > 9 {
-                            t.user_context.rbp = regs[9];
-                        }
-                        if n > 10 {
-                            t.user_context.r8 = regs[10];
-                        }
-                        if n > 11 {
-                            t.user_context.r9 = regs[11];
-                        }
-                        if n > 12 {
-                            t.user_context.r10 = regs[12];
-                        }
-                        if n > 14 {
-                            t.user_context.r12 = regs[14];
-                        }
-                        if n > 15 {
-                            t.user_context.r13 = regs[15];
-                        }
-                        if n > 16 {
-                            t.user_context.r14 = regs[16];
-                        }
-                        if n > 17 {
-                            t.user_context.r15 = regs[17];
-                        }
-                        // Decide on resume path BEFORE writing rcx
-                        // and r11, since the choice affects what we
-                        // store there.
-                        let user_rcx = if n > 5 { regs[5] } else { old_user_rcx };
-                        let user_r11 = if n > 13 { regs[13] } else { old_user_r11 };
-                        if n != 0 {
-                            // A partial write must preserve unsupplied GPRs and flags. Once RCX
-                            // is supplied independently, use iretq even when it equals RIP.
-                            let need_iretq = old_iretq || n > 5;
-                            t.user_context.rip = new_rip;
-                            t.user_context.rflags = new_rflags;
-                            t.user_context.rcx = if need_iretq { user_rcx } else { new_rip };
-                            t.user_context.r11 = if need_iretq { user_r11 } else { new_rflags };
-                            t.use_iretq_resume = need_iretq;
-                        }
-                        // fs_base / gs_base (slots 18, 19) ignored.
+                        legacy_context::install_registers(t, &regs[..count]);
                         if resume {
                             // Upstream `restart()` cancels any
                             // in-flight IPC/fault/reply wait — the
@@ -6175,6 +6101,7 @@ pub mod spec {
     include!("invocation/mapping_catalog_specs.rs");
     include!("invocation/tcb_capability_specs.rs");
     include!("invocation/tcb_register_specs.rs");
+    include!("invocation/legacy_context_specs.rs");
 
     #[cfg(target_arch = "x86_64")]
     pub(super) fn observe_untyped_release(parent_id: crate::cte::MdbId) {
@@ -6220,6 +6147,7 @@ pub mod spec {
         tcb_write_read_registers();
         #[cfg(target_arch = "x86_64")]
         tcb_register_specs::run();
+        legacy_context_specs::run();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
         tcb_write_registers_resume_cancels_reply_wait();

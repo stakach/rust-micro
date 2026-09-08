@@ -30,4 +30,12 @@
         <param dir="out" name="bound" type="seL4_Time" description="Cumulative execution by the bound TCB."/>
         <param dir="out" name="donated" type="seL4_Time" description="Cumulative execution while donated to another TCB."/>
     </method>
+    <method id="TCBReadLegacyContext" name="ReadLegacyContext" manual_name="Read Legacy Context" manual_label="tcb_readlegacycontext">
+        <brief>Atomically snapshot x86-64 public registers and legacy FXSAVE64 state.</brief>
+        <description>Exact zero-word request, no extra caps. Returns 84 words: 20 public UserContext words followed by 64 FXSAVE64 words. Requires a writable retained IPC Frame. Self-target and other architectures are rejected. Does not suspend or resume the target.</description>
+    </method>
+    <method id="TCBWriteLegacyContext" name="WriteLegacyContext" manual_name="Write Legacy Context" manual_label="tcb_writelegacycontext">
+        <brief>Atomically install x86-64 public registers and legacy FXSAVE64 state.</brief>
+        <description>Exact 85-word request, no extra caps: selection mask, 20 public UserContext words, then 64 FXSAVE64 words. Mask bits 0 through 17 select the corresponding public register, bit 20 selects the complete FXSAVE64 state, and bit 21 requests restart after installation; all other bits are rejected. Requires a readable retained IPC Frame. Selected invalid MXCSR, self-target and other architectures are rejected before target mutation. Unselected fields and separately configured TLS bases remain unchanged. Without restart, scheduling state is unchanged. Restart atomically cancels outstanding IPC and reply waits, clears pending fault state, and makes the target runnable, matching WriteRegisters restart semantics.</description>
+    </method>
 </interface>

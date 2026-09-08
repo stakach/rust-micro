@@ -63,6 +63,9 @@ pub const LBL_X86_ASID_POOL_ASSIGN: u64 = 56;
 pub const LBL_TCB_SET_HOSTED_SYSCALLS: u64 = 66;
 pub const LBL_TCB_READ_DEBUG_STATE: u64 = 67;
 pub const LBL_SCHED_CONTEXT_READ_RUNTIME: u64 = 68;
+pub const LBL_TCB_READ_LEGACY_CONTEXT: u64 = 69;
+pub const LBL_TCB_WRITE_LEGACY_CONTEXT: u64 = 70;
+pub mod legacy_context;
 
 // --- Object types -----------------------------------------------------------
 pub const OBJ_UNTYPED: u64 = 0;
