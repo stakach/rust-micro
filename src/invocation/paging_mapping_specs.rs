@@ -2,7 +2,7 @@
 mod paging_mapping_specs {
     use super::*;
     use crate::arch::x86_64::paging::kernel_virt_to_phys;
-    use crate::cap::{PageDirectoryStorage, PageTableStorage, PdptStorage, Pml4Storage};
+    use crate::cap::{PageDirectoryStorage, PageTableStorage, PdptStorage};
 
     #[repr(C, align(4096))]
     struct Table([u64; 512]);
@@ -54,15 +54,9 @@ mod paging_mapping_specs {
                 pd.add(5),
             ),
         };
-        let vspace = Cap::PML4 {
-            ptr: PPtr::<Pml4Storage>::new(root_pa).unwrap(),
-            mapped: true,
-            asid: ASID,
-        };
+        let vspace = mapping_catalog_specs::root(ASID, root_pa, 3);
         KERNEL.get().cnodes[0].0[2].set_cap(&target);
         KERNEL.get().cnodes[0].0[28].set_cap(&target);
-        KERNEL.get().cnodes[0].0[3].set_cap(&vspace);
-        crate::asid::register_boot_mapping(ASID, root_pa);
         (invoker, target, vspace, entry)
     }
 
@@ -171,10 +165,14 @@ mod paging_mapping_specs {
                         KERNEL.get().cnodes[0].0[3].set_cap(&vspace);
                         stage(invoker, vspace);
                         if failure == 5 {
-                            crate::asid::register_boot_mapping(ASID, 0x4000);
+                            mapping_catalog_specs::withdraw_pool();
+                            let replacement = kernel_virt_to_phys(
+                                (core::ptr::addr_of!(TABLES) as *const Table).add(3) as u64,
+                            );
+                            mapping_catalog_specs::root(ASID, replacement, 6);
                         }
                         if failure == 6 {
-                            crate::asid::clear_pool(ASID);
+                            mapping_catalog_specs::withdraw_pool();
                         }
                         if failure == 7 {
                             let tables = core::ptr::addr_of_mut!(TABLES) as *mut Table;

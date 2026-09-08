@@ -1057,9 +1057,10 @@ pub mod spec {
                 ThreadStateType::Running
             );
             // Cleanup.
+            s.scheduler.block(handler, ThreadStateType::Inactive);
+            s.scheduler.block(faulter, ThreadStateType::Inactive);
             s.scheduler.slab.free(handler);
             s.scheduler.slab.free(faulter);
-            s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ fault → handler → SysReply → faulter resumes\n");
     }
@@ -1073,6 +1074,11 @@ pub mod spec {
         match r {
             Err(KException::Fault(_)) => {}
             other => panic!("expected Fault, got {:?}", other),
+        }
+        unsafe {
+            let s = KERNEL.get();
+            s.scheduler.block(faulter, ThreadStateType::Inactive);
+            s.scheduler.slab.free(faulter);
         }
         arch::log("  ✓ deliver_fault with no handler returns Err(Fault)\n");
     }

@@ -2,7 +2,7 @@
 mod frame_mapping_specs {
     use super::*;
     use crate::arch::x86_64::paging::kernel_virt_to_phys;
-    use crate::cap::{FrameMapType, FrameRights, FrameSize, FrameStorage, Pml4Storage};
+    use crate::cap::{FrameMapType, FrameRights, FrameSize, FrameStorage};
 
     const ASID: u16 = 4088;
     const OTHER_ASID: u16 = 4089;
@@ -57,21 +57,8 @@ mod frame_mapping_specs {
                     pt.add(idx.pt as usize)
                 }
             };
-            let root_cap = Cap::PML4 {
-                ptr: PPtr::<Pml4Storage>::new(root_pa).unwrap(),
-                mapped: true,
-                asid: ASID,
-            };
-            let other_cap = Cap::PML4 {
-                ptr: PPtr::<Pml4Storage>::new(other_pa).unwrap(),
-                mapped: true,
-                asid: OTHER_ASID,
-            };
-            crate::asid::register_boot_mapping(ASID, root_pa);
-            crate::asid::register_boot_mapping(OTHER_ASID, other_pa);
-            // These CTEs consume the explicit fixture registrations without adding references.
-            KERNEL.get().cnodes[0].0[3] = Cte::with_cap(&root_cap);
-            KERNEL.get().cnodes[0].0[4] = Cte::with_cap(&other_cap);
+            let root_cap = mapping_catalog_specs::root(ASID, root_pa, 3);
+            let other_cap = mapping_catalog_specs::root(OTHER_ASID, other_pa, 4);
             let result = Self {
                 invoker,
                 root: root_cap,
@@ -131,6 +118,7 @@ mod frame_mapping_specs {
             KERNEL.get().cnodes[0].0[4].set_cap(&Cap::Null);
             assert_eq!(crate::asid::pml4_paddr(ASID), 0);
             assert_eq!(crate::asid::pml4_paddr(OTHER_ASID), 0);
+            mapping_catalog_specs::withdraw_pool();
             teardown_invoker(self.invoker);
         }
     }

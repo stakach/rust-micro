@@ -358,7 +358,8 @@ pub fn activate_user_vspace(root_paddr: u64, asid: u16) {
     }
 }
 
-unsafe fn flush_vspace() {
+/// Complete a shareable translation invalidation before retiring an ASID assignment.
+pub(crate) unsafe fn flush_vspace() {
     asm!(
         "dsb ishst",
         "tlbi vmalle1is",

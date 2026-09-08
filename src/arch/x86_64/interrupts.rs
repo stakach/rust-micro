@@ -331,6 +331,17 @@ extern "C" fn irq_dispatch(ctx: &mut IretqContext, irq: u64) {
     swap_iretq_context_if_preempted(ctx, from_user, interrupted);
 }
 
+unsafe fn restore_irq_thread_root(tcb: &crate::tcb::Tcb) {
+    let next = tcb.vm_root_cr3();
+    let current: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) current,
+        options(nomem, nostack, preserves_flags));
+    if next != current {
+        core::arch::asm!("mov cr3, {}", in(reg) next,
+            options(nostack, preserves_flags));
+    }
+}
+
 /// Common preemption tail used by both the PIT IRQ and the generic
 /// IRQ dispatchers. If the running thread changed during the IRQ
 /// (block on budget exhaustion, signal-driven wake of a higher-
@@ -405,6 +416,9 @@ pub(crate) fn swap_iretq_context_if_preempted(
         if Some(next) == interrupted {
             s.scheduler.set_current(Some(next));
             s.scheduler.set_active_user(Some(next));
+            // A retirement IPI may have withdrawn this same thread's ASID while it waited for
+            // BKL. Keeping its register frame does not authorize retaining its old hardware root.
+            restore_irq_thread_root(s.scheduler.slab.get(next));
             return;
         }
         if let Some(prev) = interrupted {
@@ -443,6 +457,7 @@ pub(crate) fn swap_iretq_context_if_preempted(
         if Some(next) == interrupted {
             s.scheduler.set_current(Some(next));
             s.scheduler.set_active_user(Some(next));
+            restore_irq_thread_root(s.scheduler.slab.get(next));
             return;
         }
         // `use_iretq_resume` tracks the SAVE flavor (IRQ-preempted = true,
@@ -490,22 +505,7 @@ pub(crate) fn swap_iretq_context_if_preempted(
         // clear — a spinning thread would shut the CPU off from
         // every maskable interrupt (timer ticks included).
         ctx.rflags = crate::arch::x86_64::syscall_entry::sanitize_user_rflags(ctx.rflags);
-        let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
-        if next_cr3 != 0 {
-            // This is a preemption of a *running* user thread (from_user
-            // was true), so this core was active and received any TLB
-            // shootdown IPIs — its TLB is coherent. Only reload CR3 on an
-            // actual vspace change. (The stale-TLB-after-idle flush lives
-            // in the from-idle dispatch paths: dispatch_next_or_idle and
-            // the AP scheduler loop.)
-            let cur_cr3: u64;
-            core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
-                options(nomem, nostack, preserves_flags));
-            if next_cr3 != cur_cr3 {
-                core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                    options(nostack, preserves_flags));
-            }
-        }
+        restore_irq_thread_root(s.scheduler.slab.get(next));
         // Restore the incoming thread's TLS base. Every other
         // dispatch site does this; missing it here meant an
         // IRQ-driven switch left the PREVIOUS thread's FS_BASE

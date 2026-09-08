@@ -510,20 +510,15 @@ fn ap_scheduler_loop() -> ! {
                 }
             };
             if let Some(tcb_id) = next {
-                // Only dispatch threads that have a real vspace
-                // (cr3 != 0). A bare scheduler-test TCB has cr3=0
-                // and would sysretq into RIP=0 → user PF. Specs
-                // that want to merely place a TCB on the AP's
-                // queue without dispatching should leave cr3=0.
+                // Scheduler-only TCBs have no assigned VSpace. A cached CR3 does not grant user
+                // execution, and a retired ASID cannot be revived by selecting its old TCB.
                 let dispatchable = unsafe {
                     crate::kernel::KERNEL
                         .get()
                         .scheduler
                         .slab
                         .get(tcb_id)
-                        .cpu_context
-                        .cr3
-                        != 0
+                        .has_current_vspace()
                 };
                 if dispatchable {
                     let ctx_ptr = unsafe {
@@ -553,10 +548,11 @@ fn ap_scheduler_loop() -> ! {
                             out(reg) cur_cr3,
                             options(nomem, nostack, preserves_flags),
                         );
-                        if was_idle || cur_cr3 != tcb.cpu_context.cr3 {
+                        let next_cr3 = tcb.vm_root_cr3();
+                        if was_idle || cur_cr3 != next_cr3 {
                             core::arch::asm!(
                                 "mov cr3, {}",
-                                in(reg) tcb.cpu_context.cr3,
+                                in(reg) next_cr3,
                                 options(nostack, preserves_flags),
                             );
                         }
@@ -628,8 +624,7 @@ fn ap_scheduler_loop() -> ! {
             if let Some(tcb_id) = next {
                 let dispatchable = unsafe {
                     let tcb = crate::kernel::KERNEL.get().scheduler.slab.get(tcb_id);
-                    tcb.cpu_context.cr3 != 0
-                        || matches!(tcb.vspace_root, crate::cap::Cap::PML4 { mapped: true, .. })
+                    tcb.has_current_vspace()
                 };
                 if dispatchable {
                     let context = unsafe {

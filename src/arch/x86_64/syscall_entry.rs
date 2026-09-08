@@ -172,8 +172,8 @@ fn live_user_thread_identity() -> LiveUserThreadIdentity {
 }
 
 fn tcb_matches_live_user_thread(tcb: &crate::tcb::Tcb, identity: LiveUserThreadIdentity) -> bool {
-    tcb.cpu_context.cr3 != 0
-        && tcb.cpu_context.cr3 == identity.cr3
+    tcb.has_current_vspace()
+        && tcb.vm_root_cr3() == identity.cr3
         && tcb.cpu_context.fs_base == identity.fs_base
         && tcb.cpu_context.gs_base == identity.gs_base
         && tcb.affinity == identity.cpu
@@ -927,6 +927,10 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     );
                 }
             }
+            if from_user != 0 {
+                assert_ne!(super::paging::kernel_root_cr3(), 0);
+                super::paging::park_on_kernel_root();
+            }
             return;
         }
     };
@@ -945,26 +949,6 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     }
 
     use core::sync::atomic::Ordering;
-    // Phase 13c integration: single-thread launcher signals "test
-    // done" on the first SysDebugPutChar.
-    if super::usermode::USERMODE_TEST_TRIGGERED.load(Ordering::Relaxed)
-        && matches!(syscall, Syscall::SysDebugPutChar)
-    {
-        arch::log("\n[user-mode round-trip succeeded — exiting QEMU]\n");
-        crate::arch::qemu_exit(0);
-    }
-    // Phase 14d: the two-thread IPC demo expects to see at least
-    // two SysDebugPutChar invocations ('P' from the receiver before
-    // it Recv's, then a byte after Recv returns).
-    if super::usermode::IPC_DEMO_ACTIVE.load(Ordering::Relaxed)
-        && matches!(syscall, Syscall::SysDebugPutChar)
-    {
-        let prev = super::usermode::IPC_PRINTED.fetch_add(1, Ordering::Relaxed);
-        if prev + 1 >= 2 {
-            arch::log("\n[two-thread IPC succeeded — exiting QEMU]\n");
-            crate::arch::qemu_exit(0);
-        }
-    }
     // Phase 29e/g/h + 32g — exit logic for the rootserver demo.
     //   * The 29h IPC sequence prints three newlines (alive banner,
     //     retype-Endpoint, IPC-result). On the third newline we
@@ -1069,16 +1053,19 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 }
                 s.scheduler.set_current(Some(invoker));
                 s.scheduler.set_active_user(Some(invoker));
+                let root = s.scheduler.slab.get(invoker).vm_root_cr3();
+                core::arch::asm!("mov cr3, {}", in(reg) root,
+                    options(nostack, preserves_flags));
             }
             return;
         }
         if from_user != 0 {
-            // Debug syscalls are observation-only. If bookkeeping cannot recover the
-            // caller TCB, CPU reality still proves a live user thread entered the
-            // kernel. Return through the asm tail to that captured context instead
-            // of turning a serial byte into a scheduler decision point.
+            // A saved register frame is not VSpace authority. Without an exact
+            // owner the return must not retain whichever user CR3 happened to enter.
             unsafe {
                 KERNEL.get().scheduler.nodes[arch::get_cpu_id() as usize].direct_handoff = None;
+                assert_ne!(super::paging::kernel_root_cr3(), 0);
+                super::paging::park_on_kernel_root();
             }
             return;
         }
@@ -1151,10 +1138,10 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // (and SYSCALL_SAVE / SYSCALL_KERNEL_RSP, which we
             // touch below via the naked stub's restore tail) all
             // live in the kernel half.
-            let next_cr3 = s.scheduler.slab.get(next).cpu_context.cr3;
+            let next_cr3 = s.scheduler.slab.get(next).vm_root_cr3();
             let next_fs_base = s.scheduler.slab.get(next).cpu_context.fs_base;
             let next_gs_base = s.scheduler.slab.get(next).cpu_context.gs_base;
-            if next_cr3 != 0 {
+            {
                 let cur_cr3: u64;
                 core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                     options(nomem, nostack, preserves_flags));
@@ -1338,7 +1325,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     s.scheduler.set_active_user(Some(next_id));
                     crate::sched_context::complete_yield_if_pending(next_id);
                     let tcb = s.scheduler.slab.get(next_id);
-                    let next_cr3 = tcb.cpu_context.cr3;
+                    let next_cr3 = tcb.vm_root_cr3();
                     let next_fs_base = tcb.cpu_context.fs_base;
                     let next_gs_base = tcb.cpu_context.gs_base;
                     let next_ctx = tcb.user_context;
@@ -1350,7 +1337,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     let was_idle = crate::smp::take_went_idle();
                     #[cfg(not(feature = "smp"))]
                     let was_idle = false;
-                    if next_cr3 != 0 {
+                    {
                         let cur_cr3: u64;
                         core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                             options(nomem, nostack, preserves_flags));
@@ -1436,6 +1423,11 @@ pub mod spec {
         use crate::kernel::KERNEL;
         use crate::tcb::{Tcb, ThreadStateType};
 
+        let _guard = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let physical = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
+        let actual_root = owners.root(physical);
+        let stale_root = owners.root(physical.checked_add(0x1000).unwrap());
         let (actual, duplicate, stale, identity) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -1451,7 +1443,7 @@ pub mod spec {
             actual_tcb.state = ThreadStateType::Running;
             actual_tcb.sc = Some(0);
             actual_tcb.affinity = identity.cpu;
-            actual_tcb.cpu_context.cr3 = identity.cr3;
+            assert!(actual_tcb.set_vspace_root(actual_root));
             actual_tcb.cpu_context.fs_base = identity.fs_base;
             actual_tcb.cpu_context.gs_base = identity.gs_base;
             let actual = s.scheduler.admit(actual_tcb);
@@ -1460,7 +1452,7 @@ pub mod spec {
             duplicate_tcb.state = ThreadStateType::Running;
             duplicate_tcb.sc = Some(1);
             duplicate_tcb.affinity = identity.cpu;
-            duplicate_tcb.cpu_context.cr3 = identity.cr3;
+            assert!(duplicate_tcb.set_vspace_root(actual_root));
             duplicate_tcb.cpu_context.fs_base = identity.fs_base;
             duplicate_tcb.cpu_context.gs_base = identity.gs_base;
             let duplicate = s.scheduler.admit(duplicate_tcb);
@@ -1469,7 +1461,7 @@ pub mod spec {
             stale_tcb.state = ThreadStateType::Running;
             stale_tcb.sc = Some(2);
             stale_tcb.affinity = identity.cpu;
-            stale_tcb.cpu_context.cr3 = identity.cr3.wrapping_add(0x1000);
+            assert!(stale_tcb.set_vspace_root(stale_root));
             stale_tcb.user_context.rax = 0xfeed_face;
             let stale = s.scheduler.admit(stale_tcb);
 
@@ -1901,11 +1893,15 @@ pub mod spec {
         use crate::kernel::KERNEL;
         use crate::tcb::{Tcb, ThreadStateType};
 
+        let preparation = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let physical = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
+        let actual_root = owners.root(physical);
+        let stale_root = owners.root(physical.checked_add(0x1000).unwrap());
         let (actual, stale) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
 
-            let live_cr3 = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
             let live_fs = super::rdmsr(super::IA32_FS_BASE);
             let live_gs = super::rdmsr(super::IA32_KERNEL_GS_BASE);
 
@@ -1913,7 +1909,7 @@ pub mod spec {
             actual_tcb.priority = 100;
             actual_tcb.state = ThreadStateType::Running;
             actual_tcb.sc = Some(0);
-            actual_tcb.cpu_context.cr3 = live_cr3;
+            assert!(actual_tcb.set_vspace_root(actual_root));
             actual_tcb.cpu_context.fs_base = live_fs;
             actual_tcb.cpu_context.gs_base = live_gs;
             actual_tcb.user_context.rax = 0x4444;
@@ -1923,7 +1919,7 @@ pub mod spec {
             stale_tcb.priority = 90;
             stale_tcb.state = ThreadStateType::BlockedOnReceive;
             stale_tcb.sc = Some(1);
-            stale_tcb.cpu_context.cr3 = live_cr3.wrapping_add(0x1000);
+            assert!(stale_tcb.set_vspace_root(stale_root));
             stale_tcb.user_context.rax = 0x5555;
             let stale = s.scheduler.admit(stale_tcb);
 
@@ -1934,9 +1930,12 @@ pub mod spec {
             (actual, stale)
         };
 
+        drop(preparation);
+
         super::rust_syscall_dispatch(-12i64 as u64, 1);
 
         unsafe {
+            let _guard = crate::spec::KernelGuard::acquire();
             let s = KERNEL.get();
             assert_eq!(s.scheduler.current(), Some(actual));
             assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x4444);
@@ -1948,6 +1947,7 @@ pub mod spec {
             s.scheduler.slab.free(actual);
             s.scheduler.slab.free(stale);
             s.scheduler.reset_queues();
+            drop(owners);
         }
         arch::log("  ✓ SysDebugPutChar resolves invoker from live CPU identity\n");
     }
@@ -1957,11 +1957,13 @@ pub mod spec {
         use crate::kernel::KERNEL;
         use crate::tcb::{Tcb, ThreadStateType};
 
+        let preparation = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let actual_root = owners.root(super::super::paging::read_cr3() & super::CR3_PADDR_MASK);
         let (actual, stale) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
 
-            let live_cr3 = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
             let live_fs = super::rdmsr(super::IA32_FS_BASE);
             let live_gs = super::rdmsr(super::IA32_KERNEL_GS_BASE);
 
@@ -1969,7 +1971,7 @@ pub mod spec {
             stale_tcb.priority = 90;
             stale_tcb.state = ThreadStateType::Running;
             stale_tcb.sc = Some(1);
-            stale_tcb.cpu_context.cr3 = live_cr3;
+            assert!(stale_tcb.set_vspace_root(actual_root));
             stale_tcb.cpu_context.fs_base = live_fs;
             stale_tcb.cpu_context.gs_base = live_gs;
             stale_tcb.user_context.rax = 0x5555;
@@ -1979,7 +1981,7 @@ pub mod spec {
             actual_tcb.priority = 100;
             actual_tcb.state = ThreadStateType::Running;
             actual_tcb.sc = Some(0);
-            actual_tcb.cpu_context.cr3 = live_cr3;
+            assert!(actual_tcb.set_vspace_root(actual_root));
             actual_tcb.cpu_context.fs_base = live_fs;
             actual_tcb.cpu_context.gs_base = live_gs;
             actual_tcb.user_context.rax = 0x6666;
@@ -1993,9 +1995,12 @@ pub mod spec {
             (actual, stale)
         };
 
+        drop(preparation);
+
         super::rust_syscall_dispatch(-12i64 as u64, 1);
 
         unsafe {
+            let _guard = crate::spec::KernelGuard::acquire();
             let s = KERNEL.get();
             assert_eq!(s.scheduler.current(), Some(actual));
             assert_eq!(s.scheduler.active_user(), Some(actual));
@@ -2010,6 +2015,7 @@ pub mod spec {
             s.scheduler.slab.free(actual);
             s.scheduler.slab.free(stale);
             s.scheduler.reset_queues();
+            drop(owners);
         }
         arch::log("  ✓ SysDebugPutChar prefers active user over same-vspace current\n");
     }
@@ -2019,11 +2025,13 @@ pub mod spec {
         use crate::kernel::KERNEL;
         use crate::tcb::{Tcb, ThreadStateType};
 
+        let preparation = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let actual_root = owners.root(super::super::paging::read_cr3() & super::CR3_PADDR_MASK);
         let actual = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
 
-            let live_cr3 = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
             let live_fs = super::rdmsr(super::IA32_FS_BASE);
             let live_gs = super::rdmsr(super::IA32_KERNEL_GS_BASE);
 
@@ -2032,7 +2040,7 @@ pub mod spec {
             actual_tcb.state = ThreadStateType::Running;
             actual_tcb.sc = Some(0);
             actual_tcb.domain = 3;
-            actual_tcb.cpu_context.cr3 = live_cr3;
+            assert!(actual_tcb.set_vspace_root(actual_root));
             actual_tcb.cpu_context.fs_base = live_fs;
             actual_tcb.cpu_context.gs_base = live_gs;
             actual_tcb.user_context.rax = 0x7777;
@@ -2047,9 +2055,12 @@ pub mod spec {
             actual
         };
 
+        drop(preparation);
+
         super::rust_syscall_dispatch(-12i64 as u64, 1);
 
         unsafe {
+            let _guard = crate::spec::KernelGuard::acquire();
             let s = KERNEL.get();
             assert_eq!(s.scheduler.current(), Some(actual));
             assert_eq!(s.scheduler.active_user(), Some(actual));
@@ -2058,6 +2069,7 @@ pub mod spec {
             s.scheduler.slab.free(actual);
             s.scheduler.cur_domain = 0;
             s.scheduler.reset_queues();
+            drop(owners);
         }
         arch::log("  ✓ SysDebugPutChar ignores current-domain drift for active user\n");
     }
@@ -2095,6 +2107,10 @@ pub mod spec {
         use crate::kernel::KERNEL;
         use crate::tcb::{Tcb, ThreadStateType};
 
+        let preparation = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let physical = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
+        let stale_root = owners.root(physical.checked_add(0x1000).unwrap());
         let stale = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -2103,8 +2119,7 @@ pub mod spec {
             stale_tcb.priority = 100;
             stale_tcb.state = ThreadStateType::Running;
             stale_tcb.sc = Some(0);
-            stale_tcb.cpu_context.cr3 =
-                (super::super::paging::read_cr3() & super::CR3_PADDR_MASK).wrapping_add(0x1000);
+            assert!(stale_tcb.set_vspace_root(stale_root));
             stale_tcb.hosted_syscalls = true;
             let stale = s.scheduler.admit(stale_tcb);
             s.scheduler.set_current(Some(stale));
@@ -2117,15 +2132,19 @@ pub mod spec {
             stale
         };
 
+        drop(preparation);
+
         super::rust_syscall_dispatch(-12i64 as u64, 1);
 
         unsafe {
+            let _guard = crate::spec::KernelGuard::acquire();
             let s = KERNEL.get();
             assert_eq!(s.scheduler.current(), Some(stale));
             assert_eq!(super::current_cpu_user_ctx_mut().rax, 0x9999);
             s.scheduler.block(stale, ThreadStateType::Inactive);
             s.scheduler.slab.free(stale);
             s.scheduler.reset_queues();
+            drop(owners);
         }
         arch::log("  ✓ SysDebugPutChar ignores stale hosted current\n");
     }
@@ -2135,6 +2154,10 @@ pub mod spec {
         use crate::kernel::KERNEL;
         use crate::tcb::{Tcb, ThreadStateType};
 
+        let preparation = crate::spec::KernelGuard::acquire();
+        let mut owners = crate::asid::spec::RootOwners::new();
+        let physical = super::super::paging::read_cr3() & super::CR3_PADDR_MASK;
+        let stale_root = owners.root(physical.checked_add(0x1000).unwrap());
         let (stale, peer) = unsafe {
             let s = KERNEL.get();
             s.scheduler.reset_queues();
@@ -2143,8 +2166,7 @@ pub mod spec {
             stale_tcb.priority = 100;
             stale_tcb.state = ThreadStateType::Running;
             stale_tcb.sc = Some(0);
-            stale_tcb.cpu_context.cr3 =
-                (super::super::paging::read_cr3() & super::CR3_PADDR_MASK).wrapping_add(0x1000);
+            assert!(stale_tcb.set_vspace_root(stale_root));
             stale_tcb.hosted_syscalls = true;
             let stale = s.scheduler.admit(stale_tcb);
 
@@ -2166,9 +2188,12 @@ pub mod spec {
             (stale, peer)
         };
 
+        drop(preparation);
+
         super::rust_syscall_dispatch(-12i64 as u64, 1);
 
         unsafe {
+            let _guard = crate::spec::KernelGuard::acquire();
             let s = KERNEL.get();
             assert_eq!(s.scheduler.current(), Some(stale));
             assert_eq!(
@@ -2182,6 +2207,7 @@ pub mod spec {
             s.scheduler.slab.free(peer);
             s.scheduler.slab.free(stale);
             s.scheduler.reset_queues();
+            drop(owners);
         }
         arch::log("  ✓ SysDebugPutChar clears stale handoff without identity\n");
     }

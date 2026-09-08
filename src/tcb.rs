@@ -189,7 +189,7 @@ impl Aarch64FpuState {
     };
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub struct Tcb {
     pub state: ThreadStateType,
     /// Priority used for scheduling decisions. 0..255.
@@ -255,11 +255,9 @@ pub struct Tcb {
     /// we keep it as a direct TcbId to skip the cap-derivation
     /// dance (added later in Phase 17).
     pub reply_to: Option<TcbId>,
-    /// Phase 20 — VSpace root cap (set via TCB::SetSpace).
-    /// Currently opaque (stored but not consulted) since we run
-    /// every thread in the shared kernel page tables; per-thread
-    /// CR3 lands when ASID management does.
-    pub vspace_root: crate::cap::Cap,
+    /// Owned VSpace root, changed only through the checked setter and released with this TCB.
+    /// Return paths also validate its ASID assignment before using the cached architecture root.
+    vspace_root: crate::cap::Cap,
     /// Phase 20 — bound notification slot index (within the
     /// kernel notification pool). `None` if not bound.
     /// (`fault_handler` cptr already exists above.)
@@ -467,6 +465,54 @@ impl Default for Tcb {
 }
 
 impl Tcb {
+    pub const fn vspace_root(&self) -> crate::cap::Cap {
+        self.vspace_root
+    }
+
+    pub fn has_current_vspace(&self) -> bool {
+        crate::asid::root_is_current(&self.vspace_root)
+    }
+
+    /// Replace the TCB's real held VSpace reference. Validation precedes both reference-count
+    /// changes and cached-root publication; moving the TCB into or within a slab adds no reference.
+    pub fn set_vspace_root(&mut self, root: crate::cap::Cap) -> bool {
+        use crate::cap::Cap;
+        if !matches!(root, Cap::Null) && !crate::asid::root_is_current(&root) {
+            return false;
+        }
+        let root_address = match root {
+            Cap::PML4 { ptr, .. } => ptr.addr(),
+            _ => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let root = crate::arch::x86_64::paging::kernel_root_cr3();
+                    assert_ne!(root, 0, "clearing a VSpace requires the boot kernel root");
+                    root
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                { 0 }
+            }
+        };
+        crate::asid::note_tcb_root_write(&self.vspace_root, &root);
+        self.vspace_root = root;
+        self.cpu_context.cr3 = root_address;
+        true
+    }
+
+    /// ASID-pool retirement invalidates a held root even while the TCB retains its capability.
+    /// Never select a stale cached user root, nor use zero (which means keep the current CR3).
+    #[cfg(target_arch = "x86_64")]
+    pub fn vm_root_cr3(&self) -> u64 {
+        if let crate::cap::Cap::PML4 { ptr, .. } = self.vspace_root {
+            if self.has_current_vspace() {
+                return ptr.addr();
+            }
+        }
+        let root = crate::arch::x86_64::paging::kernel_root_cr3();
+        assert_ne!(root, 0, "invalid user root requires the boot-captured kernel root");
+        root
+    }
+
     pub const fn is_runnable(&self) -> bool {
         self.state.is_runnable()
     }
@@ -498,7 +544,13 @@ impl Tcb {
 /// actually need more.
 pub const MAX_TCBS: usize = 320;
 
-#[derive(Copy, Clone, Debug)]
+impl Drop for Tcb {
+    fn drop(&mut self) {
+        crate::asid::note_tcb_root_write(&self.vspace_root, &crate::cap::Cap::Null);
+    }
+}
+
+#[derive(Debug)]
 pub struct TcbSlab {
     pub entries: [Option<Tcb>; MAX_TCBS],
 }
@@ -506,7 +558,7 @@ pub struct TcbSlab {
 impl TcbSlab {
     pub const fn new() -> Self {
         Self {
-            entries: [None; MAX_TCBS],
+            entries: [const { None }; MAX_TCBS],
         }
     }
 
@@ -590,9 +642,11 @@ pub mod spec {
     use crate::arch;
 
     pub fn test_tcb() {
+        let _guard = crate::spec::KernelGuard::acquire();
         arch::log("Running TCB tests...\n");
         thread_state_runnable();
         slab_alloc_get_free();
+        super::vspace_spec::run();
         arch::log("TCB tests completed\n");
     }
 
@@ -629,3 +683,7 @@ pub mod spec {
         arch::log("  ✓ TcbSlab alloc / get_mut / free\n");
     }
 }
+
+#[cfg(feature = "spec")]
+#[path = "tcb_vspace_spec.rs"]
+mod vspace_spec;

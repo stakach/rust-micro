@@ -1020,12 +1020,11 @@ pub mod spec {
             assert_eq!(s.available_replies(), reply_before);
 
             let tcb_before = s.scheduler.available_cap_tcbs();
+            let mut thread = Tcb::default();
+            thread.state = ThreadStateType::Inactive;
             let tcb = s
                 .scheduler
-                .try_admit_cap(Tcb {
-                    state: ThreadStateType::Inactive,
-                    ..Default::default()
-                })
+                .try_admit_cap(thread)
                 .expect("cap-backed TCB identity");
             assert_ne!(tcb, TcbId(0));
             assert_eq!(s.scheduler.available_cap_tcbs(), tcb_before - 1);
@@ -1179,6 +1178,7 @@ pub mod spec {
             let chosen = s.scheduler.choose_thread();
             assert_eq!(chosen, current_thread());
             // Free the temp.
+            s.scheduler.block(id2, crate::tcb::ThreadStateType::Inactive);
             s.scheduler.slab.free(id2);
         }
         arch::log("  ✓ KernelState singleton persists across calls\n");

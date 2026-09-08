@@ -43,9 +43,17 @@ pub fn wait_for_bsp_ready() {
 /// condition.
 pub static APS_ALIVE: AtomicU32 = AtomicU32::new(0);
 
+// Logical CPU zero is the BSP. AP bits are published only after their interrupt and control
+// register setup. There is no CPU hot-unplug path.
+static ONLINE_CPUS: AtomicU32 = AtomicU32::new(1);
+
 /// Mark the calling CPU as alive — bumps `APS_ALIVE`. Called by
 /// each AP after it finishes per-CPU init.
 pub fn mark_ap_alive() {
+    let cpu = crate::arch::get_cpu_id();
+    assert!(cpu != 0 && cpu < MAX_CPUS as u32);
+    let old = ONLINE_CPUS.fetch_or(1 << cpu, Ordering::Release);
+    assert_eq!(old & (1 << cpu), 0, "AP must publish online exactly once");
     APS_ALIVE.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -83,10 +91,14 @@ pub fn aps_alive() -> u32 {
 // ---------------------------------------------------------------------------
 
 pub static BKL: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "spec"))]
+static BKL_WAITERS: AtomicU32 = AtomicU32::new(0);
 
 /// Acquire the BKL. Spins until granted. Caller must be in kernel
 /// mode with IF=0 (so the same CPU can't re-enter via interrupt).
 pub fn bkl_acquire() {
+    #[cfg(target_arch = "x86_64")]
+    service_retirement_shootdown();
     let me = crate::arch::get_cpu_id() + 1;
     // Defensive: a re-entrant acquire by the SAME cpu must never happen —
     // the kernel keeps IF=0 while holding the BKL and clears IF (`cli`)
@@ -102,9 +114,19 @@ pub fn bkl_acquire() {
     }
     loop {
         match BKL.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed) {
-            Ok(_) => return,
+            Ok(_) => {
+                #[cfg(all(target_arch = "x86_64", feature = "spec"))]
+                BKL_WAITERS.fetch_and(!(1 << (me - 1)), Ordering::Release);
+                return;
+            }
             Err(_) => {
+                #[cfg(all(target_arch = "x86_64", feature = "spec"))]
+                BKL_WAITERS.fetch_or(1 << (me - 1), Ordering::Release);
                 while BKL.load(Ordering::Relaxed) != 0 {
+                    // IF is clear here, so a retirement IPI cannot run its ISR. Service its
+                    // independent mailbox without borrowing scheduler state or acquiring BKL.
+                    #[cfg(target_arch = "x86_64")]
+                    service_retirement_shootdown();
                     core::hint::spin_loop();
                 }
             }
@@ -417,6 +439,108 @@ pub fn shootdown_vspace(pml4_paddr: u64) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+struct RetirementMailbox {
+    requested: AtomicBool,
+    acknowledged: AtomicBool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl RetirementMailbox {
+    const EMPTY: Self = Self {
+        requested: AtomicBool::new(false),
+        acknowledged: AtomicBool::new(false),
+    };
+
+    fn publish(&self) {
+        assert!(!self.requested.load(Ordering::Acquire));
+        self.acknowledged.store(false, Ordering::Relaxed);
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn claim(&self) -> bool {
+        self.requested.swap(false, Ordering::Acquire)
+    }
+
+    fn acknowledge(&self) {
+        self.acknowledged.store(true, Ordering::Release);
+    }
+
+    fn completed(&self) -> bool {
+        self.acknowledged.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+static RETIREMENT_MAILBOXES: [RetirementMailbox; MAX_CPUS] =
+    [const { RetirementMailbox::EMPTY }; MAX_CPUS];
+#[cfg(target_arch = "x86_64")]
+static RETIREMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(all(target_arch = "x86_64", feature = "spec"))]
+static RETIREMENT_FLUSHES: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_CPUS];
+
+#[cfg(target_arch = "x86_64")]
+fn flush_retired_translations() {
+    // Changing CR4.PGE invalidates translations for all PCIDs, including global entries. Both
+    // writes preserve every other control bit, and work whether PGE was initially set or clear.
+    unsafe {
+        let cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, preserves_flags));
+        core::arch::asm!(
+            "mov cr4, {changed}",
+            "mov cr4, {original}",
+            changed = in(reg) cr4 ^ (1 << 7),
+            original = in(reg) cr4,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(feature = "spec")]
+    RETIREMENT_FLUSHES[crate::arch::get_cpu_id() as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Lock-independent retirement service. Called before an IPI tries BKL and while a kernel
+/// entrant spins for BKL with IF clear. It never touches a TCB, scheduler, or shared IPI queue.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn service_retirement_shootdown() {
+    let mailbox = &RETIREMENT_MAILBOXES[crate::arch::get_cpu_id() as usize];
+    if mailbox.claim() {
+        flush_retired_translations();
+        mailbox.acknowledge();
+    }
+}
+
+/// Synchronous assignment retirement, unlike the ordinary queued mapping shootdown. The caller
+/// holds BKL, or is in the pre-user quiescent bootstrap/spec phase. It may hold a mutable TCB
+/// borrow: no scheduler access occurs here. One batch must finish before another can begin.
+#[cfg(target_arch = "x86_64")]
+pub fn retire_vspace_assignment(pml4_paddr: u64) {
+    assert!(pml4_paddr != 0 && pml4_paddr & 0xfff == 0);
+    assert!(!RETIREMENT_ACTIVE.swap(true, Ordering::AcqRel),
+        "reentrant or concurrent ASID retirement shootdown");
+    let me = crate::arch::get_cpu_id();
+    let targets = ONLINE_CPUS.load(Ordering::Acquire) & !(1 << me);
+    for cpu in 0..MAX_CPUS as u32 {
+        if targets & (1 << cpu) != 0 {
+            RETIREMENT_MAILBOXES[cpu as usize].publish();
+            // Do not use send_ipi: its one pending cause per sender can overwrite another
+            // request, and its NodeState storage belongs to the BKL-protected dispatcher.
+            crate::arch::x86_64::lapic::send_ipi(cpu as u8, IPI_VECTOR);
+        }
+    }
+    flush_retired_translations();
+    for cpu in 0..MAX_CPUS as u32 {
+        if targets & (1 << cpu) != 0 {
+            while !RETIREMENT_MAILBOXES[cpu as usize].completed() {
+                core::hint::spin_loop();
+            }
+        }
+    }
+    // An AP published after the target snapshot has never executed user code. Its first
+    // dispatch must acquire BKL, after this retirement and the catalog withdrawal complete.
+    RETIREMENT_ACTIVE.store(false, Ordering::Release);
+}
+
 #[cfg(target_arch = "aarch64")]
 pub fn shootdown_tlb(vaddr: u64) {
     let me = crate::arch::get_cpu_id();
@@ -589,18 +713,60 @@ pub mod spec {
         ap_picks_thread_off_its_queue_via_reschedule();
         #[cfg(target_arch = "x86_64")]
         {
+            retirement_mailbox_acknowledges_real_flushes();
             shootdown_fans_invalidate_tlb_to_aps();
             ap_dispatches_user_thread_end_to_end();
         }
         arch::log("SMP tests completed\n");
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    fn retirement_mailbox_acknowledges_real_flushes() {
+        let mailbox = RetirementMailbox::EMPTY;
+        assert!(!mailbox.claim());
+        mailbox.publish();
+        assert!(!mailbox.completed());
+        assert!(mailbox.claim());
+        assert!(!mailbox.claim());
+        assert!(!mailbox.completed(), "claiming work is not completing it");
+        mailbox.acknowledge();
+        assert!(mailbox.completed());
+        mailbox.publish();
+        assert!(!mailbox.completed(), "a previous ACK cannot complete a new request");
+        assert!(mailbox.claim());
+        mailbox.acknowledge();
+
+        let guard = crate::spec::KernelGuard::acquire();
+        let online = ONLINE_CPUS.load(Ordering::Acquire);
+        let me = crate::arch::get_cpu_id();
+        let targets = online & !(1 << me);
+        let before: [u32; MAX_CPUS] =
+            core::array::from_fn(|cpu| RETIREMENT_FLUSHES[cpu].load(Ordering::Relaxed));
+        // The physical value is only an identity: retirement invalidates all translations and
+        // never dereferences this address. Both requests must receive real remote flush ACKs.
+        retire_vspace_assignment(0x1000);
+        while BKL_WAITERS.load(Ordering::Acquire) & targets != targets {
+            core::hint::spin_loop();
+        }
+        // APs are now waiting for our BKL with IF clear. This second request can complete only
+        // through the lock-independent service in their acquisition loop, not their IPI ISR.
+        retire_vspace_assignment(0x2000);
+        for cpu in 0..MAX_CPUS {
+            if online & (1 << cpu) != 0 {
+                assert_eq!(RETIREMENT_FLUSHES[cpu].load(Ordering::Acquire), before[cpu] + 2);
+            }
+        }
+        assert!(!RETIREMENT_ACTIVE.load(Ordering::Acquire));
+        drop(guard);
+        arch::log("  retirement shootdown awaits local/remote flushes including IF-clear BKL waiters\n");
+    }
+
     /// Phase 28h — the SMP capstone. BSP launches a ping thread pinned
     /// to CPU 1, kicks AP1, and polls `SYSCALL_COUNT_PER_CPU[1]` to
     /// confirm the thread actually ran (each `SysYield` iteration
     /// bumps the counter from inside `rust_syscall_dispatch` on AP1).
-    /// The ping thread keeps running after this spec returns; that's
-    /// fine — the AY demo on BSP runs in parallel without disturbance.
+    /// The assigned root is explicitly withdrawn after the thread is stopped.
     #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn ap_dispatches_user_thread_end_to_end() {
@@ -611,7 +777,7 @@ pub mod spec {
 
         let before = SYSCALL_COUNT_PER_CPU[1].load(Ordering::SeqCst);
 
-        let id = unsafe {
+        let (id, owners) = unsafe {
             bkl_acquire();
             let id = crate::arch::x86_64::usermode::launch_smp_ping_thread();
             bkl_release();
@@ -634,10 +800,10 @@ pub mod spec {
                 // throttles the rest of the kernel via the BKL.
                 unsafe {
                     bkl_acquire();
-                    crate::kernel::KERNEL
-                        .get()
-                        .scheduler
-                        .block(id, crate::tcb::ThreadStateType::Inactive);
+                    let state = crate::kernel::KERNEL.get();
+                    state.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
+                    assert!(state.scheduler.slab.get_mut(id).set_vspace_root(crate::cap::Cap::Null));
+                    drop(owners);
                     bkl_release();
                 }
                 return;

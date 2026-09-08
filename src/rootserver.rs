@@ -1046,6 +1046,19 @@ pub unsafe fn launch_rootserver() -> ! {
     #[cfg(not(feature = "extern-rootserver"))]
     s.claim_cnode(ROOTSERVER_CNODE_IDX);
 
+    // Boot owns this pool and root before publishing any counted CTE or TCB reference. This is
+    // the quiescent boot transition, not a reset after live rootserver capabilities are installed.
+    let asid_pool_va = (&raw const ROOTSERVER_ASID_POOL) as u64;
+    #[cfg(target_arch = "x86_64")]
+    let asid_pool_pa = crate::arch::x86_64::paging::kernel_virt_to_phys(asid_pool_va);
+    #[cfg(target_arch = "aarch64")]
+    let asid_pool_pa = asid_pool_va;
+    const ROOTSERVER_ASID: u16 = 1;
+    crate::asid::reset();
+    crate::asid::install_pool(0, asid_pool_pa).expect("bootstrap ASID pool authority");
+    crate::asid::install_root(0, asid_pool_pa, ROOTSERVER_ASID, img.pml4_paddr)
+        .expect("bootstrap VSpace assignment");
+
     // Build the TCB. cspace_root points at the new CNode; the
     // dispatcher consults this for cap lookups.
     let mut t = Tcb::default();
@@ -1063,7 +1076,6 @@ pub unsafe fn launch_rootserver() -> ! {
     #[cfg(target_arch = "aarch64")]
     let initial_sp = img.stack_top;
     t.user_context = UserContext::for_entry(img.entry, initial_sp, img.bootinfo_vaddr);
-    t.cpu_context.cr3 = img.pml4_paddr;
     // Phase 34c — register the rootserver's IPC buffer with the
     // kernel so long-message IPC can read/write it via paddr.
     t.ipc_buffer = img.ipc_buffer_vaddr;
@@ -1074,12 +1086,11 @@ pub unsafe fn launch_rootserver() -> ! {
     // asid lookup. ASID 0 means "unmapped/unassigned" and would
     // make our Frame::Unmap no-op even for legitimate same-vspace
     // unmaps.
-    const ROOTSERVER_ASID: u16 = 1;
-    t.vspace_root = Cap::PML4 {
+    assert!(t.set_vspace_root(Cap::PML4 {
         ptr: PPtr::<Pml4Storage>::new(img.pml4_paddr).expect("pml4 paddr"),
         mapped: true,
         asid: ROOTSERVER_ASID,
-    };
+    }));
     let id = s.scheduler.admit(t);
 
     // Phase 37b — pre-allocate the InitThreadSC. The rootserver
@@ -1163,11 +1174,6 @@ pub unsafe fn launch_rootserver() -> ! {
     rs_set(s, 5, &Cap::AsidControl);
     // Phase 37a — pre-allocated InitThreadASIDPool at canonical
     // slot 6. asid_base = 0 (rootserver gets the first 512 ASIDs).
-    let asid_pool_va = (&raw const ROOTSERVER_ASID_POOL) as u64;
-    #[cfg(target_arch = "x86_64")]
-    let asid_pool_pa = crate::arch::x86_64::paging::kernel_virt_to_phys(asid_pool_va);
-    #[cfg(target_arch = "aarch64")]
-    let asid_pool_pa = asid_pool_va;
     rs_set(
         s,
         6,
@@ -1427,13 +1433,6 @@ pub unsafe fn launch_rootserver() -> ! {
     // hook keeps counts exact and cap-delete liveness checks are
     // O(1) instead of whole-pool sweeps.
     crate::kernel::recount_refcounts();
-    // Spec-phase MakePool/Assign runs pollute the ASID allocator
-    // statics (NEXT_ASID_BASE, ASID_POOLS_MADE, per-pool used counts);
-    // reset them so the real test suite starts from a clean slate
-    // (VSPACE0005 overassigns a freshly-made pool and counts exactly
-    // 512 ASIDs).
-    crate::invocation::reset_asid_state();
-    crate::asid::register_boot_mapping(ROOTSERVER_ASID, img.pml4_paddr);
 
     // LAPIC-timer migration — the kernel's preemption clock
     // (TICK_COUNT + scheduler.tick + mcs_tick) is the LAPIC timer,

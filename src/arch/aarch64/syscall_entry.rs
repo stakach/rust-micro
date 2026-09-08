@@ -60,11 +60,15 @@ pub(crate) fn activate_thread_vspace(id: TcbId) {
         asid,
         mapped: true,
         ..
-    } = tcb.vspace_root
+    } = tcb.vspace_root()
     {
-        crate::arch::aarch64::vspace::activate_user_vspace(ptr.addr(), asid);
-    } else if tcb.cpu_context.cr3 != 0 {
-        crate::arch::aarch64::vspace::activate_user_vspace(tcb.cpu_context.cr3, 0);
+        if crate::asid::root_is_current(&tcb.vspace_root()) {
+            crate::arch::aarch64::vspace::activate_user_vspace(ptr.addr(), asid);
+        } else {
+            crate::arch::aarch64::vspace::park_on_kernel_root();
+        }
+    } else {
+        crate::arch::aarch64::vspace::park_on_kernel_root();
     }
 }
 

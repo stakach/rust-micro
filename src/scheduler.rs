@@ -453,7 +453,7 @@ impl Default for SchedulerNode {
 // scheduling nodes.
 // ---------------------------------------------------------------------------
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub struct Scheduler {
     pub slab: TcbSlab,
     pub nodes: [SchedulerNode; crate::smp::MAX_CPUS],
@@ -1381,10 +1381,8 @@ pub mod spec {
     fn empty_falls_back_to_idle() {
         let mut s = Scheduler::new();
         // Idle thread (priority 0, runnable but never enqueued by us).
-        let idle_tcb = Tcb {
-            state: ThreadStateType::Idle,
-            ..Default::default()
-        };
+        let mut idle_tcb = Tcb::default();
+        idle_tcb.state = ThreadStateType::Idle;
         let idle = s.slab.alloc(idle_tcb).unwrap();
         s.set_idle(Some(idle));
         assert_eq!(s.choose_thread(), Some(idle));

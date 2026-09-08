@@ -114,6 +114,7 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
     use crate::smp::IpiKind;
     use core::sync::atomic::Ordering;
 
+    crate::smp::service_retirement_shootdown();
     crate::smp::bkl_acquire();
     struct BklGuard;
     impl Drop for BklGuard {

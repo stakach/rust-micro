@@ -270,7 +270,7 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
             s.scheduler.set_current(Some(next_id));
             s.scheduler.set_active_user(Some(next_id));
             let tcb = s.scheduler.slab.get(next_id);
-            let next_cr3 = tcb.cpu_context.cr3;
+            let next_cr3 = tcb.vm_root_cr3();
             let next_fs_base = tcb.cpu_context.fs_base;
             let next_gs_base = tcb.cpu_context.gs_base;
             let next_ctx = tcb.user_context;
@@ -342,7 +342,7 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
             s.scheduler.set_active_user(Some(next_id));
             crate::sched_context::complete_yield_if_pending(next_id);
             let tcb = s.scheduler.slab.get(next_id);
-            let next_cr3 = tcb.cpu_context.cr3;
+            let next_cr3 = tcb.vm_root_cr3();
             let next_fs_base = tcb.cpu_context.fs_base;
             let next_gs_base = tcb.cpu_context.gs_base;
             let next_ctx = tcb.user_context;
@@ -441,7 +441,7 @@ unsafe fn resume_current_user_via_iretq(current: crate::tcb::TcbId) -> ! {
     s.scheduler.set_active_user(Some(current));
     crate::sched_context::complete_yield_if_pending(current);
     let tcb = s.scheduler.slab.get(current);
-    let next_cr3 = tcb.cpu_context.cr3;
+    let next_cr3 = tcb.vm_root_cr3();
     let next_fs_base = tcb.cpu_context.fs_base;
     let next_gs_base = tcb.cpu_context.gs_base;
     let next_ctx = tcb.user_context;

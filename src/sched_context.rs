@@ -689,7 +689,9 @@ pub mod spec {
             // Cleanup.
             super::set_test_time(None);
             s.scheduler.set_current(None);
+            s.scheduler.block(caller_id, crate::tcb::ThreadStateType::Inactive);
             s.scheduler.slab.free(caller_id);
+            s.scheduler.block(server_id, crate::tcb::ThreadStateType::Inactive);
             s.scheduler.slab.free(server_id);
             s.sched_contexts[sc_caller].bound_tcb = None;
             s.scheduler.reset_queues();
@@ -762,6 +764,7 @@ pub mod spec {
             // Cleanup.
             super::set_test_time(None);
             s.scheduler.set_current(None);
+            s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
             s.scheduler.slab.free(id);
             s.sched_contexts[sc_idx].bound_tcb = None;
             s.scheduler.reset_queues();
@@ -825,6 +828,7 @@ pub mod spec {
             // poisoned. The SC pool entry stays consumed (no
             // reclaim yet — see todo's "Pool reclaim" follow-up).
             s.scheduler.set_current(None);
+            s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
             s.scheduler.slab.free(id);
             s.sched_contexts[sc_idx].bound_tcb = None;
         }
@@ -880,6 +884,7 @@ pub mod spec {
             let dom = s.scheduler.slab.get(id).domain as usize;
             s.scheduler.nodes[crate::arch::get_cpu_id() as usize].queues[dom]
                 .dequeue(&mut s.scheduler.slab, id);
+            s.scheduler.block(id, crate::tcb::ThreadStateType::Inactive);
             s.scheduler.slab.free(id);
             s.sched_contexts[sc_idx].bound_tcb = None;
         }
