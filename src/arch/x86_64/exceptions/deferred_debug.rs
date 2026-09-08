@@ -21,7 +21,11 @@ pub(crate) fn defer_quiesced_debug(tcb: &mut crate::tcb::Tcb, kind: crate::smp::
     let (reason, trigger_addr, bp_num) = match kind {
         crate::smp::UserEntryKind::Breakpoint => (debug::SEL4_SOFTWARE_BREAK_REQUEST, 0, 0),
         crate::smp::UserEntryKind::Debug { status } => {
-            if let Some(bp) = (0..4).find(|&bp| status & (1 << bp) != 0) {
+            // Retain actual status even when counted stepping suppresses delivery, or this
+            // exact user entry was adopted by a remote quiescence controller.
+            tcb.debug.dr[4] = status;
+            if let Some(bp) = (0..4).find(|&bp|
+                status & (1 << bp) != 0 && debug::breakpoint_enabled(&tcb.debug, bp)) {
                 (debug::breakpoint_reason(&tcb.debug, bp), tcb.debug.dr[bp], bp as u64)
             } else if status & debug::DR6_SINGLE_STEP != 0 {
                 tcb.user_context.rflags |= debug::FLAGS_RF;
@@ -76,9 +80,11 @@ fn test_deferred_debug() {
     });
     assert_eq!(thread.user_context.rip, 0x1235, "INT3 is not replayed by rewinding RIP");
 
-    thread.debug.dr[2] = 0x5566;
+    debug::set_breakpoint(&mut thread.debug, 2, 0x5566,
+        debug::SEL4_INSTRUCTION_BREAKPOINT, 0, debug::SEL4_BREAK_ON_READ);
     let reason = debug::breakpoint_reason(&thread.debug, 2);
     defer_quiesced_debug(&mut thread, UserEntryKind::Debug { status: 1 << 2 });
+    assert_eq!(thread.debug.dr[4], 1 << 2);
     thread.debug.dr[2] = 0x7788;
     let trap = thread.deferred_debug.take().unwrap();
     assert_eq!(trap.trigger_addr, 0x5566, "later debug configuration cannot rewrite the event");
@@ -89,12 +95,18 @@ fn test_deferred_debug() {
     defer_quiesced_debug(&mut thread, UserEntryKind::Debug { status: debug::DR6_SINGLE_STEP });
     assert!(thread.deferred_debug.is_none());
     assert_eq!(thread.debug.n_instructions, 1);
+    assert_eq!(thread.debug.dr[4], debug::DR6_SINGLE_STEP);
     assert_ne!(thread.user_context.rflags & debug::FLAGS_RF, 0);
     defer_quiesced_debug(&mut thread, UserEntryKind::Debug { status: debug::DR6_SINGLE_STEP });
     assert_eq!(thread.deferred_debug.take().unwrap().reason, debug::SEL4_SINGLE_STEP);
     assert_eq!(thread.debug.n_instructions, 0);
     defer_quiesced_debug(&mut thread, UserEntryKind::Debug { status: 0 });
     assert!(thread.deferred_debug.is_none());
+    assert_eq!(thread.debug.dr[4], 0);
+    debug::unset_breakpoint(&mut thread.debug, 2);
+    defer_quiesced_debug(&mut thread, UserEntryKind::Debug { status: 1 << 2 });
+    assert_eq!(thread.debug.dr[4], 1 << 2);
+    assert!(thread.deferred_debug.is_none(), "disabled comparator status is not an active breakpoint");
 
     let _guard = crate::spec::KernelGuard::acquire();
     for with_handler in [false, true] {
@@ -119,7 +131,18 @@ fn test_deferred_debug() {
             let thread = state.scheduler.slab.get_mut(id);
             thread.user_context.rip = 0x4243;
             thread.use_iretq_resume = true;
-            defer_quiesced_debug(thread, UserEntryKind::Breakpoint);
+            let event = if with_handler {
+                debug::set_breakpoint(&mut thread.debug, 0, 0x4243,
+                    debug::SEL4_INSTRUCTION_BREAKPOINT, 0, debug::SEL4_BREAK_ON_READ);
+                UserEntryKind::Debug { status: 0xffff_0ff1 }
+            } else {
+                UserEntryKind::Breakpoint
+            };
+            defer_quiesced_debug(thread, event);
+            let observed_trap = thread.deferred_debug;
+            let replacement = debug::validate_raw_context(thread.debug.dr).unwrap();
+            debug::install_raw_context(&mut thread.debug, &replacement);
+            assert_eq!(thread.deferred_debug, observed_trap, "register writes do not acknowledge an event");
             assert!(deliver_deferred_debug(state, id));
             assert!(!deliver_deferred_debug(state, id), "dispatch cannot deliver the event twice");
             assert!(state.scheduler.slab.get(id).deferred_debug.is_none());
@@ -131,6 +154,15 @@ fn test_deferred_debug() {
                     crate::fault::FaultMessage::DebugException {
                         fault_ip: 0, reason: 0, trigger_addr: 0, bp_num: 0,
                     }.type_word());
+                assert_eq!(state.scheduler.slab.get(id).debug.dr[4], 0xffff_0ff1);
+                assert!(crate::fault::apply_fault_reply(state, id, 0, 0, &[]));
+                let thread = state.scheduler.slab.get_mut(id);
+                assert_eq!(thread.debug.dr[4], 0xffff_0ff0, "only fault acknowledgement consumes status");
+                debug::configure_single_stepping(&mut thread.debug, 1);
+                let next_status = thread.debug.dr[4] | debug::DR6_SINGLE_STEP;
+                defer_quiesced_debug(thread, UserEntryKind::Debug { status: next_status });
+                assert_eq!(thread.deferred_debug.take().unwrap().reason, debug::SEL4_SINGLE_STEP,
+                    "a later BS trap must not be mistaken for the acknowledged B0 event");
             } else {
                 assert_eq!(state.scheduler.slab.get(id).state, crate::tcb::ThreadStateType::Inactive);
             }

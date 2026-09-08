@@ -580,6 +580,8 @@ pub unsafe fn apply_fault_reply(
             // for a HW breakpoint it just resumes. Mirrors seL4
             // copyMRsFaultReply -> configureSingleStepping.
             #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::debug::acknowledge_fault(&mut t.debug);
+            #[cfg(target_arch = "x86_64")]
             if t.debug.single_step_enabled {
                 use crate::arch::x86_64::debug;
                 let n = if length >= 1 { regs[0] } else { 1 };

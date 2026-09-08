@@ -1,23 +1,30 @@
 //! x86-64 combined legacy-context extension; not the upstream register invocation ABI.
 //!
 //! Read has no input words and returns the 20-word public register layout followed by a
-//! 512-byte FXSAVE64 image. Write takes a selection mask followed by that same payload.
+//! 512-byte FXSAVE64 image and six debug words (DR0-3, DR6, DR7). Write takes a selection
+//! mask followed by that same payload.
+//! RIP is the canonical execution continuation, not ReadRegisters' rewound syscall reporter.
 //! Words 18/19 are reserved TLS positions: reads return zero and writes cannot select them.
 //! A write validates all selected input before a single target quiescence; unselected state
 //! is preserved from that live snapshot, not from the supplied payload. RESTART_MASK applies
 //! WriteRegisters restart semantics only after installation. Without it, scheduling state
 //! remains unchanged. Self-targets, extra caps, and non-x86 architectures are rejected.
+//! Restart consumes a pending debug fault: its cached status is acknowledged unless DEBUG_MASK
+//! supplies replacement state. Other unselected debug registers and stepping policy are retained.
 
 pub const REGISTER_WORDS: usize = 20;
 pub const FX_BYTES: usize = 512;
 pub const FX_WORDS: usize = FX_BYTES / 8;
-pub const READ_WORDS: usize = REGISTER_WORDS + FX_WORDS;
+pub const DEBUG_WORDS: usize = 6;
+pub const DEBUG_OFFSET: usize = REGISTER_WORDS + FX_WORDS;
+pub const READ_WORDS: usize = DEBUG_OFFSET + DEBUG_WORDS;
 pub const WRITE_WORDS: usize = 1 + READ_WORDS;
 pub const REGISTER_MASK: u64 = (1 << 18) - 1;
 pub const FX_MASK: u64 = 1 << 20;
 /// Cancel outstanding IPC/reply/fault state and make runnable after installing selected state.
 pub const RESTART_MASK: u64 = 1 << 21;
-pub const WRITE_MASK: u64 = REGISTER_MASK | FX_MASK | RESTART_MASK;
+pub const DEBUG_MASK: u64 = 1 << 22;
+pub const WRITE_MASK: u64 = REGISTER_MASK | FX_MASK | RESTART_MASK | DEBUG_MASK;
 
 /// TLS remains owned by the existing TLS capability operations, not this payload.
 pub const fn valid_selection(mask: u64) -> bool {
@@ -89,15 +96,15 @@ mod tests {
     }
 
     #[test]
-    fn selection_admits_only_public_gprs_and_legacy_fx() {
+    fn selection_admits_only_public_gprs_legacy_fx_and_debug() {
         assert!(valid_selection(0));
         assert!(valid_selection(WRITE_MASK));
         for bit in 0..64 {
             assert_eq!(
                 valid_selection(1 << bit),
-                bit < 18 || bit == 20 || bit == 21
+                bit < 18 || bit == 20 || bit == 21 || bit == 22
             );
         }
-        assert_eq!((READ_WORDS, WRITE_WORDS), (84, 85));
+        assert_eq!((DEBUG_OFFSET, READ_WORDS, WRITE_WORDS), (84, 90, 91));
     }
 }

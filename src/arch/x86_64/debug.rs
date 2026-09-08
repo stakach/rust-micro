@@ -8,8 +8,8 @@
 //! values; the live registers are only written on return-to-user
 //! (`load_breakpoint_state`).
 //!
-//! All edits operate on the cached DR7 (`dr[5]`); DR6 is read/cleared
-//! live in the #DB path.
+//! DR6 is captured before clearing live status in the #DB path; raw context installation
+//! changes only the register image, not the separate counted-stepping policy.
 
 // ---- API enum values (libsel4 sel4/constants.h) -------------------------
 // NB: Data = 0, Instruction = 1 — easy to invert.
@@ -25,12 +25,13 @@ pub const SEL4_BREAK_ON_READWRITE: u64 = 2;
 pub const SEL4_NUM_HW_BREAKPOINTS: usize = 4;
 
 // ---- DR7 field encodings (debug.h / breakpoint.c) -----------------------
-// Local-enable bits are the ODD bits 1,3,5,7 (L0..L3).
+// Preserve the existing seL4 setter's global-enable choice (odd bits). Hardware also accepts
+// the local-enable bits at 0,2,4,6; queries, clearing, and raw context loads recognize both.
 #[inline]
 fn enable_bit(bp: usize) -> u64 {
     1u64 << (2 * bp + 1)
 }
-const ALL_ENABLE_BITS: u64 = 0xAA; // BIT(1)|BIT(3)|BIT(5)|BIT(7)
+const ALL_ENABLE_BITS: u64 = 0xFF;
                                    // Per-bp 2-bit R/W field at 16,20,24,28 and 2-bit LEN field at 18,22,26,30.
 #[inline]
 fn type_shift(bp: usize) -> u64 {
@@ -58,6 +59,13 @@ pub const DR6_SINGLE_STEP: u64 = 1 << 14; // BS
 // Reserved-bit init images (rather than snapshotting live regs).
 const DR6_INIT: u64 = 0xFFFF_0FF0;
 const DR7_INIT: u64 = 0x0000_0400; // bit 10 reserved-must-be-1
+const DR6_STATUS_BITS: u64 = 0x0000_e00f; // B0-3, BD, BS, BT
+const DR7_ALLOWED_BITS: u64 = 0xffff_07ff; // enables, LE/GE, bit10, RW/LEN
+
+#[inline]
+fn enable_pair(bp: usize) -> u64 {
+    3u64 << (2 * bp)
+}
 
 // RFLAGS bits.
 pub const FLAGS_TF: u64 = 1 << 8; // trap flag (single step)
@@ -100,6 +108,68 @@ impl DebugState {
     fn clear_used(&mut self, bp: usize) {
         self.used_breakpoints_bf &= !(1u32 << bp);
     }
+}
+
+/// Fully validated register image. This carries no scheduling or counted-stepping policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawDebugContext {
+    dr: [u64; 6],
+    used_breakpoints_bf: u32,
+}
+
+/// Stage generic x86-64 hardware state, not NT's distinct address/control sanitization policy.
+/// Every address must be safe for MOV DR; enabled comparators must describe a lower-user span.
+pub fn validate_raw_context(mut dr: [u64; 6]) -> Result<RawDebugContext, ()> {
+    if dr[4] & !(DR6_INIT | DR6_STATUS_BITS) != 0 || dr[5] & !DR7_ALLOWED_BITS != 0 {
+        return Err(());
+    }
+    let mut used = 0;
+    for bp in 0..SEL4_NUM_HW_BREAKPOINTS {
+        if !super::vspace::canonical(dr[bp]) {
+            return Err(());
+        }
+        let ty = (dr[5] >> type_shift(bp)) & 3;
+        let len = (dr[5] >> len_shift(bp)) & 3;
+        // I/O breakpoints need a distinct CR4.DE/port authority contract that is not exposed.
+        if ty == 2 {
+            return Err(());
+        }
+        if dr[5] & enable_pair(bp) == 0 {
+            continue;
+        }
+        let bytes = if ty == X86_BP_TYPE_INSTR {
+            if len != 0 { return Err(()); }
+            1
+        } else {
+            arch_to_size(SEL4_DATA_BREAKPOINT, len)
+        };
+        if dr[bp] % bytes != 0
+            || dr[bp] >= super::vspace::USER_VADDR_END
+            || dr[bp].checked_add(bytes).is_none_or(|end| end > super::vspace::USER_VADDR_END)
+        {
+            return Err(());
+        }
+        used |= 1 << bp;
+    }
+    dr[4] = (dr[4] & DR6_STATUS_BITS) | DR6_INIT;
+    dr[5] |= DR7_INIT;
+    Ok(RawDebugContext { dr, used_breakpoints_bf: used })
+}
+
+/// Install only a prevalidated register image; live execution must already be quiescent.
+pub fn install_raw_context(st: &mut DebugState, context: &RawDebugContext) {
+    st.dr = context.dr;
+    st.used_breakpoints_bf = context.used_breakpoints_bf;
+}
+
+/// Consume an acknowledged debug event without carrying sticky status into a later trap.
+pub fn acknowledge_fault(st: &mut DebugState) {
+    st.dr[4] = DR6_INIT;
+}
+
+#[inline]
+pub fn breakpoint_enabled(st: &DebugState, bp: usize) -> bool {
+    st.dr[5] & enable_pair(bp) != 0
 }
 
 // seL4_BreakpointType/Access -> DR7 R/W field.
@@ -169,7 +239,7 @@ pub fn get_breakpoint(st: &DebugState, bp: usize) -> (u64, u64, u64, u64, u64) {
     let arch_len = (st.dr[5] >> ls) & 0x3;
     let (ty, rw) = arch_to_type_and_access(arch_rw);
     let size = arch_to_size(ty, arch_len);
-    let enabled = ((st.dr[5] & enable_bit(bp)) != 0) as u64;
+    let enabled = breakpoint_enabled(st, bp) as u64;
     (st.dr[bp], ty, size, rw, enabled)
 }
 
@@ -177,7 +247,7 @@ pub fn get_breakpoint(st: &DebugState, bp: usize) -> (u64, u64, u64, u64, u64) {
 pub fn unset_breakpoint(st: &mut DebugState, bp: usize) {
     let ts = type_shift(bp);
     let ls = len_shift(bp);
-    st.dr[5] &= !enable_bit(bp);
+    st.dr[5] &= !enable_pair(bp);
     st.dr[5] &= !((0x3u64 << ls) | (0x3u64 << ts));
     st.dr[bp] = 0;
     st.clear_used(bp);
@@ -230,16 +300,24 @@ pub unsafe fn write_dr7(v: u64) {
 /// Load a thread's full breakpoint context into the live DR registers.
 /// DR7 is written last (it activates the configuration).
 pub unsafe fn load_breakpoint_state(st: &DebugState) {
+    load_register_image(st, st.dr[5]);
+}
+
+unsafe fn load_register_image(st: &DebugState, dr7: u64) {
+    // Withdraw the previous thread's comparators before changing any address/status register.
+    write_dr7(DR7_INIT);
     core::arch::asm!("mov dr0, {}", in(reg) st.dr[0], options(nomem, nostack));
     core::arch::asm!("mov dr1, {}", in(reg) st.dr[1], options(nomem, nostack));
     core::arch::asm!("mov dr2, {}", in(reg) st.dr[2], options(nomem, nostack));
     core::arch::asm!("mov dr3, {}", in(reg) st.dr[3], options(nomem, nostack));
     write_dr6(st.dr[4]);
-    write_dr7(st.dr[5]);
+    write_dr7(dr7);
 }
 
-/// Fast path when no breakpoint is in use: just clear the enable bits in
-/// DR7 (leave the reserved bits / DR0-3 untouched).
+/// Restore disabled state too: a TF exception must not inherit another thread's live DR6.
 pub unsafe fn load_all_disabled(st: &DebugState) {
-    write_dr7(st.dr[5] & !ALL_ENABLE_BITS);
+    load_register_image(st, st.dr[5] & !ALL_ENABLE_BITS);
 }
+
+#[cfg(feature = "spec")]
+pub(crate) mod spec;

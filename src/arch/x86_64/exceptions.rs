@@ -1232,6 +1232,7 @@ pub mod spec {
     pub fn test_exceptions() {
         crate::arch::log("Running exception tests...\n");
         debug_service_gp_is_recognized_and_skips_trap_bundle();
+        crate::arch::x86_64::debug::spec::run();
         test_deferred_debug();
         crate::arch::log("Exception tests completed\n");
     }
