@@ -124,6 +124,75 @@ pub enum CacheAttr {
     WriteThrough,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameMappingAttributes {
+    pub write_through: bool,
+    pub cache_disabled: bool,
+    pub pat: bool,
+    pub execute_never: bool,
+}
+
+impl FrameMappingAttributes {
+    pub const fn upstream(word: Word) -> Self {
+        Self {
+            write_through: word & 1 != 0,
+            cache_disabled: word & 2 != 0,
+            pat: word & 4 != 0,
+            execute_never: false,
+        }
+    }
+
+    pub const fn compressed(rights: Word) -> Self {
+        Self {
+            write_through: false,
+            cache_disabled: false,
+            pat: false,
+            execute_never: rights & 4 != 0,
+        }
+    }
+}
+
+/// Construct a public frame-map leaf without changing the source capability's authority.
+/// As in seL4's x64 huge-page constructor, the 1 GiB encoding leaves PAT clear.
+pub const fn frame_mapping_entry(
+    paddr: Word,
+    size_bits: u32,
+    rights: crate::cap::FrameRights,
+    attributes: FrameMappingAttributes,
+) -> Option<Word> {
+    use crate::cap::FrameRights;
+    let pat_bit = match size_bits {
+        12 => 7,
+        21 => 12,
+        30 => 0,
+        _ => return None,
+    };
+    let mut entry = paddr & 0x000f_ffff_ffff_f000 & !((1u64 << size_bits) - 1);
+    entry |= 1;
+    if !matches!(rights, FrameRights::ReadOnly) {
+        entry |= 1 << 1;
+    }
+    if !matches!(rights, FrameRights::KernelOnly) {
+        entry |= 1 << 2;
+    }
+    if attributes.write_through {
+        entry |= 1 << 3;
+    }
+    if attributes.cache_disabled {
+        entry |= 1 << 4;
+    }
+    if size_bits != 12 {
+        entry |= 1 << 7;
+    }
+    if attributes.pat && pat_bit != 0 {
+        entry |= 1 << pat_bit;
+    }
+    if attributes.execute_never {
+        entry |= 1 << 63;
+    }
+    Some(entry)
+}
+
 // ---------------------------------------------------------------------------
 // PTE / PDE / PDPTE / PML4E construction.
 //
@@ -294,6 +363,7 @@ pub mod spec {
         decompose_kernel_addr();
         canonical_check();
         user_mapping_extents();
+        frame_mapping_attributes_and_rights();
         pte_round_trip();
         frame_map_writes_pte();
         frame_map_rejects_alignment();
@@ -342,6 +412,44 @@ pub mod spec {
         assert!(!user_frame_mapping_range(0, u32::MAX));
         assert!(canonical(0xffff_8000_0000_0000));
         arch::log("  user mapping extents exclude noncanonical and kernel addresses\n");
+    }
+
+    #[inline(never)]
+    fn frame_mapping_attributes_and_rights() {
+        use crate::cap::FrameRights;
+        for bits in [12u32, 21, 30] {
+            for word in 0u64..8 {
+                let attrs = FrameMappingAttributes::upstream(word | !7);
+                let leaf =
+                    frame_mapping_entry(0x4000_0000, bits, FrameRights::ReadWrite, attrs).unwrap();
+                assert_eq!(leaf >> 63, 0);
+                assert_eq!((leaf >> 3) & 3, word & 3);
+                let pat_bit = if bits == 12 { 7 } else { 12 };
+                assert_eq!(
+                    (leaf >> pat_bit) & 1,
+                    if bits == 30 { 0 } else { (word >> 2) & 1 }
+                );
+            }
+            let attrs = FrameMappingAttributes::compressed(7);
+            for (rights, flags) in [
+                (FrameRights::KernelOnly, 3u64),
+                (FrameRights::ReadOnly, 5),
+                (FrameRights::ReadWrite, 7),
+            ] {
+                let leaf = frame_mapping_entry(0x4000_0000, bits, rights, attrs).unwrap();
+                assert_eq!(leaf & 7, flags);
+                assert_eq!(leaf >> 63, 1);
+                assert_eq!(leaf & (3 << 3), 0);
+            }
+        }
+        assert!(frame_mapping_entry(
+            0,
+            13,
+            FrameRights::ReadWrite,
+            FrameMappingAttributes::upstream(0)
+        )
+        .is_none());
+        arch::log("  frame leaf encoding preserves rights and wire attribute dialects\n");
     }
 
     #[inline(never)]

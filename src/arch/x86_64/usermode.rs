@@ -509,11 +509,9 @@ pub fn launch_user_mode_test() -> ! {
 // Page-table helpers (shared with Phase 13c).
 // ---------------------------------------------------------------------------
 
-/// Public-from-arch helper: install a 4 KiB user-accessible
-/// mapping in the live (CR3) page tables. Re-export of the
-/// internal `map_user_4k` so the invocation layer can call it
-/// for `Cap::Frame::Map` — Frame::Map always installs in the
-/// invoker's vspace, which is whatever CR3 currently points at.
+/// Seed the real current-root hierarchy for legacy invocation fixtures. Public Frame::Map
+/// never allocates intermediate tables; only kernel bootstrap and fixture setup may do that.
+#[cfg(feature = "spec")]
 pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool, execute_never: bool) {
     let pml4 = super::paging::phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
     map_user_4k_in(pml4, vaddr, paddr, writable, execute_never);
@@ -528,6 +526,7 @@ pub unsafe fn map_user_4k_public(vaddr: u64, paddr: u64, writable: bool, execute
 /// uses a 1G/2M page, leaves the structure alone (the cap-state
 /// invariant says we only Unmap pages that Frame::Map installed
 /// at 4 KiB granularity, but we're defensive).
+#[cfg(feature = "spec")]
 pub unsafe fn unmap_user_4k_public(vaddr: u64, expected_paddr: u64) -> bool {
     let pml4_paddr = read_cr3() & 0x000F_FFFF_FFFF_F000;
     unmap_user_4k_in_pml4(pml4_paddr, vaddr, expected_paddr)
@@ -560,8 +559,8 @@ pub unsafe fn unmap_user_4k_in_pml4(pml4_paddr: u64, vaddr: u64, expected_paddr:
     }
     let pt = super::paging::phys_to_lin(pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
     let pte = core::ptr::read_volatile(pt.add(pt_idx));
+    // At the 4 KiB leaf, bit 7 is PAT rather than the large-page flag.
     if pte & PTE_PRESENT == 0
-        || pte & PTE_PS != 0
         || pte & 0x000F_FFFF_FFFF_F000 != expected_paddr & 0x000F_FFFF_FFFF_F000
     {
         return false;
@@ -683,16 +682,6 @@ unsafe fn ensure_user_table(entry_ptr: *mut u64, flags: u64) -> *mut u64 {
 /// Returns false if a parent entry is missing (caller should map
 /// the higher-level structure first) or if the target entry is
 /// already present (caller should Unmap first).
-pub unsafe fn install_user_table(level: u32, vaddr: u64, table_paddr: u64) -> Result<(), u32> {
-    let pml4 = super::paging::phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    install_user_table_in(pml4, level, vaddr, table_paddr)
-}
-
-/// Phase 33d — variant of `install_user_table` that targets an
-/// arbitrary PML4 (identified by paddr) rather than the live CR3.
-/// Used by `decode_pt_map` / `decode_pd_map` / `decode_pdpt_map`
-/// when the invoker passes a vspace cap_ptr in args.a3.
-///
 /// SAFETY: `pml4_paddr` must be a valid PML4 paddr and the
 /// rootserver pool memory must be reachable through the kernel's
 /// linear map.
@@ -701,10 +690,11 @@ pub unsafe fn install_user_table_in_paddr(
     level: u32,
     vaddr: u64,
     table_paddr: u64,
+    attributes: u64,
 ) -> Result<(), u32> {
     // Use the kernel linear map for the physical PML4 page.
     let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    install_user_table_in(pml4, level, vaddr, table_paddr)
+    install_user_table_in(pml4, level, vaddr, table_paddr, attributes)
 }
 
 pub fn current_pml4_paddr() -> u64 {
@@ -778,184 +768,62 @@ pub unsafe fn unmap_user_table_in_paddr(
     true
 }
 
-/// Diagnostic helper — prints a one-line trace of a page-table walk
-/// step, e.g. `[pd[511]=0x0000000005000007]`. Disabled by default;
-/// flip the const to true while debugging Frame::Map failures.
-const MAP_WALK_TRACE: bool = false;
 
-unsafe fn map_walk_log(level: &str, idx: usize, entry: u64) {
-    if !MAP_WALK_TRACE {
-        return;
+/// Install or replace a same-size user leaf after invocation authority checks. Intermediate
+/// tables must already exist. Errors 1/2/3 identify a missing parent; 4 means replacing a
+/// lower-level subtree would be required. Replacing an existing same-size leaf is permitted.
+pub unsafe fn map_user_frame_in_pml4(
+    pml4_paddr: u64,
+    vaddr: u64,
+    frame_paddr: u64,
+    size: crate::cap::FrameSize,
+    rights: crate::cap::FrameRights,
+    attributes: super::vspace::FrameMappingAttributes,
+) -> Result<(), u32> {
+    use super::paging::PTE_PS;
+    use crate::cap::FrameSize;
+    let bits = match size {
+        FrameSize::Small => 12,
+        FrameSize::Large => 21,
+        FrameSize::Huge => 30,
+    };
+    let entry = super::vspace::frame_mapping_entry(frame_paddr, bits, rights, attributes)
+        .expect("frame size has an x86 leaf encoding");
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let indices = super::vspace::decompose_vaddr(vaddr);
+    let pml4e = core::ptr::read_volatile(pml4.add(indices.pml4 as usize));
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+        return Err(1);
     }
-    crate::arch::log("[");
-    crate::arch::log(level);
-    crate::arch::log("[");
-    let mut buf = [b'0'; 4];
-    let mut v = idx as u64;
-    let mut i = 4;
-    if v == 0 {
-        crate::arch::log("0");
-    }
-    while v > 0 && i > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    if let Ok(s) = core::str::from_utf8(&buf[i..]) {
-        crate::arch::log(s);
-    }
-    crate::arch::log("]=0x");
-    let mut buf = [b'0'; 16];
-    let mut v = entry;
-    let mut i = 16;
-    while v > 0 && i > 0 {
-        i -= 1;
-        let nib = (v & 0xF) as u8;
-        buf[i] = if nib < 10 {
-            b'0' + nib
+    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
+    let pdpte_slot = pdpt.add(indices.pdpt as usize);
+    let pdpte = core::ptr::read_volatile(pdpte_slot);
+    let leaf = if size == FrameSize::Huge {
+        if pdpte & PTE_PRESENT != 0 && pdpte & PTE_PS == 0 {
+            return Err(4);
+        }
+        pdpte_slot
+    } else {
+        if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
+            return Err(2);
+        }
+        let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        let pde_slot = pd.add(indices.pd as usize);
+        let pde = core::ptr::read_volatile(pde_slot);
+        if size == FrameSize::Large {
+            if pde & PTE_PRESENT != 0 && pde & PTE_PS == 0 {
+                return Err(4);
+            }
+            pde_slot
         } else {
-            b'a' + (nib - 10)
-        };
-        v >>= 4;
-    }
-    if let Ok(s) = core::str::from_utf8(&buf) {
-        crate::arch::log(s);
-    }
-    crate::arch::log("]\n");
-}
-
-/// Phase 33d — map a 4 KiB frame into a foreign PML4. Walks the
-/// PML4 → PDPT → PD → PT chain (which the caller must have set up
-/// via the paging-struct `Map` invocations) and installs the leaf
-/// PTE. Returns `Err(())` if any intermediate level is missing.
-pub unsafe fn map_user_4k_into_foreign_pml4(
-    pml4_paddr: u64,
-    vaddr: u64,
-    frame_paddr: u64,
-    writable: bool,
-    execute_never: bool,
-) -> Result<(), u32> {
-    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
-    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
-    map_walk_log("pml4", pml4_idx, pml4e);
-    if pml4e & PTE_PRESENT == 0 || pml4e & super::paging::PTE_PS != 0 {
-        return Err(1);
-    }
-    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
-    map_walk_log("pdpt", pdpt_idx, pdpte);
-    if pdpte & PTE_PRESENT == 0 || pdpte & super::paging::PTE_PS != 0 {
-        return Err(2);
-    }
-    let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let pde = core::ptr::read_volatile(pd.add(pd_idx));
-    map_walk_log("pd", pd_idx, pde);
-    if pde & PTE_PRESENT == 0 || pde & super::paging::PTE_PS != 0 {
-        return Err(3);
-    }
-    let pt = super::paging::phys_to_lin(pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let cur = core::ptr::read_volatile(pt.add(pt_idx));
-    map_walk_log("pt", pt_idx, cur);
-    let mut flags = PTE_PRESENT | PTE_USER;
-    if writable {
-        flags |= PTE_RW;
-    }
-    if execute_never {
-        flags |= super::paging::PTE_NX;
-    }
-    if cur & PTE_PRESENT != 0 {
-        return Err(4);
-    }
-    core::ptr::write_volatile(pt.add(pt_idx), (frame_paddr & !0xFFF) | flags);
-    Ok(())
-}
-
-/// Map a 2 MiB Large frame into a foreign PML4. Walks PML4 → PDPT
-/// → PD and stamps the PD entry with the `PS` bit set, marking it
-/// as a 2 MiB leaf. Returns the same lookup-level error codes as
-/// `map_user_4k_into_foreign_pml4` so the seL4_FailedLookup
-/// `mr2 = level` ABI matches:
-///   Err(1) = PML4 entry empty (need PDPT)
-///   Err(2) = PDPT entry empty (need PD)
-///   Err(4) = PD slot busy (DeleteFirst)
-pub unsafe fn map_user_2m_into_foreign_pml4(
-    pml4_paddr: u64,
-    vaddr: u64,
-    frame_paddr: u64,
-    writable: bool,
-    execute_never: bool,
-) -> Result<(), u32> {
-    use super::paging::PTE_PS;
-    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
-    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
-        return Err(1);
-    }
-    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
-    if pdpte & PTE_PRESENT == 0 || pdpte & PTE_PS != 0 {
-        return Err(2);
-    }
-    let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let cur = core::ptr::read_volatile(pd.add(pd_idx));
-    if cur & PTE_PRESENT != 0 {
-        return Err(4);
-    }
-    let mut flags = PTE_PRESENT | PTE_USER | PTE_PS;
-    if writable {
-        flags |= PTE_RW;
-    }
-    if execute_never {
-        flags |= super::paging::PTE_NX;
-    }
-    // 2 MiB-aligned paddr: low 21 bits zero.
-    core::ptr::write_volatile(pd.add(pd_idx), (frame_paddr & !((1u64 << 21) - 1)) | flags);
-    Ok(())
-}
-
-/// Map a 1 GiB Huge frame into a foreign PML4. Walks PML4 → PDPT
-/// and stamps the PDPT entry with `PS` set.
-///   Err(1) = PML4 entry empty (need PDPT)
-///   Err(4) = PDPT slot busy (DeleteFirst)
-pub unsafe fn map_user_1g_into_foreign_pml4(
-    pml4_paddr: u64,
-    vaddr: u64,
-    frame_paddr: u64,
-    writable: bool,
-    execute_never: bool,
-) -> Result<(), u32> {
-    use super::paging::PTE_PS;
-    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
-    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
-        return Err(1);
-    }
-    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *mut u64;
-    let cur = core::ptr::read_volatile(pdpt.add(pdpt_idx));
-    if cur & PTE_PRESENT != 0 {
-        return Err(4);
-    }
-    let mut flags = PTE_PRESENT | PTE_USER | PTE_PS;
-    if writable {
-        flags |= PTE_RW;
-    }
-    if execute_never {
-        flags |= super::paging::PTE_NX;
-    }
-    // 1 GiB-aligned paddr: low 30 bits zero.
-    core::ptr::write_volatile(
-        pdpt.add(pdpt_idx),
-        (frame_paddr & !((1u64 << 30) - 1)) | flags,
-    );
+            if pde & PTE_PRESENT == 0 || pde & PTE_PS != 0 {
+                return Err(3);
+            }
+            let pt = super::paging::phys_to_lin(pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
+            pt.add(indices.pt as usize)
+        }
+    };
+    core::ptr::write_volatile(leaf, entry);
     Ok(())
 }
 
@@ -1026,9 +894,11 @@ unsafe fn install_user_table_in(
     level: u32,
     vaddr: u64,
     table_paddr: u64,
+    attributes: u64,
 ) -> Result<(), u32> {
     use super::paging::PTE_PS;
-    let flags = PTE_PRESENT | PTE_RW | PTE_USER;
+    // Paging structures honor PWT and PCD; PAT is a leaf attribute, not a table flag.
+    let flags = PTE_PRESENT | PTE_RW | PTE_USER | ((attributes & 3) << 3);
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;

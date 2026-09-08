@@ -316,6 +316,20 @@ pub enum FrameRights {
 }
 
 impl FrameRights {
+    /// Attenuate frame authority using seL4_CapRights_t. Write without read grants no user
+    /// access; grant bits never add frame authority.
+    pub const fn masked(self, mask: u64) -> Self {
+        if mask & 0b010 == 0 {
+            return Self::KernelOnly;
+        }
+        match self {
+            Self::KernelOnly => Self::KernelOnly,
+            Self::ReadOnly => Self::ReadOnly,
+            Self::ReadWrite if mask & 0b001 != 0 => Self::ReadWrite,
+            Self::ReadWrite => Self::ReadOnly,
+        }
+    }
+
     pub const fn to_word(self) -> u64 {
         // seL4_CapRights_t bits: 0 = can_write, 1 = can_read,
         // 2 = can_grant, 3 = can_grant_reply.
@@ -650,7 +664,7 @@ pub fn from_words(words: [Word; 2]) -> Cap {
                 rights: FrameRights::from_word(c.capFVMRights()),
                 mapped: {
                     let v = c.capFMappedAddress();
-                    if v == 0 {
+                    if c.capFMappedASID() == 0 {
                         None
                     } else {
                         Some(v)
@@ -1095,6 +1109,8 @@ pub mod spec {
         roundtrip_zero_untyped();
         roundtrip_arch_passthrough();
         roundtrip_frame();
+        frame_rights_masks_never_add_authority();
+        roundtrip_frame_at_zero_address();
         roundtrip_paging_structs();
         roundtrip_asid_caps();
         roundtrip_sched_context_cap();
@@ -1296,7 +1312,7 @@ pub mod spec {
         let back = from_words(words);
         assert_eq!(back, cap);
 
-        // Unmapped variant — capFMappedAddress = 0 → mapped: None.
+        // Unmapped variant — capFMappedASID = 0 means no mapping.
         let cap2 = Cap::Frame {
             ptr: PAddr::<FrameStorage>::new(0x80_0000),
             size: FrameSize::Large,
@@ -1321,6 +1337,52 @@ pub mod spec {
         };
         assert_eq!(from_words(to_words(&zero)), zero);
         arch::log("  ✓ frame cap round-trips with mapped + unmapped variants\n");
+    }
+
+    fn frame_rights_masks_never_add_authority() {
+        for source in [FrameRights::KernelOnly, FrameRights::ReadOnly, FrameRights::ReadWrite] {
+            for mask in 0u64..16 {
+                let expected = if mask & 2 == 0 || source == FrameRights::KernelOnly {
+                    FrameRights::KernelOnly
+                } else if source == FrameRights::ReadOnly || mask & 1 == 0 {
+                    FrameRights::ReadOnly
+                } else {
+                    FrameRights::ReadWrite
+                };
+                assert_eq!(source.masked(mask), expected);
+                assert_eq!(source.masked(mask | !15), expected);
+            }
+        }
+        arch::log("  frame rights masks preserve source authority\n");
+    }
+
+    fn roundtrip_frame_at_zero_address() {
+        for size in [FrameSize::Small, FrameSize::Large, FrameSize::Huge] {
+            let mapped = Cap::Frame {
+                ptr: PAddr::<FrameStorage>::new(0x4000_0000),
+                size,
+                rights: FrameRights::ReadWrite,
+                mapped: Some(0),
+                asid: 7,
+                is_device: false,
+                map_type: FrameMapType::VSpace,
+            };
+            assert_eq!(from_words(to_words(&mapped)), mapped);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let io = Cap::Frame {
+                ptr: PAddr::<FrameStorage>::new(0),
+                size: FrameSize::Small,
+                rights: FrameRights::ReadOnly,
+                mapped: Some(0),
+                asid: 0x100,
+                is_device: true,
+                map_type: FrameMapType::IoSpace,
+            };
+            assert_eq!(from_words(to_words(&io)), io);
+        }
+        arch::log("  mapped frame address zero retains ASID provenance\n");
     }
 
     fn roundtrip_arch_passthrough() {

@@ -514,230 +514,182 @@ unsafe fn update_invoked_frame_slot(
     }
 }
 
-/// `X86Page::Map(vaddr, rights, [vspace_cptr])` — install the frame
-/// at `vaddr` in a vspace. We only handle 4 KiB pages today;
-/// large/huge fall through with InvalidArgument.
-///
-/// ABI: a2 = vaddr, a3 = rights word (FrameRights encoding),
-/// a4 = vspace cap_ptr (0 = current CR3 — backward-compatible
-/// default; non-zero = invoker-owned PML4 cap to map the frame
-/// into, used by the Phase 33d multi-vspace path).
 #[cfg(target_arch = "x86_64")]
-fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
-    use crate::arch::x86_64::usermode;
-    let (frame_ptr, paddr, size, _device, current_mapped) = match target {
-        Cap::Frame {
-            ptr,
-            size,
-            is_device,
-            mapped,
-            ..
-        } => (ptr, ptr.addr(), size, is_device, mapped),
-        _ => unreachable!(),
-    };
-    let vaddr = args.a2;
-    let align_bits: u32 = match size {
-        crate::cap::FrameSize::Small => 12,
-        crate::cap::FrameSize::Large => 21,
-        crate::cap::FrameSize::Huge => 30,
-    };
-    if let Some(prev) = current_mapped {
-        if vaddr & ((1u64 << align_bits) - 1) != 0 {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_AlignmentError,
-            )));
-        }
-        if !crate::arch::x86_64::vspace::user_frame_mapping_range(vaddr, align_bits) {
-            return Err(KException::SyscallError(SyscallError::new(
-                seL4_Error::seL4_InvalidArgument,
-            )));
-        }
-        // Preserve the existing same-address shortcut after validating its range.
-        // Different vaddr requires Unmap first.
-        if prev == vaddr {
-            return Ok(());
-        }
+unsafe fn preflight_invoked_mapping_slot(
+    target: Cap,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<(usize, usize)> {
+    let s = KERNEL.get();
+    let cspace = s.scheduler.slab.get(invoker).cspace_root;
+    let resolved = crate::cspace::resolve_address_bits(
+        s, &cspace, args.a0, crate::cspace::WORD_BITS,
+    ).map_err(|_| KException::SyscallError(SyscallError::new(
+        seL4_Error::seL4_InvalidCapability,
+    )))?;
+    let cnode = KernelState::cnode_index(resolved.slot_ptr);
+    if resolved.bits_remaining != 0
+        || s.cnode_slot(cnode, resolved.slot_index).map(|slot| slot.cap()) != Some(target)
+    {
         return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_DeleteFirst,
+            seL4_Error::seL4_InvalidCapability,
         )));
     }
-    let rights = crate::cap::FrameRights::from_word(args.a3);
-    let writable = matches!(rights, crate::cap::FrameRights::ReadWrite);
-    // The rights word's bit 2 (0b100) carries `ExecuteNever` (`from_word` ignores
-    // it) — set the page's NX bit so it can't be executed (W^X).
-    let execute_never = args.a3 & 0b100 != 0;
+    Ok((cnode, resolved.slot_index))
+}
 
-    // Two wire formats coexist:
-    //   * Phase 33d (compressed, microtest): args.a4 = vspace_cptr.
-    //     extra_caps == 0.
-    //   * Phase 42 upstream (sel4test): vspace passed as extraCaps[0],
-    //     args.a4 = attr (we ignore — caching not yet modelled).
-    //     Distinguished by msginfo.extra_caps() > 0.
+#[cfg(target_arch = "x86_64")]
+fn resolve_x86_mapping_root(
+    invoker: TcbId,
+    upstream: bool,
+    compressed_cptr: u64,
+) -> KResult<(u64, u16)> {
+    let root_cap = unsafe {
+        if upstream {
+            let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+            let cap = if tcb.pending_extra_caps_count > 0 {
+                tcb.pending_extra_caps[0]
+            } else {
+                Cap::Null
+            };
+            tcb.pending_extra_caps_count = 0;
+            Some(cap)
+        } else if compressed_cptr != 0 {
+            let s = KERNEL.get();
+            let cspace = s.scheduler.slab.get(invoker).cspace_root;
+            Some(crate::cspace::lookup_cap(s, &cspace, compressed_cptr)?)
+        } else {
+            None
+        }
+    };
+    let (root, asid) = match root_cap {
+        Some(Cap::PML4 { ptr, mapped: true, asid }) if asid != 0 => (ptr.addr(), asid),
+        None => {
+            let root = crate::arch::x86_64::usermode::current_pml4_paddr();
+            let Some(asid) = crate::asid::asid_for_pml4(root) else {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_InvalidCapability,
+                )));
+            };
+            (root, asid)
+        }
+        _ => return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        ))),
+    };
+    if asid == 0 || root == 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+    let registered_root = crate::asid::pml4_paddr(asid);
+    if registered_root == 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_FailedLookup,
+        )));
+    }
+    if registered_root != root {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+    Ok((root, asid))
+}
+
+/// Install or replace a frame leaf. The upstream ABI carries VSpace as an extra cap and
+/// cache attributes in a4; the compressed ABI carries VSpace in a4 and NX in rights bit 2.
+#[cfg(target_arch = "x86_64")]
+fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    use crate::arch::x86_64::{usermode, vspace};
+    use crate::cap::{FrameMapType, FrameSize};
+    let (ptr, size, rights, mapped, frame_asid, is_device, map_type) = match target {
+        Cap::Frame { ptr, size, rights, mapped, asid, is_device, map_type } =>
+            (ptr, size, rights, mapped, asid, is_device, map_type),
+        _ => unreachable!(),
+    };
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
-
     if upstream {
-        let staged_caps = unsafe {
-            KERNEL
-                .get()
-                .scheduler
-                .slab
-                .get(invoker)
-                .pending_extra_caps_count
-        };
-        if info.length() < 3 || staged_caps == 0 {
-            unsafe {
-                KERNEL
-                    .get()
-                    .scheduler
-                    .slab
-                    .get_mut(invoker)
-                    .pending_extra_caps_count = 0;
-            }
+        let tcb = unsafe { KERNEL.get().scheduler.slab.get_mut(invoker) };
+        if info.length() < 3 || tcb.pending_extra_caps_count == 0 {
+            tcb.pending_extra_caps_count = 0;
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_TruncatedMessage,
             )));
         }
     }
-
-    // Per-size alignment. Small=4 KiB (12-bit), Large=2 MiB (21-bit),
-    // Huge=1 GiB (30-bit). FRAMEEXPORTS0001 reserves a 1 GiB-aligned
-    // vaddr range so all three sizes share the same base — only the
-    // size_bits-derived stride between mappings matters.
-    let align_mask = (1u64 << align_bits) - 1;
-    if vaddr & align_mask != 0 {
+    let bits = match size {
+        FrameSize::Small => 12,
+        FrameSize::Large => 21,
+        FrameSize::Huge => 30,
+    };
+    let vaddr = args.a2;
+    if vaddr & ((1u64 << bits) - 1) != 0 {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_AlignmentError,
         )));
     }
-    if !crate::arch::x86_64::vspace::user_frame_mapping_range(vaddr, align_bits) {
+    if !vspace::user_frame_mapping_range(vaddr, bits) {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidArgument,
         )));
     }
-
-    let asid_for_cap: u16;
-    unsafe {
-        // Track BOTH the PML4 paddr and the vspace's ASID so Unmap
-        // can later walk this exact vspace by asid lookup.
-        let pml4_info_opt: Option<(u64, u16)> = if upstream {
-            let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
-            let count = inv_tcb.pending_extra_caps_count as usize;
-            let cap = if count > 0 {
-                Some(inv_tcb.pending_extra_caps[0])
-            } else {
-                None
-            };
-            inv_tcb.pending_extra_caps_count = 0;
-            match cap {
-                Some(Cap::PML4 { ptr, asid, .. }) if asid != 0 => Some((ptr.addr(), asid)),
-                Some(Cap::PML4 { .. }) => {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))
-                }
-                _ => {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))
-                }
-            }
-        } else if args.a4 != 0 {
-            let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
-            let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a4)?;
-            match pml4_cap {
-                Cap::PML4 { ptr, asid, .. } if asid != 0 => Some((ptr.addr(), asid)),
-                Cap::PML4 { .. } => {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))
-                }
-                _ => {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))
-                }
-            }
-        } else {
-            None
-        };
-        let pml4_paddr_opt = pml4_info_opt.map(|(p, _)| p);
-        asid_for_cap = pml4_info_opt.map(|(_, a)| a).unwrap_or(0);
-
-        if let Some(pml4_paddr) = pml4_paddr_opt {
-            // Dispatch to the right map helper for this Frame size.
-            // Each helper returns the level-empty error code:
-            //   missing=1: PML4 entry empty → need PDPT (level 39)
-            //   missing=2: PDPT entry empty → need PD   (level 30)
-            //   missing=3: PD entry empty   → need PT   (level 21)
-            //   missing=4: leaf slot busy   → DeleteFirst
-            let map_result = match size {
-                crate::cap::FrameSize::Small => usermode::map_user_4k_into_foreign_pml4(
-                    pml4_paddr,
-                    vaddr,
-                    paddr,
-                    writable,
-                    execute_never,
-                ),
-                crate::cap::FrameSize::Large => usermode::map_user_2m_into_foreign_pml4(
-                    pml4_paddr,
-                    vaddr,
-                    paddr,
-                    writable,
-                    execute_never,
-                ),
-                crate::cap::FrameSize::Huge => usermode::map_user_1g_into_foreign_pml4(
-                    pml4_paddr,
-                    vaddr,
-                    paddr,
-                    writable,
-                    execute_never,
-                ),
-            };
-            if let Err(missing) = map_result {
-                if missing == 4 {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_DeleteFirst,
-                    )));
-                }
-                let level: u64 = match missing {
-                    1 => 39, // PML4 entry empty → need PDPT
-                    2 => 30, // PDPT entry empty → need PD
-                    _ => 21, // PD entry empty   → need PT
-                };
-                let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
-                inv_tcb.msg_regs[2] = level;
-                // Must encompass mr2, so length >= 3.
-                inv_tcb.ipc_length = 3;
-                return Err(KException::SyscallError(SyscallError::new(
-                    seL4_Error::seL4_FailedLookup,
-                )));
-            }
-        } else if matches!(size, crate::cap::FrameSize::Small) {
-            usermode::map_user_4k_public(vaddr, paddr, writable, execute_never);
-        } else {
-            // Legacy microtest path doesn't support Large/Huge.
+    let (root, asid) = resolve_x86_mapping_root(invoker, upstream, args.a4)?;
+    if let Some(previous) = mapped {
+        if frame_asid == 0 || frame_asid != asid {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
+        }
+        if map_type != FrameMapType::VSpace {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_IllegalOperation,
+            )));
+        }
+        if previous != vaddr {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_InvalidArgument,
             )));
         }
+    } else if frame_asid != 0 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
     }
-
-    // Update the invoked cap to reflect the mapping. Several caps can name the same physical frame
-    // while carrying different map state, so the cptr in the invocation is the source of truth; a
-    // paddr scan can mark a sibling cap and corrupt later derivations.
-    let updated = Cap::Frame {
-        ptr: frame_ptr,
-        size,
-        rights,
-        mapped: Some(vaddr),
-        asid: asid_for_cap,
-        is_device: _device,
-        map_type: crate::cap::FrameMapType::VSpace,
+    let location = unsafe { preflight_invoked_mapping_slot(target, args, invoker)? };
+    let attributes = if upstream {
+        vspace::FrameMappingAttributes::upstream(args.a4)
+    } else {
+        vspace::FrameMappingAttributes::compressed(args.a3)
     };
-    unsafe {
-        update_invoked_frame_slot(args, invoker, paddr, updated)?;
+    let result = unsafe {
+        usermode::map_user_frame_in_pml4(root, vaddr, ptr.addr(), size,
+            rights.masked(args.a3), attributes)
+    };
+    if let Err(missing) = result {
+        if missing == 4 {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
+        let level = match missing { 1 => 39, 2 => 30, _ => 21 };
+        let tcb = unsafe { KERNEL.get().scheduler.slab.get_mut(invoker) };
+        tcb.msg_regs[2] = level;
+        tcb.ipc_length = 3;
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_FailedLookup,
+        )));
     }
+    // The BKL keeps this exact CTE stable between preflight and commit. No fallible work remains.
+    unsafe {
+        KERNEL.get().cnode_slot_mut(location.0, location.1)
+            .expect("prevalidated frame CTE remains live under BKL")
+            .set_cap(&Cap::Frame {
+                ptr, size, rights, mapped: Some(vaddr), asid, is_device,
+                map_type: FrameMapType::VSpace,
+            });
+    }
+    crate::smp::shootdown_vspace(root);
     Ok(())
 }
 
@@ -1449,21 +1401,24 @@ fn decode_pdpt(
 #[cfg(target_arch = "x86_64")]
 fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32) -> KResult<()> {
     use crate::arch::x86_64::usermode;
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    let upstream = info.extra_caps() > 0;
+    if upstream && (info.length() < 2
+        || unsafe { KERNEL.get().scheduler.slab.get(invoker).pending_extra_caps_count } == 0)
+    {
+        unsafe { KERNEL.get().scheduler.slab.get_mut(invoker).pending_extra_caps_count = 0; }
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_TruncatedMessage,
+        )));
+    }
     let (paddr, current_mapped) = paging_struct_state(&target);
     if current_mapped.is_some() {
-        if INV_TRACE {
-            crate::arch::log("[map.lvl=");
-            log_dec(level as u64);
-            crate::arch::log(" cap-already-mapped@0x");
-            log_hex_u64(current_mapped.unwrap());
-            crate::arch::log("]\n");
-        }
         return Err(KException::SyscallError(SyscallError::new(
-            seL4_Error::seL4_DeleteFirst,
+            seL4_Error::seL4_InvalidCapability,
         )));
     }
     let vaddr = args.a2;
-    if vaddr & 0xFFF != 0 {
+    if !upstream && vaddr & 0xFFF != 0 {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_AlignmentError,
         )));
@@ -1485,85 +1440,14 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
         )));
     }
 
-    // Two wire formats coexist:
-    //   * Phase 33d compressed (microtest): args.a3 = vspace_cptr,
-    //     extra_caps == 0.
-    //   * Phase 42 upstream (sel4test): vspace via extraCaps[0],
-    //     args.a3 = attrs (ignored — caching not yet modelled).
-    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
-    let upstream = info.extra_caps() > 0;
-
-    let (installed, mapped_asid) = unsafe {
-        let vspace: Option<(u64, u16)> = if upstream {
-            let inv_tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
-            let count = inv_tcb.pending_extra_caps_count as usize;
-            let cap = if count > 0 {
-                Some(inv_tcb.pending_extra_caps[0])
-            } else {
-                None
-            };
-            inv_tcb.pending_extra_caps_count = 0;
-            match cap {
-                Some(Cap::PML4 { ptr, asid, .. }) if asid != 0 => Some((ptr.addr(), asid)),
-                Some(Cap::PML4 { .. }) => {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))
-                }
-                _ => {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))
-                }
-            }
-        } else if args.a3 != 0 {
-            let cspace_root = KERNEL.get().scheduler.slab.get(invoker).cspace_root;
-            let pml4_cap = crate::cspace::lookup_cap(KERNEL.get(), &cspace_root, args.a3)?;
-            match pml4_cap {
-                Cap::PML4 { ptr, asid, .. } if asid != 0 => Some((ptr.addr(), asid)),
-                Cap::PML4 { .. } => {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))
-                }
-                _ => {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))
-                }
-            }
-        } else {
-            #[cfg(not(feature = "spec"))]
-            {
-                let pml4_paddr = usermode::current_pml4_paddr();
-                let Some(asid) = crate::asid::asid_for_pml4(pml4_paddr) else {
-                    return Err(KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )));
-                };
-                Some((pml4_paddr, asid))
-            }
-            #[cfg(feature = "spec")]
-            {
-                None
-            }
-        };
-
-        let mapped_asid = vspace.map(|(_, asid)| asid).unwrap_or(0);
-        let installed = if let Some((pml4_paddr, _)) = vspace {
-            usermode::install_user_table_in_paddr(pml4_paddr, level, vaddr, paddr)
-        } else {
-            #[cfg(not(feature = "spec"))]
-            {
-                usermode::install_user_table(level, vaddr, paddr)
-            }
-            #[cfg(feature = "spec")]
-            {
-                let _ = (level, vaddr, paddr);
-                Ok(())
-            }
-        };
-        (installed, mapped_asid)
+    let (root, mapped_asid) = resolve_x86_mapping_root(invoker, upstream, args.a3)?;
+    let (cnode, slot) = unsafe { preflight_invoked_mapping_slot(target, args, invoker)? };
+    let updated = paging_cap_with_mapping(target, paddr, Some(span_base), mapped_asid)
+        .ok_or(KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability)))?;
+    let installed = unsafe {
+        usermode::install_user_table_in_paddr(
+            root, level, span_base, paddr, if upstream { args.a3 } else { 0 },
+        )
     };
     if let Err(missing_level) = installed {
         if missing_level == 0 {
@@ -1591,7 +1475,12 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
         )));
     }
 
-    update_invoked_paging_slot(args, invoker, &target, Some(vaddr), mapped_asid)?;
+    // The BKL keeps the exact preflighted CTE stable through the table write and metadata commit.
+    unsafe {
+        KERNEL.get().cnode_slot_mut(cnode, slot)
+            .expect("preflighted paging capability remains present").set_cap(&updated);
+    }
+    crate::smp::shootdown_vspace(root);
     Ok(())
 }
 
@@ -4844,6 +4733,16 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
     //       msg_regs[4] = rights, msg_regs[5] = badge (Mint).
     let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
     let upstream = info.extra_caps() > 0;
+    if upstream {
+        let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get_mut(invoker) };
+        let required_words = if mint { 6 } else { 5 };
+        if info.length() < required_words || inv_tcb.pending_extra_caps_count == 0 {
+            inv_tcb.pending_extra_caps_count = 0;
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_TruncatedMessage,
+            )));
+        }
+    }
     let (dest_index, dest_depth, src_index, src_depth, badge, rights_word) = if upstream {
         let inv_tcb = unsafe { KERNEL.get().scheduler.slab.get(invoker) };
         // Upstream wire layout (mirrors libsel4's CNode_Copy /
@@ -4868,7 +4767,7 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
     unsafe {
         let s = KERNEL.get();
         let inv_tcb = s.scheduler.slab.get_mut(invoker);
-        let src_root = if upstream && inv_tcb.pending_extra_caps_count > 0 {
+        let src_root = if upstream {
             let c = inv_tcb.pending_extra_caps[0];
             inv_tcb.pending_extra_caps_count = 0;
             c
@@ -4916,9 +4815,10 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
         // different: its mapping metadata is cleared in the derived cap.
         derive_paging_structure(&copy)?;
         match &mut copy {
-            Cap::Frame { mapped, asid, .. } => {
+            Cap::Frame { mapped, asid, map_type, .. } => {
                 *mapped = None;
                 *asid = 0;
+                *map_type = crate::cap::FrameMapType::None;
             }
             _ => {}
         }
@@ -4946,7 +4846,9 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
                 rights.can_send &= rights_word & ALLOW_WRITE != 0;
                 rights.can_receive &= rights_word & ALLOW_READ != 0;
             }
-            // TODO: mask Frame/Reply rights when sel4test exercises them.
+            Cap::Frame { rights, .. } => {
+                *rights = rights.masked(rights_word);
+            }
             _ => {}
         }
         let mut io_mint_invalid = false;
@@ -7102,6 +7004,9 @@ pub mod spec {
     use super::*;
     use crate::arch;
     use crate::cap::{Badge, Cap, EndpointObj, EndpointRights, PPtr};
+    include!("invocation/cnode_frame_specs.rs");
+    include!("invocation/frame_mapping_specs.rs");
+    include!("invocation/paging_mapping_specs.rs");
 
     pub fn test_invocation() {
         arch::log("Running invocation tests...\n");
@@ -7111,6 +7016,7 @@ pub mod spec {
         revoke_chain_clears_only_descendants();
         repeated_alloc_free_reclaims_untyped();
         cnode_copy_via_invocation();
+        cnode_frame_specs::run();
         cnode_move_clears_source();
         cnode_move_reparents_direct_children();
         cnode_delete_splices_derivation_children();
@@ -7125,6 +7031,7 @@ pub mod spec {
         zero_device_frame_get_address();
         #[cfg(target_arch = "x86_64")]
         {
+            frame_mapping_specs::run();
             frame_map_unmap_get_address();
             frame_map_accepts_upstream_libsel4_abi();
             paging_maps_reject_unassigned_explicit_vspace();
@@ -7132,7 +7039,7 @@ pub mod spec {
             paging_maps_reject_non_user_extents();
             paging_unmap_requires_exact_physical_identity();
             page_table_invocation_tracks_asid_and_detaches_hardware();
-            page_table_map_updates_invoked_slot_not_first_alias();
+            paging_mapping_specs::run();
         }
         tcb_write_read_registers();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
@@ -7834,7 +7741,8 @@ pub mod spec {
                     let unaligned = SyscallArgs { a2: address + 1, ..args };
                     assert_eq!(decode_invocation(table, &unaligned, invoker),
                         Err(KException::SyscallError(SyscallError::new(
-                            seL4_Error::seL4_AlignmentError))));
+                            if format == 2 { seL4_Error::seL4_InvalidArgument }
+                            else { seL4_Error::seL4_AlignmentError }))));
                 }
             }
             // A page-aligned address need not be aligned to the table span. These valid
@@ -8012,54 +7920,6 @@ pub mod spec {
         }
         teardown_invoker(invoker);
         arch::log("  ✓ PageTable Map/Unmap persists ASID and detaches hardware\n");
-    }
-
-    /// Page-structure map must update the cap slot the caller invoked, not the first sibling cap
-    /// with the same object paddr. The NT rootserver keeps copied aliases and a large root CSpace; a
-    /// full-CNode scan both mutates the wrong sibling and becomes a boot-time cliff.
-    #[cfg(target_arch = "x86_64")]
-    #[inline(never)]
-    fn page_table_map_updates_invoked_slot_not_first_alias() {
-        use crate::cap::PageTableStorage;
-        let invoker = setup_invoker(0);
-        let pt_paddr = 0x0000_0000_00B1_0000u64;
-        let pt_cap = Cap::PageTable {
-            ptr: PPtr::<PageTableStorage>::new(pt_paddr).unwrap(),
-            mapped: None,
-            asid: 0,
-        };
-        const EARLY_ALIAS_SLOT: usize = 2;
-        const INVOKED_SLOT: usize = 28;
-        unsafe {
-            let s = KERNEL.get();
-            s.cnodes[0].0[EARLY_ALIAS_SLOT] = Cte::with_cap(&pt_cap);
-            s.cnodes[0].0[INVOKED_SLOT] = Cte::with_cap(&pt_cap);
-        }
-
-        let vaddr = 0x0000_0100_0140_0000u64;
-        let args = SyscallArgs {
-            a0: INVOKED_SLOT as u64,
-            a1: (InvocationLabel::X86PageTableMap as u64) << 12,
-            a2: vaddr,
-            ..Default::default()
-        };
-        decode_invocation(pt_cap, &args, invoker).expect("PT map ok");
-
-        unsafe {
-            match KERNEL.get().cnodes[0].0[EARLY_ALIAS_SLOT].cap() {
-                Cap::PageTable { mapped: None, .. } => {}
-                other => panic!("early alias should remain unmapped, got {:?}", other),
-            }
-            match KERNEL.get().cnodes[0].0[INVOKED_SLOT].cap() {
-                Cap::PageTable {
-                    mapped: Some(v), ..
-                } if v == vaddr => {}
-                other => panic!("invoked slot should be mapped, got {:?}", other),
-            }
-        }
-
-        teardown_invoker(invoker);
-        arch::log("  ✓ Cap::PageTable Map updates invoked slot, not first alias\n");
     }
 
     /// Build a fresh state for one test: invoker TCB id, and a
@@ -9028,9 +8888,15 @@ pub mod spec {
     #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn frame_map_unmap_get_address() {
-        use crate::cap::{FrameRights, FrameSize, FrameStorage};
+        use crate::cap::{FrameRights, FrameSize, FrameStorage, Pml4Storage};
 
         let invoker = setup_invoker(0);
+        let live_root = crate::arch::x86_64::usermode::current_pml4_paddr();
+        let existing_asid = crate::asid::asid_for_pml4(live_root);
+        let live_asid = existing_asid.unwrap_or(4090);
+        if existing_asid.is_none() {
+            crate::asid::register_boot_mapping(live_asid, live_root);
+        }
         // Plant sibling Frame caps at slots 1 and 2 of CNode 0. Pick a paddr
         // in the reserved user-page pool and a vaddr in PML4[2]
         // (= same place the user-mode demo uses).
@@ -9062,6 +8928,9 @@ pub mod spec {
 
         // Invoke X86PageMap — install at vaddr 0x100_0040_0000.
         let vaddr = 0x0000_0100_0040_0000u64;
+        unsafe {
+            crate::arch::x86_64::usermode::map_user_4k_public(vaddr, paddr + 0x1000, true, false);
+        }
         let args = SyscallArgs {
             a0: 2,
             a1: (InvocationLabel::X86PageMap as u64) << 12,
@@ -9108,8 +8977,7 @@ pub mod spec {
             Some(paddr)
         );
 
-        // Re-mapping at the SAME vaddr is a no-op (mirrors upstream
-        // `decodeX86FrameMapInvocation`), so it should succeed.
+        // Same-address Map revalidates authority and rewrites the leaf permissions.
         let args = SyscallArgs {
             a0: 2,
             a1: (InvocationLabel::X86PageMap as u64) << 12,
@@ -9120,7 +8988,7 @@ pub mod spec {
         let now_cap = unsafe { KERNEL.get().cnodes[0].0[2].cap() };
         decode_invocation(now_cap, &args, invoker).expect("remap same vaddr ok");
 
-        // Re-mapping at a DIFFERENT vaddr is rejected with DeleteFirst —
+        // Re-mapping at a DIFFERENT vaddr is rejected with InvalidArgument —
         // userspace must Unmap first.
         let other_vaddr = vaddr + 0x1000;
         let args = SyscallArgs {
@@ -9134,7 +9002,7 @@ pub mod spec {
         assert!(matches!(
             r,
             Err(KException::SyscallError(SyscallError {
-                code: seL4_Error::seL4_DeleteFirst
+                code: seL4_Error::seL4_InvalidArgument
             }))
         ));
 
@@ -9154,6 +9022,12 @@ pub mod spec {
                 Cap::Frame { mapped: None, .. } => {}
                 other => panic!("expected unmapped frame, got {:?}", other),
             }
+        }
+        if existing_asid.is_none() {
+            crate::asid::note_cap_write(&Cap::PML4 {
+                ptr: PPtr::<Pml4Storage>::new(live_root).unwrap(),
+                mapped: true, asid: live_asid,
+            }, &Cap::Null);
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Frame::Map / Unmap / GetAddress round-trip\n");
@@ -9178,10 +9052,15 @@ pub mod spec {
             map_type: crate::cap::FrameMapType::None,
         };
         let pml4_paddr = crate::arch::x86_64::usermode::current_pml4_paddr();
+        let existing_asid = crate::asid::asid_for_pml4(pml4_paddr);
+        let live_asid = existing_asid.unwrap_or(4090);
+        if existing_asid.is_none() {
+            crate::asid::register_boot_mapping(live_asid, pml4_paddr);
+        }
         let pml4_cap = Cap::PML4 {
             ptr: PPtr::<Pml4Storage>::new(pml4_paddr).expect("live PML4 paddr is non-zero"),
             mapped: true,
-            asid: 1,
+            asid: live_asid,
         };
         unsafe {
             let s = KERNEL.get();
@@ -9214,14 +9093,17 @@ pub mod spec {
             match KERNEL.get().cnodes[0].0[2].cap() {
                 Cap::Frame {
                     mapped: Some(v),
-                    asid: 1,
+                    asid,
                     ..
-                } if v == vaddr => {}
+                } if v == vaddr && asid == live_asid => {}
                 other => panic!("expected upstream-mapped frame cap, got {:?}", other),
             }
             assert!(crate::arch::x86_64::usermode::unmap_user_4k_public(
                 vaddr, paddr,
             ));
+        }
+        if existing_asid.is_none() {
+            crate::asid::note_cap_write(&pml4_cap, &Cap::Null);
         }
         teardown_invoker(invoker);
         arch::log("  ✓ Frame::Map accepts upstream libsel4 ABI\n");
