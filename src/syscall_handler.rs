@@ -904,8 +904,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 if !blocking && !matches!(ntfn.state, crate::notification::NtfnState::Active) {
                     // NBWait on Idle notification — return 0 badge.
                     let tcb = sched.slab.get_mut(current);
-                    tcb.ipc_badge = 0;
-                    crate::arch::set_ipc_return(&mut tcb.user_context, 0, 0, &[]);
+                    tcb.set_empty_ipc_result(0);
                     return Ok(());
                 }
                 let _outcome = crate::notification::wait(ntfn, sched, current);
@@ -933,8 +932,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                 ntfn.state = crate::notification::NtfnState::Idle;
                 {
                     let tcb = s.scheduler.slab.get_mut(current);
-                    tcb.ipc_badge = badge;
-                    crate::arch::set_ipc_return(&mut tcb.user_context, badge, 0, &[]);
+                    tcb.set_empty_ipc_result(badge);
                 }
                 s.scheduler.rotate_current_after_bound_notification(current);
                 return Ok(());
@@ -959,8 +957,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         // a non-zero badge.
         if matches!(outcome, crate::endpoint::IpcOutcome::Skipped) {
             let tcb = s.scheduler.slab.get_mut(current);
-            tcb.ipc_badge = 0;
-            crate::arch::set_ipc_return(&mut tcb.user_context, 0, 0, &[]);
+            tcb.set_empty_ipc_result(0);
         }
         Ok(())
     }
@@ -1972,6 +1969,9 @@ pub mod spec {
                 guard: 0,
             };
             t.bound_notification = Some(ntfn_idx as u16);
+            t.ipc_label = 0xdead;
+            t.ipc_length = 19;
+            t.msg_regs.fill(0xbad);
             crate::arch::set_composite_send_destination(&mut t.user_context, true, 2);
             let server = admit_with_cspace(s, owners, t, server_cspace);
             s.scheduler.set_current(Some(server));
@@ -1994,6 +1994,9 @@ pub mod spec {
             assert_eq!(t.pending_reply, None);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
+            assert_eq!(t.ipc_label, 0);
+            assert_eq!(t.ipc_length, 0);
+            assert!(t.msg_regs.iter().all(|word| *word == 0));
             #[cfg(target_arch = "x86_64")]
             assert_eq!(t.user_context.rdi, 0xBAD0);
             s.notifications[ntfn_idx] = Notification::new();
@@ -2907,6 +2910,9 @@ pub mod spec {
             let mut t = Tcb::default();
             t.priority = 50;
             t.state = ThreadStateType::Running;
+            t.ipc_label = 0xdead;
+            t.ipc_length = 19;
+            t.msg_regs.fill(0xbad);
             let server_cspace = Cap::CNode {
                 ptr: cnode_ptr,
                 radix: 5,
@@ -2935,6 +2941,9 @@ pub mod spec {
             assert_eq!(t.pending_reply, None);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
+            assert_eq!(t.ipc_label, 0);
+            assert_eq!(t.ipc_length, 0);
+            assert!(t.msg_regs.iter().all(|word| *word == 0));
             #[cfg(target_arch = "x86_64")]
             {
                 assert_eq!(t.user_context.rdi, 0);

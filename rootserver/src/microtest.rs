@@ -14,6 +14,9 @@
 
 use crate::*;
 
+#[cfg(target_arch = "x86_64")]
+mod legacy_context_probe;
+
 type TestResult = Result<(), &'static str>;
 type TestFn = fn() -> TestResult;
 
@@ -42,6 +45,12 @@ const CASES: &[TestCase] = &[
                body: tests::tcb_configure_upstream },
     TestCase { name: "tcb_read_registers_full",
                body: tests::tcb_read_registers_full },
+    #[cfg(target_arch = "x86_64")]
+    TestCase { name: "legacy_context_fault_reply_immediate",
+               body: legacy_context_probe::immediate },
+    #[cfg(target_arch = "x86_64")]
+    TestCase { name: "legacy_context_fault_reply_parked",
+               body: legacy_context_probe::parked },
 ];
 
 /// Entry point invoked from `_start` when `--features microtest`
@@ -89,8 +98,10 @@ pub unsafe fn run(ipc_buffer_vaddr: u64, empty_start: u64) {
     print_str(b" passed, ");
     print_u64(failed as u64);
     print_str(b" failed]\n");
-    // Sentinel — kernel's exit hook qemu_exits when it sees this
-    // exact byte stream.
+    // The shared failure verdict exits QEMU nonzero; reaching the end is not itself success.
+    if failed != 0 {
+        print_str(b"*** FAILURES DETECTED ***\n");
+    }
     print_str(b"[microtest done]\n");
 }
 

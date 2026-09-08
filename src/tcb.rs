@@ -432,6 +432,17 @@ impl Default for Tcb {
 }
 
 impl Tcb {
+    /// Empty polls and notifications carry no message. Keep the saved IPC metadata and the
+    /// architectural return image coherent, including paths reprojected by the syscall tail.
+    pub(crate) fn set_empty_ipc_result(&mut self, badge: Word) {
+        self.ipc_label = 0;
+        self.ipc_length = 0;
+        self.received_extra_caps = 0;
+        self.ipc_badge = badge;
+        self.msg_regs.fill(0);
+        crate::arch::set_ipc_return(&mut self.user_context, badge, 0, &[]);
+    }
+
     pub fn cspace_root(&self) -> crate::cap::Cap {
         self.cap_slot(crate::cte::TcbSlot::CSpace).cap()
     }

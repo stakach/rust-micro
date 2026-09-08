@@ -238,8 +238,7 @@ pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Op
                         crate::endpoint::cancel_ipc_anywhere(sched, bt);
                         {
                             let tcb = sched.slab.get_mut(bt);
-                            tcb.ipc_badge = badge;
-                            crate::arch::set_ipc_return(&mut tcb.user_context, badge, 0, &[]);
+                            tcb.set_empty_ipc_result(badge);
                         }
                         let interrupted_current = sched.user_entry_thread();
                         sched.make_runnable(bt);
@@ -275,8 +274,7 @@ pub fn signal(ntfn: &mut Notification, sched: &mut Scheduler, badge: Word) -> Op
             // callback table, and calls a NULL function pointer.
             {
                 let tcb = sched.slab.get_mut(t);
-                tcb.ipc_badge = badge;
-                crate::arch::set_ipc_return(&mut tcb.user_context, badge, 0, &[]);
+                tcb.set_empty_ipc_result(badge);
             }
             // Passive-server SC donation (mirrors the bound-TCB
             // branch above): if the woken waiter has no SC of its own
@@ -316,9 +314,7 @@ pub fn wait(ntfn: &mut Notification, sched: &mut Scheduler, thread: TcbId) -> Wa
             let badge = ntfn.pending_badge;
             ntfn.pending_badge = 0;
             ntfn.state = NtfnState::Idle;
-            // Stash the badge on the TCB so `wait`'s return convention
-            // matches the receive side of an IPC transfer.
-            sched.slab.get_mut(thread).ipc_badge = badge;
+            sched.slab.get_mut(thread).set_empty_ipc_result(badge);
             WaitOutcome::Got { badge }
         }
         NtfnState::Idle | NtfnState::Waiting => {

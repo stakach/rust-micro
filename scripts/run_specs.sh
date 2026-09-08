@@ -65,6 +65,22 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# QEMU 11 on Apple Silicon stalls in host TB invalidation when a guest data watchpoint fires
+# with its default JIT mapping. Split W^X retains real watchpoints and multi-threaded TCG.
+# An explicit accelerator argument (or QEMU_ACCEL) remains authoritative for other test lanes.
+ACCEL_FLAGS=()
+EXPLICIT_ACCEL=0
+for arg in "$@"; do
+  case "$arg" in -accel|-accel=*) EXPLICIT_ACCEL=1 ;; esac
+done
+if [ "$EXPLICIT_ACCEL" = 0 ]; then
+  if [ -n "${QEMU_ACCEL:-}" ]; then
+    ACCEL_FLAGS=(-accel "$QEMU_ACCEL")
+  elif [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
+    ACCEL_FLAGS=(-accel tcg,split-wx=on)
+  fi
+fi
+
 # Display vs headless. Graphics mode selects a real display backend, keeps std
 # VGA so OVMF's GOP framebuffer is shown, and keeps serial on stdio. Both lanes
 # retain isa-debug-exit: the guest's explicit final verdict must terminate QEMU
@@ -104,6 +120,7 @@ esac
 qemu_status=0
 qemu-system-x86_64 \
   -machine q35 \
+  ${ACCEL_FLAGS[@]+"${ACCEL_FLAGS[@]}"} \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
   -drive format=raw,file="$IMAGE",if=none,id=bootdisk \
   -device ahci,id=ahci0 \
@@ -124,5 +141,9 @@ qemu-system-x86_64 \
 # status 1. Translate that successful completion to the conventional shell 0.
 if [ "$qemu_status" -eq 1 ]; then
   exit 0
+fi
+if [ "$qemu_status" -eq 0 ]; then
+  echo "error: QEMU exited without the successful guest completion verdict" >&2
+  exit 1
 fi
 exit "$qemu_status"
