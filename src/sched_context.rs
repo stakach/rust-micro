@@ -56,6 +56,8 @@ pub struct SchedContext {
     /// Bound TCB. `None` while unbound. seL4 stores this as the
     /// `scTcb` cap pointer; we use a TcbId.
     pub bound_tcb: Option<TcbId>,
+    /// Exact top of the MCS donation chain, independent of the SC's current holder.
+    pub reply_head: Option<crate::reply::ReplyNode>,
     /// Ticks consumed by the bound thread since the last
     /// `setConsumed`-style reset. seL4's `scConsumed`. Charged by
     /// `mcs_tick`; read + reset when a YieldTo completes.
@@ -103,6 +105,7 @@ impl SchedContext {
             head: 0,
             count: 0,
             bound_tcb: None,
+            reply_head: None,
             consumed: 0,
             bound_consumed: 0,
             donated_consumed: 0,
@@ -535,21 +538,6 @@ pub fn sc_donate(s: &mut crate::kernel::KernelState, sc_idx: usize, to: TcbId) {
     }
     s.sched_contexts[sc_idx].bound_tcb = Some(to);
     s.scheduler.slab.get_mut(to).sc = Some(sc_idx as u16);
-}
-
-/// On reply to a caller that donated its SC to a passive server,
-/// move the SC back to the caller (upstream `reply_pop`). `sc_donate`
-/// takes it off the server (now passive, dequeued, no longer current)
-/// and gives it to `caller`, which the reply path then make_runnable's.
-/// No-op if the caller didn't donate, or already acquired another SC
-/// while blocked (upstream keeps the donated one with the server then).
-pub fn return_donated_sc(s: &mut crate::kernel::KernelState, caller: TcbId) {
-    let donated = s.scheduler.slab.get_mut(caller).donated_sc.take();
-    if let Some(sc) = donated {
-        if s.scheduler.slab.get(caller).sc.is_none() {
-            sc_donate(s, sc as usize, caller);
-        }
-    }
 }
 
 /// "Now" in the same ticks the SC schedule uses. Driven by the

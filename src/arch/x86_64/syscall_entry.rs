@@ -1092,8 +1092,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             let Some(tcb) = s.scheduler.slab.try_get(candidate) else {
                 return false;
             };
-            let has_execution_context =
-                tcb.sc.is_some() || tcb.active_sc.is_some() || tcb.donated_sc.is_some();
+            let has_execution_context = tcb.sc.is_some() || tcb.active_sc.is_some();
             tcb.is_runnable()
                 && has_execution_context
                 && tcb.affinity as usize == arch::get_cpu_id() as usize
@@ -2386,7 +2385,6 @@ pub mod spec {
         use crate::cap::Cap;
         use crate::cte::{MdbId, TcbSlot};
         use crate::kernel::{KernelState, KERNEL};
-        use crate::reply::Reply;
         use crate::tcb::{Tcb, ThreadStateType};
 
         let preparation = crate::spec::KernelGuard::acquire();
@@ -2407,11 +2405,13 @@ pub mod spec {
             caller_tcb.state = ThreadStateType::BlockedOnReply;
             caller_tcb.sc = Some(1);
             let caller = s.scheduler.try_admit_cap(caller_tcb).expect("caller TCB");
+            s.sched_contexts[1].bound_tcb = Some(caller);
+            assert!(s.sched_contexts[1].reply_head.is_none());
 
             let mut server_tcb = Tcb::default();
             server_tcb.priority = 255;
             server_tcb.state = ThreadStateType::Running;
-            server_tcb.sc = Some(0);
+            server_tcb.sc = None;
             server_tcb.active_sc = Some(1);
             let cnode_cap = Cap::CNode {
                 ptr: KernelState::cnode_ptr(cnode_idx),
@@ -2423,9 +2423,11 @@ pub mod spec {
             let source = owners.cap_source_in(s, cnode_cap);
             crate::invocation::derive_tcb_cap(s, server, TcbSlot::CSpace, Some(source), 0).unwrap();
 
-            s.replies[reply_idx] = Reply {
-                bound_tcb: Some(caller),
-            };
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
+            s.scheduler.on_sc_gained(server);
+            assert_eq!(s.scheduler.slab.get(caller).donated_sc, Some(1));
+            assert_eq!(s.scheduler.slab.get(server).sc, Some(1));
             s.scheduler.set_current(Some(server));
 
             let ctx = super::current_cpu_user_ctx_mut();
@@ -2447,10 +2449,13 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0x5250);
             assert_eq!(s.scheduler.slab.get(server).active_sc, None);
+            assert_eq!(s.scheduler.slab.get(server).sc, None);
+            assert_eq!(s.scheduler.slab.get(caller).sc, Some(1));
+            assert_eq!(s.sched_contexts[1].reply_head, None);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             s.scheduler.block(caller, ThreadStateType::Inactive);
             s.scheduler.block(server, ThreadStateType::Inactive);
-            s.scheduler.slab.free(caller);
+            crate::invocation::retire_tcb(s, caller);
             crate::invocation::delete_cap_slot(s, MdbId::pack(cnode_idx as u32, 2)).unwrap();
             crate::invocation::retire_tcb(s, server);
             s.scheduler.reset_queues();

@@ -2216,9 +2216,10 @@ fn handoff_marked_reply_to_caller(
     s: &mut KernelState,
     invoker: TcbId,
     caller: TcbId,
-    handoff_requested: bool,
+    handoff_authorized: bool,
+    returning_invoker_sc: Option<u16>,
 ) {
-    if !handoff_requested || s.scheduler.current() != Some(invoker) {
+    if !handoff_authorized {
         return;
     }
     let Some(invoker_tcb) = s.scheduler.slab.try_get(invoker) else {
@@ -2227,6 +2228,15 @@ fn handoff_marked_reply_to_caller(
     let Some(caller_tcb) = s.scheduler.slab.try_get(caller) else {
         return;
     };
+    match s.scheduler.current() {
+        Some(current) if current == invoker => {}
+        None if returning_invoker_sc.is_some_and(|sc| {
+            invoker_tcb.sc.is_none()
+                && caller_tcb.sc == Some(sc)
+                && s.sched_contexts[sc as usize].bound_tcb == Some(caller)
+        }) => {}
+        _ => return,
+    }
     if !caller_tcb.is_runnable()
         || !caller_tcb.is_schedulable()
         || !caller_tcb.enqueued
@@ -2238,54 +2248,9 @@ fn handoff_marked_reply_to_caller(
     s.scheduler.set_current(Some(caller));
 }
 
-fn clear_receiver_call_state_for_reply_caller(s: &mut KernelState, caller: TcbId) {
-    for entry in s.scheduler.slab.entries.iter_mut() {
-        let Some(tcb) = entry.as_mut() else {
-            continue;
-        };
-        if tcb.reply_to == Some(caller) {
-            tcb.reply_to = None;
-            tcb.active_sc = None;
-        }
-        if tcb.composite_reply_handoff == Some(caller) {
-            tcb.composite_reply_handoff = None;
-        }
-    }
-}
-
 fn cancel_reply_wait_for_caller(s: &mut KernelState, caller: TcbId) {
-    // The caller can be stopped while its donated SC still runs a different, remote receiver.
-    // Stop that actual owner before withdrawing its execution authority, retaining the BKL.
-    let return_donation = match s.scheduler.slab.try_get(caller) {
-        Some(t) if t.state == crate::tcb::ThreadStateType::BlockedOnReply => {
-            if t.sc.is_some() {
-                // An independently acquired SC leaves the old donation with its receiver.
-                true
-            } else if let Some(sc) = t.donated_sc {
-                let owner = s.sched_contexts.get(sc as usize).and_then(|sc| sc.bound_tcb);
-                match owner {
-                    Some(owner)
-                        if s.scheduler.slab.try_get(owner).map(|t| t.sc) == Some(Some(sc)) =>
-                    {
-                        unsafe { crate::smp::remote_tcb_stall(s, owner); }
-                        true
-                    }
-                    _ => false,
-                }
-            } else {
-                false
-            }
-        }
-        _ => false,
-    };
-    clear_receiver_call_state_for_reply_caller(s, caller);
-    for reply in s.replies.iter_mut() {
-        if reply.bound_tcb == Some(caller) {
-            reply.bound_tcb = None;
-        }
-    }
-    if return_donation {
-        crate::sched_context::return_donated_sc(s, caller);
+    if let Some(node) = s.scheduler.slab.get(caller).call_reply {
+        crate::reply::unlink(s, node);
     }
 }
 
@@ -2297,7 +2262,8 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
     unsafe {
         let s = KERNEL.get();
         let idx = KernelState::reply_index(reply_ptr);
-        let caller = match s.replies[idx].bound_tcb {
+        let node = crate::reply::ReplyNode::Object(idx as u16);
+        let caller = match crate::reply::caller(s, node) {
             Some(c) => c,
             None => {
                 return Err(KException::SyscallError(SyscallError::new(
@@ -2306,6 +2272,15 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
             }
         };
         let handoff_requested = reply_handoff_requested(s, invoker);
+        let handoff_authorized = handoff_requested && s.scheduler.current() == Some(invoker);
+        let returning_invoker_sc = s.scheduler.slab.get(invoker).sc.filter(|&sc| {
+            handoff_authorized
+                && s.scheduler.slab.get(caller).sc.is_none()
+                && s.replies[idx].next == Some(crate::reply::Next::Head(sc))
+                && s.sched_contexts[sc as usize].reply_head == Some(node)
+                && s.sched_contexts[sc as usize].bound_tcb == Some(invoker)
+        });
+        crate::reply::remove(s, node);
         #[cfg(target_arch = "x86_64")]
         if handoff_requested {
             s.scheduler.slab.get_mut(invoker).user_context.r13 = 0;
@@ -2348,23 +2323,11 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         // upstream handleFaultReply semantics instead.
         if s.scheduler.slab.get(caller).pending_fault != 0 {
             let restart = crate::fault::apply_fault_reply(s, caller, label, length as usize, &regs);
-            s.scheduler.slab.get_mut(invoker).active_sc = None;
-            s.replies[idx].bound_tcb = None;
-            // Only clear the legacy reply_to stash if it names THIS
-            // caller — the replier may hold a SECOND outstanding reply
-            // (TIMEOUTFAULT0002: a handler replies to the client via
-            // one reply cap while still owing a TimeoutReply to the
-            // server, whose caller lives in reply_to).
-            if s.scheduler.slab.get(invoker).reply_to == Some(caller) {
-                s.scheduler.slab.get_mut(invoker).reply_to = None;
-            }
-            // IPC0021 — return the SC the faulter donated to a passive
-            // fault handler (fault delivery is a Call) so the restarted
-            // faulter is schedulable again.
-            crate::sched_context::return_donated_sc(s, caller);
             if restart {
                 s.scheduler.make_runnable(caller);
-                handoff_marked_reply_to_caller(s, invoker, caller, handoff_requested);
+                handoff_marked_reply_to_caller(
+                    s, invoker, caller, handoff_authorized, returning_invoker_sc,
+                );
             } else {
                 s.scheduler
                     .block(caller, crate::tcb::ThreadStateType::Inactive);
@@ -2376,29 +2339,10 @@ fn decode_reply(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> 
         // IPC-return fan-in, shared with endpoint IPC so long
         // replies (IPC0002/0003, up to seL4_MsgMaxLength) work.
         crate::endpoint::deliver_message(&mut s.scheduler, invoker, caller, 0);
-        debug_assert!(matches!(
-            s.scheduler.slab.get(caller).state,
-            crate::tcb::ThreadStateType::BlockedOnReply
-        ));
-        // Phase 33c — return the donated SC.
-        s.scheduler.slab.get_mut(invoker).active_sc = None;
-        // Passive-server reply: move the donated SC back to the caller
-        // (upstream reply_pop), making the server passive again and
-        // the caller schedulable.
-        crate::sched_context::return_donated_sc(s, caller);
         s.scheduler.make_runnable(caller);
-        handoff_marked_reply_to_caller(s, invoker, caller, handoff_requested);
-        // Clear the reply binding — the slot is reusable for the
-        // next Call once the receiver Recv's on the same Reply
-        // cap (or a different one).
-        s.replies[idx].bound_tcb = None;
-        // Also clear the legacy stash so a stale `reply_to` doesn't
-        // double-wake — but only when it names THIS caller (the
-        // replier may owe a second, unrelated reply; see the fault
-        // branch above, TIMEOUTFAULT0002).
-        if s.scheduler.slab.get(invoker).reply_to == Some(caller) {
-            s.scheduler.slab.get_mut(invoker).reply_to = None;
-        }
+        handoff_marked_reply_to_caller(
+            s, invoker, caller, handoff_authorized, returning_invoker_sc,
+        );
         Ok(())
     }
 }
@@ -2583,6 +2527,7 @@ fn decode_sched_context(
         InvocationLabel::SchedContextUnbind => {
             unsafe {
                 let s = KERNEL.get();
+                crate::reply::detach_sc(s, sc_id as usize);
                 if let Some(tcb_id) = s.sched_contexts[sc_id as usize].bound_tcb {
                     crate::smp::remote_tcb_stall(s, tcb_id);
                     // Remove from the ready queue / surrender the CPU
@@ -2897,12 +2842,14 @@ fn decode_sched_control(
                 // an already-bound helper, and the subsequent
                 // YieldTo saw an "unbound" SC.
                 let keep_bound = sc.bound_tcb;
+                let keep_reply_head = sc.reply_head;
                 let keep_yield = sc.yield_from;
                 let keep_consumed = sc.consumed;
                 let keep_bound_consumed = sc.bound_consumed;
                 let keep_donated_consumed = sc.donated_consumed;
                 *sc = crate::sched_context::SchedContext::new(period, budget);
                 sc.bound_tcb = keep_bound;
+                sc.reply_head = keep_reply_head;
                 sc.yield_from = keep_yield;
                 sc.consumed = keep_consumed;
                 sc.bound_consumed = keep_bound_consumed;
@@ -4724,6 +4671,7 @@ fn cnode_move(target: Cap, args: &SyscallArgs, invoker: TcbId, _mutate: bool) ->
 /// allocated TCB doesn't inherit dangling back-references from a
 /// previous occupant of its slab slot.
 unsafe fn scrub_tcb_refs(s: &mut crate::kernel::KernelState, id: TcbId) {
+    crate::reply::retire_tcb(s, id);
     crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
     s.scheduler.scrub_tcb(id);
     for n in s.notifications.iter_mut() {
@@ -4734,11 +4682,6 @@ unsafe fn scrub_tcb_refs(s: &mut crate::kernel::KernelState, id: TcbId) {
     for sc in s.sched_contexts.iter_mut() {
         if sc.bound_tcb == Some(id) {
             sc.bound_tcb = None;
-        }
-    }
-    for r in s.replies.iter_mut() {
-        if r.bound_tcb == Some(id) {
-            r.bound_tcb = None;
         }
     }
     for opt in s.scheduler.slab.entries.iter_mut() {
@@ -4974,14 +4917,6 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
                 // real reply transfer would; otherwise a non-passive
                 // server keeps `active_sc` pointing at a caller SC that
                 // may be deleted immediately afterwards.
-                if let Some(caller) = s.replies[idx].bound_tcb {
-                    // Passive-server call donation still has to be
-                    // returned to the caller before the reply object
-                    // disappears. Guarded inside the helper so we do
-                    // not disturb SC loans unrelated to the canceled
-                    // call (INTERRUPT0005).
-                    cancel_reply_wait_for_caller(s, caller);
-                }
                 s.free_reply(idx);
             }
         }
@@ -6150,6 +6085,7 @@ pub mod spec {
         legacy_context_specs::run();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
+        reply_alias_move_and_delete_preserve_unrelated_call();
         tcb_write_registers_resume_cancels_reply_wait();
         tcb_set_space_and_bind_notification();
         tcb_set_space_pml4_pins_cr3();
@@ -8228,9 +8164,11 @@ pub mod spec {
                 ptr: KernelState::reply_ptr(reply_idx),
                 can_grant: true,
             });
-            s.replies[reply_idx] = crate::reply::Reply {
-                bound_tcb: Some(target),
-            };
+            s.replies[reply_idx] = crate::reply::Reply::new();
+            let projection_sc = s.scheduler.slab.get_mut(target).sc.take();
+            crate::reply::offer(s, invoker, reply_idx as u16);
+            crate::reply::bind_call(s, target, invoker, Some(reply_idx as u16));
+            s.scheduler.slab.get_mut(target).sc = projection_sc;
             s.scheduler.set_current(Some(invoker));
             target
         };
@@ -8317,7 +8255,8 @@ pub mod spec {
             server_t.reply_to = Some(caller);
             let server = s.scheduler.admit(server_t);
             s.sched_contexts[server_sc].bound_tcb = Some(server);
-            s.replies[reply_idx].bound_tcb = Some(caller);
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
             s.scheduler.set_current(Some(invoker));
             (caller, server)
         };
@@ -8353,6 +8292,139 @@ pub mod spec {
     }
 
     #[inline(never)]
+    fn reply_alias_move_and_delete_preserve_unrelated_call() {
+        use crate::reply::{Next, Reply, ReplyNode};
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let holder = setup_invoker(0);
+        let (caller, server, other, reply_idx, other_reply_idx, caller_sc, other_sc) = unsafe {
+            let s = KERNEL.get();
+            s.scheduler.reset_queues();
+            let caller = s.scheduler.admit(Tcb::default());
+            let server = s.scheduler.admit(Tcb::default());
+            let mut other_tcb = Tcb::default();
+            other_tcb.msg_regs[0] = 0xBEEF;
+            let other = s.scheduler.admit(other_tcb);
+            let reply_idx = s.alloc_reply().expect("movable Reply object");
+            let other_reply_idx = s.alloc_reply().expect("holder's independent Reply");
+            let caller_sc = s.alloc_sched_context().expect("caller SC");
+            let other_sc = s.alloc_sched_context().expect("independent caller SC");
+            crate::sched_context::sc_donate(s, caller_sc, caller);
+            crate::sched_context::sc_donate(s, other_sc, other);
+            s.cnodes[0].0[4].set_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(reply_idx), can_grant: true,
+            });
+            s.cnodes[0].0[7].set_cap(&Cap::Reply {
+                ptr: KernelState::reply_ptr(other_reply_idx), can_grant: true,
+            });
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
+            crate::reply::offer(s, holder, other_reply_idx as u16);
+            crate::reply::bind_call(s, other, holder, Some(other_reply_idx as u16));
+            s.scheduler.on_sc_gained(holder);
+            s.scheduler.set_current(Some(holder));
+            (caller, server, other, reply_idx, other_reply_idx, caller_sc, other_sc)
+        };
+        let root = unsafe { KERNEL.get().scheduler.slab.get(holder).cspace_root() };
+        let original_chain = unsafe { KERNEL.get().replies[reply_idx] };
+        let other_chain = unsafe { KERNEL.get().replies[other_reply_idx] };
+        let check_other = || unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.replies[other_reply_idx], other_chain);
+            assert_eq!(s.scheduler.slab.get(holder).reply_to, Some(other));
+            assert_eq!(s.scheduler.slab.get(other).state, ThreadStateType::BlockedOnReply);
+            assert_eq!(s.scheduler.slab.get(other).call_reply, Some(ReplyNode::Object(other_reply_idx as u16)));
+            assert_eq!(s.scheduler.slab.get(other).msg_regs[0], 0xBEEF);
+            assert_eq!(s.scheduler.slab.get(other).sc, None);
+            assert_eq!(s.scheduler.slab.get(holder).sc, Some(other_sc as u16));
+            assert_eq!(s.sched_contexts[other_sc].bound_tcb, Some(holder));
+            assert_eq!(s.sched_contexts[other_sc].reply_head, Some(ReplyNode::Object(other_reply_idx as u16)));
+        };
+
+        decode_invocation(root, &SyscallArgs {
+            a1: (InvocationLabel::CNodeCopy as u64) << 12, a2: 5, a3: 4,
+            ..Default::default()
+        }, holder).expect("copy live Reply alias");
+        decode_invocation(root, &SyscallArgs {
+            a1: (InvocationLabel::CNodeMove as u64) << 12, a2: 6, a3: 5,
+            ..Default::default()
+        }, holder).expect("move copied live Reply alias");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(s.cnodes[0].0[5].cap().is_null());
+            assert_eq!(s.cnodes[0].0[4].cap(), s.cnodes[0].0[6].cap());
+            assert_eq!(s.replies[reply_idx], original_chain);
+        }
+        decode_invocation(root, &SyscallArgs {
+            a1: (InvocationLabel::CNodeDelete as u64) << 12, a2: 4,
+            ..Default::default()
+        }, holder).expect("non-final Reply alias deletion");
+        unsafe {
+            let s = KERNEL.get();
+            assert!(s.cnodes[0].0[4].cap().is_null());
+            assert_eq!(s.replies[reply_idx], original_chain);
+            assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::BlockedOnReply);
+            assert_eq!(s.scheduler.slab.get(caller).call_reply, Some(ReplyNode::Object(reply_idx as u16)));
+            assert_eq!(s.sched_contexts[caller_sc].bound_tcb, Some(server));
+            assert_eq!(s.replies[reply_idx].next, Some(Next::Head(caller_sc as u16)));
+        }
+        check_other();
+
+        // The holder has an unrelated incoming Call; only the invoked object chooses the caller.
+        let moved = unsafe { KERNEL.get().cnodes[0].0[6].cap() };
+        let reply = SyscallArgs { a1: 1, a2: 0xA11A5, ..Default::default() };
+        decode_invocation(moved, &reply, holder).expect("reply through moved alias from another holder");
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
+            assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0xA11A5);
+            assert_eq!(s.scheduler.slab.get(caller).call_reply, None);
+            assert_eq!(s.scheduler.slab.get(server).reply_to, None);
+            assert_eq!(s.scheduler.slab.get(server).sc, None);
+            assert_eq!(s.scheduler.slab.get(caller).sc, Some(caller_sc as u16));
+            assert_eq!(s.sched_contexts[caller_sc].bound_tcb, Some(caller));
+            assert_eq!(s.sched_contexts[caller_sc].reply_head, None);
+            assert_eq!(s.replies[reply_idx], Reply::new());
+        }
+        assert!(decode_invocation(moved, &reply, holder).is_err());
+        check_other();
+
+        let available = unsafe {
+            let s = KERNEL.get();
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
+            s.available_replies()
+        };
+        decode_invocation(root, &SyscallArgs {
+            a1: (InvocationLabel::CNodeDelete as u64) << 12, a2: 6,
+            ..Default::default()
+        }, holder).expect("final live Reply alias deletion");
+        unsafe {
+            let s = KERNEL.get();
+            assert_eq!(s.available_replies(), available + 1);
+            assert_eq!(s.replies[reply_idx], Reply::new());
+            assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Inactive);
+            assert_eq!(s.scheduler.slab.get(caller).call_reply, None);
+            assert_eq!(s.scheduler.slab.get(server).reply_to, None);
+            assert_eq!(s.scheduler.slab.get(server).sc, None);
+            assert_eq!(s.scheduler.slab.get(caller).sc, Some(caller_sc as u16));
+            assert_eq!(s.sched_contexts[caller_sc].bound_tcb, Some(caller));
+            assert_eq!(s.sched_contexts[caller_sc].reply_head, None);
+        }
+        check_other();
+        unsafe {
+            let s = KERNEL.get();
+            delete_cap_slot(s, MdbId::pack(0, 7)).unwrap();
+            for thread in [caller, server, other] { teardown_thread_in(s, thread); }
+            s.free_sched_context(caller_sc);
+            s.free_sched_context(other_sc);
+            s.scheduler.reset_queues();
+        }
+        teardown_invoker(holder);
+        arch::log("  ✓ Reply copy/move and alias deletion preserve an unrelated holder Call\n");
+    }
+
+    #[inline(never)]
     fn tcb_write_registers_resume_cancels_reply_wait() {
         let invoker = setup_invoker(0);
         let reply_idx = 11usize;
@@ -8384,7 +8456,8 @@ pub mod spec {
             let receiver = s.scheduler.admit(receiver_t);
             s.sched_contexts[receiver_sc].bound_tcb = Some(receiver);
 
-            s.replies[reply_idx].bound_tcb = Some(caller);
+            crate::reply::offer(s, receiver, reply_idx as u16);
+            crate::reply::bind_call(s, caller, receiver, Some(reply_idx as u16));
             s.scheduler.set_current(Some(invoker));
             (caller, receiver)
         };

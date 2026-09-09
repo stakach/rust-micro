@@ -66,6 +66,7 @@ pub fn test_main() {
     integration_tests::test_integration();
 
     KernelGuard::run(crate::sched_context::spec::test_sched_context);
+    KernelGuard::run(crate::reply::specs::test_reply_chains);
     crate::smp::spec::test_smp();
     #[cfg(feature = "fastpath")]
     crate::fastpath::spec::test_fastpath();

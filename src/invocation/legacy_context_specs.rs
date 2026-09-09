@@ -108,7 +108,7 @@ mod legacy_context_specs {
                 t.user_context.rax = 0x77;
                 t.user_context.rbx = 0x1111;
             }
-            s.scheduler.slab.get_mut(handler).pending_reply = Some(reply_index as u16);
+            crate::reply::offer(s, handler, reply_index as u16);
             assert_eq!(crate::endpoint::receive_ipc(
                 &mut s.endpoints[endpoint_index], &mut s.scheduler, handler,
                 RecvOptions::blocking(),
@@ -490,10 +490,10 @@ mod legacy_context_specs {
                     assert_eq!(s.sched_contexts[donated_sc].bound_tcb, Some(receiver));
                     assert_eq!(s.scheduler.slab.get(receiver).sc, None);
                     s.sched_contexts[donated_sc].bound_tcb = None;
-                    crate::sched_context::sc_donate(s, donated_sc, receiver);
+                    crate::sched_context::sc_donate(s, donated_sc, target);
                     s.replies[reply_index] = crate::reply::Reply::new();
-                    s.replies[reply_index].bound_tcb = Some(target);
-                    s.scheduler.slab.get_mut(receiver).reply_to = Some(target);
+                    crate::reply::offer(s, receiver, reply_index as u16);
+                    crate::reply::bind_call(s, target, receiver, Some(reply_index as u16));
                     let t = s.scheduler.slab.get_mut(target);
                     t.state = crate::tcb::ThreadStateType::BlockedOnReply;
                     t.pending_fault = 6;
@@ -538,9 +538,10 @@ mod legacy_context_specs {
                     assert_eq!(s.replies[reply_index].bound_tcb, None);
                     assert_eq!(s.scheduler.slab.get(receiver).reply_to, None);
                     assert_eq!(t.donated_sc, None);
-                    assert_eq!(t.sc, Some(donated_sc as u16));
-                    assert_eq!(s.sched_contexts[donated_sc].bound_tcb, Some(target));
-                    assert_eq!(s.scheduler.slab.get(receiver).sc, None);
+                    assert_eq!(t.sc, None);
+                    assert_eq!(s.sched_contexts[donated_sc].bound_tcb, Some(receiver));
+                    assert_eq!(s.scheduler.slab.get(receiver).sc, Some(donated_sc as u16));
+                    assert_eq!(s.sched_contexts[donated_sc].reply_head, None);
                     s.scheduler.scrub_tcb(target);
                     s.free_sched_context(donated_sc);
                     teardown_thread_in(s, receiver);

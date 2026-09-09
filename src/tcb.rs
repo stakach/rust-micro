@@ -326,14 +326,13 @@ pub struct Tcb {
     /// enqueued can't corrupt the intrusive list. (SC-donation
     /// rework step 1 — pure plumbing, no scheduling-policy change.)
     pub enqueued: bool,
-    /// Scheduling context this thread donated to a passive server on
-    /// its current outgoing Call (it is `BlockedOnReply`). On reply
-    /// the SC is moved back to this thread. `None` when the thread
-    /// has no in-flight donating Call, or called a server that had
-    /// its own SC (no donation). Upstream tracks this via the reply
-    /// call-stack's SC link; we store it on the caller for our flat
-    /// reply model. (SC-donation rework step 3.)
+    /// Diagnostic projection of the outgoing Call's donation. This is not execution
+    /// or return authority: only the reciprocal Reply chain and SC head own that.
     pub donated_sc: Option<u16>,
+    /// Exact outstanding Call, independent of the receiver's latest legacy reply stash.
+    pub call_reply: Option<crate::reply::ReplyNode>,
+    /// Allocation-free node for the explicit legacy no-Reply-cap IPC ABI.
+    pub legacy_reply: crate::reply::Reply,
     /// Per-thread hardware-debug state (CONFIG_HARDWARE_DEBUG_API).
     /// Mirrors seL4's `user_breakpoint_state_t`.
     pub debug: crate::arch::DebugState,
@@ -416,6 +415,8 @@ impl Default for Tcb {
             flags: 0,
             enqueued: false,
             donated_sc: None,
+            call_reply: None,
+            legacy_reply: crate::reply::Reply::new(),
             debug: crate::arch::DebugState::new(),
             #[cfg(target_arch = "x86_64")]
             deferred_debug: None,

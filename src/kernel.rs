@@ -591,6 +591,7 @@ impl KernelState {
 
     pub fn free_reply(&mut self, i: usize) {
         if i < MAX_REPLIES {
+            crate::reply::remove(self, crate::reply::ReplyNode::Object(i as u16));
             self.replies[i] = crate::reply::Reply::new();
             self.set_reply_in_use(i, false);
         }
@@ -652,21 +653,7 @@ impl KernelState {
                     ntfn.bound_sc = None;
                 }
             }
-            // IPC0023 — if this SC was donated to a passive server on
-            // an in-flight Call, the donor TCB (BlockedOnReply) still
-            // records it in `donated_sc` so a reply would move it back.
-            // Once the SC is deleted, that link must go too, otherwise
-            // the reply returns a freed SC and the donor wrongly
-            // becomes schedulable ("client should not run as it has no
-            // scheduling context"). Mirrors upstream removing the SC
-            // from the reply call-stack on schedContext deletion.
-            for e in self.scheduler.slab.entries.iter_mut() {
-                if let Some(t) = e.as_mut() {
-                    if t.donated_sc == Some(i as u16) {
-                        t.donated_sc = None;
-                    }
-                }
-            }
+            crate::reply::detach_sc(self, i);
             self.sched_contexts[i] = crate::sched_context::SchedContext::new(0, 0);
             self.set_sc_in_use(i, false);
         }

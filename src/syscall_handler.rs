@@ -109,45 +109,45 @@ pub fn handle_syscall(
         ),
         Syscall::SysRecv => handle_recv(args, /* blocking */ true),
         Syscall::SysNBRecv => handle_recv(args, /* blocking */ false),
-        // Phase 36b — under MCS there's no standalone Reply syscall;
-        // reply is via Send on a Cap::Reply. Until the cap-based
-        // reply IPC integration lands (the 34e follow-up), the
-        // existing `handle_reply` path stays callable directly from
-        // kernel specs but isn't reachable from userspace.
         Syscall::SysReplyRecv => {
-            let invoker = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
-            let reply_wake = unsafe {
+            let (invoker, reply_cap, reply_wake) = unsafe {
                 let s = crate::kernel::KERNEL.get();
-                invoker.and_then(|cur| s.scheduler.slab.get(cur).reply_to)
+                let invoker = s.scheduler.current().ok_or_else(|| {
+                    KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+                })?;
+                let tcb = s.scheduler.slab.get(invoker);
+                let cptr = crate::arch::composite_send_destination(&tcb.user_context, true);
+                if cptr == 0 {
+                    (invoker, None, tcb.reply_to)
+                } else {
+                    let cap = crate::cspace::lookup_cap(s, &tcb.cspace_root(), cptr)?;
+                    let crate::cap::Cap::Reply { ptr, .. } = cap else {
+                        return Err(KException::SyscallError(SyscallError::new(
+                            seL4_Error::seL4_InvalidCapability,
+                        )));
+                    };
+                    let node = crate::reply::ReplyNode::Object(
+                        crate::kernel::KernelState::reply_index(ptr) as u16,
+                    );
+                    let caller = crate::reply::caller(s, node).ok_or_else(|| {
+                        KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+                    })?;
+                    (invoker, Some(cap), Some(caller))
+                }
             };
-            // Phase 43 — handle_reply's `make_runnable(caller)` may
-            // clear `scheduler.current` via possibleSwitchTo (when
-            // caller > current priority). The composite syscall still
-            // has the receive part to run, and handle_recv looks up
-            // `scheduler.current()` to find the receiver. Stash the
-            // invoker before the reply and restore it afterwards so
-            // handle_recv sees the right TCB. The actual reschedule
-            // happens at the dispatcher tail once handle_recv is done.
-            let saved_current = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
-            handle_reply(args)?;
-            unsafe {
-                let s = crate::kernel::KERNEL.get();
-                if let (Some(invoker), Some(woken)) = (invoker, reply_wake) {
-                    if s.scheduler.slab.try_get(invoker).is_some() {
-                        s.scheduler.slab.get_mut(invoker).composite_reply_handoff = Some(woken);
-                    }
-                }
+            match reply_cap {
+                Some(cap) => crate::invocation::decode_invocation(cap, args, invoker)?,
+                None => handle_reply(args)?,
             }
+            // Reply can return the invoker's SC or select its caller for direct handoff.
+            // The receive half still belongs to this syscall's original invoker.
             unsafe {
                 let s = crate::kernel::KERNEL.get();
-                if s.scheduler.current().is_none() {
-                    if let Some(t) = saved_current {
-                        s.scheduler.set_current(Some(t));
-                    }
-                }
+                s.scheduler.slab.get_mut(invoker).composite_reply_handoff = reply_wake;
+                s.scheduler.set_current(Some(invoker));
             }
             let r = handle_recv(args, /* blocking */ true);
-            finish_composite_reply_handoff(invoker, r.is_ok());
+            finish_composite_reply_handoff(Some(invoker), r.is_ok());
             r
         }
         // Phase 36b — MCS notification-only Recv variants. Forward
@@ -493,6 +493,15 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
                 )));
             }
         };
+        let node = s.scheduler.slab.get(caller).call_reply.ok_or_else(|| {
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+        })?;
+        if node != crate::reply::ReplyNode::Legacy(caller)
+            || crate::reply::caller(s, node) != Some(caller)
+        {
+            return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability)));
+        }
+        crate::reply::remove(s, node);
         // Stage the reply message onto the current TCB so the
         // common transfer machinery picks it up. Words 0..3 ride in
         // registers (args.a2..a5); words 4..min(length,SCRATCH) come
@@ -508,7 +517,6 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
             me.msg_regs[1] = args.a3;
             me.msg_regs[2] = args.a4;
             me.msg_regs[3] = args.a5;
-            me.reply_to = None; // consume the reply slot
             let ipc_paddr = me.ipc_buffer_send_paddr();
             if length > 4 && ipc_paddr != 0 {
                 unsafe {
@@ -530,12 +538,6 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
                 (me.ipc_label, me.msg_regs)
             };
             let restart = crate::fault::apply_fault_reply(s, caller, label, length as usize, &regs);
-            s.scheduler.slab.get_mut(current).active_sc = None;
-            // IPC0021 — a page fault donates the FAULTER's SC to a
-            // passive fault handler (deliver_fault is a Call). On the
-            // fault reply, move it back so the restarted faulter is
-            // schedulable again (the handler goes passive).
-            crate::sched_context::return_donated_sc(s, caller);
             if restart {
                 s.scheduler.make_runnable(caller);
             } else {
@@ -547,21 +549,7 @@ pub(crate) fn handle_reply(args: &SyscallArgs) -> KResult<()> {
         // Normal reply: full message transfer (register range +
         // long tail) + IPC-return fan-in, shared with endpoint IPC.
         crate::endpoint::deliver_message(&mut s.scheduler, current, caller, 0);
-        // Wake the caller from BlockedOnReply.
-        debug_assert_eq!(
-            s.scheduler.slab.get(caller).state,
-            ThreadStateType::BlockedOnReply,
-            "caller should be parked on Reply"
-        );
-        // Phase 33c — return the donated SchedContext to the
-        // caller. While the call was in progress, `current` (the
-        // server) ran on `current.active_sc = caller.sc`; clearing
-        // it here means future `mcs_tick` charges fall back to the
-        // server's own bound SC (or no SC if it has none).
-        s.scheduler.slab.get_mut(current).active_sc = None;
-        // Passive-server reply: move the donated SC back to the caller
-        // (upstream reply_pop) so it's schedulable again.
-        crate::sched_context::return_donated_sc(s, caller);
+        // Exact reply removal already settled SC and call-state ownership.
         s.scheduler.make_runnable(caller);
         Ok(())
     }
@@ -844,7 +832,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         // offer from an earlier syscall. A valid endpoint receive
         // below installs a fresh offer after bound-notification
         // delivery has been ruled out.
-        s.scheduler.slab.get_mut(current).pending_reply = None;
+        crate::reply::release_offer(s, current);
         // Phase 36d / 43 — read seL4's architecture-defined reply register
         // (x86 R12, AArch64 X6). cptr 0 means "no reply" — we fall back to
         // the legacy Tcb.reply_to path that handle_reply consults.
@@ -858,11 +846,6 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
             &s.scheduler.slab.get(current).user_context,
             true,
         );
-        if reply_cptr != 0 {
-            if let Ok(Cap::Reply { ptr, .. }) = lookup_cap(s, &cspace_root, reply_cptr) {
-                endpoint_reply_idx = Some(crate::kernel::KernelState::reply_index(ptr) as u16);
-            }
-        }
         let ep_ptr = match target {
             Cap::Endpoint { ptr, rights, .. } => {
                 if !rights.can_receive {
@@ -879,6 +862,12 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
                         },
                     );
                     return Ok(());
+                }
+                if reply_cptr != 0 {
+                    let Cap::Reply { ptr, .. } = lookup_cap(s, &cspace_root, reply_cptr)? else {
+                        return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability)));
+                    };
+                    endpoint_reply_idx = Some(crate::kernel::KernelState::reply_index(ptr) as u16);
                 }
                 ptr
             }
@@ -942,14 +931,14 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         let ep = &mut (*s_ptr).endpoints[idx];
         let sched = &mut (*s_ptr).scheduler;
         if let Some(reply_idx) = endpoint_reply_idx {
-            sched.slab.get_mut(current).pending_reply = Some(reply_idx);
+            crate::reply::offer(&mut *s_ptr, current, reply_idx);
         }
         let outcome = receive_ipc(ep, sched, current, opts);
         if !matches!(outcome, crate::endpoint::IpcOutcome::Blocked) {
             // A Call consumes the pending reply in finish_call. Plain
             // sends and skipped non-blocking receives do not, so clear
             // the unconsumed offer before returning to user mode.
-            sched.slab.get_mut(current).pending_reply = None;
+            crate::reply::release_offer(&mut *s_ptr, current);
         }
         // For NBRecv that found nothing, mirror upstream's
         // contract: badge = 0 in rdi, msginfo = 0 in rsi. Without
@@ -1076,11 +1065,14 @@ pub mod spec {
         irq_bound_notification_wakes_blocked_endpoint_recv(&mut owners);
         recv_prefers_queued_endpoint_over_bound_notification(&mut owners);
         replyrecv_reply_wake_hands_off_after_bound_notification(&mut owners);
+        replyrecv_supplied_cap_selects_exact_caller(&mut owners);
         nbsendrecv_reply_wake_yields_after_bound_notification(&mut owners);
         nbsendrecv_deferred_reply_wake_survives_later_bound_notification(&mut owners);
         nbsendrecv_stale_reply_handoff_does_not_starve_bound_receiver(&mut owners);
         nbrecv_with_reply_cap_does_not_leave_pending_offer(&mut owners);
         plain_send_recv_with_reply_cap_does_not_leave_pending_offer(&mut owners);
+        notification_wait_and_poll_ignore_nonzero_reply_operand(&mut owners);
+        endpoint_recv_invalid_reply_operand_preserves_queued_call(&mut owners);
         arch::log("Syscall dispatcher tests completed\n");
     }
 
@@ -1466,11 +1458,13 @@ pub mod spec {
             caller_t.state = ThreadStateType::BlockedOnReply;
             caller_t.sc = Some(1);
             let caller = s.scheduler.admit(caller_t);
+            s.sched_contexts[1].bound_tcb = Some(caller);
+            assert!(s.sched_contexts[1].reply_head.is_none());
 
             let mut server_t = Tcb::default();
             server_t.priority = 255;
             server_t.state = ThreadStateType::Running;
-            server_t.sc = Some(0);
+            server_t.sc = None;
             server_t.active_sc = Some(1);
             crate::arch::set_composite_send_destination(
                 &mut server_t.user_context,
@@ -1485,9 +1479,11 @@ pub mod spec {
             };
             let server = admit_with_cspace(s, owners, server_t, server_cspace);
 
-            s.replies[reply_idx] = Reply {
-                bound_tcb: Some(caller),
-            };
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
+            s.scheduler.on_sc_gained(server);
+            assert_eq!(s.scheduler.slab.get(caller).donated_sc, Some(1));
+            assert_eq!(s.scheduler.slab.get(server).sc, Some(1));
             s.scheduler.set_current(Some(server));
             (server, caller, reply_idx)
         };
@@ -1509,6 +1505,9 @@ pub mod spec {
             assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0x5150);
             assert_eq!(s.scheduler.slab.get(server).active_sc, None);
+            assert_eq!(s.scheduler.slab.get(server).sc, None);
+            assert_eq!(s.scheduler.slab.get(caller).sc, Some(1));
+            assert_eq!(s.sched_contexts[1].reply_head, None);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
             assert_eq!(s.scheduler.current(), Some(caller));
             crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(10, 2)).unwrap();
@@ -1583,9 +1582,8 @@ pub mod spec {
             crate::invocation::derive_tcb_cap(s, server, crate::cte::TcbSlot::IpcBuffer,
                 Some(source), 0x1000).unwrap();
 
-            s.replies[reply_idx] = Reply {
-                bound_tcb: Some(caller),
-            };
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
             s.scheduler.set_current(Some(server));
             (server, caller, reply_idx)
         };
@@ -1690,7 +1688,7 @@ pub mod spec {
                 can_grant: true,
             });
             s.endpoints[ep_idx] = crate::endpoint::Endpoint::new();
-            s.replies[reply_idx] = Reply { bound_tcb: None };
+            s.replies[reply_idx] = Reply::new();
 
             let mut caller_t = Tcb::default();
             caller_t.priority = 40;
@@ -1735,9 +1733,8 @@ pub mod spec {
             crate::invocation::derive_tcb_cap(s, server, crate::cte::TcbSlot::IpcBuffer,
                 Some(source), 0x1000).unwrap();
 
-            s.replies[reply_idx] = Reply {
-                bound_tcb: Some(caller),
-            };
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
             s.scheduler.set_current(Some(server));
             (server, caller, ep_idx, reply_idx)
         };
@@ -1884,9 +1881,8 @@ pub mod spec {
             };
             let server = admit_with_cspace(s, owners, server_t, server_cspace);
 
-            s.replies[reply_idx] = Reply {
-                bound_tcb: Some(caller),
-            };
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
             s.scheduler.set_current(Some(server));
             (server, caller, reply_idx)
         };
@@ -2193,6 +2189,7 @@ pub mod spec {
             assert_eq!(server_t.state, ThreadStateType::Running);
             assert_eq!(server_t.pending_reply, None);
             assert_eq!(s.replies[reply_idx].bound_tcb, None);
+            assert_eq!(s.replies[reply_idx].offered_tcb, None);
             assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
             assert_eq!(s.notifications[ntfn_idx].state, NtfnState::Idle);
             #[cfg(target_arch = "x86_64")]
@@ -2305,6 +2302,7 @@ pub mod spec {
             assert_eq!(server_t.state, ThreadStateType::Running);
             assert_eq!(server_t.pending_reply, None);
             assert_eq!((*s_ptr).replies[reply_idx].bound_tcb, None);
+            assert_eq!((*s_ptr).replies[reply_idx].offered_tcb, None);
             assert_eq!((*s_ptr).endpoints[ep_idx].state, EpState::Idle);
             assert_eq!((*s_ptr).notifications[ntfn_idx].state, NtfnState::Idle);
             assert!((*s_ptr).irqs.get(IRQ).unwrap().pending);
@@ -2434,7 +2432,7 @@ pub mod spec {
                 assert_eq!(server_t.user_context.r10, 0xC0DE);
             }
             s.notifications[ntfn_idx] = Notification::new();
-            s.replies[reply_idx] = Reply::new();
+            crate::reply::remove(s, crate::reply::ReplyNode::Object(reply_idx as u16));
             crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(7, 1)).unwrap();
             crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(7, 2)).unwrap();
             free_temp_tcb(caller);
@@ -2493,8 +2491,8 @@ pub mod spec {
             server_t.sc = Some(0);
             let server_cspace = cspace;
             server_t.bound_notification = Some(ntfn_idx as u16);
-            server_t.reply_to = Some(caller);
             let server = admit_with_cspace(s, owners, server_t, server_cspace);
+            crate::reply::bind_call(s, caller, server, None);
             s.notifications[ntfn_idx].bound_tcb = Some(server);
             s.scheduler.set_current(Some(server));
             (server, caller, ntfn_idx, ep_idx)
@@ -2530,6 +2528,147 @@ pub mod spec {
             free_temp_tcb(server);
         }
         arch::log("  ✓ ReplyRecv reply wake hands off after bound-notification receive\n");
+    }
+
+    #[inline(never)]
+    fn replyrecv_supplied_cap_selects_exact_caller(owners: &mut RootOwners) {
+        use crate::cap::{Badge, EndpointRights};
+        use crate::endpoint::EpState;
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::notification::{Notification, NtfnState};
+        use crate::reply::ReplyNode;
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        // Ordinary/marked exact-cap replies, then missing, wrong-type, stale, and zero operands.
+        for case in 0..6 {
+            let (holder, server, caller, other, cn, ep, ntfn, reply, other_reply, sc, other_sc) = unsafe {
+                let s = KERNEL.get();
+                s.scheduler.reset_queues();
+                let cn = s.alloc_cnode().expect("ReplyRecv CSpace");
+                let ep = s.alloc_endpoint().expect("ReplyRecv endpoint");
+                let ntfn = s.alloc_notification().expect("ReplyRecv notification");
+                let reply = s.alloc_reply().expect("selected caller Reply");
+                let other_reply = s.alloc_reply().expect("latest caller Reply");
+                let stale = s.alloc_reply().expect("unbound Reply");
+                let sc = s.alloc_sched_context().expect("selected caller SC");
+                let other_sc = s.alloc_sched_context().expect("latest caller SC");
+                s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
+                    ptr: KernelState::endpoint_ptr(ep), badge: Badge(0xE1),
+                    rights: EndpointRights { can_send: true, can_receive: true,
+                        can_grant: true, can_grant_reply: true },
+                });
+                for (slot, index) in [(3, reply), (5, other_reply), (6, stale)] {
+                    s.cnodes[cn].0[slot].set_cap(&Cap::Reply {
+                        ptr: KernelState::reply_ptr(index), can_grant: true,
+                    });
+                }
+                let mut caller_t = Tcb::default();
+                caller_t.priority = 40;
+                caller_t.msg_regs[0] = 0xAAAA;
+                let caller = s.scheduler.admit(caller_t);
+                let server = s.scheduler.admit(Tcb::default());
+                let mut other_t = Tcb::default();
+                other_t.msg_regs[0] = 0xBBBB;
+                let other = s.scheduler.admit(other_t);
+                let mut holder_t = Tcb::default();
+                holder_t.state = ThreadStateType::Running;
+                holder_t.priority = 255;
+                holder_t.bound_notification = Some(ntfn as u16);
+                crate::arch::set_composite_send_destination(&mut holder_t.user_context, true,
+                    match case { 0 | 1 => 4, 2 => 2, 3 => 1, 4 => 6, _ => 0 });
+                if case == 1 {
+                    crate::arch::set_composite_send_destination(&mut holder_t.user_context, false,
+                        crate::invocation::REPLY_HANDOFF_MAGIC);
+                }
+                let holder = admit_with_cspace(s, owners, holder_t, Cap::CNode {
+                    ptr: KernelState::cnode_ptr(cn), radix: 5, guard_size: 59, guard: 0,
+                });
+                s.notifications[ntfn] = Notification {
+                    state: NtfnState::Active, pending_badge: 0xD4, bound_tcb: Some(holder),
+                    ..Notification::new()
+                };
+                crate::sched_context::sc_donate(s, sc, caller);
+                crate::sched_context::sc_donate(s, other_sc, other);
+                crate::reply::offer(s, server, reply as u16);
+                crate::reply::bind_call(s, caller, server, Some(reply as u16));
+                crate::reply::offer(s, holder, other_reply as u16);
+                crate::reply::bind_call(s, other, holder, Some(other_reply as u16));
+                s.scheduler.on_sc_gained(holder);
+                s.scheduler.set_current(Some(holder));
+                (holder, server, caller, other, cn, ep, ntfn, reply, other_reply, sc, other_sc)
+            };
+            let root_cap = unsafe { KERNEL.get().scheduler.slab.get(holder).cspace_root() };
+            crate::invocation::decode_invocation(root_cap, &SyscallArgs {
+                a1: (crate::syscalls::InvocationLabel::CNodeMove as u64) << 12, a2: 4, a3: 3,
+                ..Default::default()
+            }, holder).expect("move selected Reply capability");
+            let original = unsafe { KERNEL.get().replies[reply] };
+            let original_other = unsafe { KERNEL.get().replies[other_reply] };
+            let result = handle_syscall(Syscall::SysReplyRecv, &SyscallArgs {
+                a0: 1, a1: 1, a2: 0xC0DE, ..Default::default()
+            }, &mut BufferSink::new());
+            unsafe {
+                let s = KERNEL.get();
+                assert_eq!(s.replies[other_reply], original_other);
+                assert_eq!(s.scheduler.slab.get(holder).reply_to, Some(other));
+                assert_eq!(s.scheduler.slab.get(holder).sc, Some(other_sc as u16));
+                assert_eq!(s.scheduler.slab.get(other).state, ThreadStateType::BlockedOnReply);
+                assert_eq!(s.scheduler.slab.get(other).call_reply, Some(ReplyNode::Object(other_reply as u16)));
+                assert_eq!(s.scheduler.slab.get(other).msg_regs[0], 0xBBBB);
+                assert_eq!(s.scheduler.slab.get(other).sc, None);
+                assert_eq!(s.sched_contexts[other_sc].bound_tcb, Some(holder));
+                assert_eq!(s.sched_contexts[other_sc].reply_head, Some(ReplyNode::Object(other_reply as u16)));
+                assert_eq!(s.scheduler.slab.get(holder).pending_reply, None);
+                assert_eq!(s.scheduler.slab.get(holder).composite_reply_handoff, None);
+                assert_eq!(s.endpoints[ep].state, EpState::Idle);
+                assert_eq!(s.endpoints[ep].head, None);
+                assert_eq!(s.endpoints[ep].tail, None);
+                if case < 2 {
+                    assert!(result.is_ok());
+                    assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
+                    assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0xC0DE);
+                    assert_eq!(s.scheduler.slab.get(caller).call_reply, None);
+                    assert_eq!(s.scheduler.slab.get(caller).sc, Some(sc as u16));
+                    assert_eq!(s.scheduler.slab.get(server).reply_to, None);
+                    assert_eq!(s.scheduler.slab.get(server).sc, None);
+                    assert_eq!(s.sched_contexts[sc].bound_tcb, Some(caller));
+                    assert_eq!(s.sched_contexts[sc].reply_head, None);
+                    assert_eq!(s.replies[reply].bound_tcb, None);
+                    assert_eq!(s.replies[reply].offered_tcb, None);
+                    assert_eq!(s.notifications[ntfn].state, NtfnState::Idle);
+                    assert_eq!(crate::arch::ipc_badge(&s.scheduler.slab.get(holder).user_context), 0xD4);
+                    assert_eq!(s.scheduler.current(), Some(caller));
+                    assert_eq!(s.scheduler.take_direct_handoff(), Some(caller));
+                } else {
+                    assert!(result.is_err());
+                    assert_eq!(s.replies[reply], original);
+                    assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::BlockedOnReply);
+                    assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0xAAAA);
+                    assert_eq!(s.scheduler.slab.get(caller).call_reply, Some(ReplyNode::Object(reply as u16)));
+                    assert_eq!(s.scheduler.slab.get(caller).sc, None);
+                    assert_eq!(s.scheduler.slab.get(server).reply_to, Some(caller));
+                    assert_eq!(s.scheduler.slab.get(server).sc, Some(sc as u16));
+                    assert_eq!(s.sched_contexts[sc].bound_tcb, Some(server));
+                    assert_eq!(s.sched_contexts[sc].reply_head, Some(ReplyNode::Object(reply as u16)));
+                    assert_eq!(s.notifications[ntfn].state, NtfnState::Active);
+                    assert_eq!(s.notifications[ntfn].pending_badge, 0xD4);
+                    assert_eq!(s.scheduler.current(), Some(holder));
+                    assert_eq!(s.scheduler.take_direct_handoff(), None);
+                }
+                for slot in [1, 4, 5, 6] {
+                    crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(cn as u32, slot)).unwrap();
+                }
+                s.notifications[ntfn] = Notification::new();
+                for thread in [caller, server, other, holder] {
+                    free_temp_tcb(thread);
+                }
+                s.free_sched_context(sc);
+                s.free_sched_context(other_sc);
+                s.scheduler.reset_queues();
+                s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+            }
+        }
+        arch::log("  ✓ ReplyRecv selects moved Reply cap, never an unrelated latest caller\n");
     }
 
     #[inline(never)]
@@ -2591,9 +2730,8 @@ pub mod spec {
             caller_t.state = ThreadStateType::BlockedOnReply;
             caller_t.sc = Some(1);
             let caller = s.scheduler.admit(caller_t);
-            s.replies[reply_idx] = Reply {
-                bound_tcb: Some(caller),
-            };
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
             s.scheduler.set_current(Some(server));
             (server, caller, ntfn_idx, reply_idx)
         };
@@ -2690,9 +2828,8 @@ pub mod spec {
             caller_t.state = ThreadStateType::BlockedOnReply;
             caller_t.sc = Some(1);
             let caller = s.scheduler.admit(caller_t);
-            s.replies[reply_idx] = Reply {
-                bound_tcb: Some(caller),
-            };
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
             s.scheduler.set_current(Some(server));
             (server, caller, ntfn_idx, reply_idx, ep_idx)
         };
@@ -2729,6 +2866,7 @@ pub mod spec {
                 0xD2,
             );
             assert_eq!(woke, Some(server));
+            assert_eq!((*s_ptr).replies[reply_idx].offered_tcb, None);
             assert_eq!(
                 (*s_ptr).scheduler.slab.get(server).composite_reply_handoff,
                 None
@@ -2810,9 +2948,8 @@ pub mod spec {
             caller_t.state = ThreadStateType::BlockedOnReply;
             caller_t.sc = Some(1);
             let caller = s.scheduler.admit(caller_t);
-            s.replies[reply_idx] = Reply {
-                bound_tcb: Some(caller),
-            };
+            crate::reply::offer(s, server, reply_idx as u16);
+            crate::reply::bind_call(s, caller, server, Some(reply_idx as u16));
             s.scheduler.set_current(Some(server));
             (server, caller, ntfn_idx, reply_idx, ep_idx)
         };
@@ -3044,6 +3181,168 @@ pub mod spec {
             s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
         }
         arch::log("  ✓ plain Send receive does not retain the offered reply cap\n");
+    }
+
+    #[inline(never)]
+    fn notification_wait_and_poll_ignore_nonzero_reply_operand(owners: &mut RootOwners) {
+        use crate::cap::{Badge, NotificationRights};
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::notification::{Notification, NtfnState};
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (cn, ntfn_idx) = unsafe {
+            let s = KERNEL.get();
+            let cn = s.alloc_cnode().expect("notification receive CSpace");
+            let ntfn_idx = s.alloc_notification().expect("notification receive object");
+            s.cnodes[cn].0[1].set_cap(&Cap::Notification {
+                ptr: KernelState::ntfn_ptr(ntfn_idx), badge: Badge(0),
+                rights: NotificationRights { can_send: true, can_receive: true },
+            });
+            (cn, ntfn_idx)
+        };
+        // Both a wrong-type capability and a missing capability must be completely ignored.
+        for reply_operand in [1, 2] {
+            for blocking in [false, true] {
+                for active in [false, true] {
+                    let server = unsafe {
+                        let s = KERNEL.get();
+                        s.scheduler.reset_queues();
+                        s.notifications[ntfn_idx] = Notification {
+                            state: if active { NtfnState::Active } else { NtfnState::Idle },
+                            pending_badge: if active { 0xA17 } else { 0 },
+                            ..Notification::new()
+                        };
+                        let mut thread = Tcb::default();
+                        thread.state = ThreadStateType::Running;
+                        crate::arch::set_composite_send_destination(&mut thread.user_context, true, reply_operand);
+                        let server = admit_with_cspace(s, owners, thread, Cap::CNode {
+                            ptr: KernelState::cnode_ptr(cn), radix: 5, guard_size: 59, guard: 0,
+                        });
+                        s.scheduler.set_current(Some(server));
+                        server
+                    };
+                    handle_recv(&SyscallArgs { a0: 1, ..Default::default() }, blocking)
+                        .expect("notification receive ignores Reply register");
+                    unsafe {
+                        let s = KERNEL.get();
+                        let thread = s.scheduler.slab.get(server);
+                        assert_eq!(thread.pending_reply, None);
+                        assert_eq!(thread.call_reply, None);
+                        assert_eq!(thread.reply_to, None);
+                        if blocking && !active {
+                            assert_eq!(thread.state, ThreadStateType::BlockedOnNotification);
+                            assert_eq!(s.notifications[ntfn_idx].state, NtfnState::Waiting);
+                            assert_eq!(s.notifications[ntfn_idx].head, Some(server));
+                            let s_ptr: *mut KernelState = s;
+                            crate::notification::signal(&mut (*s_ptr).notifications[ntfn_idx],
+                                &mut (*s_ptr).scheduler, 0xA18);
+                            assert_eq!(s.scheduler.slab.get(server).state, ThreadStateType::Running);
+                            assert_eq!(crate::arch::ipc_badge(&s.scheduler.slab.get(server).user_context), 0xA18);
+                        } else {
+                            assert_eq!(thread.state, ThreadStateType::Running);
+                            assert_eq!(crate::arch::ipc_badge(&thread.user_context), if active { 0xA17 } else { 0 });
+                        }
+                        assert_eq!(s.notifications[ntfn_idx].state, NtfnState::Idle);
+                        assert_eq!(s.notifications[ntfn_idx].head, None);
+                        assert_eq!(s.notifications[ntfn_idx].tail, None);
+                        free_temp_tcb(server);
+                        s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+                    }
+                }
+            }
+        }
+        unsafe {
+            let s = KERNEL.get();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(cn as u32, 1)).unwrap();
+        }
+        arch::log("  ✓ notification Wait/Poll ignores nonzero Reply operands\n");
+    }
+
+    #[inline(never)]
+    fn endpoint_recv_invalid_reply_operand_preserves_queued_call(owners: &mut RootOwners) {
+        use crate::cap::{Badge, EndpointRights};
+        use crate::endpoint::{send_ipc, EpState, IpcOutcome, SendOptions};
+        use crate::kernel::{KernelState, KERNEL};
+        use crate::tcb::{Tcb, ThreadStateType};
+
+        let (cn, ep_idx) = unsafe {
+            let s = KERNEL.get();
+            let cn = s.alloc_cnode().expect("endpoint receive CSpace");
+            let ep_idx = s.alloc_endpoint().expect("endpoint receive object");
+            s.cnodes[cn].0[1].set_cap(&Cap::Endpoint {
+                ptr: KernelState::endpoint_ptr(ep_idx), badge: Badge(0),
+                rights: EndpointRights { can_send: true, can_receive: true,
+                    can_grant: true, can_grant_reply: true },
+            });
+            (cn, ep_idx)
+        };
+        for reply_operand in [1, 2] {
+            for blocking in [false, true] {
+                let (server, caller) = unsafe {
+                    let s = KERNEL.get();
+                    s.scheduler.reset_queues();
+                    let mut receiver = Tcb::default();
+                    receiver.state = ThreadStateType::Running;
+                    receiver.msg_regs.fill(0x5151);
+                    receiver.ipc_label = 0x61;
+                    receiver.ipc_length = 3;
+                    crate::arch::set_composite_send_destination(&mut receiver.user_context, true, reply_operand);
+                    let server = admit_with_cspace(s, owners, receiver, Cap::CNode {
+                        ptr: KernelState::cnode_ptr(cn), radix: 5, guard_size: 59, guard: 0,
+                    });
+                    let mut sender = Tcb::default();
+                    sender.state = ThreadStateType::Running;
+                    sender.sc = Some(1);
+                    sender.ipc_label = 0x72;
+                    sender.ipc_length = 1;
+                    sender.msg_regs[0] = 0xC0DE;
+                    let caller = s.scheduler.admit(sender);
+                    s.sched_contexts[1].bound_tcb = Some(caller);
+                    assert!(s.sched_contexts[1].reply_head.is_none());
+                    let s_ptr: *mut KernelState = s;
+                    let outcome = send_ipc(&mut (*s_ptr).endpoints[ep_idx], &mut (*s_ptr).scheduler,
+                        caller, SendOptions { blocking: true, do_call: true, can_grant: true,
+                            can_donate: true, badge: 0xCA11 });
+                    assert!(matches!(outcome, IpcOutcome::Blocked));
+                    s.scheduler.set_current(Some(server));
+                    (server, caller)
+                };
+                assert!(handle_recv(&SyscallArgs { a0: 1, ..Default::default() }, blocking).is_err());
+                unsafe {
+                    let s = KERNEL.get();
+                    let receiver = s.scheduler.slab.get(server);
+                    let sender = s.scheduler.slab.get(caller);
+                    assert_eq!(receiver.state, ThreadStateType::Running);
+                    assert_eq!(receiver.pending_reply, None);
+                    assert_eq!(receiver.reply_to, None);
+                    assert_eq!(receiver.call_reply, None);
+                    assert_eq!(receiver.sc, None);
+                    assert!(receiver.msg_regs.iter().all(|word| *word == 0x5151));
+                    assert_eq!((receiver.ipc_label, receiver.ipc_length), (0x61, 3));
+                    assert_eq!(sender.state, ThreadStateType::BlockedOnSend);
+                    assert_eq!(sender.call_reply, None);
+                    assert_eq!(sender.legacy_reply, crate::reply::Reply::new());
+                    assert_eq!(sender.donated_sc, None);
+                    assert_eq!(sender.sc, Some(1));
+                    assert_eq!(s.sched_contexts[1].bound_tcb, Some(caller));
+                    assert_eq!(s.sched_contexts[1].reply_head, None);
+                    assert_eq!(s.endpoints[ep_idx].state, EpState::Send);
+                    assert_eq!(s.endpoints[ep_idx].head, Some(caller));
+                    assert_eq!(s.endpoints[ep_idx].tail, Some(caller));
+                    assert!(!s.replies.iter().any(|reply| reply.offered_tcb == Some(server)
+                        || reply.bound_tcb == Some(caller)));
+                    free_temp_tcb(caller);
+                    free_temp_tcb(server);
+                    assert_eq!(s.endpoints[ep_idx].state, EpState::Idle);
+                    s.scheduler.set_current(Some(crate::tcb::TcbId(0)));
+                }
+            }
+        }
+        unsafe {
+            let s = KERNEL.get();
+            crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(cn as u32, 1)).unwrap();
+        }
+        arch::log("  ✓ invalid endpoint Reply operand preserves queued Call and SC ownership\n");
     }
 
     unsafe fn free_temp_tcb(id: crate::tcb::TcbId) {

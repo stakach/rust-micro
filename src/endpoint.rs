@@ -242,6 +242,7 @@ fn complete_queued_transfer(
     if was_call {
         finish_call(sched, sender, receiver);
     } else {
+        release_receive_offer(sched, receiver);
         sched.make_runnable(sender);
         if sender_can_donate {
             maybe_donate_on_send(sched, sender, receiver);
@@ -378,31 +379,32 @@ pub enum IpcOutcome {
 /// `BlockedOnReply`, point the receiver's reply at it, bind the reply
 /// object, and — if the receiver is a PASSIVE server (no SC of its
 /// own) — donate the caller's scheduling context so the server can
-/// run (upstream `reply_push` -> `schedContext_donate`). The donated
-/// SC is remembered on the caller (`donated_sc`) and returned on
-/// reply. Non-passive receivers stay on their own SC; carrying the
+/// run (upstream `reply_push` -> `schedContext_donate`). The exact
+/// reply chain owns SC return authority. Non-passive receivers stay
+/// on their own SC; carrying the
 /// caller's SC on an already-schedulable receiver leaks helper budget
 /// across unrelated receives in sel4test's helper-completion path.
 fn finish_call(sched: &mut Scheduler, sender: TcbId, receiver: TcbId) {
-    sched.block(sender, ThreadStateType::BlockedOnReply);
-    sched.slab.get_mut(receiver).reply_to = Some(sender);
     // Bind the reply object (if the receiver registered one via
     // Recv(ep, reply=cptr)) so Send-on-Cap::Reply can find the caller.
-    let reply_idx = sched.slab.get_mut(receiver).pending_reply.take();
+    let reply_idx = sched.slab.get(receiver).pending_reply;
     unsafe {
         let s = crate::kernel::KERNEL.get();
-        if let Some(ridx) = reply_idx {
-            s.replies[ridx as usize].bound_tcb = Some(sender);
-        }
-        let caller_sc = s.scheduler.slab.get(sender).sc;
-        let callee_passive = s.scheduler.slab.get(receiver).sc.is_none();
-        if let (Some(sc), true) = (caller_sc, callee_passive) {
-            // Passive server: MOVE the SC so the receiver becomes
-            // schedulable. The caller is BlockedOnReply (passive
-            // itself for now) and gets the SC back on reply.
-            crate::sched_context::sc_donate(s, sc as usize, receiver);
-            s.scheduler.slab.get_mut(sender).donated_sc = Some(sc);
-        }
+        crate::reply::bind_call(s, sender, receiver, reply_idx);
+    }
+}
+
+fn release_receive_offer(sched: &mut Scheduler, receiver: TcbId) {
+    if !sched.slab.try_get(receiver).is_some_and(|tcb| tcb.pending_reply.is_some()) {
+        return;
+    }
+    // A real offer belongs to the kernel's object registry. Queue-only operations
+    // with no offer need no object access and can use an independent scheduler.
+    unsafe {
+        let state: *mut crate::kernel::KernelState = crate::kernel::KERNEL.get();
+        assert!(core::ptr::eq(sched as *const Scheduler,
+            core::ptr::addr_of!((*state).scheduler)));
+        crate::reply::release_offer(&mut *state, receiver);
     }
 }
 
@@ -471,14 +473,15 @@ pub fn send_ipc(
             }
             if opts.do_call {
                 finish_call(sched, sender, receiver);
-            } else if opts.can_donate {
+            } else {
+                release_receive_offer(sched, receiver);
                 // Plain (non-Call) send to a PASSIVE receiver donates
                 // the sender's SC so it can run (upstream sendIPC's
                 // `canDonate && dest->tcbSchedContext == NULL` arm).
                 // NBSendRecv/NBSendWait set can_donate; this is the
                 // stack-spawning handoff (IPC0022) where the spawner
                 // hands its (donated) SC to the worker it just woke.
-                maybe_donate_on_send(sched, sender, receiver);
+                if opts.can_donate { maybe_donate_on_send(sched, sender, receiver); }
             }
             sched.make_runnable(receiver);
             if queue_is_empty(ep) {
@@ -512,6 +515,9 @@ pub fn receive_ipc(
     receiver: TcbId,
     opts: RecvOptions,
 ) -> IpcOutcome {
+    if let Some(index) = sched.slab.get(receiver).pending_reply {
+        unsafe { crate::reply::offer(crate::kernel::KERNEL.get(), receiver, index); }
+    }
     if queue_unlink_id(ep, sched, receiver) {
         normalize_queue_state(ep, sched);
     } else if ep.head.is_none() || ep.tail.is_none() {
@@ -521,6 +527,7 @@ pub fn receive_ipc(
         // No senders queued — block (or skip if NB).
         EpState::Idle | EpState::Recv => {
             if !opts.blocking {
+                release_receive_offer(sched, receiver);
                 return IpcOutcome::Skipped;
             }
             sched.block(receiver, ThreadStateType::BlockedOnReceive);
@@ -560,6 +567,7 @@ pub fn receive_ipc(
             if was_call {
                 finish_call(sched, sender, receiver);
             } else {
+                release_receive_offer(sched, receiver);
                 sched.make_runnable(sender);
             }
             if queue_is_empty(ep) {
@@ -586,13 +594,10 @@ pub fn receive_ipc(
 pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
     use crate::kernel::{KernelState, KERNEL};
     let s_ptr: *mut KernelState = unsafe { KERNEL.get() };
+    release_receive_offer(sched, thread);
     for i in 0..crate::kernel::MAX_ENDPOINTS {
         let ep = unsafe { &mut (*s_ptr).endpoints[i] };
         loop {
-            let was_receive = match sched.slab.try_get(thread) {
-                Some(tcb) => matches!(tcb.state, ThreadStateType::BlockedOnReceive),
-                None => false,
-            };
             if !queue_unlink_id(ep, sched, thread) {
                 break;
             }
@@ -603,9 +608,6 @@ pub fn cancel_ipc_anywhere(sched: &mut Scheduler, thread: TcbId) {
             }
             if let Some(tcb) = sched.slab.entries[thread.0 as usize].as_mut() {
                 tcb.state = ThreadStateType::Inactive;
-                if was_receive {
-                    tcb.pending_reply = None;
-                }
             }
         }
     }
@@ -661,14 +663,11 @@ pub fn cancel_ipc(ep: &mut Endpoint, sched: &mut Scheduler, thread: TcbId) {
     ) {
         return;
     }
-    let was_receive = matches!(state, ThreadStateType::BlockedOnReceive);
+    release_receive_offer(sched, thread);
     queue_remove(ep, sched, thread);
     {
         let tcb = sched.slab.get_mut(thread);
         tcb.state = ThreadStateType::Restart;
-        if was_receive {
-            tcb.pending_reply = None;
-        }
     }
     if queue_is_empty(ep) {
         ep.state = EpState::Idle;
