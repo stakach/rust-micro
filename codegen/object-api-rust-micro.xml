@@ -38,4 +38,12 @@
         <brief>Atomically install x86-64 public registers and legacy FXSAVE64 state.</brief>
         <description>Exact 91-word request, no extra caps: selection mask, 20 public UserContext words, 64 FXSAVE64 words, then DR0, DR1, DR2, DR3, DR6, DR7. Mask bits 0 through 17 select the corresponding public register, bit 20 selects the complete FXSAVE64 state, bit 21 requests restart after installation, and bit 22 selects all six debug registers; all other bits are rejected. Requires a readable retained IPC Frame. Selected invalid MXCSR or debug state, self-target and other architectures are rejected before target mutation. Unselected fields, counted single-stepping policy and separately configured TLS bases remain unchanged. Without restart, scheduling state is unchanged. Restart atomically cancels outstanding IPC and reply waits, clears pending fault state, and makes the target runnable, matching WriteRegisters restart semantics. Consuming a pending debug fault acknowledges cached DR6 unless explicit debug state is selected; no other unselected debug register changes.</description>
     </method>
+    <method id="TCBAcquireExecutionHold" name="AcquireExecutionHold" manual_name="Acquire Execution Hold" manual_label="tcb_acquireexecutionhold">
+        <brief>Exclude target execution without changing its underlying wait or context.</brief>
+        <description>Exact zero-word request without extra caps. Stalls the target under the kernel lock, withdraws execution admission, and returns one nonzero globally unique generation word. An existing hold or generation exhaustion rejects before effects. The hold survives IPC completion, Resume, context restart and SC changes.</description>
+    </method>
+    <method id="TCBReleaseExecutionHold" name="ReleaseExecutionHold" manual_name="Release Execution Hold" manual_label="tcb_releaseexecutionhold">
+        <brief>Release an exact execution hold without inventing a wake.</brief>
+        <description>Exact one-word request without extra caps containing the acquisition generation. A mismatch rejects before effects. Success has zero reply words and only reevaluates the target's current scheduling eligibility.</description>
+    </method>
 </interface>

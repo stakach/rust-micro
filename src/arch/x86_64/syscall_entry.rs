@@ -817,7 +817,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             // it, a thread preempted then making a syscall would resume
             // via iretq to the wrong RIP — boot rootserver → RIP=0).
             tcb.use_iretq_resume = false;
-            if from_user != 0 && !tcb.state.is_runnable() {
+            if from_user != 0 && !tcb.execution_held() && !tcb.state.is_runnable() {
                 // The CPU reached the kernel from this thread's user context, so
                 // stale blocked bookkeeping must be reconciled before syscall
                 // handling. This is state repair, not a wakeup policy decision.
@@ -1042,7 +1042,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         }
     }
 
-    if transparent_debug_return {
+    if transparent_debug_return && !entry_invoker.is_some_and(|id| unsafe {
+        KERNEL.get().scheduler.slab.get(id).execution_held()
+    }) {
         if let Some(invoker) = entry_invoker {
             unsafe {
                 let s = KERNEL.get();

@@ -329,6 +329,8 @@ pub struct Tcb {
     /// Diagnostic projection of the outgoing Call's donation. This is not execution
     /// or return authority: only the reciprocal Reply chain and SC head own that.
     pub donated_sc: Option<u16>,
+    /// Orthogonal execution exclusion. Zero means no hold; generations never repeat.
+    pub(crate) execution_hold: u64,
     /// Exact outstanding Call, independent of the receiver's latest legacy reply stash.
     pub call_reply: Option<crate::reply::ReplyNode>,
     /// Allocation-free node for the explicit legacy no-Reply-cap IPC ABI.
@@ -415,6 +417,7 @@ impl Default for Tcb {
             flags: 0,
             enqueued: false,
             donated_sc: None,
+            execution_hold: 0,
             call_reply: None,
             legacy_reply: crate::reply::Reply::new(),
             debug: crate::arch::DebugState::new(),
@@ -548,7 +551,11 @@ impl Tcb {
     }
 
     pub const fn is_runnable(&self) -> bool {
-        self.state.is_runnable()
+        self.state.is_runnable() && !self.execution_held()
+    }
+
+    pub const fn execution_held(&self) -> bool {
+        self.execution_hold != 0
     }
 
     /// Upstream MCS `isSchedulable`: eligible to be picked by the
@@ -561,7 +568,7 @@ impl Tcb {
     /// exhaustion already parks threads as BlockedOnBudget, which is
     /// not runnable, so we don't model release-queue membership here).
     pub const fn is_schedulable(&self) -> bool {
-        self.state.is_runnable() && self.sc.is_some()
+        self.is_runnable() && self.sc.is_some()
     }
 }
 

@@ -42,10 +42,10 @@ fn get_mut(s: &mut KernelState, node: ReplyNode) -> &mut Reply {
 }
 
 pub fn caller(s: &KernelState, node: ReplyNode) -> Option<TcbId> {
-    // Keep exact-but-Inactive callers compatible until NT has a wait-preserving
-    // execution hold and TCBSuspend can atomically adopt upstream cancellation.
     let id = get(s, node).bound_tcb?;
-    (s.scheduler.slab.try_get(id)?.call_reply == Some(node)).then_some(id)
+    let tcb = s.scheduler.slab.try_get(id)?;
+    (tcb.call_reply == Some(node) && tcb.state == ThreadStateType::BlockedOnReply)
+        .then_some(id)
 }
 
 pub fn release_offer(s: &mut KernelState, receiver: TcbId) {

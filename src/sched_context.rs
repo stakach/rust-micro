@@ -292,6 +292,7 @@ pub fn mcs_tick(delta_ticks: Ticks) {
             None => return,
         };
         let cur_tcb = s.scheduler.slab.get(cur);
+        if cur_tcb.execution_held() { return; }
         let sc_idx = match cur_tcb.active_sc.or(cur_tcb.sc) {
             Some(i) => i as usize,
             None => return,
@@ -365,6 +366,7 @@ pub fn mcs_tick(delta_ticks: Ticks) {
 pub fn dispatch_budget_check(tcb_id: TcbId) -> bool {
     unsafe {
         let s = crate::kernel::KERNEL.get();
+        if s.scheduler.slab.get(tcb_id).execution_held() { return false; }
         let sc_idx = match s.scheduler.slab.get(tcb_id).sc {
             Some(i) => i as usize,
             None => return true,
@@ -504,6 +506,7 @@ pub fn complete_yield_to(s: &mut crate::kernel::KernelState, yielder: TcbId, sc_
 pub fn complete_yield_if_pending(next: TcbId) {
     unsafe {
         let s = crate::kernel::KERNEL.get();
+        if s.scheduler.slab.try_get(next).is_some_and(|t| t.execution_held()) { return; }
         let sc_idx = match s.scheduler.slab.try_get(next).and_then(|t| t.yield_to) {
             Some(i) => i as usize,
             None => return,

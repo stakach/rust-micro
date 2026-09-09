@@ -152,7 +152,7 @@ pub fn dispatch(frame: *mut UserContext) {
             let tcb = state.scheduler.slab.get_mut(id);
             tcb.user_context = *context;
             crate::arch::aarch64::context::save_exception_fpu(frame, &mut tcb.aarch64_fpu_state);
-            if !tcb.state.is_runnable() {
+            if !tcb.execution_held() && !tcb.state.is_runnable() {
                 tcb.state = ThreadStateType::Running;
             }
         }

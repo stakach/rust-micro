@@ -44,7 +44,8 @@ pub(crate) fn debug_ready_thread(
     state: &mut crate::kernel::KernelState, mut candidate: Option<crate::tcb::TcbId>,
 ) -> Option<crate::tcb::TcbId> {
     while let Some(id) = candidate {
-        if !deliver_deferred_debug(state, id) { return Some(id); }
+        if !state.scheduler.slab.get(id).execution_held()
+            && !deliver_deferred_debug(state, id) { return Some(id); }
         candidate = state.scheduler.choose_thread();
     }
     None

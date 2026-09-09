@@ -217,7 +217,7 @@ pub unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // than hardcoding — otherwise its retypes target occupied slots and
         // fail with seL4_DeleteFirst (silently, since rax is preserved).
         let empty_start = (*bootinfo).empty.start;
-        microtest::run(ipc_buffer_vaddr, empty_start);
+        microtest::run(ipc_buffer_vaddr, empty_start, &*bootinfo);
         loop { yield_now(); }
     }
 

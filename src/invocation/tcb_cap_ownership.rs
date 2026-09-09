@@ -149,6 +149,11 @@ fn read_tcb_register_request<const N: usize>(
 
 unsafe fn suspend_tcb(s: &mut KernelState, id: TcbId) {
     crate::smp::remote_tcb_stall(s, id);
+    if let Some(node) = s.scheduler.slab.get(id).call_reply {
+        // Cancellation severs the exact call chain; it must not reclaim an SC
+        // still executing a downstream continuation.
+        crate::reply::unlink(s, node);
+    }
     crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, id);
     if let Some(sc_idx) = s.scheduler.slab.get(id).sc {
         if let Some(yielder) = s.sched_contexts[sc_idx as usize].yield_from {

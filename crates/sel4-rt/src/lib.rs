@@ -65,7 +65,10 @@ pub const LBL_TCB_READ_DEBUG_STATE: u64 = 67;
 pub const LBL_SCHED_CONTEXT_READ_RUNTIME: u64 = 68;
 pub const LBL_TCB_READ_LEGACY_CONTEXT: u64 = 69;
 pub const LBL_TCB_WRITE_LEGACY_CONTEXT: u64 = 70;
+pub const LBL_TCB_ACQUIRE_EXECUTION_HOLD: u64 = 71;
+pub const LBL_TCB_RELEASE_EXECUTION_HOLD: u64 = 72;
 pub mod legacy_context;
+pub mod execution_hold;
 
 // --- Object types -----------------------------------------------------------
 pub const OBJ_UNTYPED: u64 = 0;

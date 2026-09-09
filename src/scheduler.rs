@@ -173,6 +173,7 @@ impl ReadyQueues {
     /// RPC (SCHED0011 measured 2 extra 100 ms burns per loop
     /// iteration).
     pub fn enqueue_front(&mut self, slab: &mut TcbSlab, tcb: TcbId) {
+        if slab.get(tcb).execution_held() { return; }
         let prio = slab.get(tcb).priority;
         debug_assert!(prio <= MAX_PRIORITY);
         let p = prio as usize;
@@ -209,6 +210,7 @@ impl ReadyQueues {
 
     /// Append `tcb` to the tail of its priority's queue.
     pub fn enqueue(&mut self, slab: &mut TcbSlab, tcb: TcbId) {
+        if slab.get(tcb).execution_held() { return; }
         let prio = slab.get(tcb).priority;
         debug_assert!(prio <= MAX_PRIORITY);
         let p = prio as usize;
@@ -630,6 +632,8 @@ impl Scheduler {
     /// Publish the thread this CPU is about to enter in user mode.
     #[inline]
     pub fn set_active_user(&mut self, val: Option<TcbId>) {
+        assert!(val.is_none_or(|id| !self.slab.get(id).execution_held()),
+            "held TCB cannot enter user mode");
         let cpu = crate::arch::get_cpu_id() as usize;
         self.nodes[cpu].active_user = val;
     }
@@ -1078,7 +1082,8 @@ impl Scheduler {
             self.next_domain();
         }
         let dom = self.cur_domain as usize;
-        if let Some(id) = self.nodes[cpu].queues[dom].pop_highest(&mut self.slab) {
+        while let Some(id) = self.nodes[cpu].queues[dom].pop_highest(&mut self.slab) {
+            if self.slab.get(id).execution_held() { continue; }
             self.nodes[cpu].queues[dom].enqueue(&mut self.slab, id);
             return Some(id);
         }
@@ -1092,16 +1097,17 @@ impl Scheduler {
             if i == cpu {
                 continue;
             }
-            if let Some(id) =
+            while let Some(id) =
                 self.nodes[i].queues[dom].peek_top_with_affinity(&self.slab, cpu as u32)
             {
                 self.nodes[i].queues[dom].dequeue(&mut self.slab, id);
+                if self.slab.get(id).execution_held() { continue; }
                 self.nodes[cpu].queues[dom].enqueue(&mut self.slab, id);
                 return Some(id);
             }
         }
 
-        self.nodes[cpu].idle
+        self.nodes[cpu].idle.filter(|&id| !self.slab.get(id).execution_held())
     }
 
     /// Decide whether the current thread on this CPU should yield.
@@ -1133,6 +1139,7 @@ impl Scheduler {
             None => return false,
         };
         let t = self.slab.get_mut(cur);
+        if t.execution_held() { return false; }
         if t.time_slice == 0 {
             return true;
         }

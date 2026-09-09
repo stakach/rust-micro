@@ -524,11 +524,18 @@ mod legacy_context_specs {
                     assert_eq!(s.scheduler.slab.get(receiver).sc, Some(donated_sc as u16));
                 }
                 words[0] = REGISTER_MASK | FX_MASK | DEBUG_MASK | RESTART_MASK;
+                decode_invocation(cap, &SyscallArgs {
+                    a1: (InvocationLabel::TCBAcquireExecutionHold as u64) << 12,
+                    ..Default::default()
+                }, invoker).unwrap();
+                let hold = KERNEL.get().scheduler.slab.get(invoker).msg_regs[0];
                 decode_invocation(cap, &write_request(&words), invoker).unwrap();
                 {
                     let s = KERNEL.get();
                     let t = s.scheduler.slab.get(target);
                     assert_eq!(t.state, crate::tcb::ThreadStateType::Running);
+                    assert_eq!(t.execution_hold, hold);
+                    assert!(!t.enqueued && !t.is_runnable());
                     assert_eq!(t.pending_fault, 0);
                     assert_eq!(t.user_context.rax, words[4]);
                     assert_eq!(t.fpu_state.0, fx.0);
@@ -542,6 +549,12 @@ mod legacy_context_specs {
                     assert_eq!(s.sched_contexts[donated_sc].bound_tcb, Some(receiver));
                     assert_eq!(s.scheduler.slab.get(receiver).sc, Some(donated_sc as u16));
                     assert_eq!(s.sched_contexts[donated_sc].reply_head, None);
+                    decode_invocation(cap, &SyscallArgs {
+                        a1: ((InvocationLabel::TCBReleaseExecutionHold as u64) << 12) | 1,
+                        a2: hold, ..Default::default()
+                    }, invoker).unwrap();
+                    assert_eq!(s.scheduler.slab.get(target).execution_hold, 0);
+                    assert!(!s.scheduler.slab.get(target).enqueued);
                     s.scheduler.scrub_tcb(target);
                     s.free_sched_context(donated_sc);
                     teardown_thread_in(s, receiver);

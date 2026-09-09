@@ -222,6 +222,93 @@ pub fn test_reply_chains() {
         sc_slot_reuse(s);
         offered_reply_reuse(s);
         receiver_offer_replacement(s);
+        suspend_chain(s, false, false);
+        suspend_chain(s, false, true);
+        suspend_chain(s, true, false);
+        suspend_chain(s, true, true);
+        suspend_receive_offer(s);
     }
-    crate::arch::log("Exact MCS Reply-chain tests completed (9 cases)\n");
+    crate::arch::log("Exact MCS Reply-chain tests completed (14 cases)\n");
+}
+
+fn suspend(s: &mut KernelState, invoker: TcbId, target: TcbId) {
+    use crate::{cap::{Cap, PPtr}, syscall_handler::SyscallArgs};
+    s.scheduler.set_current(Some(invoker));
+    crate::invocation::decode_invocation(
+        Cap::Thread { tcb: PPtr::new(target.0 as u64).unwrap() },
+        &SyscallArgs { a1: (crate::syscalls::InvocationLabel::TCBSuspend as u64) << 12,
+            ..Default::default() }, invoker,
+    ).unwrap();
+}
+
+fn suspend_chain(s: &mut KernelState, legacy: bool, suspend_inner: bool) {
+    let chain = Chain::new(s, legacy);
+    let [a, b, c] = chain.threads;
+    let outer = chain.node(s, 0);
+    let inner = chain.node(s, 1);
+    let controller = s.scheduler.admit(Tcb::default());
+    let victim = if suspend_inner { b } else { a };
+    let cancelled = if suspend_inner { inner } else { outer };
+    suspend(s, controller, victim);
+    assert_eq!(caller(s, cancelled), None);
+    assert_eq!(get(s, cancelled), Reply::new());
+    assert_eq!(s.scheduler.slab.get(victim).state, ThreadStateType::Inactive);
+    assert_eq!(s.scheduler.slab.get(victim).call_reply, None);
+    assert_eq!(s.scheduler.slab.get(victim).sc, None);
+    assert_eq!(s.sched_contexts[chain.sc].bound_tcb, Some(c));
+    let head = s.sched_contexts[chain.sc].reply_head;
+    suspend(s, controller, victim);
+    assert_eq!(s.sched_contexts[chain.sc].reply_head, head);
+    assert_eq!(s.sched_contexts[chain.sc].bound_tcb, Some(c));
+    if !legacy {
+        let cap = crate::cap::Cap::Reply {
+            ptr: KernelState::reply_ptr(chain.objects[if suspend_inner { 1 } else { 0 }]),
+            can_grant: true,
+        };
+        assert!(crate::invocation::decode_invocation(
+            cap, &crate::syscall_handler::SyscallArgs::default(), controller,
+        ).is_err());
+    }
+    if suspend_inner {
+        assert_eq!(head, None);
+        assert_eq!(get(s, outer).next, None);
+        assert_eq!(caller(s, outer), Some(a));
+        remove(s, outer);
+        assert_eq!(s.sched_contexts[chain.sc].bound_tcb, Some(c));
+        assert_eq!(s.scheduler.slab.get(a).sc, None);
+    } else {
+        assert_eq!(head, Some(inner));
+        assert_eq!(get(s, inner).prev, None);
+        remove(s, inner);
+        assert_eq!(s.sched_contexts[chain.sc].bound_tcb, Some(b));
+        assert_eq!(s.scheduler.slab.get(a).sc, None);
+    }
+    s.scheduler.set_current(None);
+    s.scheduler.block(controller, ThreadStateType::Inactive);
+    s.scheduler.slab.free(controller);
+    chain.finish(s);
+}
+
+fn suspend_receive_offer(s: &mut KernelState) {
+    let receiver = s.scheduler.admit(Tcb::default());
+    let controller = s.scheduler.admit(Tcb::default());
+    let endpoint = s.alloc_endpoint().unwrap();
+    let object = s.alloc_reply().unwrap();
+    offer(s, receiver, object as u16);
+    crate::endpoint::receive_ipc(&mut s.endpoints[endpoint], &mut s.scheduler,
+        receiver, crate::endpoint::RecvOptions::blocking());
+    suspend(s, controller, receiver);
+    assert_eq!(s.scheduler.slab.get(receiver).state, ThreadStateType::Inactive);
+    assert_eq!(s.scheduler.slab.get(receiver).pending_reply, None);
+    assert_eq!(s.replies[object], Reply::new());
+    assert_eq!(s.endpoints[endpoint].head, None);
+    assert_eq!(s.endpoints[endpoint].tail, None);
+    suspend(s, controller, receiver);
+    s.free_reply(object);
+    s.free_endpoint(endpoint);
+    s.scheduler.set_current(None);
+    for id in [receiver, controller] {
+        s.scheduler.block(id, ThreadStateType::Inactive);
+        s.scheduler.slab.free(id);
+    }
 }
