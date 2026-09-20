@@ -50,6 +50,7 @@ pub const LBL_IRQ_ISSUE_IRQ_HANDLER: u64 = 30;
 pub const LBL_IRQ_SET_IRQ_HANDLER: u64 = 32;
 pub const LBL_SCHED_CONTROL_CONFIGURE: u64 = 37;
 pub const LBL_SCHED_CONTEXT_BIND: u64 = 38;
+pub const LBL_SCHED_CONTEXT_UNBIND: u64 = 39;
 pub const LBL_SCHED_CONTEXT_CONSUMED: u64 = 41;
 pub const LBL_X86_PDPT_MAP: u64 = 43;
 pub const LBL_X86_PDPT_UNMAP: u64 = 44;
@@ -345,6 +346,13 @@ pub fn sched_control_configure(
 pub fn sched_context_bind(sc_cptr: u64, tcb_cptr: u64) -> u64 {
     let msg_info = LBL_SCHED_CONTEXT_BIND << 12;
     unsafe { syscall5(SYS_SEND, sc_cptr, msg_info, tcb_cptr, 0, 0) }
+}
+
+/// Unbind every object from the scheduling context and return the acknowledged kernel error.
+/// Teardown callers must first stop its private worker and verify outstanding Reply cancellation.
+#[inline(always)]
+pub fn sched_context_unbind(sc_cptr: u64) -> u64 {
+    unsafe { syscall5_call_mr2(sc_cptr, LBL_SCHED_CONTEXT_UNBIND << 12, 0, 0, 0).0 }
 }
 
 /// Report and reset the standard seL4 MCS consumed counter.
