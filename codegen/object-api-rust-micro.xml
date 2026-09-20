@@ -46,4 +46,8 @@
         <brief>Release an exact execution hold without inventing a wake.</brief>
         <description>Exact one-word request without extra caps containing the acquisition generation. A mismatch rejects before effects. Success has zero reply words and only reevaluates the target's current scheduling eligibility.</description>
     </method>
+    <method id="TCBQueryReplyBinding" name="QueryReplyBinding" manual_name="Query Reply Binding" manual_label="tcb_queryreplybinding">
+        <brief>Observe an authorized Reply object's binding relative to the target TCB.</brief>
+        <description>Exact one-word request without extra caps: a Reply cptr in the invoker's CSpace. Returns one word: 0 free, 1 offered to a receiver, 2 bound to the target, 3 bound elsewhere. Inconsistent reciprocal ownership is rejected. Does not reserve, release, reply, wake, or alter scheduling state. The observation is not a reservation and requires exclusive ownership for subsequent reuse.</description>
+    </method>
 </interface>
