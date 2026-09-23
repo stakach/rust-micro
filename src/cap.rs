@@ -1112,6 +1112,8 @@ pub mod spec {
         frame_rights_masks_never_add_authority();
         roundtrip_frame_at_zero_address();
         roundtrip_paging_structs();
+        #[cfg(target_arch = "x86_64")]
+        roundtrip_high_canonical_mapping_caps();
         roundtrip_asid_caps();
         roundtrip_sched_context_cap();
         roundtrip_sched_control_cap();
@@ -1178,6 +1180,39 @@ pub mod spec {
         arch::log("  ✓ page-table / directory / PDPT / PML4 caps round-trip\n");
         #[cfg(target_arch = "aarch64")]
         arch::log("  ✓ page-table / VSpace caps round-trip\n");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn roundtrip_high_canonical_mapping_caps() {
+        let alias = crate::arch::x86_64::vspace::KUSER_SHARED_DATA_VADDR;
+        let frame = Cap::Frame {
+            ptr: PAddr::<FrameStorage>::new(0x4000),
+            size: FrameSize::Small,
+            rights: FrameRights::ReadOnly,
+            mapped: Some(alias),
+            asid: 7,
+            is_device: false,
+            map_type: FrameMapType::VSpace,
+        };
+        let pt = Cap::PageTable {
+            ptr: PPtr::<PageTableStorage>::new(0x5000).unwrap(),
+            mapped: Some(alias & !((1u64 << 21) - 1)),
+            asid: 7,
+        };
+        let pd = Cap::PageDirectory {
+            ptr: PPtr::<PageDirectoryStorage>::new(0x6000).unwrap(),
+            mapped: Some(alias & !((1u64 << 30) - 1)),
+            asid: 7,
+        };
+        let pdpt = Cap::Pdpt {
+            ptr: PPtr::<PdptStorage>::new(0x7000).unwrap(),
+            mapped: Some(alias & !((1u64 << 39) - 1)),
+            asid: 7,
+        };
+        for cap in [frame, pt, pd, pdpt] {
+            assert_eq!(from_words(to_words(&cap)), cap);
+        }
+        arch::log("  KUSER high-canonical cap addresses retain unmap provenance\n");
     }
 
     fn roundtrip_sched_context_cap() {

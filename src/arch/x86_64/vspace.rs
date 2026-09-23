@@ -34,6 +34,31 @@ pub const PAGE_BITS_4K: u32 = 12;
 pub const PAGE_BITS_2M: u32 = 21;
 pub const PAGE_BITS_1G: u32 = 30;
 pub const USER_VADDR_END: Word = 1u64 << 47;
+pub const KUSER_SHARED_DATA_VADDR: Word = 0xffff_f780_0000_0000;
+
+/// The sole admitted upper-canonical user container is the paging chain covering KUSER.
+pub const fn kuser_container_range(vaddr: Word, size_bits: u32) -> bool {
+    match size_bits {
+        21 | 30 | 39 => vaddr == KUSER_SHARED_DATA_VADDR & !((1u64 << size_bits) - 1),
+        _ => false,
+    }
+}
+
+/// KUSER is a single read-only, non-executable 4 KiB user leaf.
+pub const fn kuser_frame_mapping(
+    vaddr: Word,
+    size_bits: u32,
+    rights: crate::cap::FrameRights,
+    attributes: FrameMappingAttributes,
+) -> bool {
+    vaddr == KUSER_SHARED_DATA_VADDR
+        && size_bits == PAGE_BITS_4K
+        && matches!(rights, crate::cap::FrameRights::ReadOnly)
+        && attributes.execute_never
+        && !attributes.write_through
+        && !attributes.cache_disabled
+        && !attributes.pat
+}
 
 /// Whether a complete mapping extent lies in the lower canonical user half. This does not
 /// enforce alignment: paging-structure callers pass the base of the containing table span.
@@ -363,6 +388,7 @@ pub mod spec {
         decompose_kernel_addr();
         canonical_check();
         user_mapping_extents();
+        kuser_high_alias_admission();
         frame_mapping_attributes_and_rights();
         pte_round_trip();
         frame_map_writes_pte();
@@ -412,6 +438,32 @@ pub mod spec {
         assert!(!user_frame_mapping_range(0, u32::MAX));
         assert!(canonical(0xffff_8000_0000_0000));
         arch::log("  user mapping extents exclude noncanonical and kernel addresses\n");
+    }
+
+    #[inline(never)]
+    fn kuser_high_alias_admission() {
+        use crate::cap::FrameRights;
+        let base = KUSER_SHARED_DATA_VADDR;
+        for bits in [21, 30, 39] {
+            let span = 1u64 << bits;
+            let container = base & !(span - 1);
+            assert!(kuser_container_range(container, bits));
+            assert!(!kuser_container_range(container - span, bits));
+            assert!(!kuser_container_range(container + span, bits));
+            assert!(!user_mapping_range(container, bits));
+        }
+        assert!(!kuser_container_range(base, 12));
+        let nx = FrameMappingAttributes::compressed(0b110);
+        assert!(kuser_frame_mapping(base, 12, FrameRights::ReadOnly, nx));
+        assert!(!kuser_frame_mapping(base + 0x1000, 12, FrameRights::ReadOnly, nx));
+        assert!(!kuser_frame_mapping(base, 21, FrameRights::ReadOnly, nx));
+        assert!(!kuser_frame_mapping(base, 12, FrameRights::ReadWrite, nx));
+        assert!(!kuser_frame_mapping(base, 12, FrameRights::KernelOnly, nx));
+        assert!(!kuser_frame_mapping(base, 12, FrameRights::ReadOnly,
+            FrameMappingAttributes::upstream(0)));
+        assert!(!kuser_frame_mapping(base, 12, FrameRights::ReadOnly,
+            FrameMappingAttributes { cache_disabled: true, ..nx }));
+        arch::log("  KUSER high alias is exact, read-only, and non-executable\n");
     }
 
     #[inline(never)]

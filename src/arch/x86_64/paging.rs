@@ -68,31 +68,18 @@ pub unsafe fn alloc_user_table_va() -> *mut u64 {
     alloc_table_va()
 }
 
-/// Phase 24 — clone the live PML4 into a fresh page-table page.
+/// Phase 24 — clone the kernel PML4 into a fresh page-table page.
 /// Returns the new PML4's physical address (suitable for CR3).
 ///
-/// We copy *every* live PML4 entry verbatim, not just the
-/// kernel-half ones. The early loader mappings include low-memory
-/// access that the kernel relies on to walk page tables and reach
-/// ACPI / CR3-relative memory; if we zeroed the user half, the very
-/// next instruction after CR3 swap could page-fault on a missing
-/// identity-map entry. User-mode address-space isolation in our setup
-/// comes from PML4 *user-half* entries that the user code populates
-/// dynamically (above 256 GiB; PML4[2] in our demo) — those land in
-/// fresh sub-tables per PML4, so two threads sharing the PML4[0]
-/// identity map can still hold disjoint user-space mappings above
-/// 256 GiB.
+/// The user half remains empty; only boot-captured kernel mappings are inherited.
 pub unsafe fn make_user_pml4() -> u64 {
-    let live = phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *const u64;
     let new_va = alloc_table_va();
-    for i in 256..512 {
-        let entry = ptr::read_volatile(live.add(i));
-        ptr::write_volatile(new_va.add(i), entry);
-    }
-    kernel_virt_to_phys(new_va as u64)
+    let paddr = kernel_virt_to_phys(new_va as u64);
+    clone_kernel_pml4_to_paddr(paddr);
+    paddr
 }
 
-/// Clone the kernel-half entries of the live PML4 into a
+/// Clone the kernel-half entries of the boot-captured kernel PML4 into a
 /// freshly-retyped target PML4 (called from
 /// `decode_untyped_retype` for `Cap::PML4`). The user-half is
 /// zeroed so the new vspace starts empty.
@@ -105,8 +92,10 @@ pub unsafe fn make_user_pml4() -> u64 {
 ///   * The kernel-half linear map (installed at boot in PML4[256+])
 ///     lives in this range — copying it preserves kernel paddr
 ///     access while the user runs with this PML4 in CR3.
-pub unsafe fn clone_live_pml4_to_paddr(target_paddr: u64) {
-    let live = phys_to_lin(read_cr3() & 0x000F_FFFF_FFFF_F000) as *const u64;
+pub unsafe fn clone_kernel_pml4_to_paddr(target_paddr: u64) {
+    let kernel_root = kernel_root_cr3();
+    assert_ne!(kernel_root, 0, "kernel PML4 template must be installed before retype");
+    let template = phys_to_lin(kernel_root) as *const u64;
     let target = phys_to_lin(target_paddr & 0x000F_FFFF_FFFF_F000) as *mut u64;
     // Zero the whole page first — Untyped retypes don't clear memory,
     // and we don't want stale entries left over from prior retypes
@@ -124,8 +113,27 @@ pub unsafe fn clone_live_pml4_to_paddr(target_paddr: u64) {
     // entries the new process needs come from explicit
     // PDPT_Map/PD_Map/PT_Map invocations against the new PML4 cap.
     for i in 256..512 {
-        let entry = ptr::read_volatile(live.add(i));
+        let entry = ptr::read_volatile(template.add(i));
         ptr::write_volatile(target.add(i), entry);
+    }
+}
+
+/// A public KUSER paging chain must never descend into an inherited kernel hierarchy.
+pub fn kuser_slot_is_unshared(vspace_root: u64) -> bool {
+    let kernel_root = kernel_root_cr3();
+    if kernel_root == 0 || vspace_root == kernel_root {
+        return false;
+    }
+    let template = phys_to_lin(kernel_root) as *const u64;
+    let vspace = phys_to_lin(vspace_root) as *const u64;
+    let slot = crate::arch::x86_64::vspace::decompose_vaddr(
+        crate::arch::x86_64::vspace::KUSER_SHARED_DATA_VADDR,
+    ).pml4 as usize;
+    unsafe {
+        let inherited = ptr::read_volatile(template.add(slot));
+        let local = ptr::read_volatile(vspace.add(slot));
+        inherited & PTE_PRESENT == 0
+            && (local & PTE_PRESENT == 0 || local & PTE_USER != 0)
     }
 }
 
@@ -385,7 +393,13 @@ unsafe fn install_linear_map(pml4: *mut u64) {
         return;
     }
     let mut chosen_idx: Option<usize> = None;
+    let shared_alias_idx = super::vspace::decompose_vaddr(
+        super::vspace::KUSER_SHARED_DATA_VADDR,
+    ).pml4 as usize;
     for idx in 256..511 {
+        if idx == shared_alias_idx {
+            continue;
+        }
         let e = ptr::read_volatile(pml4.add(idx));
         if e & PTE_PRESENT == 0 {
             chosen_idx = Some(idx);
