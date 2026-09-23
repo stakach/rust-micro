@@ -638,12 +638,24 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
             seL4_Error::seL4_AlignmentError,
         )));
     }
-    if !vspace::user_frame_mapping_range(vaddr, bits) {
+    let attributes = if upstream {
+        vspace::FrameMappingAttributes::upstream(args.a4)
+    } else {
+        vspace::FrameMappingAttributes::compressed(args.a3)
+    };
+    let effective_rights = rights.masked(args.a3);
+    let kuser = vspace::kuser_frame_mapping(vaddr, bits, effective_rights, attributes);
+    if !vspace::user_frame_mapping_range(vaddr, bits) && !kuser {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidArgument,
         )));
     }
     let (root, asid) = resolve_x86_mapping_root(invoker, upstream, args.a4)?;
+    if kuser && !crate::arch::x86_64::paging::kuser_slot_is_unshared(root) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_DeleteFirst,
+        )));
+    }
     if let Some(previous) = mapped {
         if frame_asid == 0 || frame_asid != asid {
             return Err(KException::SyscallError(SyscallError::new(
@@ -666,14 +678,9 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         )));
     }
     let location = unsafe { preflight_invoked_mapping_slot(target, args, invoker)? };
-    let attributes = if upstream {
-        vspace::FrameMappingAttributes::upstream(args.a4)
-    } else {
-        vspace::FrameMappingAttributes::compressed(args.a3)
-    };
     let result = unsafe {
         usermode::map_user_frame_in_pml4(root, vaddr, ptr.addr(), size,
-            rights.masked(args.a3), attributes)
+            effective_rights, attributes)
     };
     if let Err(missing) = result {
         if missing == 4 {
@@ -1443,13 +1450,19 @@ fn map_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId, level: u32
         }
     };
     let span_base = vaddr & !((1u64 << span_bits) - 1);
-    if !crate::arch::x86_64::vspace::user_mapping_range(span_base, span_bits) {
+    let kuser = crate::arch::x86_64::vspace::kuser_container_range(span_base, span_bits);
+    if !crate::arch::x86_64::vspace::user_mapping_range(span_base, span_bits) && !kuser {
         return Err(KException::SyscallError(SyscallError::new(
             seL4_Error::seL4_InvalidArgument,
         )));
     }
 
     let (root, mapped_asid) = resolve_x86_mapping_root(invoker, upstream, args.a3)?;
+    if kuser && !crate::arch::x86_64::paging::kuser_slot_is_unshared(root) {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_DeleteFirst,
+        )));
+    }
     let (cnode, slot) = unsafe { preflight_invoked_mapping_slot(target, args, invoker)? };
     let updated = paging_cap_with_mapping(target, paddr, Some(span_base), mapped_asid)
         .ok_or(KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability)))?;
@@ -3981,7 +3994,7 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
                         }
                     }
                     // Phase 33d — when the rootserver retypes a fresh
-                    // PML4, copy the live PML4's entries into it so
+                    // PML4, copy the boot-captured kernel PML4's entries into it so
                     // the new vspace has the kernel half mapped. Any
                     // thread we later dispatch with this PML4 needs
                     // those entries to enter the kernel from SYSCALL
@@ -3990,7 +4003,7 @@ fn decode_untyped_retype(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
                     #[cfg(target_arch = "x86_64")]
                     Cap::PML4 { ptr, mapped, asid } => {
                         let new_paddr = ptr.addr();
-                        crate::arch::x86_64::paging::clone_live_pml4_to_paddr(new_paddr);
+                        crate::arch::x86_64::paging::clone_kernel_pml4_to_paddr(new_paddr);
                         Cap::PML4 { ptr, mapped, asid }
                     }
                     other => other,
@@ -6088,6 +6101,7 @@ pub mod spec {
             frame_maps_reject_non_user_extents();
             paging_maps_reject_non_user_extents();
             paging_unmap_requires_exact_physical_identity();
+            high_alias_leaf_map_unmap();
             page_table_invocation_tracks_asid_and_detaches_hardware();
             paging_mapping_specs::run();
         }
@@ -6529,6 +6543,53 @@ pub mod spec {
         }
 
         arch::log("  ✓ paging unmap requires exact physical identity at every level\n");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    fn high_alias_leaf_map_unmap() {
+        use crate::arch::x86_64::{usermode, vspace};
+        use crate::cap::{FrameRights, FrameSize};
+        #[repr(C, align(4096))]
+        struct Table([u64; 512]);
+        static mut PML4: Table = Table([0; 512]);
+        static mut PDPT: Table = Table([0; 512]);
+        static mut PD: Table = Table([0; 512]);
+        static mut PT: Table = Table([0; 512]);
+        unsafe {
+            use crate::arch::x86_64::paging::{kernel_virt_to_phys, PTE_PRESENT, PTE_RW, PTE_USER};
+            let pml4 = core::ptr::addr_of_mut!(PML4) as *mut u64;
+            let pdpt = core::ptr::addr_of_mut!(PDPT) as *mut u64;
+            let pd = core::ptr::addr_of_mut!(PD) as *mut u64;
+            let pt = core::ptr::addr_of_mut!(PT) as *mut u64;
+            core::ptr::write_bytes(pml4, 0, 512);
+            core::ptr::write_bytes(pdpt, 0, 512);
+            core::ptr::write_bytes(pd, 0, 512);
+            core::ptr::write_bytes(pt, 0, 512);
+            let vaddr = vspace::KUSER_SHARED_DATA_VADDR;
+            let indices = vspace::decompose_vaddr(vaddr);
+            let flags = PTE_PRESENT | PTE_RW | PTE_USER;
+            core::ptr::write_volatile(pml4.add(indices.pml4 as usize),
+                kernel_virt_to_phys(pdpt as u64) | flags);
+            core::ptr::write_volatile(pdpt.add(indices.pdpt as usize),
+                kernel_virt_to_phys(pd as u64) | flags);
+            core::ptr::write_volatile(pd.add(indices.pd as usize),
+                kernel_virt_to_phys(pt as u64) | flags);
+            let root = kernel_virt_to_phys(pml4 as u64);
+            let frame = 0x4000u64;
+            let attrs = vspace::FrameMappingAttributes::compressed(0b110);
+            assert_eq!(usermode::map_user_frame_in_pml4(root, vaddr, frame,
+                FrameSize::Small, FrameRights::ReadOnly, attrs), Ok(()));
+            let leaf = core::ptr::read_volatile(pt.add(indices.pt as usize));
+            assert_eq!(leaf & PTE_PRESENT, PTE_PRESENT);
+            assert_eq!(leaf & PTE_RW, 0);
+            assert_ne!(leaf & PTE_USER, 0);
+            assert_ne!(leaf & (1u64 << 63), 0);
+            assert!(!usermode::unmap_user_4k_in_pml4(root, vaddr, frame + 0x1000));
+            assert!(usermode::unmap_user_4k_in_pml4(root, vaddr, frame));
+            assert_eq!(core::ptr::read_volatile(pt.add(indices.pt as usize)), 0);
+        }
+        arch::log("  KUSER high alias maps UserRO+NX and unmaps by exact frame identity\n");
     }
 
     #[cfg(target_arch = "x86_64")]
