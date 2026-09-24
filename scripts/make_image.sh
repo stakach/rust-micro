@@ -46,7 +46,7 @@ if [ -f .tmp/hive.dat ]; then
   fi
   IMAGE_PROFILE=$(tr -d '\r\n' < "$IMAGE_PROFILE_MARKER")
   case "$IMAGE_PROFILE" in
-    production|pending-start|live-device-action) ;;
+    production|pending-start|live-device-action|seh-driver) ;;
     *)
       echo "error: unsupported staged image profile: $IMAGE_PROFILE" >&2
       exit 1
@@ -256,6 +256,16 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
     stage_file "$fixture_path" "$ESP_STAGE/reactos/system32/drivers/$fx"
     echo "driver test fixture staged: reactos/system32/drivers/$fx"
   done
+
+  if [ "$IMAGE_PROFILE" = "seh-driver" ]; then
+    SEH_DRIVER=../.tmp/native-driver-seh/driver_seh.sys
+    if [ ! -s "$SEH_DRIVER" ]; then
+      echo "error: verified native SEH driver missing at $SEH_DRIVER — run tests/native/driver_seh/build.sh" >&2
+      exit 1
+    fi
+    stage_file "$SEH_DRIVER" "$ESP_STAGE/reactos/system32/drivers/driver_seh.sys"
+    echo "native SEH driver staged: reactos/system32/drivers/driver_seh.sys"
+  fi
 
   if [ -f "$OUR_NTDLL" ]; then
     stage_file "$OUR_NTDLL" "$ESP_STAGE/reactos/system32/ntdll.dll"
