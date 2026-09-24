@@ -27,6 +27,7 @@ SIMPLEBOOT_BIN=.tmp/simpleboot
 SIMPLEBOOT_REF="${SIMPLEBOOT_REF:-f5fa29fe6613dc20b3729e769c68f9435daa15d1}"
 SIMPLEBOOT_RAW_BASE="${SIMPLEBOOT_RAW_BASE:-https://gitlab.com/bztsrc/simpleboot/-/raw/${SIMPLEBOOT_REF}/src}"
 IMAGE_PROFILE_MARKER=.tmp/image-profile
+SEH_LINKAGE=.tmp/nt-seh-linkage.dll
 
 if [ ! -f "$KERNEL" ]; then
   echo "error: kernel not built at $KERNEL — run scripts/build_kernel.sh first" >&2
@@ -53,6 +54,10 @@ if [ -f .tmp/hive.dat ]; then
   esac
   if [ "${NTOS_IMAGE_PROFILE:-production}" != "$IMAGE_PROFILE" ]; then
     echo "error: staged hive profile '$IMAGE_PROFILE' does not match requested '${NTOS_IMAGE_PROFILE:-production}'" >&2
+    exit 1
+  fi
+  if [ ! -s "$SEH_LINKAGE" ]; then
+    echo "error: verified SEH linkage missing at $SEH_LINKAGE — rebuild the NT rootserver" >&2
     exit 1
   fi
 fi
@@ -215,6 +220,11 @@ if [ -f .tmp/reactos/.fulltree-ok ] && [ -d .tmp/reactos/reactos ]; then
   REACTOS_TREE_STAGED=1
 else
   echo "note: full \\reactos tree not staged (.tmp/reactos/.fulltree-ok absent)"
+fi
+
+if [ -f .tmp/hive.dat ]; then
+  stage_file "$SEH_LINKAGE" "$ESP_STAGE/reactos/system32/nt-seh-linkage.dll"
+  echo "SEH linkage added: reactos/system32/nt-seh-linkage.dll"
 fi
 
 if [ -f .tmp/reactos/.profiles-ok ] && [ -d .tmp/reactos/Profiles ]; then
