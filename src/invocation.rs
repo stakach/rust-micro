@@ -216,6 +216,14 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
     };
     inv_log_entry(&target, label_n, xc_count);
 
+    // Reply MessageInfo labels belong to the blocked caller's protocol, not the kernel's
+    // invocation opcode space. Decode a Reply before interpreting any invocation label.
+    if matches!(target, Cap::Reply { .. }) {
+        let result = decode_reply(target, args, invoker);
+        inv_log_exit(&result);
+        return result;
+    }
+
     let label = match InvocationLabel::from_u64(label_n) {
         Some(l) => l,
         None => {
@@ -244,7 +252,7 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         Cap::AsidPool { .. } => decode_asid_pool(target, label, args, invoker),
         Cap::SchedContext { .. } => decode_sched_context(target, label, args, invoker),
         Cap::SchedControl { core } => decode_sched_control(core, label, args, invoker),
-        Cap::Reply { .. } => decode_reply(target, args, invoker),
+        Cap::Reply { .. } => unreachable!("Reply was dispatched before invocation labels"),
         Cap::Domain => decode_domain(label, args, invoker),
         #[cfg(target_arch = "x86_64")]
         Cap::IOPort {
@@ -8447,12 +8455,14 @@ pub mod spec {
 
         // The holder has an unrelated incoming Call; only the invoked object chooses the caller.
         let moved = unsafe { KERNEL.get().cnodes[0].0[6].cap() };
-        let reply = SyscallArgs { a1: 1, a2: 0xA11A5, ..Default::default() };
+        let reply = SyscallArgs { a1: (0x792 << 12) | 1, a2: 0xA11A5, ..Default::default() };
         decode_invocation(moved, &reply, holder).expect("reply through moved alias from another holder");
         unsafe {
             let s = KERNEL.get();
             assert_eq!(s.scheduler.slab.get(caller).state, ThreadStateType::Running);
             assert_eq!(s.scheduler.slab.get(caller).msg_regs[0], 0xA11A5);
+            assert_eq!(s.scheduler.slab.get(caller).ipc_label, 0x792);
+            assert_eq!(s.scheduler.slab.get(caller).ipc_length, 1);
             assert_eq!(s.scheduler.slab.get(caller).call_reply, None);
             assert_eq!(s.scheduler.slab.get(server).reply_to, None);
             assert_eq!(s.scheduler.slab.get(server).sc, None);
