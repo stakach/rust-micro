@@ -275,12 +275,19 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
 
   if [ "$IMAGE_PROFILE" = "mup-provider" ]; then
     MUP_PROVIDER=../.tmp/native-mup-provider/mup_provider.sys
+    READ_FORWARD=../.tmp/native-mup-provider/read_forward.sys
     if [ ! -s "$MUP_PROVIDER" ]; then
       echo "error: native Mup provider missing at $MUP_PROVIDER — run tests/native/mup_provider/build.sh" >&2
       exit 1
     fi
     stage_file "$MUP_PROVIDER" "$ESP_STAGE/reactos/system32/drivers/mup_provider.sys"
     echo "native Mup provider staged: reactos/system32/drivers/mup_provider.sys"
+    if [ ! -s "$READ_FORWARD" ]; then
+      echo "error: native READ source missing at $READ_FORWARD — run tests/native/mup_provider/build.sh" >&2
+      exit 1
+    fi
+    stage_file "$READ_FORWARD" "$ESP_STAGE/reactos/system32/drivers/read_forward.sys"
+    echo "native READ source staged: reactos/system32/drivers/read_forward.sys"
   fi
 
   if [ -f "$OUR_NTDLL" ]; then
