@@ -133,7 +133,7 @@ const ROOTSERVER_STACK_PAGES: u64 = 16;
 /// user-callback chains. Keep its guarded root-task stack large enough that regular ReactOS process
 /// bring-up does not depend on optimizer spill placement.
 #[cfg(feature = "extern-rootserver")]
-const ROOTSERVER_STACK_PAGES: u64 = 64;
+const ROOTSERVER_STACK_PAGES: u64 = 128;
 
 /// Kernel-side CNode index reserved for the rootserver's CSpace.
 ///
