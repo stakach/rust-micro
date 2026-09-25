@@ -12,9 +12,9 @@
 # livecd — the binaries sit directly in reactos/system32/ (no reactos.cab).
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 OUT=.tmp/reactos
-mkdir -p "$OUT"
 MANIFEST=vendor/reactos-acpi/manifest.txt
 
 manifest_value() {
@@ -66,11 +66,27 @@ single_iso() {
 }
 
 # Overridable via $REACTOS_7Z_URL. Defaults to a pinned GPL ReactOS x64 livecd
-# build (0.4.17-dev-478-g4117217); the binaries live directly in reactos/system32/.
-URL="${REACTOS_7Z_URL:-https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-478-g4117217-x64-msvc-win-dbg.7z}"
+# build (0.4.17-dev-933-ga9fc819); the binaries live directly in reactos/system32/.
+URL="${REACTOS_7Z_URL:-https://iso.reactos.org/livecd/reactos-livecd-0.4.17-dev-933-ga9fc819-x64-msvc-win-dbg.7z}"
 ARCHIVE_SHA256="${REACTOS_7Z_SHA256:-$(manifest_value reactos_livecd_7z_sha256)}"
 ISO_SHA256="${REACTOS_ISO_SHA256:-$(manifest_value reactos_livecd_iso_sha256)}"
 STOCK_ACPI_SHA256="${REACTOS_STOCK_ACPI_SHA256:-$(manifest_value stock_acpi_sys_sha256)}"
+
+# Keep each staged generation coherent. An old or interrupted cache is archived,
+# never mixed with binaries extracted from the requested archive.
+if [ -d "$OUT" ] && [ "$(cat "$OUT/.release-sha256" 2>/dev/null || true)" != "$ARCHIVE_SHA256" ] \
+   && [ -n "$(find "$OUT" -mindepth 1 -print -quit)" ]; then
+  OLD_SHA="$(sha256_file "$OUT/reactos-x64.7z" 2>/dev/null || printf 'unversioned')"
+  ARCHIVED=".tmp/reactos-archive-${OLD_SHA:0:12}"
+  SUFFIX=1
+  while [ -e "$ARCHIVED" ]; do
+    ARCHIVED=".tmp/reactos-archive-${OLD_SHA:0:12}-$SUFFIX"
+    SUFFIX=$((SUFFIX + 1))
+  done
+  mv "$OUT" "$ARCHIVED"
+  echo "archived previous ReactOS staging at $ARCHIVED"
+fi
+mkdir -p "$OUT"
 
 if [ -f "$OUT/reactos-x64.7z" ]; then
   verify_sha256 "$OUT/reactos-x64.7z" "$ARCHIVE_SHA256"
@@ -101,6 +117,7 @@ if [ -f "$OUT/ros-ntdll.dll" ] && [ -f "$OUT/ros-smss.exe" ] && [ -f "$OUT/ros-c
    && [ -f "$OUT/ros-winlogon.exe" ] \
    && [ -f "$OUT/ros-arial.ttf" ] \
    && [ -f "$OUT/.fulltree-ok" ] && [ -f "$OUT/.profiles-ok" ] \
+   && [ "$(cat "$OUT/.release-sha256" 2>/dev/null || true)" = "$ARCHIVE_SHA256" ] \
    && [ -f "$OUT/reactos/system32/drivers/acpi.sys" ]; then
   verify_sha256 "$OUT/reactos/system32/drivers/acpi.sys" "$STOCK_ACPI_SHA256"
   echo "ReactOS binaries + import table + NLS tables + full \\reactos tree already staged in $OUT/"
@@ -305,7 +322,7 @@ fi
 
 # Resolve smss's ntdll imports against ntdll's export table -> imports.bin (the executive
 # applies this patch table to smss's IAT at runtime).
-python3 "$(dirname "$0")/gen_reactos_imports.py" "$OUT/ros-smss.exe" "$OUT/ros-ntdll.dll" "$OUT/imports.bin"
+python3 "$SCRIPT_DIR/gen_reactos_imports.py" "$OUT/ros-smss.exe" "$OUT/ros-ntdll.dll" "$OUT/imports.bin"
 
 echo "staged: ros-ntdll.dll ($(stat -f%z "$OUT/ros-ntdll.dll") bytes), ros-smss.exe ($(stat -f%z "$OUT/ros-smss.exe") bytes), imports.bin"
 
@@ -380,3 +397,9 @@ if [ ! -f "$OUT/.profiles-ok" ]; then
     echo "note: no cached ISO — Profiles/ NOT staged (CreateUserProfileW has no copy source)"
   fi
 fi
+
+[ -f "$OUT/.fulltree-ok" ] && [ -f "$OUT/.profiles-ok" ] || {
+  echo "ERROR: ReactOS staging is incomplete; release provenance not published" >&2
+  exit 1
+}
+printf '%s\n' "$ARCHIVE_SHA256" > "$OUT/.release-sha256"
