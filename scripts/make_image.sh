@@ -46,7 +46,7 @@ if [ -f .tmp/hive.dat ]; then
   fi
   IMAGE_PROFILE=$(tr -d '\r\n' < "$IMAGE_PROFILE_MARKER")
   case "$IMAGE_PROFILE" in
-    production|pending-start|live-device-action|seh-driver|seh-terminal-unhandled|seh-terminal-exit|mup-provider) ;;
+    production|pending-start|live-device-action|seh-driver|seh-terminal-unhandled|seh-terminal-exit|mup-provider|source-irp-integration) ;;
     *)
       echo "error: unsupported staged image profile: $IMAGE_PROFILE" >&2
       exit 1
@@ -288,6 +288,17 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
     fi
     stage_file "$READ_FORWARD" "$ESP_STAGE/reactos/system32/drivers/read_forward.sys"
     echo "native READ source staged: reactos/system32/drivers/read_forward.sys"
+  fi
+
+  if [ "$IMAGE_PROFILE" = source-irp-integration ]; then
+    for name in source_irp_target source_irp_probe; do
+      SOURCE_IRP=../.tmp/native-source-irp/$name.sys
+      if [ ! -s "$SOURCE_IRP" ]; then
+        echo "error: native source IRP fixture missing at $SOURCE_IRP - run tests/native/source_irp/build.sh" >&2
+        exit 1
+      fi
+      stage_file "$SOURCE_IRP" "$ESP_STAGE/reactos/system32/drivers/$name.sys"
+    done
   fi
 
   if [ -f "$OUR_NTDLL" ]; then
