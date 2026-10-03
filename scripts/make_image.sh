@@ -46,7 +46,7 @@ if [ -f .tmp/hive.dat ]; then
   fi
   IMAGE_PROFILE=$(tr -d '\r\n' < "$IMAGE_PROFILE_MARKER")
   case "$IMAGE_PROFILE" in
-    production|pending-start|live-device-action|seh-driver|seh-terminal-unhandled|seh-terminal-exit|mup-provider|source-irp-integration) ;;
+    production|pending-start|live-device-action|seh-driver|seh-terminal-unhandled|seh-terminal-exit|mup-provider|source-irp-integration|file-acceptance) ;;
     *)
       echo "error: unsupported staged image profile: $IMAGE_PROFILE" >&2
       exit 1
@@ -299,6 +299,15 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
       fi
       stage_file "$SOURCE_IRP" "$ESP_STAGE/reactos/system32/drivers/$name.sys"
     done
+  fi
+
+  if [ "$IMAGE_PROFILE" = file-acceptance ]; then
+    FILE_ACCEPTANCE=../.tmp/native-file-acceptance/file_acceptance.exe
+    if [ ! -s "$FILE_ACCEPTANCE" ]; then
+      echo "error: native file fixture missing at $FILE_ACCEPTANCE - run tests/native/file_acceptance/build.sh" >&2
+      exit 1
+    fi
+    stage_file "$FILE_ACCEPTANCE" "$ESP_STAGE/reactos/system32/file_acceptance.exe"
   fi
 
   if [ -f "$OUR_NTDLL" ]; then
