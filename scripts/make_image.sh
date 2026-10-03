@@ -46,7 +46,7 @@ if [ -f .tmp/hive.dat ]; then
   fi
   IMAGE_PROFILE=$(tr -d '\r\n' < "$IMAGE_PROFILE_MARKER")
   case "$IMAGE_PROFILE" in
-    production|pending-start|live-device-action|seh-driver|seh-terminal-unhandled|seh-terminal-exit|mup-provider|source-irp-integration|file-acceptance) ;;
+    production|pending-start|live-device-action|seh-driver|seh-terminal-unhandled|seh-terminal-exit|mup-provider|source-irp-integration|file-acceptance|font-cleanup) ;;
     *)
       echo "error: unsupported staged image profile: $IMAGE_PROFILE" >&2
       exit 1
@@ -308,6 +308,19 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
       exit 1
     fi
     stage_file "$FILE_ACCEPTANCE" "$ESP_STAGE/reactos/system32/file_acceptance.exe"
+  fi
+
+  if [ "$IMAGE_PROFILE" = font-cleanup ]; then
+    for name in font_run_setup font_acceptance; do
+      FONT_CLEANUP=../.tmp/native-font-cleanup/$name.exe
+      if [ ! -s "$FONT_CLEANUP" ]; then
+        echo "error: native font fixture missing at $FONT_CLEANUP - run tests/native/font_cleanup/build.sh" >&2
+        exit 1
+      fi
+    done
+    for name in font_run_setup font_acceptance; do
+      stage_file "../.tmp/native-font-cleanup/$name.exe" "$ESP_STAGE/reactos/system32/$name.exe"
+    done
   fi
 
   if [ -f "$OUR_NTDLL" ]; then
