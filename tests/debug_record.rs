@@ -1,8 +1,18 @@
 #[path = "../src/debug_record.rs"]
 mod debug_record;
+#[path = "../src/ipc_buffer.rs"]
+mod ipc_buffer;
 
 use debug_record::{capture_and_emit, translate_x86_user, DebugRecordError, MAX_RECORD_BYTES};
 use std::cell::RefCell;
+
+#[test]
+fn ipc_layout_leaves_a_distinct_unused_tail_in_a_four_kib_frame() {
+    assert_eq!(ipc_buffer::SIZE_BYTES, 1024);
+    let last_word = 4096 - core::mem::size_of::<usize>();
+    assert!(last_word >= ipc_buffer::SIZE_BYTES);
+    assert!(ipc_buffer::RECEIVE_DEPTH_OFFSET * 8 < ipc_buffer::SIZE_BYTES);
+}
 
 #[test]
 fn captures_entire_record_before_single_exact_emission() {

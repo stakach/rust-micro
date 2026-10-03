@@ -37,6 +37,11 @@ mod generated_syscalls {
 }
 pub const SYS_DEBUG_WRITE: i64 = generated_syscalls::Syscall::SysDebugWrite as i32 as i64;
 
+#[path = "../../../src/ipc_buffer.rs"]
+mod ipc_buffer_layout;
+/// Bytes occupied by the kernel/libsel4 IPC ABI inside its mapped page.
+pub const IPC_BUFFER_SIZE_BYTES: usize = ipc_buffer_layout::SIZE_BYTES;
+
 // --- Invocation labels ------------------------------------------------------
 pub const LBL_UNTYPED_RETYPE: u64 = 1;
 pub const LBL_TCB_WRITE_REGISTERS: u64 = 3;
