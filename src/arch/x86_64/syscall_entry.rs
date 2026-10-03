@@ -99,6 +99,7 @@ fn syscall_prefers_entry_invoker_return(
         syscall,
         Syscall::SysCall
             | Syscall::SysDebugPutChar
+            | Syscall::SysDebugWrite
             | Syscall::SysDebugDumpScheduler
             | Syscall::SysDebugHalt
             | Syscall::SysDebugCapIdentify
@@ -117,6 +118,7 @@ fn syscall_debug_return_is_transparent(syscall: crate::syscalls::Syscall) -> boo
     matches!(
         syscall,
         Syscall::SysDebugPutChar
+            | Syscall::SysDebugWrite
             | Syscall::SysDebugDumpScheduler
             | Syscall::SysDebugHalt
             | Syscall::SysDebugCapIdentify
@@ -946,7 +948,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13);
     let transparent_debug_return = syscall_debug_return_is_transparent(syscall);
     let mut sink = SerialSink;
-    let result = handle_syscall(syscall, &args, &mut sink);
+    let result = if matches!(syscall, Syscall::SysDebugWrite) {
+        crate::syscall_handler::handle_debug_write(&args, entry_invoker, &mut sink)
+    } else {
+        handle_syscall(syscall, &args, &mut sink)
+    };
     if matches!(syscall, Syscall::SysDebugCapIdentify) {
         ctx.rdi = unsafe {
             entry_invoker
@@ -1402,6 +1408,7 @@ pub mod spec {
         per_cpu_kernel_gs_base_set();
         dispatcher_emits_byte_for_sys_debug_put_char();
         debug_put_char_does_not_consume_stale_direct_handoff();
+        debug_write_preserves_invoker_and_ipc_on_rejected_capture();
         repeated_debug_put_char_keeps_entry_invoker_running();
         debug_put_char_returns_to_budget_ready_invoker();
         debug_put_char_budget_miss_still_returns_to_invoker();
@@ -1675,6 +1682,52 @@ pub mod spec {
             s.scheduler.reset_queues();
         }
         arch::log("  ✓ SysDebugPutChar ignores stale direct handoff\n");
+    }
+
+    fn debug_write_preserves_invoker_and_ipc_on_rejected_capture() {
+        use crate::kernel::KERNEL;
+        use crate::tcb::{Tcb, ThreadStateType};
+        let (invoker, peer) = unsafe {
+            let state = KERNEL.get();
+            state.scheduler.reset_queues();
+            let mut tcb = Tcb::default();
+            tcb.state = ThreadStateType::Running;
+            tcb.priority = 100;
+            tcb.sc = Some(0);
+            tcb.msg_regs.fill(77);
+            tcb.msg_regs[..4].copy_from_slice(&[11, 22, 33, 44]);
+            tcb.user_context.rax = 0xdead_beef;
+            let invoker = state.scheduler.admit(tcb);
+            let mut tcb = Tcb::default();
+            tcb.state = ThreadStateType::Running;
+            tcb.priority = 100;
+            tcb.sc = Some(1);
+            let peer = state.scheduler.admit(tcb);
+            state.scheduler.set_current(Some(invoker));
+            state.scheduler.nodes[crate::arch::get_cpu_id() as usize].direct_handoff = Some(peer);
+            let context = super::current_cpu_user_ctx_mut();
+            *context = state.scheduler.slab.get(invoker).user_context;
+            context.rdi = 0x400000;
+            context.rsi = 8;
+            context.r13 = crate::invocation::REPLY_HANDOFF_MAGIC;
+            (invoker, peer)
+        };
+        super::rust_syscall_dispatch(crate::syscalls::Syscall::SysDebugWrite as i32 as i64 as u64, 0);
+        unsafe {
+            let state = KERNEL.get();
+            assert_eq!(state.scheduler.current(), Some(invoker));
+            assert_eq!(state.scheduler.nodes[crate::arch::get_cpu_id() as usize].direct_handoff, None);
+            assert_eq!(&state.scheduler.slab.get(invoker).msg_regs[..4], &[11, 22, 33, 44]);
+            assert!(state.scheduler.slab.get(invoker).msg_regs[4..].iter().all(|word| *word == 77));
+            assert_eq!(super::current_cpu_user_ctx_mut().rax, 0xdead_beef);
+            assert_eq!(state.scheduler.slab.get(peer).state, ThreadStateType::Running);
+            state.scheduler.block(peer, ThreadStateType::Inactive);
+            state.scheduler.block(invoker, ThreadStateType::Inactive);
+            state.scheduler.slab.free(peer);
+            state.scheduler.slab.free(invoker);
+            state.scheduler.reset_queues();
+        }
+        arch::log("  SysDebugWrite preserves invoker and IPC on rejected capture\n");
     }
 
     #[inline(never)]

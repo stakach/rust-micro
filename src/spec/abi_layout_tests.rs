@@ -203,6 +203,9 @@ fn test_syscall_decoding() {
     assert_eq!(Syscall::from_i32(-5), Some(Syscall::SysSend));
     assert_eq!(Syscall::from_i32(-9), Some(Syscall::SysWait));
     assert_eq!(Syscall::from_i32(-12), Some(Syscall::SysDebugPutChar));
+    assert_eq!(Syscall::from_i32(Syscall::SysDebugWrite as i32), Some(Syscall::SysDebugWrite));
+    assert!((Syscall::SysDebugWrite as i32) < Syscall::SysSetTLSBase as i32,
+        "new debug extension must not renumber existing calls");
     assert_eq!(Syscall::from_i32(0), None);
     assert_eq!(Syscall::from_i32(-1000), None);
     arch::log("  ✓ Syscall::from_i32 decodes per generator output\n");

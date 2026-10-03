@@ -155,6 +155,21 @@ passed, `255` = panic**. Any trailing arguments are forwarded to QEMU, e.g.:
 ./scripts/run_specs.sh -s -S      # wait for a gdb attach on :1234
 ```
 
+## Debug records
+
+`sel4-rt::print_record` uses the appended `SysDebugWrite` extension to emit at
+most 4096 bytes as one debug operation. The kernel captures the complete slice
+from the exact calling TCB's current VSpace before serial output; invalid or
+unmapped input produces no partial output. It does not use IPC buffers or Replies,
+add a newline, or change the existing `SysDebugPutChar` ABI. Formatting and line
+framing belong to userspace. Kernel specs exercise exact capture and entry-state
+preservation; focused host checks can also be run with:
+
+```sh
+rustc --edition=2024 --test tests/debug_record.rs -o .tmp/debug-record-tests
+.tmp/debug-record-tests
+```
+
 ## Running the sel4test conformance suite
 
 This builds the **upstream** sel4test against our kernel ABI and runs its
