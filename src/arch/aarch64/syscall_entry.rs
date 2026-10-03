@@ -187,7 +187,11 @@ pub fn dispatch(frame: *mut UserContext) {
     };
 
     let mut sink = SerialSink;
-    let result = handle_syscall(syscall, &args, &mut sink);
+    let result = if matches!(syscall, Syscall::SysDebugWrite) {
+        crate::syscall_handler::handle_debug_write(&args, invoker, &mut sink)
+    } else {
+        handle_syscall(syscall, &args, &mut sink)
+    };
 
     #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
     if matches!(syscall, Syscall::SysDebugPutChar) {

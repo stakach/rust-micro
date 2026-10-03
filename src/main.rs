@@ -72,6 +72,7 @@ mod error;
 
 // Syscall dispatcher (handle_syscall + handle_unknown_syscall).
 mod syscall_handler;
+mod debug_record;
 
 // Phase 34c — IPC-buffer layout offsets (mirrors libsel4's
 // seL4_IPCBuffer struct in u64-word offsets).

@@ -97,5 +97,10 @@
             <condition><config var="CONFIG_SET_TLS_BASE_SELF"/></condition>
             <syscall name="SetTLSBase"/>
         </config>
+        <!-- Append extensions so all existing syscall numbers remain stable. -->
+        <config>
+            <condition><config var="CONFIG_PRINTING"/></condition>
+            <syscall name="DebugWrite"/>
+        </config>
     </debug>
 </syscalls>

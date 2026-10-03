@@ -51,6 +51,64 @@ impl SyscallArgs {
 /// can assert the exact byte sequence emitted by `SysDebugPutChar`.
 pub trait DebugSink {
     fn put_byte(&mut self, byte: u8);
+
+    fn put_record(&mut self, bytes: &[u8]) {
+        for &byte in bytes { self.put_byte(byte); }
+    }
+}
+
+/// The architectural entry supplies the exact invoker, never a fallback VSpace.
+/// Caller holds BKL with local interrupts disabled through capture and emission.
+pub(crate) fn handle_debug_write(
+    args: &SyscallArgs,
+    invoker: Option<crate::tcb::TcbId>,
+    sink: &mut dyn DebugSink,
+) -> KResult<()> {
+    let invalid = || KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidArgument));
+    let root = unsafe {
+        let state = crate::kernel::KERNEL.get();
+        let tcb = state.scheduler.slab.try_get(invoker.ok_or_else(invalid)?).ok_or_else(invalid)?;
+        if !tcb.has_current_vspace() { return Err(invalid()); }
+        match tcb.vspace_root() {
+            crate::cap::Cap::PML4 { ptr, .. } => ptr.addr(),
+            _ => return Err(invalid()),
+        }
+    };
+    let length = usize::try_from(args.a1).map_err(|_| invalid())?;
+    crate::debug_record::capture_and_emit(args.a0, length, |address, destination| {
+        let read_entry = |table: u64, index: usize| unsafe {
+            Some(core::ptr::read_volatile((crate::arch::phys_to_virt(table) as *const u64).add(index)))
+        };
+        #[cfg(target_arch = "x86_64")]
+        let mapping = crate::debug_record::translate_x86_user(root, address, read_entry);
+        #[cfg(target_arch = "aarch64")]
+        let mapping = crate::debug_record::translate_arm_user(root, address, read_entry);
+        let (physical, available) = mapping.ok_or(crate::debug_record::DebugRecordError::Unreadable)?;
+        if destination.len() as u64 > available {
+            return Err(crate::debug_record::DebugRecordError::Unreadable);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                crate::arch::phys_to_virt(physical) as *const u8,
+                destination.as_mut_ptr(), destination.len(),
+            );
+        }
+        Ok(())
+    }, |record| {
+        sink.put_record(record);
+        // Match only bytes that were actually emitted, in the same record order.
+        #[cfg(any(feature = "spec", feature = "extern-rootserver"))]
+        for &byte in record {
+            #[cfg(target_arch = "x86_64")]
+            if crate::rootserver::microtest_check_byte(byte) {
+                crate::arch::log("[microtest sentinel matched -- exiting QEMU]\n");
+                crate::arch::qemu_exit(0);
+            }
+            if let Some(success) = crate::rootserver::sel4test_check_byte(byte) {
+                crate::arch::qemu_exit(if success { 0 } else { 255 });
+            }
+        }
+    }).map_err(|_| invalid())
 }
 
 /// Cap-type tag for `seL4_DebugCapIdentify`. Returns upstream's
@@ -98,6 +156,10 @@ pub fn handle_syscall(
     sink: &mut dyn DebugSink,
 ) -> KResult<()> {
     match syscall {
+        Syscall::SysDebugWrite => {
+            let invoker = unsafe { crate::kernel::KERNEL.get().scheduler.current() };
+            handle_debug_write(args, invoker, sink)
+        }
         Syscall::SysSend => handle_send(
             args, /* blocking */ true, /* call */ false, /* donate */ false, false,
         ),
@@ -1045,6 +1107,8 @@ pub mod spec {
     pub fn test_syscall_handler() {
         let mut owners = RootOwners::new();
         arch::log("Running syscall dispatcher tests...\n");
+        #[cfg(target_arch = "x86_64")]
+        crate::debug_record::spec::test_debug_record_capture();
         debug_putchar_emits_byte();
         unknown_syscall_becomes_fault();
         ipc_syscalls_return_invalid_cap_in_phase5();

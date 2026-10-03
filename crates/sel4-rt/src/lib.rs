@@ -31,6 +31,11 @@ pub const SYS_NB_SEND: i64 = -6;
 pub const SYS_RECV: i64 = -7;
 pub const SYS_YIELD: i64 = -11;
 pub const SYS_DEBUG_PUT_CHAR: i64 = -12;
+#[allow(dead_code)]
+mod generated_syscalls {
+    include!(concat!(env!("OUT_DIR"), "/syscalls.rs"));
+}
+pub const SYS_DEBUG_WRITE: i64 = generated_syscalls::Syscall::SysDebugWrite as i32 as i64;
 
 // --- Invocation labels ------------------------------------------------------
 pub const LBL_UNTYPED_RETYPE: u64 = 1;
@@ -217,6 +222,24 @@ pub unsafe fn syscall5_call_mr2(
 pub fn debug_put_char(c: u8) {
     unsafe {
         syscall1(SYS_DEBUG_PUT_CHAR, c as u64);
+    }
+}
+
+/// Emit one complete bounded record without IPC-buffer, Reply, or newline effects.
+pub fn print_record(record: &[u8]) {
+    assert!(record.len() <= 4096, "debug record exceeds one page");
+    unsafe {
+        asm!(
+            "syscall",
+            in("rdx") SYS_DEBUG_WRITE as u64,
+            in("rdi") record.as_ptr() as u64,
+            in("rsi") record.len() as u64,
+            in("r12") 0u64,
+            in("r13") 0u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags),
+        );
     }
 }
 
