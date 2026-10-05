@@ -925,12 +925,18 @@ pub struct CteCursor {
     thread_slot: usize,
 }
 
+#[cfg(feature = "spec")]
+pub(crate) static CTE_CURSOR_NEXT_CALLS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 impl CteCursor {
     pub const fn new() -> Self {
         Self { cnode: 0, slot: 0, thread: 0, thread_slot: 0 }
     }
 
     pub fn next(&mut self, state: &KernelState) -> Option<crate::cte::MdbId> {
+        #[cfg(feature = "spec")]
+        CTE_CURSOR_NEXT_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         while self.cnode < KernelState::cnode_pool_count() {
             let count = state.cnode_slots_at(self.cnode).map_or(0, |slots| slots.len());
             if self.slot < count {

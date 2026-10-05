@@ -4324,6 +4324,15 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         if args.a2 > MdbId::SLOT_MASK || s.cte(source).is_none() {
             return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_RangeError)));
         }
+        // Each recorded MDB edge contributes to its source's direct-child count. A zero
+        // count proves the existing descendant walk has no work, regardless of CSpace size.
+        let slot = s.cte_mut(source).unwrap();
+        if slot.child_count() == 0 {
+            if let Cap::Untyped { ptr, block_bits, is_device, .. } = slot.cap() {
+                slot.set_cap(&Cap::Untyped { ptr, block_bits, free_index: 0, is_device });
+            }
+            return Ok(());
+        }
         let epoch = begin_revoke_epoch(s);
         s.cte_mut(source).unwrap().set_revoke_epoch(epoch);
         let mut progress = true;
@@ -6061,6 +6070,7 @@ pub mod spec {
     use crate::arch;
     use crate::cap::{Badge, Cap, EndpointObj, EndpointRights, PPtr};
     include!("invocation/cnode_frame_specs.rs");
+    include!("invocation/leaf_revoke_specs.rs");
     include!("invocation/asid_specs.rs");
     include!("invocation/frame_mapping_specs.rs");
     include!("invocation/paging_mapping_specs.rs");
@@ -6085,6 +6095,7 @@ pub mod spec {
         untyped_retype_upstream_abi_far_offset();
         pooled_retype_capacity_is_atomic();
         revoke_chain_clears_only_descendants();
+        leaf_revoke_specs::run();
         repeated_alloc_free_reclaims_untyped();
         cnode_copy_via_invocation();
         cnode_frame_specs::run();
