@@ -266,9 +266,16 @@ pub unsafe fn unmap_user_table_in_paddr(
 }
 
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameMappingMutation {
+    InsertedAbsent,
+    ReplacedPresent,
+}
+
 /// Install or replace a same-size user leaf after invocation authority checks. Intermediate
 /// tables must already exist. Errors 1/2/3 identify a missing parent; 4 means replacing a
 /// lower-level subtree would be required. Replacing an existing same-size leaf is permitted.
+/// The caller must hold the BKL across the previous-entry observation and leaf mutation.
 pub unsafe fn map_user_frame_in_pml4(
     pml4_paddr: u64,
     vaddr: u64,
@@ -276,7 +283,7 @@ pub unsafe fn map_user_frame_in_pml4(
     size: crate::cap::FrameSize,
     rights: crate::cap::FrameRights,
     attributes: super::vspace::FrameMappingAttributes,
-) -> Result<(), u32> {
+) -> Result<FrameMappingMutation, u32> {
     use super::paging::PTE_PS;
     use crate::cap::FrameSize;
     let bits = match size {
@@ -320,8 +327,13 @@ pub unsafe fn map_user_frame_in_pml4(
             pt.add(indices.pt as usize)
         }
     };
+    let mutation = if core::ptr::read_volatile(leaf) & PTE_PRESENT == 0 {
+        FrameMappingMutation::InsertedAbsent
+    } else {
+        FrameMappingMutation::ReplacedPresent
+    };
     core::ptr::write_volatile(leaf, entry);
-    Ok(())
+    Ok(mutation)
 }
 
 /// Unmap a 2 MiB Large frame from a specific vspace. Bails if the

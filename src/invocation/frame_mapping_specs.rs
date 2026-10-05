@@ -124,6 +124,8 @@ mod frame_mapping_specs {
     }
 
     pub(super) fn run() {
+        table_clear_retirement_specs::run();
+        retirement_specs::run();
         unsafe {
             permissions_and_replacement();
             unmap_preserves_pat_leaf_semantics();
@@ -378,6 +380,9 @@ mod frame_mapping_specs {
         assert_eq!(f.leaf.read(), leaf);
         f.finish();
     }
+
+    include!("frame_mapping_retirement_specs.rs");
+    include!("table_clear_retirement_specs.rs");
 
     unsafe fn subtree_and_missing_parent_rejections() {
         for size in [FrameSize::Large, FrameSize::Huge] {

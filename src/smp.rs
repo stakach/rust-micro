@@ -439,6 +439,13 @@ pub(crate) fn service_retirement_shootdown() {
 #[cfg(target_arch = "x86_64")]
 pub fn retire_vspace_translations(pml4_paddr: u64) {
     assert!(pml4_paddr != 0 && pml4_paddr & 0xfff == 0);
+    retire_all_translations();
+}
+
+/// Retire all contexts after physical paging-table withdrawal, including when the recorded
+/// root is no longer available. The same BKL/bootstrap and synchronous ACK contract applies.
+#[cfg(target_arch = "x86_64")]
+pub fn retire_all_translations() {
     assert!(!RETIREMENT_ACTIVE.swap(true, Ordering::AcqRel),
         "reentrant or concurrent translation retirement shootdown");
     let me = crate::arch::get_cpu_id();
