@@ -50,4 +50,8 @@
         <brief>Observe an authorized Reply object's binding relative to the target TCB.</brief>
         <description>Exact one-word request without extra caps: a Reply cptr in the invoker's CSpace. Returns one word: 0 free, 1 offered to a receiver, 2 bound to the target, 3 bound elsewhere. Inconsistent reciprocal ownership is rejected. Does not reserve, release, reply, wake, or alter scheduling state. The observation is not a reservation and requires exclusive ownership for subsequent reuse.</description>
     </method>
+    <method id="TCBQueryVSpaceBinding" name="QueryVSpaceBinding" manual_name="Query VSpace Binding" manual_label="tcb_queryvspacebinding">
+        <brief>Compare the target's current VSpace with two authorized root capabilities.</brief>
+        <description>Exact two-word request without extra caps: expected child PML4 and retained provider PML4 cptrs in the invoker's CSpace. Returns one word: 1 only when all roots have current canonical ASID assignments, the target's actual root equals the expected physical root and differs from the provider physical root; otherwise 0. Wrong capability types and malformed requests reject. No physical identities are disclosed. This serialized observation does not pin resources or authorize subsequent effects.</description>
+    </method>
 </interface>

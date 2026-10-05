@@ -80,6 +80,8 @@ pub const LBL_TCB_ACQUIRE_EXECUTION_HOLD: u64 = 71;
 pub const LBL_TCB_RELEASE_EXECUTION_HOLD: u64 = 72;
 pub const LBL_TCB_QUERY_REPLY_BINDING: u64 = 73;
 pub mod reply_binding;
+pub const LBL_TCB_QUERY_VSPACE_BINDING: u64 = 74;
+pub mod vspace_binding;
 pub mod legacy_context;
 pub mod execution_hold;
 

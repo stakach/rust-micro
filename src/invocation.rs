@@ -33,6 +33,8 @@ mod legacy_context;
 mod execution_hold;
 #[path = "invocation/reply_binding.rs"]
 mod reply_binding;
+#[path = "invocation/vspace_binding.rs"]
+mod vspace_binding;
 
 /// Single-letter tag for the cap kind — used by `inv_log` so the
 /// trace fits on one line and is easy to grep for. Keep in sync
@@ -5252,6 +5254,9 @@ fn decode_tcb(
             InvocationLabel::TCBQueryReplyBinding => {
                 reply_binding::invoke(s, tcb_ptr.addr(), args, invoker)
             }
+            InvocationLabel::TCBQueryVSpaceBinding => {
+                vspace_binding::invoke(s, tcb_ptr.addr(), args, invoker)
+            }
             InvocationLabel::TCBSuspend => {
                 // Upstream `suspend()` = cancelIPC + Inactive. A
                 // server blocked in an endpoint recv queue must be
@@ -6088,6 +6093,7 @@ pub mod spec {
     include!("invocation/legacy_context_specs.rs");
     include!("invocation/execution_hold_specs.rs");
     include!("invocation/reply_binding_specs.rs");
+    include!("invocation/vspace_binding_specs.rs");
 
     #[cfg(target_arch = "x86_64")]
     pub(super) fn observe_untyped_release(parent_id: crate::cte::MdbId) {
@@ -6138,6 +6144,7 @@ pub mod spec {
         legacy_context_specs::run();
         execution_hold_specs::run();
         reply_binding_specs::run();
+        vspace_binding_specs::run();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
         reply_alias_move_and_delete_preserve_unrelated_call();
