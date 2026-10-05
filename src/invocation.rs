@@ -713,7 +713,11 @@ fn decode_frame_map(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
                 map_type: FrameMapType::VSpace,
             });
     }
-    crate::smp::retire_vspace_translations(root);
+    // Intel SDM 4.10.4.3 permits absent-to-present insertion without invalidation only because
+    // prior present-to-absent withdrawals complete translation retirement before returning.
+    if result == Ok(usermode::FrameMappingMutation::ReplacedPresent) {
+        crate::smp::retire_vspace_translations(root);
+    }
     Ok(())
 }
 
@@ -1577,6 +1581,10 @@ fn unmap_paging_struct(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResu
             let table = crate::arch::phys_to_virt(paging_struct_state(&target).0) as *mut u8;
             core::ptr::write_bytes(table, 0, 4096);
         }
+        // The physical table may remain reachable through another root after the recorded
+        // parent disappeared. Retire after clearing regardless of best-effort detach outcome.
+        #[cfg(target_arch = "x86_64")]
+        crate::smp::retire_all_translations();
     }
     update_invoked_paging_slot(args, invoker, &target, None, 0)?;
     Ok(())
@@ -6598,7 +6606,11 @@ pub mod spec {
             let frame = 0x4000u64;
             let attrs = vspace::FrameMappingAttributes::compressed(0b110);
             assert_eq!(usermode::map_user_frame_in_pml4(root, vaddr, frame,
-                FrameSize::Small, FrameRights::ReadOnly, attrs), Ok(()));
+                FrameSize::Small, FrameRights::ReadOnly, attrs),
+                Ok(usermode::FrameMappingMutation::InsertedAbsent));
+            assert_eq!(usermode::map_user_frame_in_pml4(root, vaddr, frame,
+                FrameSize::Small, FrameRights::ReadOnly, attrs),
+                Ok(usermode::FrameMappingMutation::ReplacedPresent));
             let leaf = core::ptr::read_volatile(pt.add(indices.pt as usize));
             assert_eq!(leaf & PTE_PRESENT, PTE_PRESENT);
             assert_eq!(leaf & PTE_RW, 0);
