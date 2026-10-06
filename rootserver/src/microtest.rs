@@ -18,6 +18,8 @@ use crate::*;
 mod legacy_context_probe;
 #[cfg(target_arch = "x86_64")]
 mod execution_hold_probe;
+#[cfg(target_arch = "x86_64")]
+mod syscall_idle_probe;
 
 type TestResult = Result<(), &'static str>;
 type TestFn = fn() -> TestResult;
@@ -32,6 +34,8 @@ struct TestCase {
 const CASES: &[TestCase] = &[
     #[cfg(target_arch = "x86_64")]
     TestCase { name: "execution_hold_live_counter", body: execution_hold_probe::run },
+    #[cfg(target_arch = "x86_64")]
+    TestCase { name: "syscall_idle_live_backedge", body: syscall_idle_probe::run },
     TestCase { name: "syscall_round_trip",   body: tests::syscall_round_trip },
     TestCase { name: "untyped_retype_tcb",   body: tests::untyped_retype_tcb },
     TestCase { name: "tcb_configure",        body: tests::tcb_configure },
@@ -63,6 +67,8 @@ const CASES: &[TestCase] = &[
 pub unsafe fn run(ipc_buffer_vaddr: u64, empty_start: u64, bootinfo: &sel4_rt::BootInfo) {
     #[cfg(target_arch = "x86_64")]
     execution_hold_probe::configure(bootinfo);
+    #[cfg(target_arch = "x86_64")]
+    syscall_idle_probe::configure(bootinfo);
     // Capture the kernel-published IPC-buffer vaddr before any test runs; the
     // tests stage syscall args through it (see `ROOTSERVER_IPCBUF`).
     ROOTSERVER_IPCBUF.store(ipc_buffer_vaddr, AtomicOrdering::Relaxed);
