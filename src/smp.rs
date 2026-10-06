@@ -90,6 +90,7 @@ pub fn aps_alive() -> u32 {
 // ---------------------------------------------------------------------------
 
 mod bkl;
+use bkl::AcquisitionCpu;
 static BKL: bkl::BigKernelLock = bkl::BigKernelLock::new();
 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
 pub(crate) static SYSCALL_IDLE_BACKEDGES: core::sync::atomic::AtomicU64 =
@@ -125,13 +126,16 @@ pub fn bkl_acquire() {
 /// Acquire BKL with the exact architectural entry snapshot available to a remote quiescence
 /// request. A true result means the controller adopted this entry; do not execute it again.
 pub(crate) fn bkl_acquire_for_user_entry(mut entry: Option<UserEntrySnapshot>) -> bool {
+    // IF remains clear throughout admission and mailbox waits. Quiescence may adopt
+    // a user TCB, but never migrates this kernel continuation or returns to user mode.
+    let cpu = AcquisitionCpu::sample(crate::arch::get_cpu_id, MAX_CPUS);
     let mut adopted = false;
     #[cfg(all(target_arch = "x86_64", feature = "spec"))]
-    observe_waiting_entry(&entry);
+    observe_waiting_entry(cpu, &entry);
     #[cfg(target_arch = "x86_64")]
-    service_retirement_shootdown();
-    adopted |= service_quiescence(&mut entry);
-    let me = crate::arch::get_cpu_id() + 1;
+    service_retirement_shootdown_for_cpu(cpu);
+    adopted |= service_quiescence(cpu, &mut entry);
+    let me = cpu.owner();
     // A nested acquire cannot mint a second exclusive KernelState borrower.
     assert_ne!(BKL.holder(), me, "nested BKL ownership");
     loop {
@@ -139,20 +143,20 @@ pub(crate) fn bkl_acquire_for_user_entry(mut entry: Option<UserEntrySnapshot>) -
             true => {
                 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
                 {
-                    BKL_WAITERS.fetch_and(!(1 << (me - 1)), Ordering::Release);
-                    WAITING_ENTRY_KIND[(me - 1) as usize].store(0, Ordering::Release);
+                    BKL_WAITERS.fetch_and(!(1 << cpu.id()), Ordering::Release);
+                    WAITING_ENTRY_KIND[cpu.index()].store(0, Ordering::Release);
                 }
                 return adopted;
             }
             false => {
                 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
-                BKL_WAITERS.fetch_or(1 << (me - 1), Ordering::Release);
+                BKL_WAITERS.fetch_or(1 << cpu.id(), Ordering::Release);
                 while BKL.holder() != 0 {
                     // IF is clear here, so a retirement IPI cannot run its ISR. Service its
                     // independent mailbox without borrowing scheduler state or acquiring BKL.
                     #[cfg(target_arch = "x86_64")]
-                    service_retirement_shootdown();
-                    adopted |= service_quiescence(&mut entry);
+                    service_retirement_shootdown_for_cpu(cpu);
+                    adopted |= service_quiescence(cpu, &mut entry);
                     core::hint::spin_loop();
                 }
             }
@@ -425,7 +429,9 @@ pub(crate) fn retirement_spec_snapshot() -> (u32, [u32; MAX_CPUS], bool) {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn flush_retired_translations() {
+fn flush_retired_translations(cpu: AcquisitionCpu) {
+    #[cfg(not(feature = "spec"))]
+    let _ = cpu;
     // Changing CR4.PGE invalidates translations for all PCIDs, including global entries. Both
     // writes preserve every other control bit, and work whether PGE was initially set or clear.
     unsafe {
@@ -440,16 +446,22 @@ fn flush_retired_translations() {
         );
     }
     #[cfg(feature = "spec")]
-    RETIREMENT_FLUSHES[crate::arch::get_cpu_id() as usize].fetch_add(1, Ordering::Relaxed);
+    RETIREMENT_FLUSHES[cpu.index()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Lock-independent retirement service. Called before an IPI tries BKL and while a kernel
 /// entrant spins for BKL with IF clear. It never touches a TCB, scheduler, or shared IPI queue.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn service_retirement_shootdown() {
-    let mailbox = &RETIREMENT_MAILBOXES[crate::arch::get_cpu_id() as usize];
+    let cpu = AcquisitionCpu::sample(crate::arch::get_cpu_id, MAX_CPUS);
+    service_retirement_shootdown_for_cpu(cpu);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn service_retirement_shootdown_for_cpu(cpu: AcquisitionCpu) {
+    let mailbox = &RETIREMENT_MAILBOXES[cpu.index()];
     if mailbox.claim() {
-        flush_retired_translations();
+        flush_retired_translations(cpu);
         mailbox.acknowledge();
     }
 }
@@ -469,8 +481,8 @@ pub fn retire_vspace_translations(pml4_paddr: u64) {
 pub fn retire_all_translations() {
     assert!(!RETIREMENT_ACTIVE.swap(true, Ordering::AcqRel),
         "reentrant or concurrent translation retirement shootdown");
-    let me = crate::arch::get_cpu_id();
-    let targets = ONLINE_CPUS.load(Ordering::Acquire) & !(1 << me);
+    let me = AcquisitionCpu::sample(crate::arch::get_cpu_id, MAX_CPUS);
+    let targets = ONLINE_CPUS.load(Ordering::Acquire) & !(1 << me.id());
     for cpu in 0..MAX_CPUS as u32 {
         if targets & (1 << cpu) != 0 {
             RETIREMENT_MAILBOXES[cpu as usize].publish();
@@ -479,7 +491,7 @@ pub fn retire_all_translations() {
             crate::arch::x86_64::lapic::send_ipi(cpu as u8, IPI_VECTOR);
         }
     }
-    flush_retired_translations();
+    flush_retired_translations(me);
     for cpu in 0..MAX_CPUS as u32 {
         if targets & (1 << cpu) != 0 {
             while !RETIREMENT_MAILBOXES[cpu as usize].completed() {

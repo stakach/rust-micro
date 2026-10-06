@@ -60,25 +60,25 @@ static QUIESCENCE: [QuiescenceMailbox; MAX_CPUS] =
 static WAITING_ENTRY_KIND: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
-fn observe_waiting_entry(entry: &Option<UserEntrySnapshot>) {
+fn observe_waiting_entry(cpu: AcquisitionCpu, entry: &Option<UserEntrySnapshot>) {
     let kind = match entry.as_ref().map(|entry| entry.kind) {
         None => 0,
         Some(UserEntryKind::Syscall) => 1,
         Some(_) => 2,
     };
-    WAITING_ENTRY_KIND[crate::arch::get_cpu_id() as usize].store(kind, Ordering::Release);
+    WAITING_ENTRY_KIND[cpu.index()].store(kind, Ordering::Release);
 }
 
 // Runs before acquiring BKL, including IF-clear lock contention. It accesses only
 // this CPU's architectural state and mailbox, never KERNEL or a TCB reference.
-fn service_quiescence(entry: &mut Option<UserEntrySnapshot>) -> bool {
-    let mailbox = &QUIESCENCE[crate::arch::get_cpu_id() as usize];
+fn service_quiescence(cpu: AcquisitionCpu, entry: &mut Option<UserEntrySnapshot>) -> bool {
+    let mailbox = &QUIESCENCE[cpu.index()];
     if mailbox.phase.load(Ordering::Acquire) != 1 {
         return false;
     }
     let captured = entry.take();
     #[cfg(all(target_arch = "x86_64", feature = "spec"))]
-    observe_waiting_entry(entry);
+    observe_waiting_entry(cpu, entry);
     let adopted = captured.is_some();
     let snapshot = QuiescenceSnapshot {
         entry: captured,
@@ -97,7 +97,7 @@ fn service_quiescence(entry: &mut Option<UserEntrySnapshot>) -> bool {
     mailbox.phase.store(2, Ordering::Release);
     while mailbox.phase.load(Ordering::Acquire) != 3 {
         #[cfg(target_arch = "x86_64")]
-        service_retirement_shootdown();
+        service_retirement_shootdown_for_cpu(cpu);
         core::hint::spin_loop();
     }
     mailbox.phase.store(0, Ordering::Release);
