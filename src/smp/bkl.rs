@@ -1,6 +1,36 @@
 //! Atomic CPU ownership for the big kernel lock; waiting and quiescence live in the caller.
 use core::sync::atomic::{AtomicU32, Ordering};
 
+/// One trusted physical-CPU sample for a non-migrating kernel acquisition.
+/// The caller supplies the hardware reader, never user TLS or thread affinity.
+/// Discard this value before returning or dispatching to user mode.
+#[derive(Copy, Clone)]
+pub(super) struct AcquisitionCpu(u32);
+
+impl AcquisitionCpu {
+    pub(super) fn sample(read_hardware: impl FnOnce() -> u32, cpu_limit: usize) -> Self {
+        let cpu = read_hardware();
+        assert!(
+            (cpu as usize) < cpu_limit,
+            "physical CPU outside mailbox range"
+        );
+        assert!(cpu < u32::MAX, "physical CPU cannot encode BKL owner");
+        Self(cpu)
+    }
+
+    pub(super) fn id(self) -> u32 {
+        self.0
+    }
+
+    pub(super) fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    pub(super) fn owner(self) -> u32 {
+        self.0 + 1
+    }
+}
+
 pub struct BigKernelLock {
     owner: AtomicU32,
 }
@@ -40,6 +70,10 @@ impl BigKernelLock {
             .map_err(|_| ReleaseError::NotOwner)
     }
 }
+
+#[cfg(test)]
+#[path = "bkl_cpu_tests.rs"]
+mod cpu_tests;
 
 #[cfg(test)]
 mod tests {
