@@ -85,12 +85,34 @@ pub fn aps_alive() -> u32 {
 // correctness > scaling.
 //
 // `BKL` holds 0 when free, or `cpu_id + 1` of the holding CPU. The
-// "+1 to encode unlocked" trick lets us release with a plain
-// store-zero and detect "this CPU already holds the BKL" panics
-// in debug builds.
+// "+1 to encode unlocked" trick lets acquisition reject nested
+// ownership and release atomically verify the releasing CPU.
 // ---------------------------------------------------------------------------
 
-pub static BKL: AtomicU32 = AtomicU32::new(0);
+mod bkl;
+static BKL: bkl::BigKernelLock = bkl::BigKernelLock::new();
+#[cfg(all(target_arch = "x86_64", feature = "spec"))]
+pub(crate) static SYSCALL_IDLE_BACKEDGES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(target_arch = "x86_64", feature = "spec"))]
+pub(crate) fn print_syscall_idle_backedges() {
+    let mut value = SYSCALL_IDLE_BACKEDGES.load(Ordering::Relaxed);
+    let mut digits = [b'0'; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    crate::arch::log("[spec-bkl] syscall_idle_backedges=");
+    crate::arch::log(core::str::from_utf8(&digits[start..]).expect("decimal ASCII"));
+    crate::arch::log("\n");
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
 static BKL_WAITERS: AtomicU32 = AtomicU32::new(0);
 
@@ -111,10 +133,10 @@ pub(crate) fn bkl_acquire_for_user_entry(mut entry: Option<UserEntrySnapshot>) -
     adopted |= service_quiescence(&mut entry);
     let me = crate::arch::get_cpu_id() + 1;
     // A nested acquire cannot mint a second exclusive KernelState borrower.
-    assert_ne!(BKL.load(Ordering::Relaxed), me, "nested BKL ownership");
+    assert_ne!(BKL.holder(), me, "nested BKL ownership");
     loop {
-        match BKL.compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed) {
-            Ok(_) => {
+        match BKL.try_acquire(me) {
+            true => {
                 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
                 {
                     BKL_WAITERS.fetch_and(!(1 << (me - 1)), Ordering::Release);
@@ -122,10 +144,10 @@ pub(crate) fn bkl_acquire_for_user_entry(mut entry: Option<UserEntrySnapshot>) -
                 }
                 return adopted;
             }
-            Err(_) => {
+            false => {
                 #[cfg(all(target_arch = "x86_64", feature = "spec"))]
                 BKL_WAITERS.fetch_or(1 << (me - 1), Ordering::Release);
-                while BKL.load(Ordering::Relaxed) != 0 {
+                while BKL.holder() != 0 {
                     // IF is clear here, so a retirement IPI cannot run its ISR. Service its
                     // independent mailbox without borrowing scheduler state or acquiring BKL.
                     #[cfg(target_arch = "x86_64")]
@@ -138,18 +160,17 @@ pub(crate) fn bkl_acquire_for_user_entry(mut entry: Option<UserEntrySnapshot>) -
     }
 }
 
-/// Release the BKL. Must be called by the same CPU that acquired it
-/// — we don't enforce that today (asserting the holder would cost
-/// an extra atomic load), but the kernel's structure guarantees it
-/// since IF=0 prevents foreign release.
+/// Release the BKL only if the calling CPU owns it. A failed ownership
+/// check preserves the current holder and fails before another CPU can
+/// acquire a lock whose protected state is still being used.
 pub fn bkl_release() {
-    BKL.store(0, Ordering::Release);
+    BKL.release(crate::arch::get_cpu_id() + 1).expect("BKL release ownership");
 }
 
 /// Read-only accessor for specs. Returns 0 if free, otherwise
 /// `cpu_id + 1` of the holder.
 pub fn bkl_holder() -> u32 {
-    BKL.load(Ordering::Relaxed)
+    BKL.holder()
 }
 
 // ---------------------------------------------------------------------------

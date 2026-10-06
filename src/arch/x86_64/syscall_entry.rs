@@ -979,6 +979,8 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     if matches!(syscall, Syscall::SysDebugPutChar) {
         let b = args.a0 as u8;
         if crate::rootserver::microtest_check_byte(b) {
+            #[cfg(feature = "spec")]
+            crate::smp::print_syscall_idle_backedges();
             arch::log("[microtest sentinel matched -- exiting QEMU]\n");
             crate::arch::qemu_exit(0);
         }
@@ -1314,15 +1316,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 // and triple-fault (MULTICORE0003). SMP-only concern.
                 crate::arch::x86_64::paging::park_on_kernel_root();
                 crate::smp::mark_went_idle();
-                // Release the BKL BEFORE idling on EVERY iteration. The
-                // old code released once before the loop, so a no-thread
-                // wake looped back here STILL holding it — and the timer
-                // IRQ then re-entered bkl_acquire (lapic.rs) and
-                // deadlock-spun with IF=0, freezing the clock (the silent
-                // DOMAINS hang). The `cli` after `hlt` restores the
-                // kernel's IF=0 invariant before the BKL-held re-acquire +
-                // dispatch below, so the timer can't re-enter while we
-                // hold the lock either.
+                // Every iteration starts with this CPU holding the BKL.
+                // Release once before HLT, then reacquire after waking.
+                // A no-thread wake keeps that ownership across the backedge.
+                // The `cli` after `hlt` restores IF=0 before reacquisition
+                // so a timer cannot re-enter while this CPU holds the lock.
                 crate::smp::bkl_release();
                 core::arch::asm!("sti", "hlt", "cli", options(nostack, preserves_flags));
                 // After waking, re-evaluate. If something is now
@@ -1381,8 +1379,16 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                     enter_user_via_sysret(pcc as *const _);
                     // unreachable
                 }
-                crate::smp::bkl_release();
-                // Spurious wake (e.g. IPI to peer) — go back to HLT.
+                #[cfg(feature = "spec")]
+                {
+                    assert_eq!(crate::smp::bkl_holder(), crate::arch::get_cpu_id() + 1,
+                        "syscall idle backedge must retain BKL ownership");
+                    crate::smp::SYSCALL_IDLE_BACKEDGES.fetch_add(
+                        1, core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                // Spurious wake: retain the BKL for the next iteration's
+                // kernel-root park and single release before HLT.
             }
         }
     }

@@ -101,6 +101,8 @@ pub(crate) fn handle_debug_write(
         for &byte in record {
             #[cfg(target_arch = "x86_64")]
             if crate::rootserver::microtest_check_byte(byte) {
+                #[cfg(feature = "spec")]
+                crate::smp::print_syscall_idle_backedges();
                 crate::arch::log("[microtest sentinel matched -- exiting QEMU]\n");
                 crate::arch::qemu_exit(0);
             }

@@ -1,0 +1,29 @@
+name: Kernel host contracts
+
+on:
+  push:
+    paths:
+      - ".github/workflows/kernel-host-contracts.yml"
+      - "src/smp.rs"
+      - "src/smp/bkl.rs"
+      - "src/arch/x86_64/syscall_entry.rs"
+  pull_request:
+    paths:
+      - ".github/workflows/kernel-host-contracts.yml"
+      - "src/smp.rs"
+      - "src/smp/bkl.rs"
+      - "src/arch/x86_64/syscall_entry.rs"
+
+permissions:
+  contents: read
+
+jobs:
+  ownership:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test the native BKL ownership module
+        run: |
+          rustc --edition 2021 --test src/smp/bkl.rs -o /tmp/kernel-bkl-tests
+          /tmp/kernel-bkl-tests
