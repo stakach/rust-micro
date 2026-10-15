@@ -6623,11 +6623,18 @@ pub mod spec {
             assert_eq!(leaf & PTE_RW, 0);
             assert_ne!(leaf & PTE_USER, 0);
             assert_ne!(leaf & (1u64 << 63), 0);
+            assert_eq!(usermode::map_user_frame_in_pml4(root, vaddr, frame,
+                FrameSize::Small, FrameRights::ReadWrite, attrs),
+                Ok(usermode::FrameMappingMutation::ReplacedPresent));
+            let writable = core::ptr::read_volatile(pt.add(indices.pt as usize));
+            assert_ne!(writable & PTE_RW, 0);
+            assert_ne!(writable & PTE_USER, 0);
+            assert_ne!(writable & (1u64 << 63), 0);
             assert!(!usermode::unmap_user_4k_in_pml4(root, vaddr, frame + 0x1000));
             assert!(usermode::unmap_user_4k_in_pml4(root, vaddr, frame));
             assert_eq!(core::ptr::read_volatile(pt.add(indices.pt as usize)), 0);
         }
-        arch::log("  KUSER high alias maps UserRO+NX and unmaps by exact frame identity\n");
+        arch::log("  KUSER high alias maps UserRO/UserRW+NX and unmaps by exact frame identity\n");
     }
 
     #[cfg(target_arch = "x86_64")]

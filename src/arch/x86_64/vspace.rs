@@ -44,7 +44,8 @@ pub const fn kuser_container_range(vaddr: Word, size_bits: u32) -> bool {
     }
 }
 
-/// KUSER is a single read-only, non-executable 4 KiB user leaf.
+/// KUSER is a single non-executable 4 KiB user leaf. The frame capability may grant a
+/// writable private kernel-personality alias; a read-only capability cannot gain write access.
 pub const fn kuser_frame_mapping(
     vaddr: Word,
     size_bits: u32,
@@ -53,7 +54,7 @@ pub const fn kuser_frame_mapping(
 ) -> bool {
     vaddr == KUSER_SHARED_DATA_VADDR
         && size_bits == PAGE_BITS_4K
-        && matches!(rights, crate::cap::FrameRights::ReadOnly)
+        && matches!(rights, crate::cap::FrameRights::ReadOnly | crate::cap::FrameRights::ReadWrite)
         && attributes.execute_never
         && !attributes.write_through
         && !attributes.cache_disabled
@@ -457,13 +458,14 @@ pub mod spec {
         assert!(kuser_frame_mapping(base, 12, FrameRights::ReadOnly, nx));
         assert!(!kuser_frame_mapping(base + 0x1000, 12, FrameRights::ReadOnly, nx));
         assert!(!kuser_frame_mapping(base, 21, FrameRights::ReadOnly, nx));
-        assert!(!kuser_frame_mapping(base, 12, FrameRights::ReadWrite, nx));
+        assert!(kuser_frame_mapping(base, 12, FrameRights::ReadWrite, nx));
+        assert!(!kuser_frame_mapping(base + 0x1000, 12, FrameRights::ReadWrite, nx));
         assert!(!kuser_frame_mapping(base, 12, FrameRights::KernelOnly, nx));
         assert!(!kuser_frame_mapping(base, 12, FrameRights::ReadOnly,
             FrameMappingAttributes::upstream(0)));
         assert!(!kuser_frame_mapping(base, 12, FrameRights::ReadOnly,
             FrameMappingAttributes { cache_disabled: true, ..nx }));
-        arch::log("  KUSER high alias is exact, read-only, and non-executable\n");
+        arch::log("  KUSER high alias is exact, capability-rights gated, and non-executable\n");
     }
 
     #[inline(never)]
