@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 missing=()
-for tool in cc cmp curl cp dd find mkdir mv python3 rm tar wc; do
+for tool in cc cmp curl cp dd find mkdir mv patch python3 rm tar wc; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -118,11 +118,18 @@ ensure_simpleboot() {
     fi
   done
 
+  # Simpleboot's upstream FAT allocator rescans from cluster 3 for every
+  # 512-byte block. The pinned LiberNT tree includes large DLLs, so apply our
+  # checked source patch before building the host image creator.
+  if ! grep -q 'LIBERNT_FAST_FAT_ALLOC' "$SIMPLEBOOT_SRC_DIR/simpleboot.c"; then
+    patch -d "$SIMPLEBOOT_SRC_DIR" -p0 < scripts/patches/simpleboot-fat-allocation.patch >&2
+  fi
+
   if [ ! -x "$SIMPLEBOOT_BIN" ] || [ "$SIMPLEBOOT_BIN" -ot "$SIMPLEBOOT_SRC_DIR/simpleboot.c" ]; then
     echo "building Simpleboot image creator..." >&2
     (
       cd "$SIMPLEBOOT_SRC_DIR"
-      cc -ansi -Wall -Wextra simpleboot.c -o ../simpleboot
+      cc -O2 -ansi -Wall -Wextra simpleboot.c -o ../simpleboot
     )
   fi
   printf '%s\n' "$SIMPLEBOOT_BIN"

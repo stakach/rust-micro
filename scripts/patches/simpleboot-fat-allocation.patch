@@ -1,0 +1,24 @@
+--- simpleboot.c
++++ simpleboot.c
+@@ -737 +737 @@
+-    uint32_t i, clu;
++    uint32_t i, clu, capacity;
+@@ -744,5 +744,13 @@
+-    for(clu = 3; clu < fat_nextcluster; clu++) {
+-        for(i = 0; i < cnt && clu + i < fat_nextcluster && !fat_fat32[clu + i]; i++);
+-        if(i == cnt) break;
+-    }
+-    if(clu == fat_nextcluster) fat_nextcluster += cnt;
++    /* LIBERNT_FAST_FAT_ALLOC: fresh image writes have a free contiguous tail.
++       Keep the old scan for a fragmented or exhausted tail. */
++    capacity = (partsize - (fat_spf*fs_base[0x10]+fs_base[0xE]) * 512) / fat_bpc + 2;
++    if(fat_nextcluster < capacity && cnt <= capacity - fat_nextcluster) {
++        clu = fat_nextcluster;
++        fat_nextcluster += cnt;
++    } else {
++        for(clu = 3; clu < fat_nextcluster; clu++) {
++            for(i = 0; i < cnt && clu + i < fat_nextcluster && !fat_fat32[clu + i]; i++);
++            if(i == cnt) break;
++        }
++        if(clu == fat_nextcluster) return 0;
++    }
