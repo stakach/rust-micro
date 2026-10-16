@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 missing=()
-for tool in cc curl cp dd find mkdir mv python3 rm tar wc; do
+for tool in cc cmp curl cp dd find mkdir mv python3 rm tar wc; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -138,7 +138,7 @@ stage_file() {
   mv -f "$staged" "$dst"
 }
 
-IMAGE_MIB="${IMAGE_MIB:-256}"
+IMAGE_MIB="${IMAGE_MIB:-1024}"
 PERSIST_IMAGE_MIB="${PERSIST_IMAGE_MIB:-32}"
 if [ "$PERSIST_IMAGE_MIB" -ne 0 ] && [ "$PERSIST_IMAGE_MIB" -ne 16 ] && [ "$PERSIST_IMAGE_MIB" -lt 32 ]; then
   echo "error: PERSIST_IMAGE_MIB must be 0, 16 (legacy snapshots), or at least 32 (snapshots plus append area)" >&2
@@ -190,66 +190,39 @@ if [ -f .tmp/hive.dat ]; then
   echo "registry hive added: SYSTEM.DAT"
 fi
 
-if [ -f .tmp/reactos/imports.bin ]; then
-  stage_file .tmp/reactos/imports.bin "$ESP_STAGE/IMPORTS.BIN"
-  echo "ReactOS import table added: IMPORTS.BIN"
+if [ ! -f .tmp/libernt/.image-sha256 ] || [ ! -d .tmp/libernt/tree/Windows ]; then
+  echo "error: verified LiberNT userspace absent; run scripts/fetch_libernt.sh" >&2
+  exit 1
 fi
-
-if [ "${STAGE_FLAT_REACTOS:-0}" = "1" ]; then
-  echo "STAGE_FLAT_REACTOS=1: also staging the legacy flat ReactOS copies (debug)"
-  for pair in \
-    ros-csrss.exe:CSRSS.EXE ros-csrsrv.dll:CSRSRV.DLL ros-basesrv.dll:BASESRV.DLL \
-    ros-winsrv.dll:WINSRV.DLL ros-win32k.sys:WIN32K.SYS ros-dxg.sys:DXG.SYS \
-    ros-dxgthk.sys:DXGTHK.SYS ros-ftfd.dll:FTFD.DLL ros-framebuf.dll:FRAMEBUF.DLL \
-    ros-arial.ttf:ARIAL.TTF ros-gdi32.dll:GDI32.DLL ros-user32.dll:USER32.DLL \
-    ros-kernel32.dll:KERNEL32.DLL ros-rpcrt4.dll:RPCRT4.DLL ros-msvcrt.dll:MSVCRT.DLL \
-    ros-advapi32.dll:ADVAPI32.DLL ros-ws2_32.dll:WS2_32.DLL ros-kernel32_vista.dll:K32VISTA.DLL \
-    ros-advapi32_vista.dll:A32VISTA.DLL ros-ws2help.dll:WS2HELP.DLL ros-ntdll_vista.dll:NTDLLVIS.DLL \
-    ros-smss.exe:SMSS.EXE ros-winlogon.exe:WINLOGON.EXE ros-userenv.dll:USERENV.DLL \
-    ros-mpr.dll:MPR.DLL ros-system.hiv:ROSSYS.HIV \
-    ros-c1252.nls:C_1252.NLS ros-c437.nls:C_437.NLS ros-lintl.nls:L_INTL.NLS ros-c20127.nls:C_20127.NLS; do
-    src=".tmp/reactos/${pair%%:*}"
-    dst="$ESP_STAGE/${pair##*:}"
-    [ -f "$src" ] && stage_file "$src" "$dst"
-  done
+OUR_NTDLL=../.tmp/nt-ntdll.dll
+if [ ! -s "$OUR_NTDLL" ]; then
+  echo "error: source-built ntdll absent at $OUR_NTDLL — run scripts/build_ntdll_dll.sh" >&2
+  exit 1
 fi
-
-REACTOS_TREE_STAGED=0
-if [ -f .tmp/reactos/.fulltree-ok ] && [ -d .tmp/reactos/reactos ]; then
-  echo "staging the full \\reactos tree into the Simpleboot ESP..."
-  t0=$(date +%s)
-  cp -R .tmp/reactos/reactos "$ESP_STAGE/"
-  t1=$(date +%s)
-  echo "full \\reactos tree staged ($(find .tmp/reactos/reactos -type f | wc -l | tr -d ' ') files, $((t1 - t0))s)"
-  REACTOS_TREE_STAGED=1
-else
-  echo "note: full \\reactos tree not staged (.tmp/reactos/.fulltree-ok absent)"
-fi
+cargo run -q --manifest-path ../Cargo.toml -p ntdll-dll-verify -- --compare-exports \
+  .tmp/libernt/tree/Windows/system32/ntdll.dll \
+  "$OUR_NTDLL"
+python3 scripts/gen_reactos_imports.py \
+  .tmp/libernt/tree/Windows/system32/smss.exe \
+  "$OUR_NTDLL" \
+  .tmp/libernt/imports.bin
+stage_file .tmp/libernt/imports.bin "$ESP_STAGE/IMPORTS.BIN"
+echo "staging the installed LiberNT tree into the Simpleboot ESP..."
+t0=$(date +%s)
+cp -R .tmp/libernt/tree/. "$ESP_STAGE/"
+t1=$(date +%s)
+echo "LiberNT tree staged ($(find .tmp/libernt/tree -type f | wc -l | tr -d ' ') files, $((t1 - t0))s)"
+stage_file "$OUR_NTDLL" "$ESP_STAGE/Windows/system32/ntdll.dll"
+echo "source-built ntdll staged: Windows/system32/ntdll.dll"
 
 if [ -f .tmp/hive.dat ]; then
-  stage_file "$SEH_LINKAGE" "$ESP_STAGE/reactos/system32/nt-seh-linkage.dll"
-  echo "SEH linkage added: reactos/system32/nt-seh-linkage.dll"
-fi
-
-if [ -f .tmp/reactos/.profiles-ok ] && [ -d .tmp/reactos/Profiles ]; then
-  cp -R .tmp/reactos/Profiles "$ESP_STAGE/"
-  echo "user-profile tree staged: Profiles ($(find .tmp/reactos/Profiles -mindepth 1 | wc -l | tr -d ' ') entries)"
-  mkdir -p "$ESP_STAGE/Profiles/Default User/Local Settings/Temp"
-  echo "setup profile dir ensured: Profiles/Default User/Local Settings/Temp"
-else
-  echo "note: user-profile tree not staged (.tmp/reactos/.profiles-ok absent)"
+  stage_file "$SEH_LINKAGE" "$ESP_STAGE/Windows/system32/nt-seh-linkage.dll"
+  echo "SEH linkage added: Windows/system32/nt-seh-linkage.dll"
 fi
 
 FIXTURES=../crates/nt-driver-test-fixtures/fixtures
-OUR_NTDLL="../.tmp/nt-ntdll.dll"
-if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]; then
-  mkdir -p "$ESP_STAGE/reactos/system32/drivers"
-
-  ACPI_PROVIDER=vendor/reactos-acpi/acpi.sys
-  ./scripts/verify_reactos_acpi_provider.sh "$ACPI_PROVIDER"
-  stage_file "$ACPI_PROVIDER" "$ESP_STAGE/reactos/system32/drivers/acpi.sys"
-  ./scripts/verify_reactos_acpi_provider.sh "$ESP_STAGE/reactos/system32/drivers/acpi.sys"
-  echo "patched ReactOS ACPI provider staged: reactos/system32/drivers/acpi.sys"
+if [ -d "$FIXTURES" ]; then
+  mkdir -p "$ESP_STAGE/Windows/system32/drivers"
 
   for fixture_path in "$FIXTURES"/*.sys; do
     [ -f "$fixture_path" ] || continue
@@ -257,8 +230,8 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
     if [ "$fx" = "PendingStartTest.sys" ] && [ "$IMAGE_PROFILE" != "pending-start" ]; then
       continue
     fi
-    stage_file "$fixture_path" "$ESP_STAGE/reactos/system32/drivers/$fx"
-    echo "driver test fixture staged: reactos/system32/drivers/$fx"
+    stage_file "$fixture_path" "$ESP_STAGE/Windows/system32/drivers/$fx"
+    echo "driver test fixture staged: Windows/system32/drivers/$fx"
   done
 
   if [ "$IMAGE_PROFILE" = "seh-driver" ] || \
@@ -273,8 +246,8 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
       echo "error: verified native SEH driver missing at $SEH_DRIVER — run tests/native/driver_seh/build.sh" >&2
       exit 1
     fi
-    stage_file "$SEH_DRIVER" "$ESP_STAGE/reactos/system32/drivers/driver_seh.sys"
-    echo "native SEH driver staged: reactos/system32/drivers/driver_seh.sys"
+    stage_file "$SEH_DRIVER" "$ESP_STAGE/Windows/system32/drivers/driver_seh.sys"
+    echo "native SEH driver staged: Windows/system32/drivers/driver_seh.sys"
   fi
 
   if [ "$IMAGE_PROFILE" = "mup-provider" ]; then
@@ -284,14 +257,14 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
       echo "error: native Mup provider missing at $MUP_PROVIDER — run tests/native/mup_provider/build.sh" >&2
       exit 1
     fi
-    stage_file "$MUP_PROVIDER" "$ESP_STAGE/reactos/system32/drivers/mup_provider.sys"
-    echo "native Mup provider staged: reactos/system32/drivers/mup_provider.sys"
+    stage_file "$MUP_PROVIDER" "$ESP_STAGE/Windows/system32/drivers/mup_provider.sys"
+    echo "native Mup provider staged: Windows/system32/drivers/mup_provider.sys"
     if [ ! -s "$READ_FORWARD" ]; then
       echo "error: native READ source missing at $READ_FORWARD — run tests/native/mup_provider/build.sh" >&2
       exit 1
     fi
-    stage_file "$READ_FORWARD" "$ESP_STAGE/reactos/system32/drivers/read_forward.sys"
-    echo "native READ source staged: reactos/system32/drivers/read_forward.sys"
+    stage_file "$READ_FORWARD" "$ESP_STAGE/Windows/system32/drivers/read_forward.sys"
+    echo "native READ source staged: Windows/system32/drivers/read_forward.sys"
   fi
 
   if [ "$IMAGE_PROFILE" = source-irp-integration ]; then
@@ -301,7 +274,7 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
         echo "error: native source IRP fixture missing at $SOURCE_IRP - run tests/native/source_irp/build.sh" >&2
         exit 1
       fi
-      stage_file "$SOURCE_IRP" "$ESP_STAGE/reactos/system32/drivers/$name.sys"
+      stage_file "$SOURCE_IRP" "$ESP_STAGE/Windows/system32/drivers/$name.sys"
     done
   fi
 
@@ -311,7 +284,7 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
       echo "error: native file fixture missing at $FILE_ACCEPTANCE - run tests/native/file_acceptance/build.sh" >&2
       exit 1
     fi
-    stage_file "$FILE_ACCEPTANCE" "$ESP_STAGE/reactos/system32/file_acceptance.exe"
+    stage_file "$FILE_ACCEPTANCE" "$ESP_STAGE/Windows/system32/file_acceptance.exe"
   fi
 
   if [ "$IMAGE_PROFILE" = font-cleanup ]; then
@@ -323,20 +296,15 @@ if [ "$REACTOS_TREE_STAGED" = "1" ] || [ -f "$OUR_NTDLL" ] || [ -d "$FIXTURES" ]
       fi
     done
     for name in font_run_setup font_acceptance; do
-      stage_file "../.tmp/native-font-cleanup/$name.exe" "$ESP_STAGE/reactos/system32/$name.exe"
+      stage_file "../.tmp/native-font-cleanup/$name.exe" "$ESP_STAGE/Windows/system32/$name.exe"
     done
   fi
 
-  if [ -f "$OUR_NTDLL" ]; then
-    stage_file "$OUR_NTDLL" "$ESP_STAGE/reactos/system32/ntdll.dll"
-    echo "our Rust ntdll staged AS reactos/system32/ntdll.dll ($(wc -c < "$OUR_NTDLL" | tr -d ' ') bytes)"
-  elif [ "$REACTOS_TREE_STAGED" = "1" ]; then
-    echo "ERROR: our Rust ntdll ($OUR_NTDLL) not built — run scripts/build_ntdll_dll.sh" >&2
-    exit 1
-  else
-    echo "note: Rust ntdll not staged (ReactOS tree absent)"
-  fi
 fi
+
+cmp .tmp/libernt/tree/Windows/system32/drivers/acpi.sys \
+  "$ESP_STAGE/Windows/system32/drivers/acpi.sys"
+cmp "$OUR_NTDLL" "$ESP_STAGE/Windows/system32/ntdll.dll"
 
 SIMPLEBOOT_TOOL="$(ensure_simpleboot)"
 rm -f "$IMAGE"
