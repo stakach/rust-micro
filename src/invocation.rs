@@ -247,6 +247,8 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         #[cfg(target_arch = "aarch64")]
         Cap::PML4 { .. } => decode_aarch64_vspace(target, label, args),
         #[cfg(target_arch = "x86_64")]
+        Cap::PML4 { .. } => decode_x86_vspace(target, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::PageDirectory { .. } => decode_page_directory(target, label, args, invoker),
         #[cfg(target_arch = "x86_64")]
         Cap::Pdpt { .. } => decode_pdpt(target, label, args, invoker),
@@ -282,6 +284,60 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
     };
     inv_log_exit(&result);
     result
+}
+
+#[cfg(target_arch = "x86_64")]
+fn decode_x86_vspace(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    if label != InvocationLabel::X86VSpaceQueryPage {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    if info.length() < 1 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_TruncatedMessage,
+        )));
+    }
+    let (root, asid) = match target {
+        Cap::PML4 { ptr, mapped: true, asid } if asid != 0 => (ptr.addr(), asid),
+        _ => {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )))
+        }
+    };
+    if pml4_paddr_for_asid(asid) != root {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+
+    // Only the public user half and its explicitly admitted KUSER leaf may
+    // be inspected through this invocation. A caller cannot probe the kernel
+    // half merely by holding a VSpace root capability.
+    let address = args.a2;
+    let page = address & !0xfff;
+    let admitted = crate::arch::x86_64::vspace::user_mapping_range(page, 12)
+        || page == crate::arch::x86_64::vspace::KUSER_SHARED_DATA_VADDR;
+    if !admitted {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
+        )));
+    }
+
+    let present = unsafe { crate::arch::x86_64::usermode::page_present_in_pml4(root, address) };
+    unsafe {
+        let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+        tcb.msg_regs[0] = present as u64;
+        tcb.ipc_length = 1;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
