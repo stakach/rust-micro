@@ -27,7 +27,16 @@ verify_sha256() {
   fi
 }
 
-for tool in awk curl 7zz mktemp mv rm; do
+verify_tree() {
+  local actual
+  actual="$(python3 scripts/hash_libernt_tree.py "$1")"
+  if [ "$actual" != "$tree_sha" ]; then
+    echo "error: installed tree SHA-256 mismatch: expected $tree_sha, got $actual" >&2
+    exit 1
+  fi
+}
+
+for tool in awk curl 7zz mktemp mv python3 rm; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "error: $tool is required to stage the installed LiberNT image" >&2
     exit 1
@@ -43,6 +52,7 @@ archive="$(value archive)"
 archive_sha="$(value archive_sha256)"
 image="$(value image)"
 image_sha="$(value image_sha256)"
+tree_sha="$(value tree_sha256)"
 ntdll_sha="$(value ntdll_sha256)"
 acpi_sha="$(value acpi_sha256)"
 smss_sha="$(value smss_sha256)"
@@ -80,6 +90,7 @@ for path in "${required[@]}"; do
   [ -e "$out/tree/$path" ] || complete=0
 done
 if [ "$complete" = 1 ]; then
+  verify_tree "$out/tree"
   verify_sha256 "$out/tree/Windows/system32/ntdll.dll" "$ntdll_sha"
   verify_sha256 "$out/tree/Windows/system32/drivers/acpi.sys" "$acpi_sha"
   verify_sha256 "$out/tree/Windows/system32/smss.exe" "$smss_sha"
@@ -108,6 +119,7 @@ for path in "${required[@]}"; do
     exit 1
   }
 done
+verify_tree "$work/tree"
 verify_sha256 "$work/tree/Windows/system32/ntdll.dll" "$ntdll_sha"
 verify_sha256 "$work/tree/Windows/system32/drivers/acpi.sys" "$acpi_sha"
 verify_sha256 "$work/tree/Windows/system32/smss.exe" "$smss_sha"
