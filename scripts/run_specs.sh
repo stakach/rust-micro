@@ -40,7 +40,7 @@ if [ ! -f "$IMAGE" ]; then
   echo "error: $IMAGE missing — run scripts/build_kernel.sh first" >&2
   exit 1
 fi
-QEMU_MEMORY="${QEMU_MEMORY:-2048M}"
+QEMU_MEMORY="${QEMU_MEMORY:-3072M}"
 QEMU_CPUS="${QEMU_CPUS:-4}"
 
 DEBUG_FLAGS=()

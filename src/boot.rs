@@ -535,10 +535,9 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 
     // Phase 42 — backing memory for the rootserver's Untyped cap.
     //
-    // This remains a single power-of-two, power-of-two-aligned seL4 Untyped. Size it from the live
-    // Simpleboot free map instead of hard-coding the old 256 MiB value: the ReactOS desktop workload
-    // now reaches a broader steady-state service/process wave, and the normal QEMU launch gives us
-    // enough RAM to hand the rootserver 512 MiB while preserving smaller spec maps.
+    // This remains a single power-of-two, power-of-two-aligned seL4 Untyped. The installed
+    // LiberNT service/process wave exhausted 512 MiB before a new page table could be retyped.
+    // Size it from the live Simpleboot map so smaller spec maps still boot.
     let ut_size_bits = choose_rootserver_untyped_size_bits(&free)?;
     let ut_size = 1u64 << ut_size_bits;
     let ut_base = carve_chunk(&mut free, ut_size, ut_size_bits)?;
@@ -559,7 +558,7 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 }
 
 const ROOTSERVER_UT_MIN_SIZE_BITS: u32 = 28; // 256 MiB
-const ROOTSERVER_UT_TARGET_SIZE_BITS: u32 = 29; // 512 MiB
+const ROOTSERVER_UT_TARGET_SIZE_BITS: u32 = 30; // 1 GiB
 
 fn choose_rootserver_untyped_size_bits(free: &RegionList) -> Result<u32, BootError> {
     let mut size_bits = ROOTSERVER_UT_TARGET_SIZE_BITS;
@@ -678,6 +677,7 @@ pub mod spec {
         place_rootserver_picks_aligned_address();
         place_rootserver_fails_when_too_small();
         rootserver_untyped_prefers_target_when_available();
+        rootserver_untyped_uses_512_mib_when_target_does_not_fit();
         rootserver_untyped_falls_back_to_minimum();
         rootserver_untyped_fails_below_minimum();
         #[cfg(target_arch = "x86_64")]
@@ -787,13 +787,21 @@ pub mod spec {
 
     #[inline(never)]
     fn rootserver_untyped_prefers_target_when_available() {
-        let map = [entry(0x10_0000, 0x4010_0000, MemKind::Free)];
+        let map = [entry(0x10_0000, 0x8000_0000, MemKind::Free)];
         let free = extract_free(&map).unwrap();
         assert_eq!(
             choose_rootserver_untyped_size_bits(&free).unwrap(),
             ROOTSERVER_UT_TARGET_SIZE_BITS
         );
         arch::log("  ✓ rootserver Untyped prefers target size when available\n");
+    }
+
+    #[inline(never)]
+    fn rootserver_untyped_uses_512_mib_when_target_does_not_fit() {
+        let map = [entry(0x1000_0000, 0x4000_0000, MemKind::Free)];
+        let free = extract_free(&map).unwrap();
+        assert_eq!(choose_rootserver_untyped_size_bits(&free).unwrap(), 29);
+        arch::log("  ✓ rootserver Untyped uses 512 MiB when target does not fit\n");
     }
 
     #[inline(never)]
