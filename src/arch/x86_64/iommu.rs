@@ -141,6 +141,10 @@ fn cte_present(low: u64) -> bool {
 fn cte_asr(low: u64) -> u64 {
     low & ADDR_MASK
 }
+#[inline]
+fn cte_domain_id(high: u64) -> u16 {
+    ((high >> 8) & 0xffff) as u16
+}
 
 #[inline]
 fn pte_new(addr_paddr: u64, write: bool, read: bool) -> u64 {
@@ -207,6 +211,12 @@ impl CtxSlot {
     pub unsafe fn asr(&self) -> u64 {
         cte_asr(core::ptr::read_volatile(self.0))
     }
+    /// An existing PCI requester context may only be extended by its installed domain.
+    pub unsafe fn matches_domain(&self, domain_id: u16) -> bool {
+        domain_id != 0
+            && self.present()
+            && cte_domain_id(core::ptr::read_volatile(self.0.add(1))) == domain_id
+    }
     /// Install this context entry as the root of an IO address space.
     pub unsafe fn install_root(&self, domain_id: u16, asr_paddr: u64) {
         let aw = NUM_IOPT_LEVELS - 2;
@@ -216,6 +226,28 @@ impl CtxSlot {
     pub unsafe fn clear(&self) {
         core::ptr::write_volatile(self.0, 0);
         core::ptr::write_volatile(self.0.add(1), 0);
+    }
+}
+
+#[cfg(test)]
+mod context_domain_tests {
+    use super::*;
+
+    #[test]
+    fn existing_context_accepts_only_its_own_domain() {
+        let mut words = [cte_low(0x4000, 0, true), cte_high(2, 17)];
+        let slot = CtxSlot(words.as_mut_ptr());
+        assert!(unsafe { slot.matches_domain(17) });
+        assert!(!unsafe { slot.matches_domain(2) });
+        assert!(!unsafe { slot.matches_domain(0) });
+        assert_eq!(words, [cte_low(0x4000, 0, true), cte_high(2, 17)]);
+    }
+
+    #[test]
+    fn absent_context_never_authorizes_an_existing_domain() {
+        let mut words = [0, cte_high(2, 17)];
+        let slot = CtxSlot(words.as_mut_ptr());
+        assert!(!unsafe { slot.matches_domain(17) });
     }
 }
 

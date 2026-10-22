@@ -1133,6 +1133,12 @@ fn decode_x86_iopt(
             return Ok(());
         }
 
+        if !unsafe { ctx.matches_domain(domain_id) } {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
+        }
+
         // Context present — install this PT as an intermediate table.
         let top = unsafe { ctx.asr() };
         let lu = unsafe { iommu::lookup_iopt_slot(top, io_address) };
@@ -1272,8 +1278,11 @@ fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         let io_address = args.a3 & !((1u64 << iommu::PAGE_BITS) - 1);
 
         let io_space = take_single_extra_cap(invoker);
-        let pci_request_id = match io_space {
-            Cap::IoSpace { pci_device, .. } => pci_device,
+        let (pci_request_id, domain_id) = match io_space {
+            Cap::IoSpace {
+                pci_device,
+                domain_id,
+            } => (pci_device, domain_id),
             _ => {
                 return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_InvalidCapability,
@@ -1295,6 +1304,11 @@ fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         if !unsafe { ctx.present() } {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_FailedLookup,
+            )));
+        }
+        if !unsafe { ctx.matches_domain(domain_id) } {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
             )));
         }
 
