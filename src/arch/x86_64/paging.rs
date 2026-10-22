@@ -193,10 +193,11 @@ pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
 pub static mut LINEAR_MAP_BASE: u64 = 0;
 #[no_mangle]
 pub static mut LINEAR_MAP_PML4_IDX: usize = 0;
-/// Coverage in 1 GiB increments. 4 GiB is comfortably above the current
-/// rootserver Untyped target plus the 2 GiB QEMU RAM we configure today;
-/// bumping this just adds a few PDPT entries.
-pub const LINEAR_MAP_GIB: u64 = 4;
+/// Coverage in 1 GiB increments. QEMU places RAM above the PCI hole at
+/// physical 4 GiB when the guest has more than 2 GiB; the rootserver's
+/// 1 GiB Untyped then lives at 4..5 GiB. Keep the whole configured guest
+/// RAM within this map so physical frame clearing cannot fault in the kernel.
+pub const LINEAR_MAP_GIB: u64 = 8;
 
 /// Translate a physical address to its kernel-virtual counterpart
 /// in the linear map. Caller must have invoked
@@ -481,6 +482,7 @@ pub mod spec {
         cr3_readable();
         existing_pml4_has_kernel_mapping();
         install_then_lapic_reads();
+        linear_map_covers_high_root_untyped();
         arch::log("Paging tests completed\n");
     }
 
@@ -520,5 +522,16 @@ pub mod spec {
         let id = super::super::lapic::apic_id();
         assert!(id < 256, "LAPIC ID is 8 bits");
         arch::log("  ✓ kernel PT installed; LAPIC MMIO live\n");
+    }
+
+    #[inline(never)]
+    fn linear_map_covers_high_root_untyped() {
+        let root = read_pml4_entry(unsafe { LINEAR_MAP_PML4_IDX });
+        assert_ne!(root & PTE_PRESENT, 0);
+        let pdpt = phys_to_lin(root & !0xfff) as *const u64;
+        let high_ram = unsafe { core::ptr::read_volatile(pdpt.add(4)) };
+        assert_eq!(high_ram & (PTE_PRESENT | PTE_PS), PTE_PRESENT | PTE_PS);
+        assert_eq!(high_ram & 0x000f_ffff_c000_0000, 0x1_0000_0000);
+        arch::log("  ✓ linear map covers root Untyped above 4 GiB\n");
     }
 }
