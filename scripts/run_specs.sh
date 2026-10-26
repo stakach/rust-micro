@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_specs.sh — boot the disk image in QEMU with serial-on-stdio and exit
+# run_specs.sh — boot the disk image in QEMU and exit
 # via the isa-debug-exit device once the spec runner finishes.
 #
 # Pass `--debug` to dump interrupts and CPU resets (useful for triple-fault
@@ -46,7 +46,7 @@ QEMU_CPUS="${QEMU_CPUS:-4}"
 DEBUG_FLAGS=()
 # GRAPHICS=1 (or the `--display`/`--graphics` flag) boots with a real QEMU
 # display WINDOW instead of the headless `-nographic` gate, so you can SEE the
-# Simpleboot GOP framebuffer that win32k paints (the ReactOS desktop background).
+# Simpleboot GOP framebuffer that win32k paints.
 # Default stays headless so the CI/spec gate is unchanged.
 GRAPHICS="${GRAPHICS:-0}"
 while [ $# -gt 0 ]; do
@@ -81,9 +81,10 @@ if [ "$EXPLICIT_ACCEL" = 0 ]; then
   fi
 fi
 
-# Display vs headless. Graphics mode selects a real display backend, keeps std
-# VGA so OVMF's GOP framebuffer is shown, and keeps serial on stdio. Both lanes
-# retain isa-debug-exit: the guest's explicit final verdict must terminate QEMU
+# Display vs headless. Graphics mode selects a real display backend and keeps std
+# VGA so OVMF's GOP framebuffer is shown. The kernel debug transport determines
+# whether COM1 goes to stdio or a guest log file. Both lanes retain
+# isa-debug-exit: the guest's explicit final verdict must terminate QEMU
 # instead of falling through to the post-verdict spin loop indefinitely.
 DISPLAY_FLAGS=()
 EXIT_DEVICE=(-device isa-debug-exit,iobase=0x501,iosize=0x2)
