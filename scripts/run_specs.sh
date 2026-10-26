@@ -87,6 +87,18 @@ fi
 # instead of falling through to the post-verdict spin loop indefinitely.
 DISPLAY_FLAGS=()
 EXIT_DEVICE=(-device isa-debug-exit,iobase=0x501,iosize=0x2)
+SERIAL_FLAGS=(-serial stdio)
+DEBUGCON_FLAGS=()
+if [ -f .tmp/kernel-debug-output ]; then
+  case "$(cat .tmp/kernel-debug-output)" in
+    debugcon)
+      SERIAL_FLAGS=(-serial file:.tmp/guest-com1.log)
+      DEBUGCON_FLAGS=(-chardev stdio,id=ntdebugcon,mux=off -device isa-debugcon,iobase=0xe9,chardev=ntdebugcon)
+      ;;
+    uart) ;;
+    *) echo "error: unknown kernel debug transport marker" >&2; exit 1 ;;
+  esac
+fi
 case "$GRAPHICS" in
   1|true|yes|on)
     DISP="${QEMU_DISPLAY:-}"
@@ -130,7 +142,8 @@ qemu-system-x86_64 \
   -device intel-iommu,intremap=off \
   -m "$QEMU_MEMORY" \
   -smp "$QEMU_CPUS" \
-  -serial stdio \
+  "${SERIAL_FLAGS[@]}" \
+  "${DEBUGCON_FLAGS[@]}" \
   -no-reboot \
   ${DISPLAY_FLAGS[@]+"${DISPLAY_FLAGS[@]}"} \
   ${EXIT_DEVICE[@]+"${EXIT_DEVICE[@]}"} \

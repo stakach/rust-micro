@@ -2,8 +2,11 @@ const SERIAL_PORT: u16 = 0x3F8; // COM1
 const SERIAL_LINE_STATUS: u16 = SERIAL_PORT + 5;
 const SERIAL_THR_EMPTY: u8 = 0x20;
 const SERIAL_WRITE_SPIN_LIMIT: usize = 256;
+#[cfg(feature = "qemu-debugcon")]
+const DEBUGCON_PORT: u16 = 0xE9;
 
 pub fn init_serial() {
+    #[cfg(not(feature = "qemu-debugcon"))]
     init_uart();
 }
 
@@ -22,6 +25,9 @@ fn init_uart() {
 pub fn log(msg: &str) {
     for byte in msg.bytes() {
         unsafe {
+            #[cfg(feature = "qemu-debugcon")]
+            outb(DEBUGCON_PORT, byte);
+            #[cfg(not(feature = "qemu-debugcon"))]
             write_uart_byte(byte);
         }
     }

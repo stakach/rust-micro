@@ -14,6 +14,8 @@ default = ["arch-x86_64"]
 spec = []
 arch-x86_64 = []
 arch-aarch64 = []
+# Hosted QEMU keeps kernel diagnostics off COM1 so an NT serial driver owns the UART.
+qemu-debugcon = []
 # Mixed-Criticality Systems is the only scheduler model. The
 # `mcs` cargo feature is retained as a no-op so existing
 # `--features mcs` invocations don't break; nothing is gated on
