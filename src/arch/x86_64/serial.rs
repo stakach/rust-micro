@@ -4,6 +4,10 @@ const SERIAL_THR_EMPTY: u8 = 0x20;
 const SERIAL_WRITE_SPIN_LIMIT: usize = 256;
 
 pub fn init_serial() {
+    init_uart();
+}
+
+fn init_uart() {
     unsafe {
         outb(SERIAL_PORT + 1, 0x00); // Disable interrupts
         outb(SERIAL_PORT + 3, 0x80); // Enable DLAB
@@ -18,12 +22,12 @@ pub fn init_serial() {
 pub fn log(msg: &str) {
     for byte in msg.bytes() {
         unsafe {
-            write_byte(byte);
+            write_uart_byte(byte);
         }
     }
 }
 
-unsafe fn write_byte(byte: u8) {
+unsafe fn write_uart_byte(byte: u8) {
     for _ in 0..SERIAL_WRITE_SPIN_LIMIT {
         if serial_thr_empty(unsafe { inb(SERIAL_LINE_STATUS) }) {
             unsafe {
