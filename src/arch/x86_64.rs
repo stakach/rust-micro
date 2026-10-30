@@ -19,6 +19,7 @@ pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod syscall_entry;
+mod star_selectors;
 pub mod usermode;
 pub mod vspace;
 

@@ -12,8 +12,9 @@
 //!   6-7     0x30      TSS        16-byte system descriptor
 //!
 //! The user-DS / user-CS pair sits adjacent to USER32_CS so the
-//! IA32_STAR MSR's user base of 0x18 lands on USER_DS for SS and
-//! USER32_CS+0x10 for CS — exactly what SYSRET decodes.
+//! IA32_STAR's user base carries RPL 3 (0x1b). SYSRET adds 8 for
+//! SS=0x23 and 16 for CS=0x2b; omitting RPL produced SS=0x20 on KVM
+//! and a #GP at the next interrupt return.
 //!
 //! The TSS holds `rsp0`, the kernel stack the CPU loads when a user
 //! thread enters the kernel via SYSCALL or an exception. It's
@@ -29,7 +30,7 @@ use core::arch::asm;
 
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
-pub const USER32_CS: u16 = 0x18; // legacy, kept for SYSRET
+pub const USER32_CS: u16 = 0x18; // GDT index; STAR adds user RPL bits
 pub const USER_DS: u16 = 0x20 | 3;
 pub const USER_CS: u16 = 0x28 | 3;
 /// Selector for CPU 0's TSS. Subsequent CPUs use selectors at
