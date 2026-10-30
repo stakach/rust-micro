@@ -130,6 +130,8 @@ esac
 # need. Under q35 the boot disk lands on AHCI/SATA and OVMF won't
 # auto-boot it from a bare `-drive`, so we attach it explicitly with
 # `bootindex=0`. intremap=off: we only do DMA remapping, not IRQ remap.
+# The kernel's VT-d context and IO page tables require four levels. Explicitly
+# request 48-bit IOVA support: older QEMU defaults to 39-bit/three-level VT-d.
 qemu_status=0
 qemu-system-x86_64 \
   -machine q35 \
@@ -140,7 +142,7 @@ qemu-system-x86_64 \
   -device ide-hd,drive=bootdisk,bus=ahci0.0,bootindex=0 \
   -netdev user,id=ntnet0 \
   -device e1000,netdev=ntnet0 \
-  -device intel-iommu,intremap=off \
+  -device intel-iommu,intremap=off,aw-bits=48 \
   -m "$QEMU_MEMORY" \
   -smp "$QEMU_CPUS" \
   "${SERIAL_FLAGS[@]}" \

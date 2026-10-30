@@ -7,8 +7,9 @@
 //! translation enable and every required invalidation must complete
 //! before a mapping or its backing frame can be reused.
 //!
-//! Key decision: `numIOPTLevels = 4`. QEMU's TCG VT-d unit advertises
-//! SAGAW with 4-level support; the sel4test IOPT0008/0011 cases index
+//! Key decision: `numIOPTLevels = 4`. The QEMU launcher requests 48-bit
+//! VT-d so CAP.SAGAW advertises four-level support; older QEMU defaults to
+//! 39-bit/three-level VT-d. The sel4test IOPT0008/0011 cases index
 //! `pts[EXPECTED_PT_DEPTH = 3]`, which only exists when the map loop
 //! allocates 4 page tables. The context-entry address-width field is
 //! `aw = numIOPTLevels - 2 = 2`.
@@ -647,10 +648,14 @@ pub fn vtd_init() {
     let ecap = unsafe { core::ptr::read_volatile((regs + ECAP_REG) as *const u64) };
     let sagaw = (cap >> 8) & 0x1F;
     let iotlb_offset = ((ecap >> 8) & 0x3ff) * 16 + IOTLB_REG;
-    if ver == 0 || ver == 0xFFFF_FFFF || cap == u64::MAX || sagaw & 0x4 == 0
+    if ver == 0 || ver == 0xFFFF_FFFF || cap == u64::MAX
         || iotlb_offset == IOTLB_REG || (base & 0xfff) + iotlb_offset + 8 > 4096
     {
         crate::arch::log("IOMMU: VT-d register file dead — disabled\n");
+        return;
+    }
+    if sagaw & 0x4 == 0 {
+        crate::arch::log("IOMMU: VT-d lacks four-level IO page tables — disabled\n");
         return;
     }
 
