@@ -1,4 +1,60 @@
 use super::interrupts::{interrupt, interrupt_with_error, IdtEntry, IDT};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static USER_PAGE_FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn log_user_page_fault(
+    faulter: Option<crate::tcb::TcbId>,
+    cr2: u64,
+    error_code: u64,
+    saved_rip: u64,
+) {
+    crate::arch::log("[user #PF: tcb=");
+    if let Some(id) = faulter {
+        let mut v = u64::from(id.0);
+        let mut buf = [b'0'; 20];
+        let mut i = buf.len();
+        if v == 0 {
+            crate::arch::log("0");
+        }
+        while v > 0 {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+            crate::arch::log(s);
+        }
+    } else {
+        crate::arch::log("none");
+    }
+    crate::arch::log(" cr2=0x");
+    log_hex64(cr2);
+    crate::arch::log(" err=0x");
+    log_hex64(error_code);
+    crate::arch::log(" rip=0x");
+    log_hex64(saved_rip);
+    if let Some(id) = faulter.filter(|_| cr2 == 0x10 && saved_rip == 0x801a_0009) {
+        // Preserve the special GS diagnosis when a fault is logged.
+        let live_user_gs = unsafe {
+            crate::arch::x86_64::msr::rdmsr(crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE)
+        };
+        let configured_gs = unsafe {
+            crate::kernel::KERNEL
+                .get()
+                .scheduler
+                .slab
+                .get(id)
+                .cpu_context
+                .gs_base
+        };
+        crate::arch::log(" user_gs=0x");
+        log_hex64(live_user_gs);
+        crate::arch::log(" configured_gs=0x");
+        log_hex64(configured_gs);
+    }
+    crate::arch::log("]\n");
+}
 
 const X86_DEBUG_SERVICE_GP_ERROR: u64 = (0x2d << 3) | 2;
 const X86_DEBUG_SERVICE_SKIP_BYTES: u64 = 3;
@@ -683,6 +739,37 @@ extern "C" fn handle_general_protection_fault_typed(
         crate::arch::log(" cpu=0x");
         log_hex64(crate::arch::get_cpu_id() as u64);
         crate::arch::log("\n");
+        let current_rsp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) current_rsp, options(nostack, nomem));
+        }
+        if error_code == 0x20
+            && saved_rip == super::lapic::timer_irq_iretq_site()
+            && saved_rsp & 7 == 0
+            && saved_rsp >= 0xffff_8000_0000_0000
+            && saved_rsp <= u64::MAX - 5 * 8
+            && saved_rsp >= current_rsp
+            && saved_rsp - current_rsp <= 4096
+        {
+            let frame = saved_rsp as *const u64;
+            crate::arch::log("  attempted iretq rip/cs/rflags/rsp/ss:");
+            for index in 0..5 {
+                crate::arch::log(" 0x");
+                log_hex64(unsafe { core::ptr::read_volatile(frame.add(index)) });
+            }
+            crate::arch::log("\n  gdtr base=0x");
+            let (base, limit, descriptors) = super::gdt::live_user_descriptors();
+            log_hex64(base);
+            crate::arch::log(" limit=0x");
+            log_hex64(limit as u64);
+            if let Some((user_ds, user_cs)) = descriptors {
+                crate::arch::log(" user_ds=0x");
+                log_hex64(user_ds);
+                crate::arch::log(" user_cs=0x");
+                log_hex64(user_cs);
+            }
+            crate::arch::log("\n");
+        }
         fatal_exception(13, error_code);
     }
     acquire_user_fault_entry();
@@ -937,10 +1024,20 @@ extern "C" fn handle_page_fault_typed(cr2: u64, error_code: u64, saved_cs: u64, 
     // User-mode page fault — try to deliver to the thread's
     // fault handler. If delivery fails (no handler / bad cap),
     // we kill the thread by parking it Inactive.
+    let fault_count = USER_PAGE_FAULT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(not(feature = "trace-user-page-faults"))]
+    if fault_count % 4096 == 0 {
+        crate::arch::log("[user #PF count: ");
+        log_hex64(fault_count);
+        crate::arch::log("]\n");
+    }
+    #[cfg(feature = "trace-user-page-faults")]
+    let _ = fault_count;
     let current = crate::arch::x86_64::syscall_entry::resolve_live_user_thread();
     if current.is_none() {
         // We took a user-mode #PF before this CPU had a published user-entry
         // owner. Don't refault forever; dispatch whatever is runnable.
+        log_user_page_fault(None, cr2, error_code, saved_rip);
         unsafe { dispatch_next_or_idle("[USER #PF no current, no runnable — idle]\n") }
     }
     let faulter = current.unwrap();
@@ -958,57 +1055,16 @@ extern "C" fn handle_page_fault_typed(cr2: u64, error_code: u64, saved_cs: u64, 
         t.user_context = snapshot;
         t.use_iretq_resume = true;
     }
-    let _ = saved_rip; // captured in the snapshot's .rip slot
     let fault = crate::fault::FaultMessage::VMFault {
         addr: cr2,
         fsr: error_code,
         instruction: (error_code & (1 << 4)) != 0,
     };
-    crate::arch::log("[user #PF: tcb=");
-    {
-        let mut buf = [b'0'; 6];
-        let mut v = faulter.0 as u64;
-        let mut i = 6;
-        if v == 0 {
-            crate::arch::log("0");
-        }
-        while v > 0 && i > 0 {
-            i -= 1;
-            buf[i] = b'0' + (v % 10) as u8;
-            v /= 10;
-        }
-        if let Ok(s) = core::str::from_utf8(&buf[i..]) {
-            crate::arch::log(s);
-        }
-    }
-    crate::arch::log(" cr2=0x");
-    log_hex64(cr2);
-    crate::arch::log(" err=0x");
-    log_hex64(error_code);
-    crate::arch::log(" rip=0x");
-    log_hex64(saved_rip);
-    if cr2 == 0x10 && saved_rip == 0x801a_0009 {
-        // User-mode exception entry already executed swapgs, so the
-        // shadow MSR is the exact GS base that was active at the fault.
-        let live_user_gs = unsafe {
-            crate::arch::x86_64::msr::rdmsr(crate::arch::x86_64::msr::IA32_KERNEL_GS_BASE)
-        };
-        let configured_gs = unsafe {
-            crate::kernel::KERNEL
-                .get()
-                .scheduler
-                .slab
-                .get(faulter)
-                .cpu_context
-                .gs_base
-        };
-        crate::arch::log(" user_gs=0x");
-        log_hex64(live_user_gs);
-        crate::arch::log(" configured_gs=0x");
-        log_hex64(configured_gs);
-    }
-    crate::arch::log("]\n");
+    #[cfg(feature = "trace-user-page-faults")]
+    log_user_page_fault(Some(faulter), cr2, error_code, saved_rip);
     let suspended = if crate::fault::deliver_fault(faulter, fault).is_err() {
+        #[cfg(not(feature = "trace-user-page-faults"))]
+        log_user_page_fault(Some(faulter), cr2, error_code, saved_rip);
         crate::arch::log("[no fault handler — suspending thread]\n");
         unsafe {
             crate::kernel::KERNEL

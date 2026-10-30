@@ -73,6 +73,7 @@ const fn is_hosted_nt_native_call_msginfo(msginfo: u64) -> bool {
 fn syscall_may_consume_direct_handoff(
     syscall: crate::syscalls::Syscall,
     reply_register: u64,
+    msginfo: u64,
 ) -> bool {
     use crate::syscalls::Syscall;
 
@@ -80,7 +81,8 @@ fn syscall_may_consume_direct_handoff(
         syscall,
         Syscall::SysReplyRecv | Syscall::SysNBSendRecv | Syscall::SysNBSendWait
     ) || (matches!(syscall, Syscall::SysCall)
-        && reply_register == crate::invocation::REPLY_HANDOFF_MAGIC)
+        && (reply_register == crate::invocation::REPLY_HANDOFF_MAGIC
+            || msginfo == (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12))
 }
 
 fn syscall_prefers_entry_invoker_return(
@@ -250,10 +252,9 @@ pub fn init_syscall_msrs() {
         //                 in long mode)
         //   bits 47..32 = CS selector for SYSCALL: kernel CS at
         //                 entry; SS = entry+8.
-        //   bits 63..48 = base for SYSRET: SS = base+8, CS = base+16.
-        let kernel_cs = KERNEL_CS as u64;
-        let user_base = USER32_CS as u64; // 0x18 → SS=0x20+3, CS=0x28+3
-        let star = (kernel_cs << 32) | (user_base << 48);
+        //   bits 63..48 = user base including RPL 3: SYSRET SS =
+        //                 base+8 (0x23), CS = base+16 (0x2b).
+        let star = super::star_selectors::star_value(KERNEL_CS, USER32_CS);
         wrmsr(IA32_STAR, star);
 
         // SYSCALL entry RIP.
@@ -944,8 +945,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             return;
         }
     };
-    let may_consume_direct_handoff = syscall_may_consume_direct_handoff(syscall, ctx.r13);
-    let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13);
+    let may_consume_direct_handoff = syscall_may_consume_direct_handoff(syscall, ctx.r13, args.a1);
+    let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13)
+        && args.a1 != (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12;
     let transparent_debug_return = syscall_debug_return_is_transparent(syscall);
     let mut sink = SerialSink;
     let result = if matches!(syscall, Syscall::SysDebugWrite) {
@@ -1555,8 +1557,10 @@ pub mod spec {
         let kcs = ((star >> 32) & 0xFFFF) as u16;
         let ucb = ((star >> 48) & 0xFFFF) as u16;
         assert_eq!(kcs, KERNEL_CS);
-        assert_eq!(ucb, USER32_CS);
-        arch::log("  ✓ STAR holds kernel CS + user-base selectors\n");
+        assert_eq!(ucb, USER32_CS | 3);
+        assert_eq!(ucb + 8, crate::arch::x86_64::gdt::USER_DS);
+        assert_eq!(ucb + 16, crate::arch::x86_64::gdt::USER_CS);
+        arch::log("  ✓ STAR produces ring-3 SYSRET SS + CS selectors\n");
     }
 
     #[inline(never)]

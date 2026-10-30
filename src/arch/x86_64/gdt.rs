@@ -12,8 +12,9 @@
 //!   6-7     0x30      TSS        16-byte system descriptor
 //!
 //! The user-DS / user-CS pair sits adjacent to USER32_CS so the
-//! IA32_STAR MSR's user base of 0x18 lands on USER_DS for SS and
-//! USER32_CS+0x10 for CS — exactly what SYSRET decodes.
+//! IA32_STAR's user base carries RPL 3 (0x1b). SYSRET adds 8 for
+//! SS=0x23 and 16 for CS=0x2b; omitting RPL produced SS=0x20 on KVM
+//! and a #GP at the next interrupt return.
 //!
 //! The TSS holds `rsp0`, the kernel stack the CPU loads when a user
 //! thread enters the kernel via SYSCALL or an exception. It's
@@ -29,7 +30,7 @@ use core::arch::asm;
 
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
-pub const USER32_CS: u16 = 0x18; // legacy, kept for SYSRET
+pub const USER32_CS: u16 = 0x18; // GDT index; STAR adds user RPL bits
 pub const USER_DS: u16 = 0x20 | 3;
 pub const USER_CS: u16 = 0x28 | 3;
 /// Selector for CPU 0's TSS. Subsequent CPUs use selectors at
@@ -254,6 +255,27 @@ pub fn set_kernel_rsp_for_cpu(cpu_id: u32, rsp: u64) {
     unsafe {
         TSS_PER_CPU[cpu_id as usize].rsp0 = rsp;
     }
+}
+
+/// Read the live GDTR for fatal selector diagnostics. Only dereference it when
+/// it still names our statically mapped table; a corrupted GDTR must not turn
+/// a diagnostic into another fault.
+pub(crate) fn live_user_descriptors() -> (u64, u16, Option<(u64, u64)>) {
+    let mut gdtr = [0u8; 10];
+    unsafe {
+        asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr(), options(nostack, preserves_flags));
+    }
+    let limit = u16::from_le_bytes([gdtr[0], gdtr[1]]);
+    let base = u64::from_le_bytes([
+        gdtr[2], gdtr[3], gdtr[4], gdtr[5], gdtr[6], gdtr[7], gdtr[8], gdtr[9],
+    ]);
+    let expected = &raw const GDT as u64;
+    let descriptors = if base == expected && limit >= 6 * 8 - 1 {
+        unsafe { Some((GDT.entries[4], GDT.entries[5])) }
+    } else {
+        None
+    };
+    (base, limit, descriptors)
 }
 
 /// Read the GDT entry at `index` for spec assertions.

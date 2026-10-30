@@ -471,9 +471,19 @@ pub unsafe extern "C" fn lapic_timer_irq_entry() {
         "pop r11", "pop r10", "pop r9",  "pop r8",
         "pop rbp", "pop rdi", "pop rsi", "pop rdx",
         "pop rcx", "pop rbx", "pop rax",
+        ".global lapic_timer_irq_iretq_site",
+        "lapic_timer_irq_iretq_site:",
         "iretq",
         handler = sym lapic_timer_irq_dispatch,
     );
+}
+
+unsafe extern "C" {
+    static lapic_timer_irq_iretq_site: u8;
+}
+
+pub(crate) fn timer_irq_iretq_site() -> u64 {
+    &raw const lapic_timer_irq_iretq_site as u64
 }
 
 /// LAPIC kernel-tick ISR: advance the tick clock, charge the

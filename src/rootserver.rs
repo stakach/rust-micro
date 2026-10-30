@@ -141,7 +141,7 @@ const ROOTSERVER_STACK_PAGES: u64 = 128;
 ///   index 3 (radix 12 = 4096 slots). Matches the AY-demo convention
 ///   (CNodes 1, 2 went to sender/receiver); cnode_ptr(3) backs
 ///   `Cap::CNode` slot 2 in the rootserver's own CNode.
-/// * extern-rootserver (the NT executive): descriptor zero names a radix-18 CNode whose exact
+/// * extern-rootserver (the NT executive): descriptor zero names a radix-19 CNode whose exact
 ///   physical storage is reserved from boot RAM. It carries no fixed CTE array in the kernel ELF.
 #[cfg(not(feature = "extern-rootserver"))]
 pub const ROOTSERVER_CNODE_IDX: usize = 3;
@@ -156,7 +156,7 @@ pub const ROOTSERVER_CNODE_IDX: usize = crate::kernel::DYNAMIC_CNODE_BASE;
 #[cfg(not(feature = "extern-rootserver"))]
 pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::CNODE_RADIX;
 #[cfg(feature = "extern-rootserver")]
-pub const ROOTSERVER_CNODE_RADIX: u8 = 18;
+pub const ROOTSERVER_CNODE_RADIX: u8 = 19;
 #[cfg(feature = "extern-rootserver")]
 pub const ROOTSERVER_CNODE_SIZE_BITS: u32 =
     ROOTSERVER_CNODE_RADIX as u32 + crate::object_type::CTE_SIZE_BITS;

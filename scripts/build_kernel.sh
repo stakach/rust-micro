@@ -136,3 +136,13 @@ KERNEL_BIN="target/mykernel-x86/release/mykernel-rust"
 echo "kernel built: $KERNEL_BIN"
 
 ./scripts/make_image.sh
+
+# The runner must bind stdout to the transport compiled into this image. Publish
+# the marker only after the complete image succeeds so a failed build cannot
+# change the transport used for the previous bootable disk.
+if [[ ",${FEATURES}," == *",qemu-debugcon,"* ]]; then
+  printf 'debugcon\n' > .tmp/kernel-debug-output.tmp
+else
+  printf 'uart\n' > .tmp/kernel-debug-output.tmp
+fi
+mv .tmp/kernel-debug-output.tmp .tmp/kernel-debug-output

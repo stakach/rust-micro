@@ -218,6 +218,10 @@ pub fn iter_madt_entries<F: FnMut(MadtEntry)>(
 
 pub const DMAR_SIGNATURE: &[u8; 4] = b"DMAR";
 
+#[path = "dmar_scope.rs"]
+mod dmar_scope;
+pub use dmar_scope::DmarUnit;
+
 /// Walk the loader-provided RSDT/XSDT for one checksummed table signature.
 pub fn find_table(sdt_addr: u64, wanted: &[u8; 4]) -> Result<u64, AcpiError> {
     let hdr = validate_sdt(sdt_addr)?;
@@ -320,30 +324,44 @@ pub fn find_pc_rtc(sdt_addr: u64) -> Result<PcRtcInfo, AcpiError> {
     })
 }
 
-/// Parse the DMAR remapping structures for the first DRHD (DMA
-/// Remapping Hardware unit Definition, type 0) and return its IOMMU
-/// register base physical address. Layout after the 36-byte SDT header:
-/// host_addr_width(u8), flags(u8), reserved[10]; then remapping
-/// structures each `type(u16) length(u16) ...`; DRHD has the 64-bit
-/// register base at struct-offset +8.
-pub fn dmar_first_drhd_base(dmar_addr: u64) -> Option<u64> {
+/// This VT-d backend programs one register unit and one root table. Admit
+/// exactly one DRHD for segment zero; a scoped DRHD must authorize each
+/// requester individually. Multi-unit routing needs an explicit extension.
+pub fn dmar_single_drhd(dmar_addr: u64) -> Option<DmarUnit> {
     let total_len =
         unsafe { read_unaligned(&raw const (*(dmar_addr as *const SdtHeader)).length) } as usize;
-    let mut off = core::mem::size_of::<SdtHeader>() + 12; // +host_addr_width/flags/resv
+    let mut off = core::mem::size_of::<SdtHeader>() + 12;
+    let mut selected = None;
     while off + 4 <= total_len {
         let ty: u16 = unsafe { read_unaligned((dmar_addr + off as u64) as *const u16) };
         let len: u16 = unsafe { read_unaligned((dmar_addr + (off + 2) as u64) as *const u16) };
         if len < 4 || off + len as usize > total_len {
-            break;
+            return None;
         }
         if ty == 0 {
-            // DRHD — register base at +8.
-            let base: u64 = unsafe { read_unaligned((dmar_addr + (off + 8) as u64) as *const u64) };
-            return Some(base);
+            // DRHD fixed part: type/length/flags/reserved/segment/base.
+            if len < 16 || selected.is_some() {
+                return None;
+            }
+            let flags = unsafe { read_unaligned((dmar_addr + (off + 4) as u64) as *const u8) };
+            let segment = unsafe { read_unaligned((dmar_addr + (off + 6) as u64) as *const u16) };
+            let base = unsafe { read_unaligned((dmar_addr + (off + 8) as u64) as *const u64) };
+            if segment != 0 || base == 0 {
+                return None;
+            }
+            selected = Some(DmarUnit {
+                base,
+                include_all: flags & 1 != 0,
+                scopes_paddr: dmar_addr + off as u64 + 16,
+                scopes_len: len as usize - 16,
+            });
         }
         off += len as usize;
     }
-    None
+    if off != total_len {
+        return None;
+    }
+    selected.filter(|unit| unit.scopes_valid())
 }
 
 // ---------------------------------------------------------------------------

@@ -671,6 +671,38 @@ impl Scheduler {
         Some(target)
     }
 
+    /// Grant one dispatch to an exact, already authorized TCB. Invocation decoding must
+    /// authenticate the target capability before calling this scheduler-only operation.
+    /// Neither thread's priority or scheduling context changes, and the normal priority
+    /// order resumes after the target's next kernel entry.
+    pub fn request_one_shot_handoff(&mut self, invoker: TcbId, target: TcbId) -> bool {
+        let cpu = crate::arch::get_cpu_id() as usize;
+        if invoker == target || self.nodes[cpu].current != Some(invoker)
+            || self.nodes[cpu].direct_handoff.is_some()
+        {
+            return false;
+        }
+        let Some(source) = self.slab.try_get(invoker) else {
+            return false;
+        };
+        if source.affinity as usize != cpu || source.domain != self.cur_domain
+            || !source.is_runnable() || !source.is_schedulable()
+        {
+            return false;
+        }
+        let Some(destination) = self.slab.try_get(target) else {
+            return false;
+        };
+        if destination.affinity as usize != cpu || destination.domain != self.cur_domain
+            || !destination.is_runnable() || !destination.is_schedulable()
+            || !destination.enqueued
+        {
+            return false;
+        }
+        self.nodes[cpu].direct_handoff = Some(target);
+        true
+    }
+
     /// Read another CPU's `current` thread (used by IPI handlers
     /// once Phase 28d lands).
     #[inline]
@@ -1173,6 +1205,7 @@ pub mod spec {
         block_and_sc_loss_clear_active_user();
         scrub_tcb_removes_stale_ready_queue_entries();
         direct_handoff_beats_higher_priority_current();
+        targeted_handoff_is_one_shot_and_rejects_ineligible_threads();
         arch::log("Scheduler tests completed\n");
     }
 
@@ -1304,6 +1337,60 @@ pub mod spec {
         assert_eq!(s.current(), Some(executive));
         assert_eq!(s.take_direct_handoff(), None);
         arch::log("  ✓ direct handoff beats a higher-priority current thread once\n");
+    }
+
+    /// A privileged caller has already resolved an exact TCB capability before requesting this
+    /// scheduler effect. A timer notification can keep the executive runnable at priority 255;
+    /// an ordinary yield cannot let a priority-100 worker publish its first Call in that case.
+    /// The handoff grants one dispatch opportunity without changing anyone's priority.
+    #[inline(never)]
+    fn targeted_handoff_is_one_shot_and_rejects_ineligible_threads() {
+        let mut s = Scheduler::new();
+        let executive = s.admit(runnable(255));
+        let service = s.admit(runnable(200));
+        let user = s.admit(runnable(118));
+        let exact_worker = s.admit(runnable(100));
+        let unrelated_worker = s.admit(runnable(100));
+        s.set_current(Some(executive));
+
+        // Model repeated timer-notification returns: absent an explicit handoff, the executive
+        // remains the highest-priority runnable thread and the worker cannot enter user mode.
+        for _ in 0..3 {
+            assert_eq!(s.choose_thread(), Some(executive));
+        }
+        assert!(s.request_one_shot_handoff(executive, exact_worker));
+        assert_eq!(s.take_direct_handoff(), Some(exact_worker));
+        assert_eq!(s.take_direct_handoff(), None);
+        s.set_current(Some(exact_worker));
+        s.set_current(None);
+        assert_eq!(s.choose_thread(), Some(executive));
+        assert_eq!(s.slab.get(executive).priority, 255);
+        assert_eq!(s.slab.get(service).priority, 200);
+        assert_eq!(s.slab.get(user).priority, 118);
+        assert_eq!(s.slab.get(exact_worker).priority, 100);
+        assert_eq!(s.slab.get(unrelated_worker).priority, 100);
+
+        s.set_current(Some(executive));
+        let stale = s.admit(runnable(100));
+        s.scrub_tcb(stale);
+        s.slab.free(stale);
+        assert!(!s.request_one_shot_handoff(executive, stale));
+        assert!(!s.request_one_shot_handoff(executive, TcbId(MAX_TCBS as u16)));
+        let mut blocked = runnable(100);
+        blocked.state = ThreadStateType::BlockedOnReply;
+        let blocked = s.admit(blocked);
+        assert!(!s.request_one_shot_handoff(executive, blocked));
+        let mut no_sc = runnable(100);
+        no_sc.sc = None;
+        let no_sc = s.admit(no_sc);
+        assert!(!s.request_one_shot_handoff(executive, no_sc));
+        let mut other_domain = runnable(100);
+        other_domain.domain = 1;
+        let other_domain = s.admit(other_domain);
+        assert!(!s.request_one_shot_handoff(executive, other_domain));
+        assert_eq!(s.take_direct_handoff(), None);
+        assert_eq!(s.choose_thread(), Some(executive));
+        arch::log("  ✓ exact targeted handoff is one shot and rejects ineligible threads\n");
     }
 
     fn runnable(prio: u8) -> Tcb {
