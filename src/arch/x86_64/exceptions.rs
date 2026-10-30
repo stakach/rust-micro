@@ -739,6 +739,37 @@ extern "C" fn handle_general_protection_fault_typed(
         crate::arch::log(" cpu=0x");
         log_hex64(crate::arch::get_cpu_id() as u64);
         crate::arch::log("\n");
+        let current_rsp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) current_rsp, options(nostack, nomem));
+        }
+        if error_code == 0x20
+            && saved_rip == super::lapic::timer_irq_iretq_site()
+            && saved_rsp & 7 == 0
+            && saved_rsp >= 0xffff_8000_0000_0000
+            && saved_rsp <= u64::MAX - 5 * 8
+            && saved_rsp >= current_rsp
+            && saved_rsp - current_rsp <= 4096
+        {
+            let frame = saved_rsp as *const u64;
+            crate::arch::log("  attempted iretq rip/cs/rflags/rsp/ss:");
+            for index in 0..5 {
+                crate::arch::log(" 0x");
+                log_hex64(unsafe { core::ptr::read_volatile(frame.add(index)) });
+            }
+            crate::arch::log("\n  gdtr base=0x");
+            let (base, limit, descriptors) = super::gdt::live_user_descriptors();
+            log_hex64(base);
+            crate::arch::log(" limit=0x");
+            log_hex64(limit as u64);
+            if let Some((user_ds, user_cs)) = descriptors {
+                crate::arch::log(" user_ds=0x");
+                log_hex64(user_ds);
+                crate::arch::log(" user_cs=0x");
+                log_hex64(user_cs);
+            }
+            crate::arch::log("\n");
+        }
         fatal_exception(13, error_code);
     }
     acquire_user_fault_entry();

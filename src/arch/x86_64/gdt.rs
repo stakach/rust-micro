@@ -256,6 +256,27 @@ pub fn set_kernel_rsp_for_cpu(cpu_id: u32, rsp: u64) {
     }
 }
 
+/// Read the live GDTR for fatal selector diagnostics. Only dereference it when
+/// it still names our statically mapped table; a corrupted GDTR must not turn
+/// a diagnostic into another fault.
+pub(crate) fn live_user_descriptors() -> (u64, u16, Option<(u64, u64)>) {
+    let mut gdtr = [0u8; 10];
+    unsafe {
+        asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr(), options(nostack, preserves_flags));
+    }
+    let limit = u16::from_le_bytes([gdtr[0], gdtr[1]]);
+    let base = u64::from_le_bytes([
+        gdtr[2], gdtr[3], gdtr[4], gdtr[5], gdtr[6], gdtr[7], gdtr[8], gdtr[9],
+    ]);
+    let expected = &raw const GDT as u64;
+    let descriptors = if base == expected && limit >= 6 * 8 - 1 {
+        unsafe { Some((GDT.entries[4], GDT.entries[5])) }
+    } else {
+        None
+    };
+    (base, limit, descriptors)
+}
+
 /// Read the GDT entry at `index` for spec assertions.
 #[cfg(feature = "spec")]
 pub fn gdt_entry(index: usize) -> u64 {
