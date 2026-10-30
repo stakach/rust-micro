@@ -81,6 +81,7 @@ pub const LBL_TCB_RELEASE_EXECUTION_HOLD: u64 = 72;
 pub const LBL_TCB_QUERY_REPLY_BINDING: u64 = 73;
 pub mod reply_binding;
 pub const LBL_TCB_QUERY_VSPACE_BINDING: u64 = 74;
+pub const LBL_TCB_YIELD_TO: u64 = 76;
 pub const LBL_X86_VSPACE_QUERY_PAGE: u64 = 75;
 pub mod vspace_binding;
 pub mod legacy_context;
@@ -323,6 +324,13 @@ pub fn tcb_write_registers(target: u64, rip: u64, rsp: u64, arg0: u64) -> u64 {
 pub fn tcb_resume(target: u64) -> u64 {
     let msg_info = LBL_TCB_RESUME << 12;
     unsafe { syscall5(SYS_SEND, target, msg_info, 0, 0, 0) }
+}
+
+/// Give the exact TCB named by `target` one dispatch opportunity. Returns the invocation
+/// error label; a nonzero label means that no handoff was scheduled.
+#[inline(always)]
+pub fn tcb_yield_to(target: u64) -> u64 {
+    unsafe { syscall5_call(target, LBL_TCB_YIELD_TO << 12, 0, 0, 0) }
 }
 
 /// `TCB::SetPriority(target, prio)`.

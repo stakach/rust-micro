@@ -5542,6 +5542,28 @@ fn decode_tcb(
     unsafe {
         let s = KERNEL.get();
         match label {
+            InvocationLabel::TCBYieldTo => {
+                if args.a1 != (InvocationLabel::TCBYieldTo as u64) << 12
+                    || s.scheduler.slab.get(invoker).pending_extra_caps_count != 0
+                {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidArgument,
+                    )));
+                }
+                let target = u16::try_from(tcb_ptr.addr())
+                    .ok()
+                    .map(TcbId)
+                    .filter(|&candidate| s.scheduler.slab.try_get(candidate).is_some())
+                    .ok_or_else(|| KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))?;
+                if !s.scheduler.request_one_shot_handoff(invoker, target) {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_IllegalOperation,
+                    )));
+                }
+                Ok(())
+            }
             InvocationLabel::TCBReadLegacyContext | InvocationLabel::TCBWriteLegacyContext => {
                 legacy_context::invoke(s, tcb_ptr.addr(), label, args, invoker)
             }
@@ -6391,6 +6413,7 @@ pub mod spec {
     include!("invocation/execution_hold_specs.rs");
     include!("invocation/reply_binding_specs.rs");
     include!("invocation/vspace_binding_specs.rs");
+    include!("invocation/yield_to_specs.rs");
 
     #[cfg(target_arch = "x86_64")]
     pub(super) fn observe_untyped_release(parent_id: crate::cte::MdbId) {
@@ -6442,6 +6465,7 @@ pub mod spec {
         execution_hold_specs::run();
         reply_binding_specs::run();
         vspace_binding_specs::run();
+        yield_to_specs::run();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
         reply_alias_move_and_delete_preserve_unrelated_call();

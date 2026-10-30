@@ -24,11 +24,13 @@ impl DebugSink for SerialSink {
     }
 }
 
-fn may_consume_direct_handoff(syscall: Syscall, reply: u64) -> bool {
+fn may_consume_direct_handoff(syscall: Syscall, reply: u64, msginfo: u64) -> bool {
     matches!(
         syscall,
         Syscall::SysReplyRecv | Syscall::SysNBSendRecv | Syscall::SysNBSendWait
-    ) || (matches!(syscall, Syscall::SysCall) && reply == crate::invocation::REPLY_HANDOFF_MAGIC)
+    ) || (matches!(syscall, Syscall::SysCall)
+        && (reply == crate::invocation::REPLY_HANDOFF_MAGIC
+            || msginfo == (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12))
 }
 
 fn completed_receive(
@@ -205,7 +207,7 @@ pub fn dispatch(frame: *mut UserContext) {
         invoker,
         syscall,
         result.is_ok(),
-        may_consume_direct_handoff(syscall, context.x[6]),
+        may_consume_direct_handoff(syscall, context.x[6], args.a1),
     );
 }
 

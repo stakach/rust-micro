@@ -73,6 +73,7 @@ const fn is_hosted_nt_native_call_msginfo(msginfo: u64) -> bool {
 fn syscall_may_consume_direct_handoff(
     syscall: crate::syscalls::Syscall,
     reply_register: u64,
+    msginfo: u64,
 ) -> bool {
     use crate::syscalls::Syscall;
 
@@ -80,7 +81,8 @@ fn syscall_may_consume_direct_handoff(
         syscall,
         Syscall::SysReplyRecv | Syscall::SysNBSendRecv | Syscall::SysNBSendWait
     ) || (matches!(syscall, Syscall::SysCall)
-        && reply_register == crate::invocation::REPLY_HANDOFF_MAGIC)
+        && (reply_register == crate::invocation::REPLY_HANDOFF_MAGIC
+            || msginfo == (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12))
 }
 
 fn syscall_prefers_entry_invoker_return(
@@ -943,8 +945,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             return;
         }
     };
-    let may_consume_direct_handoff = syscall_may_consume_direct_handoff(syscall, ctx.r13);
-    let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13);
+    let may_consume_direct_handoff = syscall_may_consume_direct_handoff(syscall, ctx.r13, args.a1);
+    let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13)
+        && args.a1 != (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12;
     let transparent_debug_return = syscall_debug_return_is_transparent(syscall);
     let mut sink = SerialSink;
     let result = if matches!(syscall, Syscall::SysDebugWrite) {

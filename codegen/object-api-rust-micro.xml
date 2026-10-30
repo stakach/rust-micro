@@ -62,3 +62,9 @@
         <param dir="out" name="present" type="seL4_Word" description="One if the page is present, zero otherwise."/>
     </method>
 </interface>
+<interface name="seL4_TCB_YieldTo" manual_name="TCB Yield To">
+    <method id="TCBYieldTo" name="YieldTo" manual_name="Yield To" manual_label="tcb_yieldto">
+        <brief>Give one dispatch opportunity to this exact authorized runnable TCB.</brief>
+        <description>Exact zero-word request without extra caps. The invoked TCB capability names the sole eligible target. Reject self-target, stale, blocked, unschedulable, different-affinity or different-domain targets before effects. A successful request gives the target one dispatch opportunity without changing any TCB priority, IPC binding, Reply ownership or scheduling context. Normal priority scheduling resumes immediately afterward.</description>
+    </method>
+</interface>
