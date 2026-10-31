@@ -288,7 +288,7 @@ pub fn get_bootstrap_processor_id() -> u16 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::arch::get_cpu_id() as u16
+        crate::arch::x86_64::cpu::get_hardware_cpu_id() as u16
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

@@ -225,8 +225,17 @@ extern "C" fn aarch64_start(magic: u64, mbi_addr: u64) -> ! {
 fn kernel_entry() -> ! {
     // Only initialize on the bootstrap processor
     // Check if the current architectural CPU ID matches Simpleboot's BSP ID.
+    #[cfg(target_arch = "x86_64")]
+    let current_cpu_id = arch::x86_64::cpu::get_hardware_cpu_id();
+    #[cfg(not(target_arch = "x86_64"))]
     let current_cpu_id = arch::get_cpu_id();
     let simpleboot_bsp_id = simpleboot::get_bootstrap_processor_id() as arch::CpuId;
+
+    // The shared GDT and SMP scheduler currently index the BSP as CPU 0.
+    // Catch an incompatible boot topology before loading CPU 0's TSS on
+    // another physical CPU.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(simpleboot_bsp_id, 0, "x86 BSP APIC ID must be 0");
 
     if current_cpu_id == simpleboot_bsp_id {
         bsp_main();

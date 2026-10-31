@@ -241,6 +241,11 @@ pub fn init_gdt_for_cpu(cpu_id: u32) {
         );
         load_tss(tss_selector(cpu_id));
     }
+    assert_eq!(
+        super::cpu::get_cpu_id(),
+        cpu_id,
+        "loaded TSS selector must match the entry CPU ID"
+    );
 }
 
 /// Update the kernel-mode rsp the CPU loads on user→kernel
@@ -331,7 +336,8 @@ unsafe fn load_gdt(base: u64, limit: u16) {
 }
 
 unsafe fn load_tss(sel: u16) {
-    asm!("ltr {0:x}", in(reg) sel, options(nostack, nomem, preserves_flags));
+    // LTR fetches its descriptor from the GDT, so this is a memory read.
+    asm!("ltr {0:x}", in(reg) sel, options(nostack, preserves_flags));
 }
 
 // ---------------------------------------------------------------------------

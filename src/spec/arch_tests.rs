@@ -3,11 +3,30 @@ pub fn test_architecture() {
     crate::arch::log("Running architecture tests...\n");
 
     test_cpu_id();
+    #[cfg(all(feature = "spec", target_arch = "x86_64"))]
+    test_post_gdt_cpu_id_avoids_apic_reads();
     test_bootstrap_processor();
     #[cfg(target_arch = "aarch64")]
     test_simpleboot_handoff();
 
     crate::arch::log("Architecture tests completed\n");
+}
+
+#[cfg(all(feature = "spec", target_arch = "x86_64"))]
+fn test_post_gdt_cpu_id_avoids_apic_reads() {
+    crate::arch::x86_64::cpu::test_tss_selector_decode();
+
+    // GDT/TSS initialization has run on this CPU, and the LAPIC is mapped.
+    // The live APIC ID remains the independent architectural identity oracle.
+    let expected = crate::arch::x86_64::lapic::apic_id();
+    assert!((expected as usize) < crate::smp::MAX_CPUS);
+    let before = crate::arch::x86_64::cpu::apic_identity_samples(expected);
+    for _ in 0..1024 {
+        assert_eq!(crate::arch::get_cpu_id(), expected);
+    }
+    let after = crate::arch::x86_64::cpu::apic_identity_samples(expected);
+    assert_eq!(after, before, "post-GDT CPU ID lookup still reads IA32_APIC_BASE and APIC ID MMIO");
+    crate::arch::log("  ✓ post-GDT CPU identity uses no APIC MMIO lookup\n");
 }
 
 #[cfg(all(feature = "spec", target_arch = "aarch64"))]
