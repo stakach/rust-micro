@@ -169,9 +169,11 @@ impl FrameMappingAttributes {
     }
 
     pub const fn compressed(rights: Word) -> Self {
+        // Compressed map bit 3 opts into strong UC: PWT=1, PCD=1 with the
+        // default PAT. Bits 0-1 remain capability rights and bit 2 is NX.
         Self {
-            write_through: false,
-            cache_disabled: false,
+            write_through: rights & 0b1000 != 0,
+            cache_disabled: rights & 0b1000 != 0,
             pat: false,
             execute_never: rights & 4 != 0,
         }
@@ -485,6 +487,11 @@ pub mod spec {
                 );
             }
             let attrs = FrameMappingAttributes::compressed(7);
+            let uncached = FrameMappingAttributes::compressed(0b1111);
+            let uncached_leaf = frame_mapping_entry(0x4000_0000, bits,
+                FrameRights::ReadWrite, uncached).unwrap();
+            assert_eq!(uncached_leaf & (3 << 3), 3 << 3);
+            assert_eq!(uncached_leaf >> 63, 1);
             for (rights, flags) in [
                 (FrameRights::KernelOnly, 3u64),
                 (FrameRights::ReadOnly, 5),
