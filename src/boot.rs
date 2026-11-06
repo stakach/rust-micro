@@ -698,6 +698,7 @@ pub mod spec {
         extract_filters_to_free_only();
         sort_and_coalesce();
         reserve_splits_around_overlap();
+        dynamic_rootserver_reserve_refuses_insufficient_ram();
         place_rootserver_carves_region();
         place_rootserver_picks_aligned_address();
         place_rootserver_fails_when_too_small();
@@ -759,6 +760,17 @@ pub mod spec {
         assert_eq!(free.entries[0], PRegion::new(0, 0x4000));
         assert_eq!(free.entries[1], PRegion::new(0x6000, 0x10000));
         arch::log("  ✓ reserve splits a free region around the carve\n");
+    }
+
+    #[inline(never)]
+    fn dynamic_rootserver_reserve_refuses_insufficient_ram() {
+        let size = crate::rootserver_page_budget::reserve_bytes(4104, 0).unwrap();
+        assert_eq!(size, 17 * 1024 * 1024);
+        let map = [entry(0x20_0000, 0x120_0000, MemKind::Free)];
+        let mut free = extract_free(&map).unwrap();
+        assert_eq!(carve_chunk(&mut free, size, 12), Err(BootError::NoSuitableRegion));
+        assert_eq!(free.as_slice(), &[PRegion::new(0x20_0000, 0x120_0000)]);
+        arch::log("  ✓ dynamic rootserver reserve refuses insufficient RAM\n");
     }
 
     #[inline(never)]
