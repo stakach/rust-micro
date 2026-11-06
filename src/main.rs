@@ -126,6 +126,7 @@ mod initrd;
 // Pre-39 this was an `include_bytes!` of a sibling crate's output;
 // now it's a runtime `initrd::find_file("boot/rootserver")`.
 mod rootserver_image;
+mod rootserver_page_budget;
 
 // Phase 29b — minimal ELF64 parser. Reads the embedded
 // rootserver image and exposes its entry point + PT_LOAD segments.
@@ -353,8 +354,11 @@ fn bsp_main_big_stack() -> ! {
             boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
             boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
             boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
+            boot::BootError::InvalidRootserverImage => arch::log("InvalidRootserverImage"),
+            boot::BootError::RootserverImageTooLarge => arch::log("RootserverImageTooLarge"),
         }
         arch::log("\n");
+        loop { arch::halt_cpu(); }
     }
 
     // Phase 44 — initialise the VT-d IOMMU now that the IOMMU table
@@ -380,6 +384,8 @@ fn bsp_main_big_stack() -> ! {
                 boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
                 boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
                 boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
+                boot::BootError::InvalidRootserverImage => arch::log("InvalidRootserverImage"),
+                boot::BootError::RootserverImageTooLarge => arch::log("RootserverImageTooLarge"),
             }
             arch::log("\n");
         }

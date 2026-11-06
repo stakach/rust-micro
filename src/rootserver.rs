@@ -128,12 +128,14 @@ pub unsafe fn reset_page_pool() {
 
 /// Number of 4 KiB pages reserved for the rootserver's user stack.
 #[cfg(not(feature = "extern-rootserver"))]
-const ROOTSERVER_STACK_PAGES: u64 = 16;
+pub(crate) const ROOTSERVER_STACK_PAGES: u64 = 16;
 /// The external NT executive root task has deep loader, service-dispatch, hosted-driver and
 /// user-callback chains. Keep its guarded root-task stack large enough that regular ReactOS process
 /// bring-up does not depend on optimizer spill placement.
 #[cfg(feature = "extern-rootserver")]
-const ROOTSERVER_STACK_PAGES: u64 = 128;
+pub(crate) const ROOTSERVER_STACK_PAGES: u64 = 128;
+/// IPC buffer, BootInfo page, and its extension page are mapped after the stack.
+pub(crate) const ROOTSERVER_AUX_PAGES: u64 = 3;
 
 /// Kernel-side CNode index reserved for the rootserver's CSpace.
 ///
@@ -1746,7 +1748,7 @@ pub struct PageMapping {
 #[cfg(not(feature = "extern-rootserver"))]
 pub const IMAGE_PAGES_CAP: usize = 2048;
 #[cfg(feature = "extern-rootserver")]
-pub const IMAGE_PAGES_CAP: usize = 4096;
+pub const IMAGE_PAGES_CAP: usize = 8192;
 
 /// All user-image pages the loader installed in the rootserver's
 /// PML4. Populated by `load()`, consumed by `install_rootserver_initial_caps`
@@ -1764,6 +1766,7 @@ unsafe fn load_segment(
     seen: &mut [PageMapping],
     n_seen: &mut usize,
 ) -> Result<(), LoadError> {
+    if seg.mem_size == 0 { return Ok(()); }
     // Iterate every 4 KiB page that the segment touches. We don't
     // require `vaddr` to be page-aligned (lld emits overlapping R-only
     // segments mid-page).
@@ -1933,7 +1936,7 @@ pub mod spec {
             let aux_pages = super::IMAGE_PAGE_COUNT as u64 - result.elf_page_count as u64;
             assert_eq!(
                 aux_pages,
-                super::ROOTSERVER_STACK_PAGES + 3,
+                super::ROOTSERVER_STACK_PAGES + super::ROOTSERVER_AUX_PAGES,
                 "aux mappings must be stack pages plus IPC/BootInfo/extra-BI",
             );
 

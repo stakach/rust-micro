@@ -86,6 +86,10 @@ pub enum BootError {
     /// Reserved region overlaps with itself or the existing list in
     /// an unexpected way.
     OverlapInternal,
+    /// The required embedded rootserver is not a valid supported ELF image.
+    InvalidRootserverImage,
+    /// Its checked mappings exceed the supported table or address arithmetic.
+    RootserverImageTooLarge,
 }
 
 // ---------------------------------------------------------------------------
@@ -478,34 +482,55 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
     let mut free = extract_free(&entries[..n])?;
     reserve_simpleboot_allocations(&mut free)?;
 
-    const USER_PAGES_SIZE: u64 = 16 * 1024 * 1024;
+    let image = crate::elf::parse(crate::rootserver_image::rootserver_elf())
+        .map_err(|_| BootError::InvalidRootserverImage)?;
+    let mapped_pages = crate::rootserver_page_budget::budget(
+        image.load_segments().map(|segment| crate::rootserver_page_budget::LoadSpan {
+            vaddr: segment.vaddr,
+            mem_size: segment.mem_size,
+        }),
+        crate::rootserver::ROOTSERVER_STACK_PAGES,
+        crate::rootserver::ROOTSERVER_AUX_PAGES,
+        crate::rootserver::IMAGE_PAGES_CAP as u64,
+    ).map_err(|_| BootError::RootserverImageTooLarge)?;
+    #[cfg(target_arch = "x86_64")]
+    let extra_physical_pages = 0;
+    #[cfg(target_arch = "aarch64")]
+    let extra_physical_pages = mapped_pages.checked_mul(3)
+        .and_then(|pages| pages.checked_add(1))
+        .ok_or(BootError::RootserverImageTooLarge)?;
+    let user_pages_size = crate::rootserver_page_budget::reserve_bytes(
+        mapped_pages, extra_physical_pages,
+    ).map_err(|_| BootError::RootserverImageTooLarge)?;
     // Phase 44 — the VT-d IOMMU's root + context tables live in a small
     // pool sliced off the TOP of the user-pages carve. Bundling it with
-    // the 16 MiB user-pages chunk (rather than a separate carve_chunk)
+    // the user-pages chunk (rather than a separate carve_chunk)
     // is deliberate: a standalone small carve would land in the lowest
     // free region (conventional memory at paddr 0), which is exactly
     // where place_rootserver lays down the rootserver — vtd_init would
-    // then zero the rootserver's TCB. The 16 MiB chunk is large enough
+    // then zero the rootserver's TCB. The minimum 16 MiB chunk is large enough
     // that it never fits in that low region, so the pool stays clear.
     #[cfg(target_arch = "x86_64")]
     const IOMMU_POOL_SIZE: u64 = 64 * 1024;
     #[cfg(not(target_arch = "x86_64"))]
     const IOMMU_POOL_SIZE: u64 = 0;
-    let user_pages_base = carve_chunk(&mut free, USER_PAGES_SIZE + IOMMU_POOL_SIZE, 12)?;
+    let carve_size = user_pages_size.checked_add(IOMMU_POOL_SIZE)
+        .ok_or(BootError::RootserverImageTooLarge)?;
+    let user_pages_base = carve_chunk(&mut free, carve_size, 12)?;
 
     arch::log("boot: reserved user-pages @0x");
     log_hex64(user_pages_base);
     arch::log("..");
-    log_hex64(user_pages_base + USER_PAGES_SIZE);
+    log_hex64(user_pages_base + user_pages_size);
     arch::log("\n");
 
     unsafe {
-        crate::rootserver::install_user_page_region(user_pages_base, USER_PAGES_SIZE);
+        crate::rootserver::install_user_page_region(user_pages_base, user_pages_size);
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        let iommu_base = user_pages_base + USER_PAGES_SIZE;
+        let iommu_base = user_pages_base + user_pages_size;
         arch::log("boot: reserved iommu-pool @0x");
         log_hex64(iommu_base);
         arch::log("..");
