@@ -48,6 +48,8 @@ const _: () = assert!(size_of::<seL4_IPCBuffer>() == 1024);
 // seL4_BootInfo must fit in a single page (4 KiB on x86_64) because
 // the kernel maps it as one frame to the initial thread.
 const _: () = assert!(size_of::<seL4_BootInfo>() <= 4096);
+#[cfg(all(feature = "extern-rootserver", target_arch = "x86_64"))]
+const _: () = assert!(crate::smp::MAX_CPUS == 4);
 
 // Generated bitfield types — sizes from .bf comments.
 const _: () = assert!(NullCap::SIZE_BYTES == 16);
@@ -145,6 +147,11 @@ fn test_runtime_offsets() {
     assert_eq!(
         off(&bi.tscFrequencyHz as *const _ as *const u8),
         off(&bi.acpiRootTableFlags as *const _ as *const u8) + core::mem::size_of::<u16>(),
+    );
+    #[cfg(all(feature = "extern-rootserver", target_arch = "x86_64"))]
+    assert_eq!(
+        off(&bi.processorApicIds as *const _ as *const u8),
+        off(&bi.tscFrequencyHz as *const _ as *const u8) + core::mem::size_of::<u64>(),
     );
     arch::log("  ✓ seL4_BootInfo field offsets match libsel4 layout\n");
 }

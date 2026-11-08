@@ -70,6 +70,36 @@ pub fn aps_alive() -> u32 {
     APS_ALIVE.load(Ordering::SeqCst)
 }
 
+/// The x86 scheduler and IPI path currently use APIC IDs directly as logical indices.
+/// Publish that identity only after every started CPU has appeared exactly once in the
+/// dense prefix described by Simpleboot. The online bits are set after per-CPU setup.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn started_boot_apic_ids() -> Option<[u32; MAX_CPUS]> {
+    let count = usize::from(crate::simpleboot::get_num_cores());
+    if !(1..=MAX_CPUS).contains(&count)
+        || APS_ALIVE.load(Ordering::SeqCst) != (count - 1) as u32
+    {
+        return None;
+    }
+    validated_boot_apic_ids(count, ONLINE_CPUS.load(Ordering::Acquire))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn validated_boot_apic_ids(count: usize, online_mask: u32) -> Option<[u32; MAX_CPUS]> {
+    if !(1..=MAX_CPUS).contains(&count) {
+        return None;
+    }
+    let expected = (1u32 << count) - 1;
+    if online_mask != expected {
+        return None;
+    }
+    let mut ids = [0; MAX_CPUS];
+    for (index, id) in ids[..count].iter_mut().enumerate() {
+        *id = index as u32;
+    }
+    Some(ids)
+}
+
 // ---------------------------------------------------------------------------
 // Big Kernel Lock (Phase 28b).
 //
@@ -666,6 +696,8 @@ pub mod spec {
 
     pub fn test_smp() {
         arch::log("Running SMP tests...\n");
+        #[cfg(target_arch = "x86_64")]
+        boot_processor_apic_ids_require_started_dense_topology();
         per_cpu_indexes_correctly();
         signal_then_handle_round_trip();
         multiple_signals_coalesce_into_pending_mask();
@@ -681,6 +713,18 @@ pub mod spec {
             ap_dispatches_user_thread_end_to_end();
         }
         arch::log("SMP tests completed\n");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    fn boot_processor_apic_ids_require_started_dense_topology() {
+        assert_eq!(validated_boot_apic_ids(4, 0b1111), Some([0, 1, 2, 3]));
+        assert_eq!(validated_boot_apic_ids(1, 0b0001), Some([0, 0, 0, 0]));
+        assert_eq!(validated_boot_apic_ids(4, 0b1011), None, "sparse started APIC IDs cannot index the current scheduler");
+        assert_eq!(validated_boot_apic_ids(3, 0b1111), None, "Simpleboot count must match started CPUs");
+        assert_eq!(validated_boot_apic_ids(0, 0), None);
+        assert_eq!(validated_boot_apic_ids(5, 0b1111), None);
+        arch::log("  validated started APIC IDs match dense scheduler indices\n");
     }
 
     #[cfg(target_arch = "x86_64")]

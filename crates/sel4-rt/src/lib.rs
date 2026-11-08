@@ -669,9 +669,36 @@ pub struct BootInfo {
     pub acpi_root_table_kind: u16,
     pub acpi_root_table_flags: u16,
     pub tsc_frequency_hz: u64,
+    /// APIC IDs of started CPUs in logical scheduler order; `num_nodes` is the length.
+    #[cfg(target_arch = "x86_64")]
+    pub processor_apic_ids: [u32; 4],
 }
 
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    core::mem::offset_of!(BootInfo, processor_apic_ids)
+        == core::mem::offset_of!(BootInfo, tsc_frequency_hz) + core::mem::size_of::<u64>()
+);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(core::mem::size_of::<BootInfo>() <= 4096);
+
 impl BootInfo {
+    /// The running x86 kernel indexes scheduler state and IPI destinations by APIC ID.
+    /// Refuse a malformed or sparse topology before an NT processor number is published.
+    #[cfg(target_arch = "x86_64")]
+    pub fn started_processor_apic_ids(&self) -> Option<&[u32]> {
+        let count = usize::try_from(self.num_nodes).ok()?;
+        if !(1..=self.processor_apic_ids.len()).contains(&count)
+            || self.node_id != 0
+            || self.processor_apic_ids[..count]
+                .iter().enumerate().any(|(logical, &apic)| apic != logical as u32)
+            || self.processor_apic_ids[count..].iter().any(|&apic| apic != 0)
+        {
+            return None;
+        }
+        Some(&self.processor_apic_ids[..count])
+    }
+
     pub fn wall_clock(&self) -> Option<BootWallClock> {
         let required = BOOT_WALL_CLOCK_VALID | BOOT_WALL_CLOCK_UTC;
         if self.wall_clock_flags & required != required {
@@ -814,6 +841,38 @@ impl BootInfo {
             offset = end;
         }
         None
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod boot_processor_identity_tests {
+    use super::BootInfo;
+
+    fn boot_info(num_nodes: u64, node_id: u64, apic_ids: [u32; 4]) -> BootInfo {
+        // BootInfo contains only plain C ABI fields; all-zero is a valid test fixture.
+        let mut info: BootInfo = unsafe { core::mem::zeroed() };
+        info.num_nodes = num_nodes;
+        info.node_id = node_id;
+        info.processor_apic_ids = apic_ids;
+        info
+    }
+
+    #[test]
+    fn accepts_exact_started_dense_apic_prefix() {
+        let four = boot_info(4, 0, [0, 1, 2, 3]);
+        assert_eq!(four.started_processor_apic_ids(), Some(&[0, 1, 2, 3][..]));
+        let one = boot_info(1, 0, [0, 0, 0, 0]);
+        assert_eq!(one.started_processor_apic_ids(), Some(&[0][..]));
+    }
+
+    #[test]
+    fn rejects_sparse_count_mismatch_tail_and_wrong_bsp() {
+        assert!(boot_info(4, 0, [0, 1, 3, 4]).started_processor_apic_ids().is_none());
+        assert!(boot_info(3, 0, [0, 1, 2, 3]).started_processor_apic_ids().is_none());
+        assert!(boot_info(2, 0, [0, 1, 9, 0]).started_processor_apic_ids().is_none());
+        assert!(boot_info(4, 1, [0, 1, 2, 3]).started_processor_apic_ids().is_none());
+        assert!(boot_info(0, 0, [0; 4]).started_processor_apic_ids().is_none());
+        assert!(boot_info(5, 0, [0, 1, 2, 3]).started_processor_apic_ids().is_none());
     }
 }
 

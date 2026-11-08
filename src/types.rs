@@ -402,6 +402,10 @@ pub struct seL4_BootInfo {
     /// BSP TSC frequency measured against the PIT before the initial task is dispatched.
     #[cfg(feature = "extern-rootserver")]
     pub tscFrequencyHz: u64,
+    /// APIC IDs of physically started CPUs in logical scheduler order. The occupied prefix
+    /// has `numNodes` entries; the current x86 scheduler requires IDs 0..numNodes.
+    #[cfg(all(feature = "extern-rootserver", target_arch = "x86_64"))]
+    pub processorApicIds: [u32; crate::smp::MAX_CPUS],
 }
 
 #[repr(C)]

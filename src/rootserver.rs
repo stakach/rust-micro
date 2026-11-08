@@ -1603,6 +1603,9 @@ unsafe fn build_bootinfo(
     #[cfg(feature = "extern-rootserver")]
     let acpi_root =
         crate::arch::x86_64::acpi::root_table_info(crate::simpleboot::acpi_table_address()).ok();
+    #[cfg(all(feature = "extern-rootserver", target_arch = "x86_64"))]
+    let processor_apic_ids = crate::smp::started_boot_apic_ids()
+        .expect("started APIC IDs must match the dense x86 scheduler topology");
     seL4_BootInfo {
         extraLen: extra_bi_size,
         nodeID: 0,
@@ -1717,6 +1720,8 @@ unsafe fn build_bootinfo(
         acpiRootTableFlags: acpi_root.map(|_| BOOT_ACPI_ROOT_VALID).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         tscFrequencyHz: 0,
+        #[cfg(all(feature = "extern-rootserver", target_arch = "x86_64"))]
+        processorApicIds: processor_apic_ids,
     }
 }
 
