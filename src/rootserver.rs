@@ -130,10 +130,11 @@ pub unsafe fn reset_page_pool() {
 #[cfg(not(feature = "extern-rootserver"))]
 pub(crate) const ROOTSERVER_STACK_PAGES: u64 = 16;
 /// The external NT executive root task has deep loader, service-dispatch, hosted-driver and
-/// user-callback chains. Keep its guarded root-task stack large enough that regular ReactOS process
-/// bring-up does not depend on optimizer spill placement.
+/// user-callback chains. A pinned LiberNT keyboard START boot reached the guard below the former
+/// 128-page stack, after earlier nested work had already used roughly 477 KiB. Preserve both
+/// guard pages and provide room for the bounded nested dispatcher frames.
 #[cfg(feature = "extern-rootserver")]
-pub(crate) const ROOTSERVER_STACK_PAGES: u64 = 128;
+pub(crate) const ROOTSERVER_STACK_PAGES: u64 = 256;
 /// IPC buffer, BootInfo page, and its extension page are mapped after the stack.
 pub(crate) const ROOTSERVER_AUX_PAGES: u64 = 3;
 
