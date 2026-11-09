@@ -132,9 +132,10 @@ fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
         Some((read_word(24), read_word(88), read_word(216), read_word(248),
             read_word(296), read_word(0x4cf8), read_word(0x4d60),
             read_word(0x4d78), read_word(0x9638), read_word(0xdc08),
-            read_word(0xf698), read_word(0xfa88), read_word(0xfaf8)))
+            read_word(0xf698), read_word(0xfa88), read_word(0xfaf8),
+            read_word(0xfb18)))
     })();
-    crate::arch::log("[hook-user-stack] rsp/record-return/line-return/redrive-return/parent-return/file-runner-return/receive-return/seh-parent/ordinary-parent/loop-parent/autonomous-parent/continue-parent/enter-parent/inner-parent=");
+    crate::arch::log("[hook-user-stack] rsp/record-return/line-return/redrive-return/parent-return/file-runner-return/receive-return/seh-parent/ordinary-parent/loop-parent/autonomous-parent/continue-parent/enter-parent/inner-parent/pump-parent=");
     hook_debug_number(rsp);
     crate::arch::log("/");
     hook_debug_number(values.and_then(|pair| pair.0).unwrap_or(u64::MAX));
@@ -162,6 +163,8 @@ fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
     hook_debug_number(values.and_then(|pair| pair.11).unwrap_or(u64::MAX));
     crate::arch::log("/");
     hook_debug_number(values.and_then(|pair| pair.12).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.13).unwrap_or(u64::MAX));
     crate::arch::log("\n");
 }
 
