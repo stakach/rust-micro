@@ -31,6 +31,51 @@ use crate::arch::x86_64::msr::*;
 /// anyway).
 struct BklGuard;
 
+// Temporary, exact-record boot diagnostic. Remove after the Hook return is explained.
+const HOOK_REDRIVE_EXIT_RECORD: &[u8] =
+    b"[hook-redrive] stage/index/owner/entered/published/key/unowned=7/";
+
+fn hook_debug_number(mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 { break; }
+    }
+    if let Ok(number) = core::str::from_utf8(&digits[start..]) {
+        crate::arch::log(number);
+    }
+}
+
+fn trace_hook_debug_return(stage: &'static str, invoker: Option<crate::tcb::TcbId>) {
+    use crate::kernel::KERNEL;
+    let s = unsafe { KERNEL.get() };
+    crate::arch::log("[hook-debug-return] ");
+    crate::arch::log(stage);
+    crate::arch::log(" invoker=");
+    hook_debug_number(invoker.map_or(u64::MAX, |id| u64::from(id.0)));
+    crate::arch::log(" current=");
+    hook_debug_number(s.scheduler.current().map_or(u64::MAX, |id| u64::from(id.0)));
+    if let Some(id) = invoker.and_then(|id| s.scheduler.slab.try_get(id).map(|_| id)) {
+        let tcb = s.scheduler.slab.get(id);
+        crate::arch::log(" hold/sc/active/donated/state/sched=");
+        hook_debug_number(tcb.execution_hold);
+        crate::arch::log("/");
+        hook_debug_number(tcb.sc.map_or(u64::MAX, u64::from));
+        crate::arch::log("/");
+        hook_debug_number(tcb.active_sc.map_or(u64::MAX, u64::from));
+        crate::arch::log("/");
+        hook_debug_number(tcb.donated_sc.map_or(u64::MAX, u64::from));
+        crate::arch::log("/");
+        hook_debug_number(tcb.state as u64);
+        crate::arch::log("/");
+        hook_debug_number(u64::from(tcb.is_schedulable()));
+    }
+    crate::arch::log("\n");
+}
+
 impl Drop for BklGuard {
     fn drop(&mut self) {
         crate::smp::bkl_release();
@@ -782,7 +827,10 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // we look it up by APIC ID here.
     let ctx: &mut UserContext = current_cpu_user_ctx_mut();
 
-    struct SerialSink;
+    struct SerialSink {
+        invoker: Option<crate::tcb::TcbId>,
+        hook_redrive_exit: bool,
+    }
     impl DebugSink for SerialSink {
         fn put_byte(&mut self, b: u8) {
             // Tiny wrapper: arch::log takes a &str; we route through
@@ -790,6 +838,14 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             let buf = [b];
             if let Ok(s) = core::str::from_utf8(&buf) {
                 arch::log(s);
+            }
+        }
+
+        fn put_record(&mut self, bytes: &[u8]) {
+            for &byte in bytes { self.put_byte(byte); }
+            if bytes.starts_with(HOOK_REDRIVE_EXIT_RECORD) {
+                self.hook_redrive_exit = true;
+                trace_hook_debug_return("emitted", self.invoker);
             }
         }
     }
@@ -949,7 +1005,10 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13)
         && args.a1 != (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12;
     let transparent_debug_return = syscall_debug_return_is_transparent(syscall);
-    let mut sink = SerialSink;
+    let mut sink = SerialSink {
+        invoker: entry_invoker,
+        hook_redrive_exit: false,
+    };
     let result = if matches!(syscall, Syscall::SysDebugWrite) {
         crate::syscall_handler::handle_debug_write(&args, entry_invoker, &mut sink)
     } else {
@@ -1052,10 +1111,16 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         }
     }
 
+    if sink.hook_redrive_exit {
+        trace_hook_debug_return("decision", entry_invoker);
+    }
     if transparent_debug_return && !entry_invoker.is_some_and(|id| unsafe {
         KERNEL.get().scheduler.slab.get(id).execution_held()
     }) {
         if let Some(invoker) = entry_invoker {
+            if sink.hook_redrive_exit {
+                trace_hook_debug_return("direct", entry_invoker);
+            }
             unsafe {
                 let s = KERNEL.get();
                 let cpu = arch::get_cpu_id() as usize;
@@ -1089,6 +1154,10 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             }
             return;
         }
+    }
+
+    if sink.hook_redrive_exit {
+        trace_hook_debug_return("scheduler", entry_invoker);
     }
 
     // If the current thread blocked on a Send/Recv, scheduler.current
