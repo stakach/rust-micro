@@ -123,14 +123,18 @@ fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
                 core::ptr::read_unaligned(crate::arch::phys_to_virt(physical) as *const u64)
             })
         };
-        Some((read_word(24), read_word(88)))
+        // The third slot is the return address of the redrive frame. It identifies
+        // whether the main service loop or a nested child runner made this call.
+        Some((read_word(24), read_word(88), read_word(216)))
     })();
-    crate::arch::log("[hook-user-stack] rsp/record-return/line-return=");
+    crate::arch::log("[hook-user-stack] rsp/record-return/line-return/redrive-return=");
     hook_debug_number(rsp);
     crate::arch::log("/");
     hook_debug_number(values.and_then(|pair| pair.0).unwrap_or(u64::MAX));
     crate::arch::log("/");
     hook_debug_number(values.and_then(|pair| pair.1).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.2).unwrap_or(u64::MAX));
     crate::arch::log("\n");
 }
 
