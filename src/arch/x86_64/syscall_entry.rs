@@ -34,6 +34,7 @@ struct BklGuard;
 // Temporary, exact-record boot diagnostic. Remove after the Hook return is explained.
 const HOOK_REDRIVE_EXIT_RECORD: &[u8] =
     b"[hook-redrive] stage/index/owner/entered/published/key/unowned=7/";
+const HOOK_USER_RETURN_RECORD: &[u8] = b"[hook-user-return] print-record resumed";
 static HOOK_DEBUG_TAIL_PROBE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static HOOK_DEBUG_TIMER_PROBE: core::sync::atomic::AtomicBool =
@@ -96,11 +97,11 @@ fn trace_hook_debug_return(stage: &'static str, invoker: Option<crate::tcb::TcbI
     crate::arch::log("\n");
 }
 
-pub(crate) fn trace_hook_first_timer(from_user: bool, interrupted: Option<crate::tcb::TcbId>) {
+pub(crate) fn trace_hook_first_timer(from_user: bool, interrupted: Option<crate::tcb::TcbId>) -> bool {
     if crate::arch::get_cpu_id() != 0
         || !HOOK_DEBUG_TIMER_PROBE.swap(false, core::sync::atomic::Ordering::Relaxed)
     {
-        return;
+        return false;
     }
     crate::arch::log("[hook-debug-return] first-timer from-user/interrupted=");
     hook_debug_number(u64::from(from_user));
@@ -108,6 +109,11 @@ pub(crate) fn trace_hook_first_timer(from_user: bool, interrupted: Option<crate:
     hook_debug_number(interrupted.map_or(u64::MAX, |id| u64::from(id.0)));
     crate::arch::log("\n");
     trace_hook_debug_return("first-timer", Some(crate::tcb::TcbId(1)));
+    true
+}
+
+pub(crate) fn trace_hook_timer_post_tick() {
+    trace_hook_debug_return("timer-post-tick", Some(crate::tcb::TcbId(1)));
 }
 
 impl Drop for BklGuard {
@@ -879,7 +885,9 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
 
         fn put_record(&mut self, bytes: &[u8]) {
             for &byte in bytes { self.put_byte(byte); }
-            if bytes.starts_with(HOOK_REDRIVE_EXIT_RECORD) {
+            if bytes.starts_with(HOOK_REDRIVE_EXIT_RECORD)
+                || bytes.starts_with(HOOK_USER_RETURN_RECORD)
+            {
                 self.hook_redrive_exit = true;
                 trace_hook_debug_return("emitted", self.invoker);
             }

@@ -535,7 +535,7 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
             scheduler.current()
         }
     };
-    super::syscall_entry::trace_hook_first_timer(from_user, interrupted);
+    let trace_hook_timer = super::syscall_entry::trace_hook_first_timer(from_user, interrupted);
 
     if charge_ms > 0 {
         unsafe {
@@ -544,6 +544,9 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
     }
     if wall_ms > 0 || charge_ms > 0 {
         crate::sched_context::mcs_tick(charge_ms);
+    }
+    if trace_hook_timer {
+        super::syscall_entry::trace_hook_timer_post_tick();
     }
 
     eoi();
