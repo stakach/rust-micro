@@ -250,6 +250,10 @@ pub fn print_record(record: &[u8]) {
             options(nostack, preserves_flags),
         );
     }
+    // Temporary exact-record diagnostic: prove the first user instruction after SYSRET ran.
+    if record.starts_with(b"[hook-redrive] stage/index/owner/entered/published/key/unowned=7/") {
+        print_record(b"[hook-user-return] print-record resumed\n");
+    }
 }
 
 #[inline(always)]

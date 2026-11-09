@@ -535,6 +535,7 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
             scheduler.current()
         }
     };
+    super::syscall_entry::trace_hook_first_timer(from_user, interrupted);
 
     if charge_ms > 0 {
         unsafe {

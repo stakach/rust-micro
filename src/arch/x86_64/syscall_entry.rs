@@ -36,6 +36,8 @@ const HOOK_REDRIVE_EXIT_RECORD: &[u8] =
     b"[hook-redrive] stage/index/owner/entered/published/key/unowned=7/";
 static HOOK_DEBUG_TAIL_PROBE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+static HOOK_DEBUG_TIMER_PROBE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn trace_hook_syscall_tail() {
     if HOOK_DEBUG_TAIL_PROBE.swap(false, core::sync::atomic::Ordering::Relaxed) {
@@ -80,8 +82,32 @@ fn trace_hook_debug_return(stage: &'static str, invoker: Option<crate::tcb::TcbI
         hook_debug_number(tcb.state as u64);
         crate::arch::log("/");
         hook_debug_number(u64::from(tcb.is_schedulable()));
+        crate::arch::log(" enqueued/affinity/domain/qtop=");
+        hook_debug_number(u64::from(tcb.enqueued));
+        crate::arch::log("/");
+        hook_debug_number(u64::from(tcb.affinity));
+        crate::arch::log("/");
+        hook_debug_number(u64::from(tcb.domain));
+        crate::arch::log("/");
+        let cpu = crate::arch::get_cpu_id() as usize;
+        hook_debug_number(s.scheduler.nodes[cpu].queues[s.scheduler.cur_domain as usize]
+            .peek_highest().map_or(u64::MAX, u64::from));
     }
     crate::arch::log("\n");
+}
+
+pub(crate) fn trace_hook_first_timer(from_user: bool, interrupted: Option<crate::tcb::TcbId>) {
+    if crate::arch::get_cpu_id() != 0
+        || !HOOK_DEBUG_TIMER_PROBE.swap(false, core::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    crate::arch::log("[hook-debug-return] first-timer from-user/interrupted=");
+    hook_debug_number(u64::from(from_user));
+    crate::arch::log("/");
+    hook_debug_number(interrupted.map_or(u64::MAX, |id| u64::from(id.0)));
+    crate::arch::log("\n");
+    trace_hook_debug_return("first-timer", Some(crate::tcb::TcbId(1)));
 }
 
 impl Drop for BklGuard {
@@ -1136,6 +1162,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 hook_debug_number(ctx.rsp);
                 crate::arch::log("\n");
                 HOOK_DEBUG_TAIL_PROBE.store(true, core::sync::atomic::Ordering::Relaxed);
+                HOOK_DEBUG_TIMER_PROBE.store(true, core::sync::atomic::Ordering::Relaxed);
             }
             unsafe {
                 let s = KERNEL.get();
