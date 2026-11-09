@@ -34,6 +34,14 @@ struct BklGuard;
 // Temporary, exact-record boot diagnostic. Remove after the Hook return is explained.
 const HOOK_REDRIVE_EXIT_RECORD: &[u8] =
     b"[hook-redrive] stage/index/owner/entered/published/key/unowned=7/";
+static HOOK_DEBUG_TAIL_PROBE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn trace_hook_syscall_tail() {
+    if HOOK_DEBUG_TAIL_PROBE.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        crate::arch::log("[hook-debug-return] after-dispatch\n");
+    }
+}
 
 fn hook_debug_number(mut value: u64) {
     let mut digits = [0u8; 20];
@@ -756,6 +764,7 @@ pub unsafe extern "C" fn syscall_entry() {
         "mov rdi, gs:[16 + 24]",
         "mov rsi, 1",
         "call {handler}",
+        "call {tail_probe}",
 
         // Restore user GPRs (rcx and r11 carry the SYSRET targets).
         "mov rax, gs:[16 + 0]",
@@ -786,6 +795,7 @@ pub unsafe extern "C" fn syscall_entry() {
         "swapgs",
         "sysretq",
         handler = sym rust_syscall_dispatch,
+        tail_probe = sym trace_hook_syscall_tail,
     );
 }
 
@@ -1120,6 +1130,12 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         if let Some(invoker) = entry_invoker {
             if sink.hook_redrive_exit {
                 trace_hook_debug_return("direct", entry_invoker);
+                crate::arch::log("[hook-debug-return] sysret-rip/rsp=");
+                hook_debug_number(ctx.rcx);
+                crate::arch::log("/");
+                hook_debug_number(ctx.rsp);
+                crate::arch::log("\n");
+                HOOK_DEBUG_TAIL_PROBE.store(true, core::sync::atomic::Ordering::Relaxed);
             }
             unsafe {
                 let s = KERNEL.get();
