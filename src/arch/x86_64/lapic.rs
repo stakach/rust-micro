@@ -535,7 +535,9 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
             scheduler.current()
         }
     };
-    let trace_hook_timer = super::syscall_entry::trace_hook_first_timer(from_user, interrupted);
+    let trace_hook_timer = super::syscall_entry::trace_hook_timer(
+        from_user, interrupted, ctx.rip, ctx.rsp,
+    );
 
     if charge_ms > 0 {
         unsafe {
@@ -556,6 +558,9 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
         unsafe { super::interrupts::dispatch_adopted_irq(); }
     }
     super::interrupts::swap_iretq_context_if_preempted(ctx, from_user, interrupted);
+    if trace_hook_timer {
+        super::syscall_entry::trace_hook_timer_selected(ctx.rip, ctx.rsp);
+    }
 }
 
 // ---------------------------------------------------------------------------

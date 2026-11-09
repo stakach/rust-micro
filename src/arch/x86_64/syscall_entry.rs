@@ -37,8 +37,8 @@ const HOOK_REDRIVE_EXIT_RECORD: &[u8] =
 const HOOK_USER_RETURN_RECORD: &[u8] = b"[hook-user-return] print-record resumed";
 static HOOK_DEBUG_TAIL_PROBE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static HOOK_DEBUG_TIMER_PROBE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static HOOK_DEBUG_TIMER_PROBE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 extern "C" fn trace_hook_syscall_tail() {
     if HOOK_DEBUG_TAIL_PROBE.swap(false, core::sync::atomic::Ordering::Relaxed) {
@@ -97,23 +97,41 @@ fn trace_hook_debug_return(stage: &'static str, invoker: Option<crate::tcb::TcbI
     crate::arch::log("\n");
 }
 
-pub(crate) fn trace_hook_first_timer(from_user: bool, interrupted: Option<crate::tcb::TcbId>) -> bool {
-    if crate::arch::get_cpu_id() != 0
-        || !HOOK_DEBUG_TIMER_PROBE.swap(false, core::sync::atomic::Ordering::Relaxed)
-    {
+pub(crate) fn trace_hook_timer(
+    from_user: bool, interrupted: Option<crate::tcb::TcbId>, rip: u64, rsp: u64,
+) -> bool {
+    if crate::arch::get_cpu_id() != 0 {
         return false;
     }
-    crate::arch::log("[hook-debug-return] first-timer from-user/interrupted=");
+    let remaining = HOOK_DEBUG_TIMER_PROBE.load(core::sync::atomic::Ordering::Relaxed);
+    if remaining == 0 { return false; }
+    HOOK_DEBUG_TIMER_PROBE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    crate::arch::log("[hook-debug-return] timer remaining/from-user/interrupted/rip/rsp=");
+    hook_debug_number(remaining);
+    crate::arch::log("/");
     hook_debug_number(u64::from(from_user));
     crate::arch::log("/");
     hook_debug_number(interrupted.map_or(u64::MAX, |id| u64::from(id.0)));
+    crate::arch::log("/");
+    hook_debug_number(rip);
+    crate::arch::log("/");
+    hook_debug_number(rsp);
     crate::arch::log("\n");
-    trace_hook_debug_return("first-timer", Some(crate::tcb::TcbId(1)));
+    trace_hook_debug_return("timer-before", Some(crate::tcb::TcbId(1)));
     true
 }
 
 pub(crate) fn trace_hook_timer_post_tick() {
     trace_hook_debug_return("timer-post-tick", Some(crate::tcb::TcbId(1)));
+}
+
+pub(crate) fn trace_hook_timer_selected(rip: u64, rsp: u64) {
+    crate::arch::log("[hook-debug-return] timer-selected rip/rsp=");
+    hook_debug_number(rip);
+    crate::arch::log("/");
+    hook_debug_number(rsp);
+    crate::arch::log("\n");
+    trace_hook_debug_return("timer-selected", Some(crate::tcb::TcbId(1)));
 }
 
 impl Drop for BklGuard {
@@ -1170,7 +1188,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 hook_debug_number(ctx.rsp);
                 crate::arch::log("\n");
                 HOOK_DEBUG_TAIL_PROBE.store(true, core::sync::atomic::Ordering::Relaxed);
-                HOOK_DEBUG_TIMER_PROBE.store(true, core::sync::atomic::Ordering::Relaxed);
+                HOOK_DEBUG_TIMER_PROBE.store(4, core::sync::atomic::Ordering::Relaxed);
             }
             unsafe {
                 let s = KERNEL.get();
