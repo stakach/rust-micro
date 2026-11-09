@@ -123,12 +123,12 @@ fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
                 core::ptr::read_unaligned(crate::arch::phys_to_virt(physical) as *const u64)
             })
         };
-        // The last slots identify both the redrive caller and its parent. The
-        // nested input runner in this exact image pushes three registers, so
-        // its caller return follows the redrive return by 32 bytes.
-        Some((read_word(24), read_word(88), read_word(216), read_word(248)))
+        // This exact image's nested input runner pushes three registers and
+        // its enclosing File runner pushes five words. Their caller returns
+        // follow the redrive return at offsets 248 and 296 respectively.
+        Some((read_word(24), read_word(88), read_word(216), read_word(248), read_word(296)))
     })();
-    crate::arch::log("[hook-user-stack] rsp/record-return/line-return/redrive-return/parent-return=");
+    crate::arch::log("[hook-user-stack] rsp/record-return/line-return/redrive-return/parent-return/file-runner-return=");
     hook_debug_number(rsp);
     crate::arch::log("/");
     hook_debug_number(values.and_then(|pair| pair.0).unwrap_or(u64::MAX));
@@ -138,6 +138,8 @@ fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
     hook_debug_number(values.and_then(|pair| pair.2).unwrap_or(u64::MAX));
     crate::arch::log("/");
     hook_debug_number(values.and_then(|pair| pair.3).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.4).unwrap_or(u64::MAX));
     crate::arch::log("\n");
 }
 
