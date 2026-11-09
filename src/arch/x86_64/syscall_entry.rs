@@ -127,13 +127,14 @@ fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
         // its enclosing File runner pushes five words. Their caller returns
         // follow the redrive return at offsets 248 and 296 respectively.
         // The shared receiver's exact image frame allocates 0x4b98 bytes
-        // after six pushes. These slots identify its direct caller and the
-        // next caller for either ordinary or retained-SEH receive.
+        // after six pushes. The later slots unwind its ordinary pump loop and
+        // the three possible callers of that loop in this exact artifact.
         Some((read_word(24), read_word(88), read_word(216), read_word(248),
             read_word(296), read_word(0x4cf8), read_word(0x4d60),
-            read_word(0x4d78)))
+            read_word(0x4d78), read_word(0x9638), read_word(0xdc08),
+            read_word(0xf698), read_word(0xfa88)))
     })();
-    crate::arch::log("[hook-user-stack] rsp/record-return/line-return/redrive-return/parent-return/file-runner-return/receive-return/seh-parent/ordinary-parent=");
+    crate::arch::log("[hook-user-stack] rsp/record-return/line-return/redrive-return/parent-return/file-runner-return/receive-return/seh-parent/ordinary-parent/loop-parent/autonomous-parent/continue-parent/enter-parent=");
     hook_debug_number(rsp);
     crate::arch::log("/");
     hook_debug_number(values.and_then(|pair| pair.0).unwrap_or(u64::MAX));
@@ -151,6 +152,14 @@ fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
     hook_debug_number(values.and_then(|pair| pair.6).unwrap_or(u64::MAX));
     crate::arch::log("/");
     hook_debug_number(values.and_then(|pair| pair.7).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.8).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.9).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.10).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.11).unwrap_or(u64::MAX));
     crate::arch::log("\n");
 }
 
