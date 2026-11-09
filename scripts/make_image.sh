@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 missing=()
-for tool in cc cmp curl cp dd find mkdir mv patch python3 rm tar wc; do
+for tool in cc cmp cp dd find mkdir mv patch python3 rm tar wc; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -24,8 +24,7 @@ INITRD_STAGE=.tmp/initrd
 ESP_STAGE=.tmp/simpleboot-esp
 SIMPLEBOOT_SRC_DIR=.tmp/simpleboot-src
 SIMPLEBOOT_BIN=.tmp/simpleboot
-SIMPLEBOOT_REF="${SIMPLEBOOT_REF:-f5fa29fe6613dc20b3729e769c68f9435daa15d1}"
-SIMPLEBOOT_RAW_BASE="${SIMPLEBOOT_RAW_BASE:-https://gitlab.com/bztsrc/simpleboot/-/raw/${SIMPLEBOOT_REF}/src}"
+SIMPLEBOOT_VENDOR_DIR=vendor/simpleboot
 IMAGE_PROFILE_MARKER=.tmp/image-profile
 SEH_LINKAGE=.tmp/nt-seh-linkage.dll
 
@@ -110,28 +109,39 @@ ensure_simpleboot() {
     exit 1
   fi
 
-  mkdir -p "$SIMPLEBOOT_SRC_DIR"
+  if ! python3 - "$SIMPLEBOOT_VENDOR_DIR" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+directory = pathlib.Path(sys.argv[1])
+for line in (directory / "checksums.sha256").read_text().splitlines():
+    expected, filename = line.split(maxsplit=1)
+    source = directory / filename
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+        raise SystemExit(f"error: pinned Simpleboot source failed SHA-256: {source}")
+PY
+  then
+    echo "error: verified pinned Simpleboot source is required at $SIMPLEBOOT_VENDOR_DIR" >&2
+    return 1
+  fi
+  mkdir -p "$SIMPLEBOOT_SRC_DIR" || return 1
   for file in simpleboot.c loader.h data.h; do
-    if [ ! -f "$SIMPLEBOOT_SRC_DIR/$file" ]; then
-      echo "downloading Simpleboot $file..." >&2
-      curl -fL -o "$SIMPLEBOOT_SRC_DIR/$file" "$SIMPLEBOOT_RAW_BASE/$file"
-    fi
+    cp "$SIMPLEBOOT_VENDOR_DIR/$file" "$SIMPLEBOOT_SRC_DIR/$file" || return 1
   done
 
   # Simpleboot's upstream FAT allocator rescans from cluster 3 for every
   # 512-byte block. The pinned LiberNT tree includes large DLLs, so apply our
   # checked source patch before building the host image creator.
-  if ! grep -q 'LIBERNT_FAST_FAT_ALLOC' "$SIMPLEBOOT_SRC_DIR/simpleboot.c"; then
-    patch -d "$SIMPLEBOOT_SRC_DIR" -p0 < scripts/patches/simpleboot-fat-allocation.patch >&2
-  fi
+  patch -d "$SIMPLEBOOT_SRC_DIR" -p0 < scripts/patches/simpleboot-fat-allocation.patch >&2 || return 1
 
-  if [ ! -x "$SIMPLEBOOT_BIN" ] || [ "$SIMPLEBOOT_BIN" -ot "$SIMPLEBOOT_SRC_DIR/simpleboot.c" ]; then
-    echo "building Simpleboot image creator..." >&2
-    (
-      cd "$SIMPLEBOOT_SRC_DIR"
-      cc -O2 -ansi -Wall -Wextra simpleboot.c -o ../simpleboot
-    )
-  fi
+  echo "building Simpleboot image creator from verified source..." >&2
+  (
+    cd "$SIMPLEBOOT_SRC_DIR"
+    cc -O2 -ansi -Wall -Wextra simpleboot.c -o ../simpleboot.stage.$$
+  ) || return 1
+  mv -f "${SIMPLEBOOT_BIN}.stage.$$" "$SIMPLEBOOT_BIN" || return 1
+  [ -x "$SIMPLEBOOT_BIN" ] || return 1
   printf '%s\n' "$SIMPLEBOOT_BIN"
 }
 
@@ -313,7 +323,7 @@ cmp .tmp/libernt/tree/Windows/system32/drivers/acpi.sys \
   "$ESP_STAGE/Windows/system32/drivers/acpi.sys"
 cmp "$OUR_NTDLL" "$ESP_STAGE/Windows/system32/ntdll.dll"
 
-SIMPLEBOOT_TOOL="$(ensure_simpleboot)"
+SIMPLEBOOT_TOOL="$(ensure_simpleboot)" || exit 1
 rm -f "$IMAGE"
 "$SIMPLEBOOT_TOOL" -c -vv -s "$IMAGE_MIB" -b "$BOOT_PARTITION_MIB" "$ESP_STAGE" "$IMAGE"
 
