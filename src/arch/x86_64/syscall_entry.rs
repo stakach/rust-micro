@@ -102,28 +102,35 @@ fn trace_hook_debug_return(stage: &'static str, invoker: Option<crate::tcb::TcbI
 }
 
 fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
-    let value = (|| {
-        let address = rsp.checked_add(24)?;
+    let values = (|| {
         let s = unsafe { crate::kernel::KERNEL.get() };
         let tcb = s.scheduler.slab.try_get(invoker)?;
         let root = match tcb.vspace_root() {
             crate::cap::Cap::PML4 { ptr, .. } => ptr.addr(),
             _ => return None,
         };
-        let read_entry = |table: u64, index: usize| unsafe {
-            Some(core::ptr::read_volatile(
-                (crate::arch::phys_to_virt(table) as *const u64).add(index),
-            ))
+        let read_word = |offset: u64| {
+            let address = rsp.checked_add(offset)?;
+            let read_entry = |table: u64, index: usize| unsafe {
+                Some(core::ptr::read_volatile(
+                    (crate::arch::phys_to_virt(table) as *const u64).add(index),
+                ))
+            };
+            let (physical, available) =
+                crate::debug_record::translate_x86_user(root, address, read_entry)?;
+            if available < core::mem::size_of::<u64>() as u64 { return None; }
+            Some(unsafe {
+                core::ptr::read_unaligned(crate::arch::phys_to_virt(physical) as *const u64)
+            })
         };
-        let (physical, available) =
-            crate::debug_record::translate_x86_user(root, address, read_entry)?;
-        if available < core::mem::size_of::<u64>() as u64 { return None; }
-        Some(unsafe { core::ptr::read_unaligned(crate::arch::phys_to_virt(physical) as *const u64) })
+        Some((read_word(24), read_word(88)))
     })();
-    crate::arch::log("[hook-user-stack] rsp/return=");
+    crate::arch::log("[hook-user-stack] rsp/record-return/line-return=");
     hook_debug_number(rsp);
     crate::arch::log("/");
-    hook_debug_number(value.unwrap_or(u64::MAX));
+    hook_debug_number(values.and_then(|pair| pair.0).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.1).unwrap_or(u64::MAX));
     crate::arch::log("\n");
 }
 
