@@ -796,6 +796,8 @@ extern "C" fn handle_general_protection_fault_typed(
                 let ptr = t.user_context.rcx;
                 let len = (t.user_context.rdx as usize).min(240);
                 if ptr != 0 {
+                    let started = super::debug_output_cost::start();
+                    let mut message_bytes = 0usize;
                     crate::arch::log("[dbg] ");
                     for i in 0..len {
                         let c = core::ptr::read_volatile((ptr as *const u8).add(i));
@@ -809,9 +811,15 @@ extern "C" fn handle_general_protection_fault_typed(
                         }];
                         if let Ok(sst) = core::str::from_utf8(&ch) {
                             crate::arch::log(sst);
+                            message_bytes += 1;
                         }
                     }
                     crate::arch::log("\n");
+                    super::debug_output_cost::finish(
+                        super::debug_output_cost::Channel::DebugService,
+                        started,
+                        message_bytes + b"[dbg] \n".len(),
+                    );
                 }
             }
             if service == 2 {

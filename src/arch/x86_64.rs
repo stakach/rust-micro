@@ -7,6 +7,7 @@ pub mod acpi;
 pub mod context;
 pub mod cpu;
 pub mod debug;
+mod debug_output_cost;
 pub mod exceptions;
 pub mod fpu_ctx;
 pub mod gdt;

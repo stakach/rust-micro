@@ -979,7 +979,13 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         }
 
         fn put_record(&mut self, bytes: &[u8]) {
+            let started = super::debug_output_cost::start();
             for &byte in bytes { self.put_byte(byte); }
+            super::debug_output_cost::finish(
+                super::debug_output_cost::Channel::Record,
+                started,
+                bytes.len(),
+            );
             if bytes.starts_with(HOOK_REDRIVE_EXIT_RECORD)
                 || bytes.starts_with(HOOK_USER_RETURN_RECORD)
             {
