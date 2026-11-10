@@ -5423,9 +5423,12 @@ unsafe fn release_parent_edge(s: &mut KernelState, parent_id: Option<crate::cte:
 // ---------------------------------------------------------------------------
 
 include!("invocation/tcb_cap_ownership.rs");
+#[path = "invocation/tcb_debug_reply_observation.rs"]
+mod tcb_debug_reply_observation;
 
-const TCB_DEBUG_STATE_WORDS: usize = 29;
+const TCB_DEBUG_STATE_WORDS: usize = 34;
 const TCB_DEBUG_NONE: Word = Word::MAX;
+const TCB_DEBUG_AMBIGUOUS: Word = tcb_debug_reply_observation::AMBIGUOUS;
 
 #[inline]
 fn debug_opt_tcb(v: Option<TcbId>) -> Word {
@@ -5435,6 +5438,51 @@ fn debug_opt_tcb(v: Option<TcbId>) -> Word {
 #[inline]
 fn debug_opt_u16(v: Option<u16>) -> Word {
     v.map(|id| id as Word).unwrap_or(TCB_DEBUG_NONE)
+}
+
+#[inline]
+fn debug_cspace_index(t: &crate::tcb::Tcb) -> Word {
+    match t.cspace_root() {
+        Cap::CNode { ptr, .. } => KernelState::cnode_index(ptr) as Word,
+        _ => TCB_DEBUG_NONE,
+    }
+}
+
+/// Raw Call Reply identity plus a receiver only when both sides still name this Call.
+/// Inconsistent state is diagnostic data, never a reason to panic in debug inspection.
+fn debug_call_reply(s: &KernelState, id: TcbId) -> [Word; 5] {
+    use crate::reply::ReplyNode;
+    let t = s.scheduler.slab.get(id);
+    let Some(node) = t.call_reply else {
+        return [0, TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE];
+    };
+    let (kind, index, bound) = match node {
+        ReplyNode::Object(index) => (
+            1,
+            index as Word,
+            s.replies.get(index as usize),
+        ),
+        ReplyNode::Legacy(caller) => (
+            2,
+            caller.0 as Word,
+            s.scheduler.slab.try_get(caller).map(|t| &t.legacy_reply),
+        ),
+    };
+    let reciprocal = t.state == crate::tcb::ThreadStateType::BlockedOnReply
+        && !matches!(node, ReplyNode::Legacy(caller) if caller != id)
+        && bound.is_some_and(|reply| reply.bound_tcb == Some(id) && reply.offered_tcb.is_none());
+    let receivers = s.scheduler.slab.entries.iter().enumerate().filter_map(|(index, slot)| {
+        let receiver = slot.as_ref()?;
+        (receiver.reply_to == Some(id)).then(|| {
+            tcb_debug_reply_observation::ReceiverObservation {
+                tcb: index as Word,
+                cspace: debug_cspace_index(receiver),
+                state: receiver.state as Word,
+            }
+        })
+    });
+    let receiver = tcb_debug_reply_observation::select_exact_receiver(reciprocal, receivers);
+    [kind, index, receiver.tcb, receiver.cspace, receiver.state]
 }
 
 #[inline]
@@ -5635,10 +5683,7 @@ fn decode_tcb(
                     TCB_DEBUG_NONE
                 };
                 let t = s.scheduler.slab.get(id);
-                let cspace_idx = match t.cspace_root() {
-                    Cap::CNode { ptr, .. } => KernelState::cnode_index(ptr) as Word,
-                    _ => TCB_DEBUG_NONE,
-                };
+                let cspace_idx = debug_cspace_index(t);
                 let fault_slot = debug_tcb_fault_slot(s, cspace_idx);
                 let queue_top_priority = s.scheduler.nodes[t.affinity as usize].queues
                     [t.domain as usize]
@@ -5647,6 +5692,9 @@ fn decode_tcb(
                     .unwrap_or(TCB_DEBUG_NONE);
                 let direct_handoff =
                     debug_opt_tcb(s.scheduler.nodes[t.affinity as usize].direct_handoff);
+                let call_reply = debug_call_reply(s, id);
+                // Keep the original 29 words stable. Appended words 29..34 are the
+                // Call Reply kind/index and reciprocal receiver TCB/CSpace/state.
                 let words: [Word; TCB_DEBUG_STATE_WORDS] = [
                     t.state as Word,
                     t.is_schedulable() as Word,
@@ -5677,6 +5725,11 @@ fn decode_tcb(
                     s.scheduler.cur_domain as Word,
                     queue_top_priority,
                     direct_handoff,
+                    call_reply[0],
+                    call_reply[1],
+                    call_reply[2],
+                    call_reply[3],
+                    call_reply[4],
                 ];
                 let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_receive_paddr();
                 let inv = s.scheduler.slab.get_mut(invoker);
@@ -8649,10 +8702,49 @@ pub mod spec {
             assert_eq!(inv.msg_regs[16], target.0 as u64);
             assert_eq!(inv.msg_regs[17], TCB_DEBUG_NONE);
             assert_eq!(inv.msg_regs[18], 0);
+            assert_eq!(inv.msg_regs[29], 1); // object-backed Call Reply
+            assert_eq!(inv.msg_regs[30], reply_idx as u64);
+            assert_eq!(inv.msg_regs[31], invoker.0 as u64); // reciprocal receiver
+            assert_eq!(inv.msg_regs[32], 0); // receiver CSpace
+            assert_eq!(inv.msg_regs[33], crate::tcb::ThreadStateType::Running as u64);
             for index in 4..TCB_DEBUG_STATE_WORDS {
                 assert_eq!((core::ptr::addr_of!(BUFFER) as *const u64).add(index + 1).read_volatile(),
                     inv.msg_regs[index]);
             }
+            // A stale receiver link or Reply binding must be reported as unknown, not guessed.
+            s.scheduler.slab.get_mut(invoker).reply_to = None;
+            decode_invocation(target_cap, &args, invoker).expect("debug missing receiver");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[1, reply_idx as u64,
+                TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE]);
+            s.scheduler.slab.get_mut(invoker).reply_to = Some(target);
+            let bound = s.replies[reply_idx];
+            s.replies[reply_idx].bound_tcb = None;
+            decode_invocation(target_cap, &args, invoker).expect("debug stale Reply");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[1, reply_idx as u64,
+                TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE]);
+            s.replies[reply_idx] = bound;
+            let mut duplicate = crate::tcb::Tcb::default();
+            duplicate.reply_to = Some(target);
+            let duplicate = s.scheduler.admit(duplicate);
+            decode_invocation(target_cap, &args, invoker).expect("debug ambiguous receiver");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[1, reply_idx as u64,
+                TCB_DEBUG_AMBIGUOUS, TCB_DEBUG_AMBIGUOUS, TCB_DEBUG_AMBIGUOUS]);
+            s.scheduler.slab.get_mut(duplicate).reply_to = None;
+            teardown_thread_in(s, duplicate);
+            crate::reply::unlink(s, crate::reply::ReplyNode::Object(reply_idx as u16));
+            crate::reply::bind_call(s, target, invoker, None);
+            decode_invocation(target_cap, &args, invoker).expect("debug legacy Call");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[2, target.0 as u64,
+                invoker.0 as u64, 0, crate::tcb::ThreadStateType::Running as u64]);
+            crate::reply::unlink(s, crate::reply::ReplyNode::Legacy(target));
+            decode_invocation(target_cap, &args, invoker).expect("debug unbound Call");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[0, TCB_DEBUG_NONE,
+                TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE]);
             crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(0, 2)).unwrap();
             s.replies[reply_idx] = crate::reply::Reply::new();
             teardown_thread_in(s, target);
