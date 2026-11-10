@@ -1513,6 +1513,8 @@ pub unsafe fn launch_rootserver() -> ! {
         log_rootserver_hex(s.scheduler.slab.get(id).cpu_context.fs_base);
         crate::arch::log(" gs-shadow=0x");
         log_rootserver_hex(s.scheduler.slab.get(id).cpu_context.gs_base);
+        crate::arch::log(" pml4=0x");
+        log_rootserver_hex(img.pml4_paddr);
         crate::arch::log("\n");
     }
     #[cfg(target_arch = "aarch64")]
