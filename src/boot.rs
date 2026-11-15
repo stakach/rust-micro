@@ -560,9 +560,10 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 
     // Phase 42 — backing memory for the rootserver's Untyped cap.
     //
-    // This remains a single power-of-two, power-of-two-aligned seL4 Untyped. The installed
-    // LiberNT service/process wave exhausted 512 MiB before a new page table could be retyped.
-    // Size it from the live Simpleboot map so smaller spec maps still boot.
+    // This remains a single power-of-two, power-of-two-aligned seL4 Untyped, and it is the
+    // last carve: free memory it does not take is used by nothing. Size it from the live
+    // Simpleboot map, as large as fits, so a guest given more RAM hands the rootserver more
+    // and smaller spec maps still boot.
     let ut_size_bits = choose_rootserver_untyped_size_bits(&free)?;
     let ut_size = 1u64 << ut_size_bits;
     let ut_base = carve_chunk(&mut free, ut_size, ut_size_bits)?;
@@ -583,10 +584,19 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 }
 
 const ROOTSERVER_UT_MIN_SIZE_BITS: u32 = 28; // 256 MiB
-const ROOTSERVER_UT_TARGET_SIZE_BITS: u32 = 30; // 1 GiB
+/// The largest rootserver Untyped. An aligned power of two needs a free region that contains
+/// a multiple of its own size, so guest RAM maps to it in steps: QEMU's 3 GiB guest has 1 GiB
+/// above the PCI hole at 4 GiB and yields 1 GiB; a 4 GiB guest has 2 GiB there and yields
+/// 2 GiB; a 6 GiB guest yields 4 GiB.
+const ROOTSERVER_UT_MAX_SIZE_BITS: u32 = 32; // 4 GiB
+// Retype clears frames through the kernel's linear map, which must reach the whole Untyped.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    (1u64 << ROOTSERVER_UT_MAX_SIZE_BITS) <= crate::arch::x86_64::paging::LINEAR_MAP_GIB << 30
+);
 
 fn choose_rootserver_untyped_size_bits(free: &RegionList) -> Result<u32, BootError> {
-    let mut size_bits = ROOTSERVER_UT_TARGET_SIZE_BITS;
+    let mut size_bits = ROOTSERVER_UT_MAX_SIZE_BITS;
     loop {
         if rootserver_untyped_fits(free, size_bits) {
             return Ok(size_bits);
@@ -702,8 +712,8 @@ pub mod spec {
         place_rootserver_carves_region();
         place_rootserver_picks_aligned_address();
         place_rootserver_fails_when_too_small();
-        rootserver_untyped_prefers_target_when_available();
-        rootserver_untyped_uses_512_mib_when_target_does_not_fit();
+        rootserver_untyped_takes_the_largest_size_that_fits();
+        rootserver_untyped_uses_512_mib_when_1_gib_does_not_fit();
         rootserver_untyped_falls_back_to_minimum();
         rootserver_untyped_fails_below_minimum();
         #[cfg(target_arch = "x86_64")]
@@ -823,22 +833,33 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn rootserver_untyped_prefers_target_when_available() {
-        let map = [entry(0x10_0000, 0x8000_0000, MemKind::Free)];
-        let free = extract_free(&map).unwrap();
-        assert_eq!(
-            choose_rootserver_untyped_size_bits(&free).unwrap(),
-            ROOTSERVER_UT_TARGET_SIZE_BITS
-        );
-        arch::log("  ✓ rootserver Untyped prefers target size when available\n");
+    fn rootserver_untyped_takes_the_largest_size_that_fits() {
+        // Free memory below 2 GiB that starts above zero holds one aligned 1 GiB block.
+        // Each case adds the RAM QEMU places above the PCI hole at 4 GiB for a larger guest.
+        for (high_end, expected) in [
+            (0x1_0000_0000u64, 30u32), // 2 GiB guest: nothing above the hole
+            (0x1_4000_0000, 30),       // 3 GiB guest: 1 GiB above it
+            (0x1_8000_0000, 31),       // 4 GiB guest: 2 GiB
+            (0x1_c000_0000, 31),       // 5 GiB guest: 3 GiB holds no aligned 4 GiB
+            (0x2_0000_0000, 32),       // 6 GiB guest: 4 GiB
+            (0x4_0000_0000, ROOTSERVER_UT_MAX_SIZE_BITS), // more never exceeds the maximum
+        ] {
+            let low = entry(0x10_0000, 0x8000_0000, MemKind::Free);
+            let high = entry(0x1_0000_0000, high_end, MemKind::Free);
+            let both = [low, high];
+            let map = if high_end > 0x1_0000_0000 { &both[..] } else { &both[..1] };
+            let free = extract_free(map).unwrap();
+            assert_eq!(choose_rootserver_untyped_size_bits(&free).unwrap(), expected);
+        }
+        arch::log("  ✓ rootserver Untyped takes the largest size that fits\n");
     }
 
     #[inline(never)]
-    fn rootserver_untyped_uses_512_mib_when_target_does_not_fit() {
+    fn rootserver_untyped_uses_512_mib_when_1_gib_does_not_fit() {
         let map = [entry(0x1000_0000, 0x4000_0000, MemKind::Free)];
         let free = extract_free(&map).unwrap();
         assert_eq!(choose_rootserver_untyped_size_bits(&free).unwrap(), 29);
-        arch::log("  ✓ rootserver Untyped uses 512 MiB when target does not fit\n");
+        arch::log("  ✓ rootserver Untyped uses 512 MiB when 1 GiB does not fit\n");
     }
 
     #[inline(never)]
