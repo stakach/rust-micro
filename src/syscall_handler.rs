@@ -726,14 +726,16 @@ fn handle_send(
             if buf_paddr != 0 {
                 let buf = crate::arch::phys_to_virt(buf_paddr) as *const u64;
                 let mut staged: [crate::cap::Cap; 3] = [crate::cap::Cap::Null; 3];
+                let mut sources: [Option<crate::cte::MdbId>; 3] = [None; 3];
                 let mut count = 0u8;
                 let n = n_caps.min(staged.len());
                 for i in 0..n {
                     let cptr = core::ptr::read_volatile(
                         buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET + i),
                     );
-                    if let Ok(c) = crate::cspace::lookup_cap(s, &snd_cspace, cptr) {
+                    if let Ok((c, source)) = crate::cspace::lookup_cap_and_slot(s, &snd_cspace, cptr) {
                         staged[i] = c;
+                        sources[i] = Some(source);
                         count += 1;
                     } else {
                         break;
@@ -741,6 +743,7 @@ fn handle_send(
                 }
                 let snd = s.scheduler.slab.get_mut(current);
                 snd.pending_extra_caps = staged;
+                snd.pending_extra_cap_sources = sources;
                 snd.pending_extra_caps_count = count;
             }
         }

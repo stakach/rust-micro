@@ -222,6 +222,20 @@ pub fn lookup_cap<C: CSpace>(cspace: &C, root: &Cap, cptr: Word) -> Result<Cap, 
     Ok(slots[res.slot_index].cap())
 }
 
+/// `lookupCapAndSlot`: the cap `lookup_cap` returns, and the identity of the CTE holding it.
+pub fn lookup_cap_and_slot(
+    state: &crate::kernel::KernelState,
+    root: &Cap,
+    cptr: Word,
+) -> Result<(Cap, crate::cte::MdbId), LookupFault> {
+    let res = resolve_address_bits(state, root, cptr, WORD_BITS)?;
+    let slots = state
+        .cnode_at(res.slot_ptr, res.slot_count)
+        .ok_or(LookupFault::InvalidRoot)?;
+    let cnode = crate::kernel::KernelState::cnode_index(res.slot_ptr) as u32;
+    Ok((slots[res.slot_index].cap(), crate::cte::MdbId::pack(cnode, res.slot_index as u32)))
+}
+
 #[inline]
 const fn mask(bits: u32) -> Word {
     if bits >= WORD_BITS {

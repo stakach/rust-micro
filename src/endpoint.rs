@@ -829,18 +829,21 @@ pub fn transfer_extra_caps(
     unsafe {
         let s = crate::kernel::KERNEL.get();
         let staged = s.scheduler.slab.get(sender).pending_extra_caps;
-        // Dispatch across all three CNode pools — the receiver's
-        // cspace root may be an XL page (test processes), not a
-        // big-pool entry.
-        let slots = match s.cnode_slots_at_mut(base_cnode_idx) {
-            Some(sl) => sl,
-            None => {
-                s.scheduler.slab.get_mut(sender).pending_extra_caps_count = 0;
-                return;
-            }
-        };
+        let sources = s.scheduler.slab.get(sender).pending_extra_cap_sources;
         let mut placed = 0u8;
         for i in 0..count {
+            // seL4 transferCaps looks each cap up when the message is transferred and stops at
+            // the first one it cannot derive. A blocked sender's source slot may have changed
+            // since staging: transfer only while that exact CTE still holds the staged cap.
+            let Some(source) = sources[i] else { break };
+            if s.cte(source).map(|cte| cte.cap()) != Some(staged[i]) {
+                break;
+            }
+            let Ok(cap) = crate::invocation::derive_cap(staged[i]) else { break };
+            // Dispatch across all three CNode pools — the receiver's
+            // cspace root may be an XL page (test processes), not a
+            // big-pool entry.
+            let Some(slots) = s.cnode_slots_at_mut(base_cnode_idx) else { break };
             let dest_idx = base_slot + i;
             if dest_idx >= slots.len() {
                 break;
@@ -849,24 +852,14 @@ pub fn transfer_extra_caps(
             if !slots[dest_idx].cap().is_null() {
                 continue;
             }
-            // A Frame cap transferred over IPC is DERIVED as an
-            // UNMAPPED copy: seL4 frame caps record their mapping
-            // (asid + vaddr), and X86PageMap rejects mapping a frame
-            // that is already mapped in a different vspace. The
-            // receiver (e.g. the serial server establishing shared
-            // memory, SERSERV) must be able to map it into ITS own
-            // vspace, so the transferred copy starts unmapped.
-            let mut cap = staged[i];
-            if let crate::cap::Cap::Frame { mapped, asid, .. } = &mut cap {
-                *mapped = None;
-                *asid = 0;
-            }
-            slots[dest_idx].set_cap(&cap);
-            // MDB: the new cap is derived from… we have no source
-            // CTE id (the cap was looked up by cptr through the
-            // sender's CSpace, not retyped). For now record None;
-            // proper provenance tracking is a follow-up.
-            slots[dest_idx].set_parent(None);
+            // cteInsert: the receiver's copy is a derived child of the sender's CTE, so a
+            // revoke of the source (or of any ancestor) reaches it.
+            let slot = &mut slots[dest_idx];
+            slot.set_cap(&cap);
+            slot.set_parent(Some(source));
+            slot.set_child_count(0);
+            slot.set_revoke_epoch(0);
+            crate::invocation::child_count_inc(source, 1);
             placed += 1;
         }
         // Report how many caps landed so the receiver's Recv return
@@ -896,6 +889,7 @@ pub fn transfer_extra_caps(
 pub mod spec {
     use super::*;
     use crate::arch;
+    use crate::cap::Cap;
     use crate::tcb::{Tcb, ThreadStateType};
 
     fn runnable(prio: u8) -> Tcb {
@@ -921,112 +915,180 @@ pub mod spec {
         send_pairs_receiver_head_when_state_is_stale_send();
         long_message_via_ipc_buffer();
         extra_cap_transfer_via_ipc();
+        revoking_the_source_revokes_transferred_copies();
+        a_stale_staged_cap_is_not_transferred();
 
         arch::log("Endpoint IPC tests completed\n");
     }
 
-    /// Phase 34d — staging an Endpoint cap on the sender and
-    /// arranging for a receive slot via the receiver's IPC buffer
-    /// should land the cap in the receiver's CSpace at the named
-    /// slot after the IPC transfer.
-    ///
-    /// Uses `KERNEL.get().scheduler` rather than a local
-    /// `Scheduler::new()` — `transfer_extra_caps` reaches into
-    /// `KERNEL.get().cnodes[]` via raw pointer to write the cap,
-    /// so the sender/receiver TCBs need to live in the same slab
-    /// that production code consults.
-    #[inline(never)]
-    fn extra_cap_transfer_via_ipc() {
-        use crate::cap::{Badge, Cap, EndpointObj, EndpointRights, PPtr};
+    /// A sender/receiver pair whose receiver names slot `RECEIVE_SLOT` of CNode 0 as its receive
+    /// slot, and a Frame source CTE the sender can transfer. Frames keep finalization benign: a
+    /// deleted derived Frame names no kernel object.
+    struct TransferFixture {
+        owners: crate::asid::spec::RootOwners,
+        ep: Endpoint,
+        sender: TcbId,
+        receiver: TcbId,
+        source: crate::cte::MdbId,
+    }
 
-        #[repr(C, align(4096))]
-        struct IpcPage([u64; 512]);
-        static mut SENDER_BUF: IpcPage = IpcPage([0; 512]);
-        static mut RECEIVER_BUF: IpcPage = IpcPage([0; 512]);
+    const RECEIVE_SLOT: usize = 5;
 
-        let mut owners = crate::asid::spec::RootOwners::new();
-        let s = unsafe { crate::kernel::KERNEL.get() };
-        s.scheduler.reset_queues();
-        s.scheduler.set_current(None);
+    impl TransferFixture {
+        unsafe fn new() -> Self {
+            #[repr(C, align(4096))]
+            struct IpcPage([u64; 512]);
+            static mut SENDER_BUF: IpcPage = IpcPage([0; 512]);
+            static mut RECEIVER_BUF: IpcPage = IpcPage([0; 512]);
+            static mut TRANSFERRED: IpcPage = IpcPage([0; 512]);
 
-        let mut ep = Endpoint::new();
-        let sender = s.scheduler.admit(runnable(50));
-        let receiver = s.scheduler.admit(runnable(50));
-
-        unsafe {
+            let mut owners = crate::asid::spec::RootOwners::new();
+            let s = crate::kernel::KERNEL.get();
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
+            let sender = s.scheduler.admit(runnable(50));
+            let receiver = s.scheduler.admit(runnable(50));
             bind_ipc_buffer(s, &mut owners, sender, (&raw mut SENDER_BUF) as u64,
                 crate::cap::FrameRights::ReadOnly);
             bind_ipc_buffer(s, &mut owners, receiver, (&raw mut RECEIVER_BUF) as u64,
                 crate::cap::FrameRights::ReadWrite);
-        }
-
-        // Receiver names slot 5 of its own CSpace as the receive
-        // target. `receiveCNode = 0` ⇒ "use cspace_root".
-        unsafe {
-            let buf = (&raw mut RECEIVER_BUF) as *mut u64;
-            core::ptr::write_volatile(buf.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET), 0);
-            core::ptr::write_volatile(buf.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET), 5);
-            // Full-word depth: the cspace_root below is radix 5 +
-            // guard 59 = 64, so index 5 resolves to slot 5.
-            core::ptr::write_volatile(buf.add(crate::ipc_buffer::RECEIVE_DEPTH_OFFSET), 64);
-        }
-
-        // Sender stages a fake Endpoint cap. We don't go through
-        // CSpace lookup here — `transfer_extra_caps` reads from
-        // `pending_extra_caps[]` directly.
-        let to_transfer = Cap::Endpoint {
-            ptr: PPtr::<EndpointObj>::new(0x4000).unwrap(),
-            badge: Badge(0xBEEF),
-            rights: EndpointRights {
-                can_send: true,
-                can_receive: true,
-                can_grant: false,
-                can_grant_reply: false,
-            },
-        };
-        s.scheduler.slab.get_mut(sender).pending_extra_caps[0] = to_transfer;
-        s.scheduler.slab.get_mut(sender).pending_extra_caps_count = 1;
-
-        // Plant the receiver's cspace_root pointing at CNode 0 so
-        // `transfer_extra_caps` can resolve the receive CNode.
-        let cspace = Cap::CNode {
-            ptr: crate::kernel::KernelState::cnode_ptr(0),
-            radix: 5,
-            guard_size: 59,
-            guard: 0,
-        };
-        let source = owners.cap_source_in(s, cspace);
-        unsafe {
+            let cspace = Cap::CNode {
+                ptr: crate::kernel::KernelState::cnode_ptr(0),
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            let cspace_source = owners.cap_source_in(s, cspace);
             crate::invocation::derive_tcb_cap(s, receiver, crate::cte::TcbSlot::CSpace,
-                Some(source), 0).unwrap();
-        }
-        // Make sure slot 5 starts empty.
-        s.cnodes[0].0[5].set_cap(&Cap::Null);
-
-        receive_ipc(&mut ep, &mut s.scheduler, receiver, RecvOptions::blocking());
-        send_ipc(&mut ep, &mut s.scheduler, sender, SendOptions::blocking(0));
-
-        let landed = s.cnodes[0].0[5].cap();
-        match landed {
-            Cap::Endpoint { ptr, badge, .. } => {
-                assert_eq!(ptr.addr(), 0x4000);
-                assert_eq!(badge.0, 0xBEEF);
+                Some(cspace_source), 0).unwrap();
+            let source = owners.frame_source(
+                crate::arch::virt_to_phys((&raw mut TRANSFERRED) as u64),
+                crate::cap::FrameSize::Small,
+                crate::cap::FrameRights::ReadWrite,
+            );
+            let fixture = Self { owners, ep: Endpoint::new(), sender, receiver, source };
+            for slot in [RECEIVE_SLOT, RECEIVE_SLOT + 1] {
+                assert!(s.cnodes[0].0[slot].cap().is_null(), "receive slot {slot} starts empty");
             }
-            other => panic!("expected Endpoint at slot 5, got {:?}", other),
+            fixture.receive_into(RECEIVE_SLOT);
+            fixture
         }
-        s.cnodes[0].0[5].set_cap(&Cap::Null);
-        assert_eq!(
-            s.scheduler.slab.get(sender).pending_extra_caps_count,
-            0,
-            "transfer should drain the staged caps"
-        );
 
-        // Cleanup.
-        unsafe { crate::invocation::retire_tcb(s, sender); }
-        unsafe { crate::invocation::retire_tcb(s, receiver); }
-        s.scheduler.reset_queues();
-        s.scheduler.set_current(None);
-        arch::log("  ✓ extra cap transfers through IPC into receiver's CNode\n");
+        /// The receiver's IPC buffer names `slot` of its own CSpace (receiveCNode = 0).
+        unsafe fn receive_into(&self, slot: usize) {
+            let s = crate::kernel::KERNEL.get();
+            let buffer = crate::arch::phys_to_virt(
+                s.scheduler.slab.get(self.receiver).ipc_buffer_send_paddr()) as *mut u64;
+            core::ptr::write_volatile(buffer.add(crate::ipc_buffer::RECEIVE_CNODE_OFFSET), 0);
+            core::ptr::write_volatile(buffer.add(crate::ipc_buffer::RECEIVE_INDEX_OFFSET), slot as u64);
+            core::ptr::write_volatile(buffer.add(crate::ipc_buffer::RECEIVE_DEPTH_OFFSET), 64);
+        }
+
+        /// Stage the source cap as the sender's syscall path does: by value and source CTE.
+        unsafe fn stage(&self) {
+            let s = crate::kernel::KERNEL.get();
+            let cap = s.cte(self.source).unwrap().cap();
+            let sender = s.scheduler.slab.get_mut(self.sender);
+            sender.pending_extra_caps[0] = cap;
+            sender.pending_extra_cap_sources[0] = Some(self.source);
+            sender.pending_extra_caps_count = 1;
+        }
+
+        unsafe fn transfer(&mut self) -> u8 {
+            let s = crate::kernel::KERNEL.get();
+            receive_ipc(&mut self.ep, &mut s.scheduler, self.receiver, RecvOptions::blocking());
+            send_ipc(&mut self.ep, &mut s.scheduler, self.sender, SendOptions::blocking(0));
+            assert_eq!(s.scheduler.slab.get(self.sender).pending_extra_caps_count, 0,
+                "transfer drains the staged caps");
+            s.scheduler.slab.get(self.receiver).received_extra_caps
+        }
+
+        unsafe fn retire(self) {
+            let s = crate::kernel::KERNEL.get();
+            for slot in [RECEIVE_SLOT, RECEIVE_SLOT + 1] {
+                crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(0, slot as u32)).unwrap();
+            }
+            assert_eq!(s.cte(self.source).unwrap().child_count(), 0,
+                "deleting every received copy releases its derivation edge");
+            crate::invocation::retire_tcb(s, self.sender);
+            crate::invocation::retire_tcb(s, self.receiver);
+            s.scheduler.reset_queues();
+            s.scheduler.set_current(None);
+            drop(self.owners);
+        }
+    }
+
+    /// seL4 transferCaps: the received cap is a derived child of the sender's CTE.
+    #[inline(never)]
+    fn extra_cap_transfer_via_ipc() {
+        unsafe {
+            let mut fixture = TransferFixture::new();
+            let s = crate::kernel::KERNEL.get();
+            let children = s.cte(fixture.source).unwrap().child_count();
+            fixture.stage();
+            assert_eq!(fixture.transfer(), 1);
+            let landed = &s.cnodes[0].0[RECEIVE_SLOT];
+            assert!(matches!(landed.cap(), Cap::Frame { mapped: None, .. }),
+                "a transferred Frame is an unmapped derived copy");
+            assert_eq!(landed.parent(), Some(fixture.source));
+            assert_eq!(s.cte(fixture.source).unwrap().child_count(), children + 1);
+            fixture.retire();
+        }
+        arch::log("  ✓ extra cap transfers as a derived child of the sender's CTE\n");
+    }
+
+    /// Revoking the sender's source reaches every receiver's copy (#286).
+    #[inline(never)]
+    fn revoking_the_source_revokes_transferred_copies() {
+        unsafe {
+            let mut fixture = TransferFixture::new();
+            let s = crate::kernel::KERNEL.get();
+            fixture.stage();
+            assert_eq!(fixture.transfer(), 1);
+            fixture.receive_into(RECEIVE_SLOT + 1);
+            fixture.stage();
+            assert_eq!(fixture.transfer(), 1);
+            assert_eq!(s.cte(fixture.source).unwrap().child_count(), 2);
+            let cnode = Cap::CNode {
+                ptr: crate::kernel::KernelState::cnode_ptr(fixture.source.cnode_idx() as usize),
+                radix: 5,
+                guard_size: 59,
+                guard: 0,
+            };
+            let revoke = crate::syscall_handler::SyscallArgs {
+                a1: (crate::syscalls::InvocationLabel::CNodeRevoke as u64) << 12,
+                a2: fixture.source.slot() as u64,
+                ..Default::default()
+            };
+            crate::invocation::decode_invocation(cnode, &revoke, fixture.sender).expect("revoke");
+            for slot in [RECEIVE_SLOT, RECEIVE_SLOT + 1] {
+                assert!(s.cnodes[0].0[slot].cap().is_null(), "received copy in slot {slot} revoked");
+            }
+            assert!(matches!(s.cte(fixture.source).unwrap().cap(), Cap::Frame { .. }),
+                "revoke keeps the source itself");
+            assert_eq!(s.cte(fixture.source).unwrap().child_count(), 0);
+            fixture.retire();
+        }
+        arch::log("  ✓ revoking a source revokes the caps it sent over IPC\n");
+    }
+
+    /// A blocked sender's staged cap is not transferred once its source CTE no longer holds it:
+    /// the copy would otherwise escape a revoke that ran while the sender waited.
+    #[inline(never)]
+    fn a_stale_staged_cap_is_not_transferred() {
+        unsafe {
+            let mut fixture = TransferFixture::new();
+            let s = crate::kernel::KERNEL.get();
+            fixture.stage();
+            let staged = s.cte(fixture.source).unwrap().cap();
+            s.cte_mut(fixture.source).unwrap().set_cap(&Cap::Null);
+            assert_eq!(fixture.transfer(), 0);
+            assert!(s.cnodes[0].0[RECEIVE_SLOT].cap().is_null());
+            assert_eq!(s.cte(fixture.source).unwrap().child_count(), 0);
+            s.cte_mut(fixture.source).unwrap().set_cap(&staged);
+            fixture.retire();
+        }
+        arch::log("  ✓ a staged cap whose source changed is not transferred\n");
     }
 
     unsafe fn bind_ipc_buffer(

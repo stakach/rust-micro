@@ -273,6 +273,9 @@ pub struct Tcb {
     /// which copies them into the receiver's CNode at the slots
     /// the receiver named in `receiveIndex`.
     pub pending_extra_caps: [crate::cap::Cap; 3],
+    /// The sender CTE each staged cap was read from. IPC transfer derives the receiver's copy
+    /// from this exact slot (seL4 `cteInsert`), so revoking the source reaches the copy.
+    pub pending_extra_cap_sources: [Option<crate::cte::MdbId>; 3],
     pub pending_extra_caps_count: u8,
     /// Number of extra caps the kernel transferred INTO this thread's
     /// receive slots on its last successful Recv. Surfaced in the
@@ -407,6 +410,7 @@ impl Default for Tcb {
             active_sc: None,
             yield_to: None,
             pending_extra_caps: [crate::cap::Cap::Null; 3],
+            pending_extra_cap_sources: [None; 3],
             pending_extra_caps_count: 0,
             received_extra_caps: 0,
             pending_reply: None,

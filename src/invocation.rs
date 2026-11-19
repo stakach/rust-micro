@@ -1836,6 +1836,18 @@ unsafe fn finalise_cap_mapping(s: &crate::kernel::KernelState, cap: &Cap) {
     }
 }
 
+/// seL4 `deriveCap` as CNode Copy/Mint and IPC transfer apply it: paging structures derive only
+/// while mapped, and a derived Frame starts unmapped.
+pub(crate) fn derive_cap(mut cap: Cap) -> KResult<Cap> {
+    derive_paging_structure(&cap)?;
+    if let Cap::Frame { mapped, asid, map_type, .. } = &mut cap {
+        *mapped = None;
+        *asid = 0;
+        *map_type = crate::cap::FrameMapType::None;
+    }
+    Ok(cap)
+}
+
 fn derive_paging_structure(cap: &Cap) -> KResult<()> {
     if matches!(
         cap,
@@ -4783,15 +4795,7 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
         // unmapped structure. Every mapped alias therefore names the same hardware edge, and only
         // the final alias may explicitly unmap or detach it during deletion. Frame derivation is
         // different: its mapping metadata is cleared in the derived cap.
-        derive_paging_structure(&copy)?;
-        match &mut copy {
-            Cap::Frame { mapped, asid, map_type, .. } => {
-                *mapped = None;
-                *asid = 0;
-                *map_type = crate::cap::FrameMapType::None;
-            }
-            _ => {}
-        }
+        copy = derive_cap(copy)?;
         // Mask rights against `rights_word`. Mirrors upstream
         // `maskCapRights` — applies to BOTH Copy and Mint, regardless
         // of badge. Bit layout matches `seL4_CapRights_t`:
