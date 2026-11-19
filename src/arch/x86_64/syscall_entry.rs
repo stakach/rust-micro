@@ -1440,6 +1440,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 // slots — SERSERV's connect handler asserts on this),
                 // top bits label.
                 let mi = (tcb.ipc_label << 12)
+                    | (((tcb.received_caps_unwrapped as u64) & 0x7) << 9)
                     | (((tcb.received_extra_caps as u64) & 0x3) << 7)
                     | (tcb.ipc_length as u64 & 0x7F);
                 new_ctx.rsi = mi;

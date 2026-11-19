@@ -97,6 +97,7 @@ fn choose_next(may_handoff: bool) -> Option<TcbId> {
 
 fn publish_receive(context: &mut UserContext, tcb: &crate::tcb::Tcb) {
     let info = (tcb.ipc_label << 12)
+        | (((tcb.received_caps_unwrapped as u64) & 0x7) << 9)
         | (((tcb.received_extra_caps as u64) & 0x3) << 7)
         | (tcb.ipc_length as u64 & 0x7f);
     crate::arch::set_ipc_return(context, tcb.ipc_badge, info, &tcb.msg_regs[..4]);

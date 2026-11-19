@@ -893,6 +893,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         // receive slots so it reflects only THIS receive (a sender's
         // transfer_extra_caps sets it before we return).
         s.scheduler.slab.get_mut(current).received_extra_caps = 0;
+        s.scheduler.slab.get_mut(current).received_caps_unwrapped = 0;
         let cspace_root = s.scheduler.slab.get(current).cspace_root();
         let target = lookup_cap(s, &cspace_root, args.a0)?;
         // A running thread must not carry a stale receive-side reply
