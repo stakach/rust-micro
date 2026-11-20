@@ -36,6 +36,7 @@ mod generated_syscalls {
     include!(concat!(env!("OUT_DIR"), "/syscalls.rs"));
 }
 pub const SYS_DEBUG_WRITE: i64 = generated_syscalls::Syscall::SysDebugWrite as i32 as i64;
+pub const SYS_DEBUG_SNAPSHOT: i64 = generated_syscalls::Syscall::SysDebugSnapshot as i32 as i64;
 
 #[path = "../../../src/ipc_buffer.rs"]
 mod ipc_buffer_layout;
@@ -225,6 +226,14 @@ pub unsafe fn syscall5_call_mr2(
         options(nostack, preserves_flags),
     );
     (reply >> 12, mr0, mr1)
+}
+
+/// Ask the kernel to print its IRQ route snapshot (binding state and live IOAPIC redirection
+/// entry of every IOAPIC-routed IRQ) to the debug log. Read-only; no IPC-buffer or Reply effect.
+pub fn debug_snapshot() {
+    unsafe {
+        syscall0(SYS_DEBUG_SNAPSHOT);
+    }
 }
 
 #[inline(always)]

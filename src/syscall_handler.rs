@@ -404,7 +404,14 @@ pub fn handle_syscall(
             }
             Ok(())
         }
-        Syscall::SysDebugSnapshot | Syscall::SysDebugNameThread | Syscall::SysDebugSendIPI => {
+        Syscall::SysDebugSnapshot => {
+            // Read-only: one line per IOAPIC-routed IRQ with its kernel binding state and the
+            // live redirection entry (mask, remote IRR, delivery status).
+            #[cfg(target_arch = "x86_64")]
+            unsafe { debug_snapshot_irq_routes(&crate::kernel::KERNEL.get().irqs) };
+            Ok(())
+        }
+        Syscall::SysDebugNameThread | Syscall::SysDebugSendIPI => {
             // Best-effort no-ops. Names would print to serial; we
             // skip for now.
             Ok(())
@@ -1056,6 +1063,40 @@ pub fn handle_unknown_syscall(
         // kernel; if we land here with one, treat it as an unknown
         // syscall fault.
         _ => Err(KException::Fault(FaultKind::UnknownSyscall { number })),
+    }
+}
+
+/// `SysDebugSnapshot`: the kernel side of an interrupt that never arrives. For every IRQ with an
+/// IOAPIC source, print its binding state, whether a delivery awaits its Ack, and the redirection
+/// entry: bit 16 masked, bit 14 remote IRR (level lines), bit 12 delivery pending.
+#[cfg(target_arch = "x86_64")]
+unsafe fn debug_snapshot_irq_routes(irqs: &crate::interrupt::IrqTable) {
+    use crate::invocation::log_hex_u64;
+    for (irq, entry) in irqs.entries.iter().enumerate() {
+        let crate::interrupt::IrqSource::IoApic { controller, pin } = entry.source else { continue };
+        crate::arch::log("[kernel-irq-route] irq=0x");
+        log_hex_u64(irq as u64);
+        crate::arch::log(" ioapic=0x");
+        log_hex_u64(u64::from(controller));
+        crate::arch::log(" pin=0x");
+        log_hex_u64(u64::from(pin));
+        crate::arch::log(match entry.state {
+            crate::interrupt::IrqState::Inactive => " state=inactive",
+            crate::interrupt::IrqState::Signal => " state=signal",
+            crate::interrupt::IrqState::Reserved => " state=reserved",
+        });
+        crate::arch::log(if entry.pending { " awaiting-ack=1" } else { " awaiting-ack=0" });
+        match crate::arch::x86_64::ioapic::read_redirection(controller as usize, u32::from(pin)) {
+            Ok((low, high)) => {
+                crate::arch::log(" rte=0x");
+                log_hex_u64((u64::from(high) << 32) | u64::from(low));
+                crate::arch::log(if low & (1 << 16) != 0 { " masked=1" } else { " masked=0" });
+                crate::arch::log(if low & (1 << 14) != 0 { " remote-irr=1" } else { " remote-irr=0" });
+                crate::arch::log(if low & (1 << 12) != 0 { " delivery-pending=1" } else { " delivery-pending=0" });
+                crate::arch::log(if low & (1 << 15) != 0 { " trigger=level\n" } else { " trigger=edge\n" });
+            }
+            Err(_) => crate::arch::log(" rte=unreadable\n"),
+        }
     }
 }
 
