@@ -14,6 +14,38 @@ pub(crate) fn apic_identity_samples(cpu: CpuId) -> u64 {
     APIC_IDENTITY_SAMPLES[cpu as usize].load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "spec")]
+static ENTRY_NO_EXECUTE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Kernel mappings set bit 63 (NX), which is a reserved bit until this CPU's EFER.NXE is
+/// set. Simpleboot enters each AP with its own loader EFER, and a late AP reads the MBI and
+/// its APIC ID through the BSP's NX linear map before its own init: without NXE that walk
+/// takes a reserved-bit #PF on the loader IDT and triple-faults the machine
+/// (userspace-ntos#287). Call first on every CPU, before any kernel memory access.
+#[inline(always)]
+pub fn prepare_entry() {
+    use super::msr::{rdmsr, wrmsr, EFER_NXE, IA32_EFER};
+    unsafe {
+        wrmsr(IA32_EFER, rdmsr(IA32_EFER) | EFER_NXE);
+        #[cfg(feature = "spec")]
+        if rdmsr(IA32_EFER) & EFER_NXE != 0 {
+            ENTRY_NO_EXECUTE.fetch_or(1 << initial_apic_id(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// CPUID's initial APIC ID; needs no memory mapping.
+#[cfg(feature = "spec")]
+fn initial_apic_id() -> u32 {
+    unsafe { core::arch::x86_64::__cpuid(1).ebx >> 24 }
+}
+
+/// CPUs whose EFER.NXE was set when they left `prepare_entry`.
+#[cfg(feature = "spec")]
+pub(crate) fn entry_no_execute_mask() -> u32 {
+    ENTRY_NO_EXECUTE.load(Ordering::Relaxed)
+}
+
 /// After `ltr`, the live Task Register names this CPU's TSS in the shared
 /// GDT. It remains valid across address spaces and user/kernel transitions.
 #[inline(always)]

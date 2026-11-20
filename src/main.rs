@@ -179,6 +179,7 @@ _arm64_image_start:
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 extern "C" fn _start(magic: u64, mbi_addr: u64) -> ! {
+    arch::x86_64::cpu::prepare_entry();
     simpleboot::init(magic, mbi_addr);
     kernel_entry()
 }

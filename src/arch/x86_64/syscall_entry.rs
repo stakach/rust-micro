@@ -415,16 +415,10 @@ pub(crate) fn resolve_live_user_thread() -> Option<crate::tcb::TcbId> {
 /// CS / SS selectors in IA32_STAR refer to a real GDT entry).
 pub fn init_syscall_msrs() {
     unsafe {
-        // Enable SYSCALL/SYSRET via IA32_EFER.SCE, and No-eXecute
-        // page-table support via EFER.NXE so PTEs with bit 63 set
-        // don't trip a reserved-bit fault on this CPU. Firmware and
-        // bootloader setup is BSP-centric, so per-CPU setup makes APs
-        // match.
+        // Enable SYSCALL/SYSRET via IA32_EFER.SCE. EFER.NXE was already set at entry
+        // (`cpu::prepare_entry`), before this CPU could walk an NX kernel mapping.
         let efer = rdmsr(IA32_EFER);
-        wrmsr(
-            IA32_EFER,
-            efer | EFER_SCE | crate::arch::x86_64::msr::EFER_NXE,
-        );
+        wrmsr(IA32_EFER, efer | EFER_SCE);
 
         // IA32_STAR layout:
         //   bits 31..0  = legacy SYSCALL target EIP (32-bit; unused

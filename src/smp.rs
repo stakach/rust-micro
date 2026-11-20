@@ -715,6 +715,8 @@ pub mod spec {
         arch::log("Running SMP tests...\n");
         #[cfg(target_arch = "x86_64")]
         boot_processor_apic_ids_require_started_dense_topology();
+        #[cfg(target_arch = "x86_64")]
+        every_cpu_enables_no_execute_before_kernel_mappings();
         per_cpu_indexes_correctly();
         signal_then_handle_round_trip();
         multiple_signals_coalesce_into_pending_mask();
@@ -731,6 +733,17 @@ pub mod spec {
             ap_dispatches_user_thread_end_to_end();
         }
         arch::log("SMP tests completed\n");
+    }
+
+    /// The BSP's linear map uses NX leaves; an AP that reads it with EFER.NXE clear takes a
+    /// reserved-bit fault on the loader IDT (userspace-ntos#287).
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    fn every_cpu_enables_no_execute_before_kernel_mappings() {
+        let started = (1u32 << crate::simpleboot::get_num_cores()) - 1;
+        assert_eq!(crate::arch::x86_64::cpu::entry_no_execute_mask(), started,
+            "every started CPU must set EFER.NXE at entry");
+        arch::log("  every CPU sets EFER.NXE before touching NX kernel mappings\n");
     }
 
     #[cfg(target_arch = "x86_64")]
