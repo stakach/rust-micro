@@ -1199,6 +1199,7 @@ unsafe fn snapshot_into_tcb(faulter: crate::tcb::TcbId) {
 #[no_mangle]
 extern "C" fn handle_debug_typed(saved_cs: u64, saved_rip: u64) {
     use crate::arch::x86_64::debug;
+    debug::hardware_changed_live_registers();
     if (saved_cs & 3) != 3 {
         // Kernel-mode #DB — clear status and resume.
         unsafe {
