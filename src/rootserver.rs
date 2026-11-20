@@ -1474,11 +1474,7 @@ pub unsafe fn launch_rootserver() -> ! {
         crate::arch::x86_64::pit::install_irq_handler();
 
         // Swap CR3 to the rootserver's PML4 (kernel half preserved).
-        core::arch::asm!(
-            "mov cr3, {}",
-            in(reg) img.pml4_paddr,
-            options(nostack, preserves_flags),
-        );
+        crate::smp::load_root(img.pml4_paddr);
 
         // Establish the rootserver as this core's FPU owner so its
         // x87/SSE state is tracked from first entry (otherwise a later

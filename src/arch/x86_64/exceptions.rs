@@ -339,8 +339,7 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
                 core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                     options(nomem, nostack, preserves_flags));
                 if next_cr3 != cur_cr3 {
-                    core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                        options(nostack, preserves_flags));
+                    crate::smp::load_root(next_cr3);
                 }
             }
             crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
@@ -419,8 +418,7 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
                 core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                 options(nomem, nostack, preserves_flags));
                 if was_idle || next_cr3 != cur_cr3 {
-                    core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                    options(nostack, preserves_flags));
+                    crate::smp::load_root(next_cr3);
                 }
             }
             crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);
@@ -493,8 +491,7 @@ unsafe fn resume_current_user_via_iretq(current: crate::tcb::TcbId) -> ! {
         core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
             options(nomem, nostack, preserves_flags));
         if next_cr3 != cur_cr3 {
-            core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                options(nostack, preserves_flags));
+            crate::smp::load_root(next_cr3);
         }
     }
     crate::arch::x86_64::msr::wrmsr(crate::arch::x86_64::msr::IA32_FS_BASE, next_fs_base);

@@ -570,11 +570,7 @@ fn ap_scheduler_loop() -> ! {
                         );
                         let next_cr3 = tcb.vm_root_cr3();
                         if was_idle || cur_cr3 != next_cr3 {
-                            core::arch::asm!(
-                                "mov cr3, {}",
-                                in(reg) next_cr3,
-                                options(nostack, preserves_flags),
-                            );
+                            crate::smp::load_root(next_cr3);
                         }
 
                         // Restore per-thread FS_BASE so userspace TLS

@@ -252,7 +252,7 @@ pub fn park_on_kernel_root() {
         let cur: u64;
         asm!("mov {}, cr3", out(reg) cur, options(nomem, nostack, preserves_flags));
         if cur & 0x000F_FFFF_FFFF_F000 != root {
-            asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+            crate::smp::load_root(root);
         }
     }
 }

@@ -365,8 +365,7 @@ unsafe fn restore_irq_thread_root(tcb: &crate::tcb::Tcb) {
     core::arch::asm!("mov {}, cr3", out(reg) current,
         options(nomem, nostack, preserves_flags));
     if next != current {
-        core::arch::asm!("mov cr3, {}", in(reg) next,
-            options(nostack, preserves_flags));
+        crate::smp::load_root(next);
     }
 }
 

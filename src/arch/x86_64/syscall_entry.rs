@@ -1298,8 +1298,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 s.scheduler.set_current(Some(invoker));
                 s.scheduler.set_active_user(Some(invoker));
                 let root = s.scheduler.slab.get(invoker).vm_root_cr3();
-                core::arch::asm!("mov cr3, {}", in(reg) root,
-                    options(nostack, preserves_flags));
+                crate::smp::load_root(root);
             }
             return;
         }
@@ -1394,8 +1393,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                     options(nomem, nostack, preserves_flags));
                 if next_cr3 != cur_cr3 {
-                    core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                        options(nostack, preserves_flags));
+                    crate::smp::load_root(next_cr3);
                 }
             }
             // Restore per-thread FS_BASE so userspace TLS (`%fs:0`)
@@ -1581,8 +1579,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                         core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                             options(nomem, nostack, preserves_flags));
                         if was_idle || next_cr3 != cur_cr3 {
-                            core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                                options(nostack, preserves_flags));
+                            crate::smp::load_root(next_cr3);
                         }
                     }
                     crate::arch::x86_64::msr::wrmsr(

@@ -6486,6 +6486,9 @@ pub mod spec {
 
     pub fn test_invocation() {
         let _guard = crate::spec::KernelGuard::acquire();
+        // Fixture VSpaces are never loaded; keep their retirements reaching every online CPU.
+        #[cfg(target_arch = "x86_64")]
+        let _remote = crate::smp::AssumeRemoteUserTranslations::new();
         unsafe { KERNEL.get().scheduler.reset_queues(); }
         unsafe { INVOKER_CAP_OWNERS = Some(crate::asid::spec::RootOwners::new()); }
         arch::log("Running invocation tests...\n");

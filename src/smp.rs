@@ -384,11 +384,7 @@ pub fn shootdown_vspace(pml4_paddr: u64) {
     let live = crate::arch::x86_64::paging::read_cr3() & 0x000F_FFFF_FFFF_F000;
     if live == target {
         unsafe {
-            core::arch::asm!(
-                "mov cr3, {}",
-                in(reg) live,
-                options(nostack, preserves_flags),
-            );
+            crate::smp::load_root(live);
         }
     }
 
@@ -496,23 +492,43 @@ fn service_retirement_shootdown_for_cpu(cpu: AcquisitionCpu) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+mod translation_residency;
+#[cfg(target_arch = "x86_64")]
+pub use translation_residency::load_root;
+#[cfg(all(target_arch = "x86_64", feature = "spec"))]
+pub use translation_residency::AssumeRemoteUserTranslations;
+#[cfg(target_arch = "x86_64")]
+use translation_residency::RetirementScope;
+
 /// Synchronous translation retirement for root withdrawal, unmap, or mapping replacement. The caller
 /// holds BKL, or is in the pre-user quiescent bootstrap/spec phase. It may hold a mutable TCB
 /// borrow: no scheduler access occurs here. One batch must finish before another can begin.
 #[cfg(target_arch = "x86_64")]
 pub fn retire_vspace_translations(pml4_paddr: u64) {
     assert!(pml4_paddr != 0 && pml4_paddr & 0xfff == 0);
-    retire_all_translations();
+    let kernel_root = crate::arch::x86_64::paging::kernel_root_cr3();
+    retire_translations(RetirementScope::for_root(pml4_paddr, kernel_root));
 }
 
 /// Retire all contexts after physical paging-table withdrawal, including when the recorded
 /// root is no longer available. The same BKL/bootstrap and synchronous ACK contract applies.
 #[cfg(target_arch = "x86_64")]
 pub fn retire_all_translations() {
+    retire_translations(RetirementScope::AnyUserRoot);
+}
+
+/// Flush locally, then wait for every other CPU that may cache a covered user translation.
+/// A CPU parked on the kernel root caches none and is not interrupted. Returns the targets.
+#[cfg(target_arch = "x86_64")]
+fn retire_translations(scope: RetirementScope) -> u32 {
     assert!(!RETIREMENT_ACTIVE.swap(true, Ordering::AcqRel),
         "reentrant or concurrent translation retirement shootdown");
     let me = AcquisitionCpu::sample(crate::arch::get_cpu_id, MAX_CPUS);
-    let targets = ONLINE_CPUS.load(Ordering::Acquire) & !(1 << me.id());
+    // The snapshot fences the caller's page-table stores before sampling residency.
+    let resident = translation_residency::snapshot_after_unmap();
+    let targets = translation_residency::retirement_targets(
+        ONLINE_CPUS.load(Ordering::Acquire), me.id(), &resident, scope);
     for cpu in 0..MAX_CPUS as u32 {
         if targets & (1 << cpu) != 0 {
             RETIREMENT_MAILBOXES[cpu as usize].publish();
@@ -532,6 +548,7 @@ pub fn retire_all_translations() {
     // An AP published after the target snapshot has never executed user code. Its first
     // dispatch must acquire BKL, after this retirement and the catalog withdrawal complete.
     RETIREMENT_ACTIVE.store(false, Ordering::Release);
+    targets
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -708,6 +725,7 @@ pub mod spec {
         ap_picks_thread_off_its_queue_via_reschedule();
         #[cfg(target_arch = "x86_64")]
         {
+            translation_residency::spec::run();
             retirement_mailbox_acknowledges_real_flushes();
             shootdown_fans_invalidate_tlb_to_aps();
             ap_dispatches_user_thread_end_to_end();
@@ -748,20 +766,46 @@ pub mod spec {
         let online = ONLINE_CPUS.load(Ordering::Acquire);
         let me = crate::arch::get_cpu_id();
         let targets = online & !(1 << me);
-        let before: [u32; MAX_CPUS] =
-            core::array::from_fn(|cpu| RETIREMENT_FLUSHES[cpu].load(Ordering::Relaxed));
-        // The physical value is only an identity: retirement invalidates all translations and
-        // never dereferences this address. Both requests must receive real remote flush ACKs.
-        retire_vspace_translations(0x1000);
+        let flushes = || -> [u32; MAX_CPUS] {
+            core::array::from_fn(|cpu| RETIREMENT_FLUSHES[cpu].load(Ordering::Acquire))
+        };
+        // The physical values are only identities: retirement invalidates all translations and
+        // never dereferences these addresses.
+        let (vspace, other) = (0x1000, 0x2000);
+        for cpu in 0..MAX_CPUS {
+            if targets & (1 << cpu) != 0 {
+                assert_eq!(translation_residency::resident(cpu), translation_residency::NO_USER_ROOT,
+                    "a halted AP is parked on the kernel root");
+            }
+        }
+        let before = flushes();
+        assert_eq!(retire_translations(RetirementScope::AnyUserRoot), 0,
+            "CPUs halted on the kernel root are not interrupted");
+        for cpu in 0..MAX_CPUS {
+            if targets & (1 << cpu) != 0 {
+                assert_eq!(flushes()[cpu], before[cpu]);
+                // As if each AP had just run this VSpace and still has it in CR3.
+                translation_residency::set_resident_for_spec(cpu, vspace);
+            }
+        }
+        // Both requests must receive real remote flush ACKs.
+        assert_eq!(retire_translations(RetirementScope::Root(vspace)), targets);
         while BKL_WAITERS.load(Ordering::Acquire) & targets != targets {
             core::hint::spin_loop();
         }
         // APs are now waiting for our BKL with IF clear. This second request can complete only
         // through the lock-independent service in their acquisition loop, not their IPI ISR.
-        retire_vspace_translations(0x2000);
+        retire_vspace_translations(vspace);
+        assert_eq!(retire_translations(RetirementScope::Root(other)), 0,
+            "another VSpace's retirement skips CPUs that hold only this one");
         for cpu in 0..MAX_CPUS {
             if online & (1 << cpu) != 0 {
-                assert_eq!(RETIREMENT_FLUSHES[cpu].load(Ordering::Acquire), before[cpu] + 2);
+                let local = if cpu as u32 == me { 4 } else { 2 };
+                assert_eq!(flushes()[cpu], before[cpu] + local);
+            }
+            if targets & (1 << cpu) != 0 {
+                // Their CR3 remains the kernel root; the residency was synthetic.
+                translation_residency::set_resident_for_spec(cpu, translation_residency::NO_USER_ROOT);
             }
         }
         assert!(!RETIREMENT_ACTIVE.load(Ordering::Acquire));
@@ -801,6 +845,7 @@ pub mod spec {
             if now >= target {
                 arch::log("  ✓ AP1 dispatched user thread; ");
                 arch::log("AP1 SYSCALL count climbed past 64\n");
+                unsafe { retirement_reaches_cpu_running_vspace(id); }
                 // Phase 43 — block the ping thread so it stops
                 // chewing AP1 cycles once the spec is satisfied.
                 // Otherwise it stays in a SysYield loop forever and
@@ -827,6 +872,35 @@ pub mod spec {
             }
             core::hint::spin_loop();
         }
+    }
+
+    /// AP1 is executing the ping thread, so its CR3 holds the ping VSpace. Retiring that root
+    /// must interrupt and flush AP1, and every other online CPU exactly when targeted.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn retirement_reaches_cpu_running_vspace(id: TcbId) {
+        bkl_acquire();
+        let state = crate::kernel::KERNEL.get();
+        let root = state.scheduler.slab.get(id).vm_root_cr3();
+        assert_eq!(state.scheduler.active_user_for_cpu(1), Some(id));
+        assert_eq!(translation_residency::resident(1), root, "AP1 records the root it loaded");
+        let me = crate::arch::get_cpu_id();
+        let online = ONLINE_CPUS.load(Ordering::Acquire);
+        let before: [u32; MAX_CPUS] =
+            core::array::from_fn(|cpu| RETIREMENT_FLUSHES[cpu].load(Ordering::Acquire));
+        let targets = retire_translations(RetirementScope::for_root(
+            root, crate::arch::x86_64::paging::kernel_root_cr3()));
+        assert_ne!(targets & 0b10, 0, "the CPU running the VSpace must be flushed");
+        for cpu in 0..MAX_CPUS as u32 {
+            if online & (1 << cpu) == 0 {
+                continue;
+            }
+            let flushed = RETIREMENT_FLUSHES[cpu as usize].load(Ordering::Acquire)
+                - before[cpu as usize];
+            let expected = (cpu == me || targets & (1 << cpu) != 0) as u32;
+            assert_eq!(flushed, expected, "a CPU flushes exactly when it may hold the root");
+        }
+        bkl_release();
+        arch::log("  retirement of a running VSpace flushes its CPU and skips the others\n");
     }
 
     #[cfg(target_arch = "x86_64")]
