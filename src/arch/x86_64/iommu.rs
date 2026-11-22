@@ -18,6 +18,14 @@ use super::acpi;
 use super::paging::{self, phys_to_lin, KERNEL_IOMMU_VBASE};
 use core::sync::atomic::{fence, Ordering};
 
+mod retirement;
+use retirement::INVALIDATION_SPINS;
+use retirement::{
+    context_admits_domain, cte_asr, cte_high, cte_low, cte_present, invalidate_context_and_iotlb_at,
+    retire_context, retire_leaf, VtdRegisters,
+};
+pub use retirement::{dma_retirement_phase, retire_last_iopt_alias, DmaRetirementKind, VtdError};
+
 // VT-d register offsets (intel-vtd.c:21-37).
 const VER_REG: u64 = 0x00;
 const CAP_REG: u64 = 0x08;
@@ -25,12 +33,8 @@ const ECAP_REG: u64 = 0x10;
 const GCMD_REG: u64 = 0x18;
 const GSTS_REG: u64 = 0x1C;
 const RTADDR_REG: u64 = 0x20;
-const CCMD_REG: u64 = 0x28;
 const IOTLB_REG: u64 = 0x08;
-const INVALIDATION_SPINS: u32 = 100_000;
-const CONTEXT_INVALIDATE: u64 = (1 << 63) | (1 << 61);
 // Register-based global IOTLB invalidation, with DMA read and write drain.
-const IOTLB_INVALIDATE: u64 = (1 << 63) | (1 << 60) | (1 << 49) | (1 << 48);
 const SRTP: u32 = 30; // Set Root Table Pointer (GCMD, one-shot)
 const RTPS: u32 = 30; // Root Table Pointer Status (GSTS)
 const TE: u32 = 31; // Translation Enable (GCMD, persistent)
@@ -59,16 +63,6 @@ static mut VTD_IOTLB_OFFSET: u64 = 0;
 static mut VTD_ALLOWED_RIDS: [u64; 1024] = [0; 1024];
 static mut VTD_INCLUDE_ALL_RIDS: bool = false;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VtdError {
-    Unavailable,
-    TimedOut,
-    UnsupportedGranularity,
-    OwnershipConflict,
-}
-
-/// A timed-out invalidation leaves DMA translation ownership uncertain. No
-/// capability, frame, or IOVA may be recycled after this point.
 #[cold]
 pub fn fail_stop(error: VtdError) -> ! {
     panic!("VT-d translation retirement failed: {error:?}")
@@ -82,22 +76,6 @@ pub fn iommu_present() -> bool {
     unsafe { NUM_DRHU > 0 }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DmaRetirementKind {
-    Frame,
-    Table(u8),
-}
-
-/// Phase zero retires mapped frames; subsequent phases retire IO page
-/// tables from leaf to root. Unmapped caps use the ordinary final pass.
-pub fn dma_retirement_phase(kind: DmaRetirementKind, levels: u8) -> Option<u8> {
-    match kind {
-        DmaRetirementKind::Frame => Some(0),
-        DmaRetirementKind::Table(level) if level < levels => Some(levels - level),
-        DmaRetirementKind::Table(_) => None,
-    }
-}
-
 pub fn iopt_contains_address(level: u8, mapped_address: u64, address: u64) -> bool {
     if level == 0 || level as u64 >= num_iopt_levels() {
         return true;
@@ -107,10 +85,6 @@ pub fn iopt_contains_address(level: u8, mapped_address: u64, address: u64) -> bo
 }
 
 /// A copied mapped IOPT cap is an alias of the same hardware edge.
-pub fn retire_last_iopt_alias(remaining_mapped_aliases: usize) -> bool {
-    remaining_mapped_aliases == 0
-}
-
 pub fn external_descendant_needs_explicit_unmap(
     owner_cnode: usize,
     descendant_cnode: usize,
@@ -120,11 +94,6 @@ pub fn external_descendant_needs_explicit_unmap(
 ) -> bool {
     owner_cnode != descendant_cnode
         && iopt_contains_address(level, mapped_address, descendant_address)
-}
-
-trait VtdRegisters {
-    fn read64(&mut self, offset: u64) -> u64;
-    fn write64(&mut self, offset: u64, value: u64);
 }
 
 struct MmioRegisters(u64);
@@ -137,16 +106,6 @@ impl VtdRegisters for MmioRegisters {
     fn write64(&mut self, offset: u64, value: u64) {
         unsafe { core::ptr::write_volatile((self.0 + offset) as *mut u64, value) }
     }
-}
-
-fn wait_command_clear<R: VtdRegisters>(regs: &mut R, offset: u64, bit: u64) -> Result<(), VtdError> {
-    for _ in 0..INVALIDATION_SPINS {
-        if regs.read64(offset) & bit == 0 {
-            return Ok(());
-        }
-        core::hint::spin_loop();
-    }
-    Err(VtdError::TimedOut)
 }
 
 /// Register-based invalidation is available only while queued invalidation is off.
@@ -174,33 +133,6 @@ pub unsafe fn invalidate_context_and_iotlb() -> Result<(), VtdError> {
     invalidate_context_and_iotlb_at(&mut MmioRegisters(base), iotlb)
 }
 
-fn invalidate_context_and_iotlb_at<R: VtdRegisters>(regs: &mut R, iotlb: u64) -> Result<(), VtdError> {
-    wait_command_clear(regs, CCMD_REG, 1 << 63)?;
-    regs.write64(CCMD_REG, CONTEXT_INVALIDATE);
-    wait_command_clear(regs, CCMD_REG, 1 << 63)?;
-    // CAIG=0 means hardware did not perform the requested invalidation.
-    if (regs.read64(CCMD_REG) >> 59) & 0x3 == 0 {
-        return Err(VtdError::UnsupportedGranularity);
-    }
-    invalidate_iotlb_at(regs, iotlb)
-}
-
-fn invalidate_iotlb_at<R: VtdRegisters>(regs: &mut R, iotlb: u64) -> Result<(), VtdError> {
-    wait_command_clear(regs, iotlb, 1 << 63)?;
-    regs.write64(iotlb, IOTLB_INVALIDATE);
-    wait_command_clear(regs, iotlb, 1 << 63)?;
-    if (regs.read64(iotlb) >> 57) & 0x7 == 0 {
-        return Err(VtdError::UnsupportedGranularity);
-    }
-    Ok(())
-}
-
-/// The caller has already updated an IO page-table entry.
-pub unsafe fn invalidate_iotlb() -> Result<(), VtdError> {
-    let (base, iotlb) = invalidation_regs()?;
-    fence(Ordering::SeqCst);
-    invalidate_iotlb_at(&mut MmioRegisters(base), iotlb)
-}
 
 // ---------------------------------------------------------------------------
 // IOMMU page pool — root + context tables. Seeded at boot from a small
@@ -268,27 +200,6 @@ fn rte_present(w: u64) -> bool {
 #[inline]
 fn rte_ctp(w: u64) -> u64 {
     w & ADDR_MASK
-}
-
-#[inline]
-fn cte_low(asr_paddr: u64, tt: u64, present: bool) -> u64 {
-    (asr_paddr & ADDR_MASK) | ((tt & 0x3) << 2) | (present as u64)
-}
-#[inline]
-fn cte_high(aw: u64, did: u64) -> u64 {
-    (aw & 0x7) | ((did & 0xFFFF) << 8)
-}
-#[inline]
-fn cte_present(low: u64) -> bool {
-    low & 1 != 0
-}
-#[inline]
-fn cte_asr(low: u64) -> u64 {
-    low & ADDR_MASK
-}
-#[inline]
-fn cte_domain_id(high: u64) -> u16 {
-    ((high >> 8) & 0xffff) as u16
 }
 
 #[inline]
@@ -364,9 +275,11 @@ impl CtxSlot {
     }
     /// An existing PCI requester context may only be extended by its installed domain.
     pub unsafe fn matches_domain(&self, domain_id: u16) -> bool {
-        domain_id != 0
-            && self.present()
-            && cte_domain_id(core::ptr::read_volatile(self.0.add(1))) == domain_id
+        context_admits_domain(
+            core::ptr::read_volatile(self.0),
+            core::ptr::read_volatile(self.0.add(1)),
+            domain_id,
+        )
     }
     /// Install this context entry as the root of an IO address space.
     pub unsafe fn install_root(&self, domain_id: u16, asr_paddr: u64) {
@@ -376,131 +289,14 @@ impl CtxSlot {
         invalidate_context_and_iotlb().unwrap_or_else(|error| fail_stop(error));
     }
     pub unsafe fn clear(&self) {
-        core::ptr::write_volatile(self.0, 0);
-        invalidate_context_and_iotlb().unwrap_or_else(|error| fail_stop(error));
-        core::ptr::write_volatile(self.0.add(1), 0);
-    }
-}
-
-#[cfg(test)]
-mod invalidation_tests {
-    use super::*;
-
-    struct FakeRegisters {
-        active_command: Option<u64>,
-        completed_command: Option<u64>,
-        complete: bool,
-        writes: [(u64, u64); 2],
-        count: usize,
-    }
-
-    impl FakeRegisters {
-        fn new(complete: bool) -> Self {
-            Self { active_command: None, completed_command: None, complete,
-                writes: [(0, 0); 2], count: 0 }
-        }
-    }
-
-    impl VtdRegisters for FakeRegisters {
-        fn read64(&mut self, offset: u64) -> u64 {
-            if self.active_command == Some(offset) {
-                if self.complete {
-                    self.active_command = None;
-                    self.completed_command = Some(offset);
-                    if offset == CCMD_REG { 1 << 59 } else { 1 << 57 }
-                } else {
-                    1 << 63
-                }
-            } else if self.completed_command == Some(offset) {
-                if offset == CCMD_REG { 1 << 59 } else { 1 << 57 }
-            } else {
-                0
-            }
-        }
-
-        fn write64(&mut self, offset: u64, value: u64) {
-            self.writes[self.count] = (offset, value);
-            self.count += 1;
-            self.active_command = Some(offset);
-            self.completed_command = None;
-        }
-    }
-
-    #[test]
-    fn context_retirement_waits_before_iotlb_retirement() {
-        let mut regs = FakeRegisters::new(true);
-        let iotlb = 0x108;
-        assert_eq!(invalidate_context_and_iotlb_at(&mut regs, iotlb), Ok(()));
-        assert_eq!(regs.count, 2);
-        assert_eq!(regs.writes, [(CCMD_REG, CONTEXT_INVALIDATE), (iotlb, IOTLB_INVALIDATE)]);
-    }
-
-    #[test]
-    fn context_timeout_never_starts_iotlb_retirement() {
-        let mut regs = FakeRegisters::new(false);
-        assert_eq!(invalidate_context_and_iotlb_at(&mut regs, 0x108), Err(VtdError::TimedOut));
-        assert_eq!(regs.count, 1);
-        assert_eq!(regs.writes[0], (CCMD_REG, CONTEXT_INVALIDATE));
-    }
-
-    #[test]
-    fn iotlb_timeout_is_reported_after_command() {
-        let mut regs = FakeRegisters::new(false);
-        assert_eq!(invalidate_iotlb_at(&mut regs, 0x108), Err(VtdError::TimedOut));
-        assert_eq!(regs.count, 1);
-    }
-
-    #[test]
-    fn cnode_retirement_orders_dma_leaves_before_table_parents() {
-        let levels = 4;
-        let phases = [
-            dma_retirement_phase(DmaRetirementKind::Table(0), levels),
-            dma_retirement_phase(DmaRetirementKind::Table(1), levels),
-            dma_retirement_phase(DmaRetirementKind::Frame, levels),
-            dma_retirement_phase(DmaRetirementKind::Table(3), levels),
-            dma_retirement_phase(DmaRetirementKind::Table(2), levels),
-        ];
-        assert_eq!(phases, [Some(4), Some(3), Some(0), Some(1), Some(2)]);
-        assert_eq!(dma_retirement_phase(DmaRetirementKind::Table(4), levels), None);
-    }
-
-    #[test]
-    fn external_descendant_blocks_cnode_retirement_within_table_range() {
-        let table_start = 0x2_0000_0000;
-        assert!(external_descendant_needs_explicit_unmap(
-            7, 9, 2, table_start, table_start + 0x4000));
-        assert!(!external_descendant_needs_explicit_unmap(
-            7, 7, 2, table_start, table_start + 0x4000));
-        assert!(!external_descendant_needs_explicit_unmap(
-            7, 9, 2, table_start, table_start + (1 << 30)));
-    }
-
-    #[test]
-    fn copied_iopt_alias_preserves_mapping_until_last_cap_deletes() {
-        assert!(!retire_last_iopt_alias(1));
-        assert!(retire_last_iopt_alias(0));
-    }
-}
-
-#[cfg(test)]
-mod context_domain_tests {
-    use super::*;
-
-    #[test]
-    fn existing_context_accepts_only_its_own_domain() {
-        let mut words = [cte_low(0x4000, 0, true), cte_high(2, 17)];
-        let slot = CtxSlot(words.as_mut_ptr());
-        assert!(unsafe { slot.matches_domain(17) });
-        assert!(!unsafe { slot.matches_domain(2) });
-        assert!(!unsafe { slot.matches_domain(0) });
-        assert_eq!(words, [cte_low(0x4000, 0, true), cte_high(2, 17)]);
-    }
-
-    #[test]
-    fn absent_context_never_authorizes_an_existing_domain() {
-        let mut words = [0, cte_high(2, 17)];
-        let slot = CtxSlot(words.as_mut_ptr());
-        assert!(!unsafe { slot.matches_domain(17) });
+        let (base, iotlb) = invalidation_regs().unwrap_or_else(|error| fail_stop(error));
+        retire_context(
+            &mut MmioRegisters(base),
+            iotlb,
+            || core::ptr::write_volatile(self.0, 0),
+            || core::ptr::write_volatile(self.0.add(1), 0),
+        )
+        .unwrap_or_else(|error| fail_stop(error));
     }
 }
 
@@ -581,13 +377,17 @@ pub unsafe fn slot_addr(slot: *mut u64) -> u64 {
 }
 /// Install a read/write PTE pointing at `paddr`.
 pub unsafe fn slot_install(slot: *mut u64, paddr: u64, write: bool, read: bool) {
-    core::ptr::write_volatile(slot, pte_new(paddr, write, read));
-    invalidate_iotlb().unwrap_or_else(|error| fail_stop(error));
+    retire_slot(slot, pte_new(paddr, write, read));
 }
-/// Zero a PTE slot.
+/// Zero a PTE slot. Returns only after the IOTLB no longer caches the old target.
 pub unsafe fn slot_clear(slot: *mut u64) {
-    core::ptr::write_volatile(slot, 0);
-    invalidate_iotlb().unwrap_or_else(|error| fail_stop(error));
+    retire_slot(slot, 0);
+}
+
+unsafe fn retire_slot(slot: *mut u64, entry: u64) {
+    let (base, iotlb) = invalidation_regs().unwrap_or_else(|error| fail_stop(error));
+    retire_leaf(&mut MmioRegisters(base), iotlb, || core::ptr::write_volatile(slot, entry))
+        .unwrap_or_else(|error| fail_stop(error));
 }
 
 // ---------------------------------------------------------------------------

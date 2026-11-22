@@ -12,6 +12,8 @@ on:
       - "src/arch/x86_64/syscall_entry.rs"
       - "src/arch/x86_64/cpu_exception_vectors.rs"
       - "tests/cpu_exception_vectors.rs"
+      - "src/arch/x86_64/iommu/retirement.rs"
+      - "tests/vtd_retirement.rs"
       - "src/idle_log_budget.rs"
       - "tests/idle_log_budget.rs"
       - "src/arch/x86_64/exceptions.rs"
@@ -26,6 +28,8 @@ on:
       - "src/arch/x86_64/syscall_entry.rs"
       - "src/arch/x86_64/cpu_exception_vectors.rs"
       - "tests/cpu_exception_vectors.rs"
+      - "src/arch/x86_64/iommu/retirement.rs"
+      - "tests/vtd_retirement.rs"
       - "src/idle_log_budget.rs"
       - "tests/idle_log_budget.rs"
       - "src/arch/x86_64/exceptions.rs"
@@ -51,3 +55,7 @@ jobs:
         run: |
           rustc --edition 2021 --test tests/idle_log_budget.rs -o /tmp/kernel-idle-log-budget-tests
           /tmp/kernel-idle-log-budget-tests
+      - name: Test the VT-d retirement ordering
+        run: |
+          rustc --edition 2021 --test tests/vtd_retirement.rs -o /tmp/kernel-vtd-retirement-tests
+          /tmp/kernel-vtd-retirement-tests
