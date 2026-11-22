@@ -455,6 +455,20 @@ extern "C" fn handle_device_not_available_typed(saved_rip: u64, saved_cs: u64) {
     }
 }
 
+/// Idle tags are reported on first sighting and every `REPORT_EVERY`th time after.
+static IDLE_LOG: crate::idle_log_budget::IdleLogBudget = crate::idle_log_budget::IdleLogBudget::new();
+
+/// Print an admitted idle tag with its running count. Called with the BKL released: a
+/// serial line is one VM exit per byte, and no other CPU should wait behind it.
+fn log_idle_tag(tag: &str, count: u64) {
+    crate::arch::log(tag.strip_suffix('\n').unwrap_or(tag));
+    if count > 1 {
+        crate::arch::log(" seen=0x");
+        crate::invocation::log_hex_u64(count);
+    }
+    crate::arch::log("\n");
+}
+
 /// Dispatch the next runnable thread or idle in HLT. Shared tail
 /// for exception handlers that just blocked the current thread
 /// (fault delivery): returning via iretq would re-execute the
@@ -520,10 +534,8 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
             crate::smp::bkl_release();
             crate::arch::x86_64::syscall_entry::enter_user_via_sysret(pcc as *const _);
         }
-        if !logged {
-            crate::arch::log(idle_tag);
-            logged = true;
-        }
+        let report = if logged { None } else { IDLE_LOG.admit(idle_tag) };
+        logged = true;
         // Flush before idle so migration need not wake this CPU to capture
         // its last resident FPU owner's hardware state.
         crate::arch::x86_64::fpu_ctx::flush_local_fpu(&mut s.scheduler.slab);
@@ -537,6 +549,9 @@ pub(crate) unsafe fn dispatch_next_or_idle(idle_tag: &str) -> ! {
         crate::arch::x86_64::paging::park_on_kernel_root();
         crate::smp::mark_went_idle();
         crate::smp::bkl_release();
+        if let Some(count) = report {
+            log_idle_tag(idle_tag, count);
+        }
         // `cli` after `hlt`: restore the kernel's IF=0 invariant before the
         // BKL-held re-acquire + loop-back below, so the timer IRQ can't
         // re-enter bkl_acquire while we hold the lock (the silent DOMAINS

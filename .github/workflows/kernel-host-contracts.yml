@@ -12,6 +12,9 @@ on:
       - "src/arch/x86_64/syscall_entry.rs"
       - "src/arch/x86_64/cpu_exception_vectors.rs"
       - "tests/cpu_exception_vectors.rs"
+      - "src/idle_log_budget.rs"
+      - "tests/idle_log_budget.rs"
+      - "src/arch/x86_64/exceptions.rs"
   pull_request:
     paths:
       - ".github/workflows/kernel-host-contracts.yml"
@@ -23,6 +26,9 @@ on:
       - "src/arch/x86_64/syscall_entry.rs"
       - "src/arch/x86_64/cpu_exception_vectors.rs"
       - "tests/cpu_exception_vectors.rs"
+      - "src/idle_log_budget.rs"
+      - "tests/idle_log_budget.rs"
+      - "src/arch/x86_64/exceptions.rs"
 
 permissions:
   contents: read
@@ -41,3 +47,7 @@ jobs:
         run: |
           rustc --edition 2021 --test tests/cpu_exception_vectors.rs -o /tmp/kernel-cpu-exception-vector-tests
           /tmp/kernel-cpu-exception-vector-tests
+      - name: Test the idle-tag log budget
+        run: |
+          rustc --edition 2021 --test tests/idle_log_budget.rs -o /tmp/kernel-idle-log-budget-tests
+          /tmp/kernel-idle-log-budget-tests
