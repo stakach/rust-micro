@@ -1,4 +1,4 @@
-use super::interrupts::{interrupt, interrupt_with_error, IdtEntry, IDT};
+use super::interrupts::{IdtEntry, IDT};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static USER_PAGE_FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -80,99 +80,176 @@ impl Drop for BklGuard {
     }
 }
 
-// Define all exception handlers using macros
-interrupt!(divide_error_handler, handle_divide_error);
+use super::cpu_exception_vectors as vector;
+
+/// Shared entry for the CPU exceptions without a dedicated path. A user-mode fault saves the
+/// full fault-time register state (the TRUE rcx/r11 in the GPR slots, the frame's
+/// RIP/RFLAGS/RSP in the iretq slots, as the #PF/#GP entries do) and is delivered to the
+/// thread's fault handler; anything else halts. Neither path returns.
+///
+/// Stack on entry, after the optional error code at [rsp+0]:
+///   [rsp+F+0]  = saved RIP
+///   [rsp+F+8]  = saved CS
+///   [rsp+F+16] = saved RFLAGS
+///   [rsp+F+24] = saved RSP
+///   [rsp+F+32] = saved SS
+macro_rules! cpu_exception_entry {
+    ($name:ident, $vector:expr) => {
+        const _: () = assert!(!vector::pushes_error_code($vector));
+        cpu_exception_entry!(@entry $name, $vector, 0, "xor edi, edi");
+    };
+    ($name:ident, $vector:expr, error_code) => {
+        const _: () = assert!(vector::pushes_error_code($vector));
+        cpu_exception_entry!(@entry $name, $vector, 8, "mov rdi, [rsp]");
+    };
+    (@entry $name:ident, $vector:expr, $frame:expr, $load_error:literal) => {
+        #[unsafe(naked)]
+        #[no_mangle]
+        pub unsafe extern "C" fn $name() {
+            core::arch::naked_asm!(
+                "test byte ptr [rsp + {cs}], 3",
+                "jz 2f",
+                // -------- user mode: full save into the per-CPU UserContext --------
+                "swapgs",
+                "mov gs:[16 + 0],   rax",
+                "mov gs:[16 + 8],   rbx",
+                "mov gs:[16 + 16],  rcx",
+                "mov gs:[16 + 24],  rdx",
+                "mov gs:[16 + 32],  rsi",
+                "mov gs:[16 + 40],  rdi",
+                "mov gs:[16 + 48],  rbp",
+                "mov gs:[16 + 56],  r8",
+                "mov gs:[16 + 64],  r9",
+                "mov gs:[16 + 72],  r10",
+                "mov gs:[16 + 80],  r11",
+                "mov gs:[16 + 88],  r12",
+                "mov gs:[16 + 96],  r13",
+                "mov gs:[16 + 104], r14",
+                "mov gs:[16 + 112], r15",
+                "mov rax, [rsp + {rip}]",
+                "mov gs:[16 + 128], rax",   // user_ctx.rip    = saved RIP
+                "mov rax, [rsp + {rflags}]",
+                "mov gs:[16 + 136], rax",   // user_ctx.rflags = saved RFLAGS
+                "mov rax, [rsp + {rsp}]",
+                "mov gs:[16 + 120], rax",   // user_ctx.rsp    = saved RSP
+                "2:",
+                $load_error,                // error code (0 when the CPU pushes none)
+                "mov esi, {vector}",
+                "mov rdx, [rsp + {rip}]",
+                "mov rcx, [rsp + {cs}]",
+                "and rsp, -16",
+                "call {handler}",
+                "ud2",
+                vector = const $vector,
+                rip = const $frame,
+                cs = const $frame + 8,
+                rflags = const $frame + 16,
+                rsp = const $frame + 24,
+                handler = sym handle_cpu_exception,
+            );
+        }
+    };
+}
+
+cpu_exception_entry!(divide_error_entry, vector::DIVIDE_ERROR);
 // #DB (1) and INT3 (3) are handled by debug_exception_entry / int3_entry
 // (CONFIG_HARDWARE_DEBUG_API), defined below.
-interrupt!(nmi_handler, handle_nmi);
-interrupt!(overflow_handler, handle_overflow);
-interrupt!(bound_range_handler, handle_bound_range);
-interrupt!(invalid_opcode_handler, handle_invalid_opcode);
-interrupt!(device_not_available_handler, handle_device_not_available);
-interrupt_with_error!(double_fault_handler, handle_double_fault, 8);
-interrupt_with_error!(invalid_tss_handler, handle_invalid_tss, 10);
-interrupt_with_error!(segment_not_present_handler, handle_segment_not_present, 11);
-interrupt_with_error!(stack_segment_fault_handler, handle_stack_segment_fault, 12);
-// general_protection_fault_handler defined manually below — we want
-// the saved RIP/CS/RSP for diagnostics, which the macro stub doesn't
-// pass.
-interrupt_with_error!(page_fault_handler, handle_page_fault, 14);
-interrupt!(x87_floating_point_handler, handle_x87_floating_point);
-interrupt_with_error!(alignment_check_handler, handle_alignment_check, 17);
-interrupt!(machine_check_handler, handle_machine_check);
-interrupt!(simd_floating_point_handler, handle_simd_floating_point);
-interrupt!(virtualization_handler, handle_virtualization);
+cpu_exception_entry!(nmi_entry, vector::NMI);
+cpu_exception_entry!(overflow_entry, vector::OVERFLOW);
+cpu_exception_entry!(bound_range_entry, vector::BOUND_RANGE);
+cpu_exception_entry!(invalid_opcode_entry, vector::INVALID_OPCODE);
+cpu_exception_entry!(double_fault_entry, vector::DOUBLE_FAULT, error_code);
+cpu_exception_entry!(invalid_tss_entry, vector::INVALID_TSS, error_code);
+cpu_exception_entry!(segment_not_present_entry, vector::SEGMENT_NOT_PRESENT, error_code);
+cpu_exception_entry!(stack_segment_entry, vector::STACK_SEGMENT, error_code);
+// #GP (13) and #PF (14) have dedicated entries below.
+cpu_exception_entry!(x87_floating_point_entry, vector::X87_FLOATING_POINT);
+cpu_exception_entry!(alignment_check_entry, vector::ALIGNMENT_CHECK, error_code);
+cpu_exception_entry!(machine_check_entry, vector::MACHINE_CHECK);
+cpu_exception_entry!(simd_floating_point_entry, vector::SIMD_FLOATING_POINT);
+cpu_exception_entry!(virtualization_entry, vector::VIRTUALIZATION);
 
 pub fn init_exceptions() {
     unsafe {
-        IDT[0] = IdtEntry::new(divide_error_handler as u64, 0x08, 0, 0x8E);
+        IDT[0] = IdtEntry::new(divide_error_entry as u64, 0x08, 0, 0x8E);
         IDT[1] = IdtEntry::new(debug_exception_entry as u64, 0x08, 0, 0x8E);
-        IDT[2] = IdtEntry::new(nmi_handler as u64, 0x08, 0, 0x8E);
+        IDT[2] = IdtEntry::new(nmi_entry as u64, 0x08, 0, 0x8E);
         // INT3 (#BP) gate needs DPL=3 so a user-mode `int3` traps here
         // instead of #GP'ing (BREAK_REQUEST_001).
         IDT[3] = IdtEntry::new(int3_entry as u64, 0x08, 0, 0xEE);
-        IDT[4] = IdtEntry::new(overflow_handler as u64, 0x08, 0, 0x8E);
-        IDT[5] = IdtEntry::new(bound_range_handler as u64, 0x08, 0, 0x8E);
+        IDT[4] = IdtEntry::new(overflow_entry as u64, 0x08, 0, 0x8E);
+        IDT[5] = IdtEntry::new(bound_range_entry as u64, 0x08, 0, 0x8E);
         // PAGEFAULT0005 — #UD from user mode becomes a UserException
         // fault to the thread's fault handler (upstream
-        // handleUserLevelFault). The custom entry captures the full
-        // fault-time register state like the #PF / #NM entries.
+        // handleUserLevelFault).
         IDT[6] = IdtEntry::new(invalid_opcode_entry as u64, 0x08, 0, 0x8E);
         // FPU0004 — replace the macro stub with `device_not_available_entry`,
         // which captures saved CS so the handler can distinguish user-mode
         // (CPL=3 → check `tcbFlags & seL4_TCBFlag_fpuDisabled`) from
         // kernel-mode #NM. Same pattern the page-fault handler uses.
         IDT[7] = IdtEntry::new(device_not_available_entry as u64, 0x08, 0, 0x8E);
-        IDT[8] = IdtEntry::new(double_fault_handler as u64, 0x08, 0, 0x8E);
-        IDT[10] = IdtEntry::new(invalid_tss_handler as u64, 0x08, 0, 0x8E);
-        IDT[11] = IdtEntry::new(segment_not_present_handler as u64, 0x08, 0, 0x8E);
-        IDT[12] = IdtEntry::new(stack_segment_fault_handler as u64, 0x08, 0, 0x8E);
+        IDT[8] = IdtEntry::new(double_fault_entry as u64, 0x08, 0, 0x8E);
+        IDT[10] = IdtEntry::new(invalid_tss_entry as u64, 0x08, 0, 0x8E);
+        IDT[11] = IdtEntry::new(segment_not_present_entry as u64, 0x08, 0, 0x8E);
+        IDT[12] = IdtEntry::new(stack_segment_entry as u64, 0x08, 0, 0x8E);
         IDT[13] = IdtEntry::new(general_protection_fault_handler as u64, 0x08, 0, 0x8E);
-        // Phase 25: replace the broken interrupt_with_error stub
-        // (which doesn't pass cr2/error_code/saved CS correctly)
-        // with the proper page_fault_entry that sets up System V
-        // ABI registers before calling the typed handler.
+        // Phase 25: page_fault_entry passes CR2, the error code and the
+        // saved CS/RIP to the typed handler.
         IDT[14] = IdtEntry::new(page_fault_entry as u64, 0x08, 0, 0x8E);
-        IDT[16] = IdtEntry::new(x87_floating_point_handler as u64, 0x08, 0, 0x8E);
-        IDT[17] = IdtEntry::new(alignment_check_handler as u64, 0x08, 0, 0x8E);
-        IDT[18] = IdtEntry::new(machine_check_handler as u64, 0x08, 0, 0x8E);
-        IDT[19] = IdtEntry::new(simd_floating_point_handler as u64, 0x08, 0, 0x8E);
-        IDT[20] = IdtEntry::new(virtualization_handler as u64, 0x08, 0, 0x8E);
+        IDT[16] = IdtEntry::new(x87_floating_point_entry as u64, 0x08, 0, 0x8E);
+        IDT[17] = IdtEntry::new(alignment_check_entry as u64, 0x08, 0, 0x8E);
+        IDT[18] = IdtEntry::new(machine_check_entry as u64, 0x08, 0, 0x8E);
+        IDT[19] = IdtEntry::new(simd_floating_point_entry as u64, 0x08, 0, 0x8E);
+        IDT[20] = IdtEntry::new(virtualization_entry as u64, 0x08, 0, 0x8E);
     }
 }
 
-extern "C" fn handle_divide_error(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Divide by zero error\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_nmi(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Non-maskable interrupt\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_overflow(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Overflow\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_bound_range(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Bound range exceeded\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_invalid_opcode(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Invalid opcode\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_device_not_available(error_code: u64, exception_num: u64) {
-    // The plain `interrupt!` stub doesn't pass saved CS or RIP, so
-    // route #NM through `device_not_available_entry` instead (see
-    // init_exceptions). This wrapper is unreachable in practice but
-    // kept so the macro-generated stub compiles.
-    crate::arch::log("EXCEPTION: Device not available (legacy stub)\n");
-    fatal_exception(exception_num, error_code);
+/// Typed tail of `cpu_exception_entry!`. A user-mode fault on a delivered vector becomes a
+/// `UserException { number: vector, code: error_code }` for the thread's fault handler
+/// (upstream handleUserLevelFault), and the CPU moves on to the next runnable thread: returning
+/// would re-execute the faulting instruction. Everything else is fatal.
+extern "C" fn handle_cpu_exception(error_code: u64, vector: u64, saved_rip: u64, saved_cs: u64) -> ! {
+    let from_user = (saved_cs & 3) == 3;
+    if !from_user || !vector::delivers_user_exception(vector) {
+        crate::arch::log("EXCEPTION: ");
+        crate::arch::log(vector::name(vector));
+        crate::arch::log(if from_user { " (user mode)\n" } else { " (kernel mode)\n" });
+        fatal_exception(vector, error_code, saved_rip);
+    }
+    acquire_user_fault_entry();
+    let Some(faulter) = crate::arch::x86_64::syscall_entry::resolve_live_user_thread() else {
+        // Same race as the #PF no-current path: another CPU blocked
+        // us mid-flight. Dispatch whatever is runnable.
+        unsafe { dispatch_next_or_idle("[user CPU exception: no current, idling CPU]\n") }
+    };
+    unsafe {
+        // Mirror the per-CPU snapshot (full fault-time state) into
+        // the faulter and mark iretq resume.
+        let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
+        let s = crate::kernel::KERNEL.get();
+        let t = s.scheduler.slab.get_mut(faulter);
+        t.user_context = snapshot;
+        t.use_iretq_resume = true;
+        if crate::fault::deliver_fault(
+            faulter,
+            crate::fault::FaultMessage::UserException { number: vector as u32, code: error_code as u32 },
+        )
+        .is_err()
+        {
+            crate::arch::log("[user ");
+            crate::arch::log(vector::name(vector));
+            crate::arch::log(": tcb=");
+            log_dec_u64(faulter.0 as u64);
+            crate::arch::log(" rip=0x");
+            log_hex64(saved_rip);
+            crate::arch::log(" err=0x");
+            log_hex64(error_code);
+            crate::arch::log(" — no fault handler, suspending thread]\n");
+            s.scheduler
+                .block(faulter, crate::tcb::ThreadStateType::Inactive);
+        }
+        dispatch_next_or_idle("[user CPU exception: no next thread, idling CPU]\n")
+    }
 }
 
 /// Custom #NM (Device Not Available, vector 7) entry. CPU pushes no
@@ -504,141 +581,6 @@ unsafe fn resume_current_user_via_iretq(current: crate::tcb::TcbId) -> ! {
     crate::arch::x86_64::syscall_entry::enter_user_via_iretq(pcc as *const _);
 }
 
-/// Custom #UD (Invalid Opcode, vector 6) entry. No error code.
-/// Same full fault-time capture as the #PF entry: TRUE rcx/r11 in
-/// the GPR slots, frame RIP/RFLAGS/RSP in the dedicated iretq
-/// slots. PAGEFAULT0005's `ud2` relies on the handler reading the
-/// exact fault-time SP (the test points RSP at a magic variable).
-///
-/// Stack on entry (no error code from CPU):
-///   [rsp+0]  = saved RIP
-///   [rsp+8]  = saved CS
-///   [rsp+16] = saved RFLAGS
-///   [rsp+24] = saved RSP
-///   [rsp+32] = saved SS
-#[unsafe(naked)]
-#[no_mangle]
-pub unsafe extern "C" fn invalid_opcode_entry() {
-    core::arch::naked_asm!(
-        "test byte ptr [rsp + 8], 3",
-        "jz 2f",
-        // -------- user-mode #UD: full save --------
-        "swapgs",
-        "mov gs:[16 + 0],   rax",
-        "mov gs:[16 + 8],   rbx",
-        "mov gs:[16 + 16],  rcx",   // TRUE rcx
-        "mov gs:[16 + 24],  rdx",
-        "mov gs:[16 + 32],  rsi",
-        "mov gs:[16 + 40],  rdi",
-        "mov gs:[16 + 48],  rbp",
-        "mov gs:[16 + 56],  r8",
-        "mov gs:[16 + 64],  r9",
-        "mov gs:[16 + 72],  r10",
-        "mov gs:[16 + 80],  r11",   // TRUE r11
-        "mov gs:[16 + 88],  r12",
-        "mov gs:[16 + 96],  r13",
-        "mov gs:[16 + 104], r14",
-        "mov gs:[16 + 112], r15",
-        "mov rax, [rsp + 0]",
-        "mov gs:[16 + 128], rax",   // user_ctx.rip    = saved RIP
-        "mov rax, [rsp + 16]",
-        "mov gs:[16 + 136], rax",   // user_ctx.rflags = saved RFLAGS
-        "mov rax, [rsp + 24]",
-        "mov gs:[16 + 120], rax",   // user_ctx.rsp    = saved RSP
-        "mov rdi, [rsp + 0]",
-        "mov rsi, [rsp + 8]",
-        "sub rsp, 8",
-        "call {handler}",
-        "add rsp, 8",
-        // Unreachable for user faults; defensive restore + return.
-        "mov rax, gs:[16 + 0]",
-        "mov rbx, gs:[16 + 8]",
-        "mov rcx, gs:[16 + 16]",
-        "mov rdx, gs:[16 + 24]",
-        "mov rsi, gs:[16 + 32]",
-        "mov rdi, gs:[16 + 40]",
-        "mov rbp, gs:[16 + 48]",
-        "mov r8,  gs:[16 + 56]",
-        "mov r9,  gs:[16 + 64]",
-        "mov r10, gs:[16 + 72]",
-        "mov r11, gs:[16 + 80]",
-        "mov r12, gs:[16 + 88]",
-        "mov r13, gs:[16 + 96]",
-        "mov r14, gs:[16 + 104]",
-        "mov r15, gs:[16 + 112]",
-        "swapgs",
-        "iretq",
-        // -------- kernel-mode #UD: fatal --------
-        "2:",
-        "mov rdi, [rsp + 0]",
-        "mov rsi, [rsp + 8]",
-        "sub rsp, 8",
-        "call {handler}",
-        "add rsp, 8",
-        "iretq",
-        handler = sym handle_invalid_opcode_typed,
-    );
-}
-
-extern "C" fn handle_invalid_opcode_typed(saved_rip: u64, saved_cs: u64) {
-    let from_user = (saved_cs & 3) == 3;
-    if !from_user {
-        crate::arch::log("FATAL: kernel #UD @ rip=0x");
-        log_hex64(saved_rip);
-        crate::arch::log("\n");
-        fatal_exception(6, 0);
-    }
-    acquire_user_fault_entry();
-    let current = crate::arch::x86_64::syscall_entry::resolve_live_user_thread();
-    let Some(faulter) = current else {
-        // Same race as the #PF no-current path: another CPU blocked
-        // us mid-flight. Dispatch whatever is runnable.
-        unsafe { dispatch_next_or_idle("[#UD: no current, idling CPU]\n") }
-    };
-    unsafe {
-        // Mirror the per-CPU snapshot (full fault-time state) into
-        // the faulter and mark iretq resume.
-        let snapshot = *crate::arch::x86_64::syscall_entry::current_cpu_user_ctx_mut();
-        let s = crate::kernel::KERNEL.get();
-        let t = s.scheduler.slab.get_mut(faulter);
-        t.user_context = snapshot;
-        t.use_iretq_resume = true;
-        // UserException(number=6 (#UD vector), code=0) — mirrors
-        // upstream handleUserLevelFault for int_invalid_op.
-        if crate::fault::deliver_fault(
-            faulter,
-            crate::fault::FaultMessage::UserException { number: 6, code: 0 },
-        )
-        .is_err()
-        {
-            crate::arch::log("[#UD: no fault handler — suspending thread]\n");
-            s.scheduler
-                .block(faulter, crate::tcb::ThreadStateType::Inactive);
-        }
-        dispatch_next_or_idle("[#UD: no next thread, idling CPU]\n")
-    }
-}
-
-extern "C" fn handle_double_fault(error_code: u64, exception_num: u64) {
-    crate::arch::log("FATAL: Double fault - system is in an unrecoverable state\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_invalid_tss(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Invalid TSS\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_segment_not_present(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Segment not present\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_stack_segment_fault(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Stack segment fault\n");
-    fatal_exception(exception_num, error_code);
-}
-
 /// #GP (General Protection, vector 13) entry. The CPU pushes an
 /// error code, so the frame is offset by 8 vs the #UD entry:
 ///   [rsp+0]  = error_code
@@ -767,7 +709,7 @@ extern "C" fn handle_general_protection_fault_typed(
             }
             crate::arch::log("\n");
         }
-        fatal_exception(13, error_code);
+        fatal_exception(vector::GENERAL_PROTECTION, error_code, saved_rip);
     }
     acquire_user_fault_entry();
     let current = crate::arch::x86_64::syscall_entry::resolve_live_user_thread();
@@ -885,19 +827,11 @@ extern "C" fn handle_general_protection_fault_typed(
     }
 }
 
-extern "C" fn handle_page_fault(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Page fault\n");
-    fatal_exception(exception_num, error_code);
-}
-
 // ---------------------------------------------------------------------------
 // Phase 25 — proper page-fault entry that routes user faults
 // through deliver_fault.
 //
-// The original `interrupt_with_error!` macro pushes a placeholder
-// vector then `call`s the Rust handler. The handler is `extern "C"`
-// (System V ABI) but the macro doesn't put args in rdi/rsi, so it
-// reads garbage. We write a focused stub that:
+// A focused stub that:
 //   1. captures CR2 + error code + saved CS into the right argument
 //      registers
 //   2. calls the Rust handler
@@ -1308,36 +1242,13 @@ pub mod spec {
     }
 }
 
-extern "C" fn handle_x87_floating_point(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: x87 floating point exception\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_alignment_check(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Alignment check\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_machine_check(error_code: u64, exception_num: u64) {
-    crate::arch::log("FATAL: Machine check exception - hardware error\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_simd_floating_point(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: SIMD floating point exception\n");
-    fatal_exception(exception_num, error_code);
-}
-
-extern "C" fn handle_virtualization(error_code: u64, exception_num: u64) {
-    crate::arch::log("EXCEPTION: Virtualization exception\n");
-    fatal_exception(exception_num, error_code);
-}
-
-fn fatal_exception(exception_num: u64, error_code: u64) -> ! {
-    crate::arch::log("Exception number: ");
-    print_hex(exception_num);
+fn fatal_exception(vector: u64, error_code: u64, saved_rip: u64) -> ! {
+    crate::arch::log("Vector: ");
+    print_hex(vector);
     crate::arch::log("\nError code: ");
     print_hex(error_code);
+    crate::arch::log("\nRIP: ");
+    print_hex(saved_rip);
     crate::arch::log("\nSystem halted due to unrecoverable error\n");
 
     #[cfg(any(feature = "spec", feature = "extern-rootserver"))]

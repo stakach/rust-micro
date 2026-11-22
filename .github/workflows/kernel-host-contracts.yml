@@ -10,6 +10,8 @@ on:
       - "src/smp/quiescence.rs"
       - "tests/bkl_contracts.rs"
       - "src/arch/x86_64/syscall_entry.rs"
+      - "src/arch/x86_64/cpu_exception_vectors.rs"
+      - "tests/cpu_exception_vectors.rs"
   pull_request:
     paths:
       - ".github/workflows/kernel-host-contracts.yml"
@@ -19,6 +21,8 @@ on:
       - "src/smp/quiescence.rs"
       - "tests/bkl_contracts.rs"
       - "src/arch/x86_64/syscall_entry.rs"
+      - "src/arch/x86_64/cpu_exception_vectors.rs"
+      - "tests/cpu_exception_vectors.rs"
 
 permissions:
   contents: read
@@ -33,3 +37,7 @@ jobs:
         run: |
           rustc --edition 2021 --test tests/bkl_contracts.rs -o /tmp/kernel-bkl-tests
           /tmp/kernel-bkl-tests
+      - name: Test the CPU exception vector routing
+        run: |
+          rustc --edition 2021 --test tests/cpu_exception_vectors.rs -o /tmp/kernel-cpu-exception-vector-tests
+          /tmp/kernel-cpu-exception-vector-tests

@@ -8,6 +8,7 @@ pub mod context;
 pub mod cpu;
 pub mod debug;
 mod debug_output_cost;
+pub mod cpu_exception_vectors;
 pub mod exceptions;
 pub mod fpu_ctx;
 pub mod gdt;

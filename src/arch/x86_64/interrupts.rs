@@ -71,47 +71,6 @@ pub fn load_idt() {
     }
 }
 
-macro_rules! interrupt {
-    ($name:ident, $handler:ident) => {
-        #[unsafe(naked)]
-        #[no_mangle]
-        pub unsafe extern "C" fn $name() {
-            core::arch::naked_asm!(
-                "push 0",            // Push error code (0 for exceptions without it)
-                "push 0",            // Dummy IRQ number or vector
-                "sub rsp, 8",        // Align before entering the System V Rust handler
-                "call {handler}",    // Call actual handler function
-                "add rsp, 8",        // Restore the exception frame
-                "add rsp, 16",       // Clean up stack
-                "iretq",             // Return from interrupt
-                handler = sym $handler
-            );
-        }
-    };
-}
-
-macro_rules! interrupt_with_error {
-    ($name:ident, $handler:ident, $vector:expr) => {
-        #[unsafe(naked)]
-        #[no_mangle]
-        pub unsafe extern "C" fn $name() {
-            core::arch::naked_asm!(
-                "push {vector}",     // Push vector number
-                "sub rsp, 8",        // Hardware error code + vector leave RSP misaligned
-                "call {handler}",    // Call actual handler function
-                "add rsp, 8",        // Restore the exception frame
-                "add rsp, 16",       // Clean up stack (error code + vector)
-                "iretq",             // Return from interrupt
-                vector = const $vector,
-                handler = sym $handler
-            );
-        }
-    };
-}
-
-pub(crate) use interrupt;
-pub(crate) use interrupt_with_error;
-
 #[unsafe(naked)]
 unsafe extern "C" fn default_interrupt_handler() {
     core::arch::naked_asm!(
