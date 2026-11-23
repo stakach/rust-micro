@@ -13,6 +13,8 @@ use crate::region::{align_down, align_up, PRegion};
 
 #[path = "boot/direct_map_policy.rs"]
 pub(crate) mod direct_map_policy;
+#[path = "boot/direct_map_owners.rs"]
+mod direct_map_owners;
 #[path = "boot/simpleboot_mmap_policy.rs"]
 mod simpleboot_mmap_policy;
 
@@ -377,7 +379,7 @@ pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
         return Err(BootError::InvalidMemoryMap);
     }
     // Keep the byte-exact firmware ranges for allocation and BootInfo. The
-    // page-normalized `converted` ranges above are the separate direct-map
+    // page-normalized `normalized` ranges above are the separate direct-map
     // admission view and validate the complete map before any output write.
     for (slot, entry) in out.iter_mut().zip(raw[..raw_count].iter().copied()) {
         let kind = simpleboot_mmap_policy::classify_simpleboot_kind(entry)

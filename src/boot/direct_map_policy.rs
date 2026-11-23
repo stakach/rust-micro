@@ -15,7 +15,7 @@ pub struct PhysicalRange {
 }
 
 impl PhysicalRange {
-    fn overlaps(self, other: Self) -> bool {
+    pub(crate) fn overlaps(self, other: Self) -> bool {
         self.start < other.end && other.start < self.end
     }
 }
@@ -143,7 +143,7 @@ pub fn count_direct_map_tables(
     Ok(())
 }
 
-fn valid_range(range: PhysicalRange) -> bool {
+pub(crate) fn valid_range(range: PhysicalRange) -> bool {
     range.start < range.end && (range.start | range.end) & (PAGE_4K - 1) == 0
 }
 
