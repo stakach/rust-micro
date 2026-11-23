@@ -171,3 +171,53 @@ fn a_copied_iopt_alias_keeps_the_mapping_until_the_last_cap_deletes() {
     assert!(!retire_last_iopt_alias(1));
     assert!(retire_last_iopt_alias(0));
 }
+
+#[path = "../src/arch/x86_64/iommu/domain.rs"]
+mod domain;
+
+#[test]
+fn domain_capacity_follows_the_advertised_width_and_refuses_reserved_encoding() {
+    use domain::domain_count;
+    for (nd, expected) in [16, 64, 256, 1024, 4096, 16384, 65536].into_iter().enumerate() {
+        assert_eq!(domain_count(0x1080 | nd as u64), Some(expected));
+    }
+    assert_eq!(domain_count(7), None);
+}
+
+#[test]
+fn domain_reservation_refuses_foreign_requesters_without_overwriting_the_owner() {
+    use domain::{check_domain, reserve_domain};
+    let mut owners = [0; 16];
+    assert_eq!(reserve_domain(&mut owners, 0, 3), Err(VtdError::InvalidDomain));
+    assert_eq!(reserve_domain(&mut owners, 16, 3), Err(VtdError::InvalidDomain));
+    assert_eq!(reserve_domain(&mut owners, 15, 3), Ok(()));
+    assert_eq!(check_domain(&owners, 15, 3), Ok(()));
+    assert_eq!(reserve_domain(&mut owners, 15, 4), Err(VtdError::OwnershipConflict));
+    assert_eq!(owners[15], 3);
+}
+
+#[test]
+fn domain_remains_reserved_until_the_retirement_effect_acknowledges() {
+    use domain::{reserve_domain, retire_owned_domain};
+    let mut owners = [0; 16];
+    reserve_domain(&mut owners, 6, 16).unwrap();
+    let log = RefCell::new(Vec::new());
+    let mut regs = FakeRegisters::new(&log, false);
+    assert_eq!(
+        retire_owned_domain(&mut owners, 6, 17, || unreachable!("foreign RID enters no effect")),
+        Err(VtdError::OwnershipConflict)
+    );
+    assert_eq!(
+        retire_owned_domain(&mut owners, 6, 16, || retire_context(
+            &mut regs, IOTLB, || memory(&log, "clear present"), || memory(&log, "clear domain")
+        )),
+        Err(VtdError::TimedOut)
+    );
+    assert_eq!(owners[6], 16);
+    assert_eq!(reserve_domain(&mut owners, 6, 17), Err(VtdError::OwnershipConflict));
+    let mut regs = FakeRegisters::new(&log, true);
+    retire_owned_domain(&mut owners, 6, 16, || retire_context(
+        &mut regs, IOTLB, || memory(&log, "clear present"), || memory(&log, "clear domain")
+    )).unwrap();
+    assert_eq!(reserve_domain(&mut owners, 6, 17), Ok(()));
+}

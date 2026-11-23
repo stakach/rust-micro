@@ -18,11 +18,13 @@ use super::acpi;
 use super::paging::{self, phys_to_lin, KERNEL_IOMMU_VBASE};
 use core::sync::atomic::{fence, Ordering};
 
+mod domain;
 mod retirement;
+use domain::{check_domain, domain_count, reserve_domain, retire_owned_domain, MAX_DOMAINS};
 use retirement::INVALIDATION_SPINS;
 use retirement::{
-    context_admits_domain, cte_asr, cte_high, cte_low, cte_present, invalidate_context_and_iotlb_at,
-    retire_context, retire_leaf, VtdRegisters,
+    context_admits_domain, cte_asr, cte_domain_id, cte_high, cte_low, cte_present,
+    invalidate_context_and_iotlb_at, retire_context, retire_leaf, VtdRegisters,
 };
 pub use retirement::{dma_retirement_phase, retire_last_iopt_alias, DmaRetirementKind, VtdError};
 
@@ -62,6 +64,10 @@ static mut VTD_IOTLB_OFFSET: u64 = 0;
 /// Kernel BSS remains mapped in every user CR3; the ACPI physical pointer does not.
 static mut VTD_ALLOWED_RIDS: [u64; 1024] = [0; 1024];
 static mut VTD_INCLUDE_ALL_RIDS: bool = false;
+/// Exclusive upper bound for domain IDs on the discovered remapping unit.
+static mut VTD_DOMAIN_COUNT: usize = 0;
+/// BKL-owned domain reservations. Nonzero entries hold the context's requester ID.
+static mut VTD_DOMAIN_OWNERS: [u16; MAX_DOMAINS] = [0; MAX_DOMAINS];
 
 #[cold]
 pub fn fail_stop(error: VtdError) -> ! {
@@ -232,8 +238,20 @@ fn get_pci_bus(rid: u16) -> usize {
 // first map). With `allocate == false`, an absent table yields `None`.
 // ---------------------------------------------------------------------------
 
-/// Pointer to a context entry: `[0]` = low qword, `[1]` = high qword.
-pub struct CtxSlot(pub *mut u64);
+/// Context entry and the requester whose root/context table lookup produced it.
+pub struct CtxSlot {
+    entry: *mut u64,
+    requester: u16,
+}
+
+/// Refuse invalid domains and foreign owners before a lazy context-table allocation.
+pub unsafe fn check_context_domain(requester: u16, domain_id: u16) -> Result<(), VtdError> {
+    if VTD_ROOT_TABLE_PADDR == 0 {
+        return Err(VtdError::Unavailable);
+    }
+    let owners = &*core::ptr::addr_of!(VTD_DOMAIN_OWNERS);
+    check_domain(&owners[..VTD_DOMAIN_COUNT], domain_id, requester)
+}
 
 pub unsafe fn lookup_vtd_context_slot(pci_request_id: u16, allocate: bool) -> Option<CtxSlot> {
     if VTD_ROOT_TABLE_PADDR == 0 {
@@ -263,40 +281,58 @@ pub unsafe fn lookup_vtd_context_slot(pci_request_id: u16, allocate: bool) -> Op
     let ct_lin = phys_to_lin(ctp) as *mut u64;
     // Context index = (dev << 3) | fun = RID & 0xff; each CTE = 16 B.
     let ctx_index = (pci_request_id & 0xff) as usize;
-    Some(CtxSlot(ct_lin.add(ctx_index * 2)))
+    Some(CtxSlot {
+        entry: ct_lin.add(ctx_index * 2),
+        requester: pci_request_id,
+    })
 }
 
 impl CtxSlot {
     pub unsafe fn present(&self) -> bool {
-        cte_present(core::ptr::read_volatile(self.0))
+        cte_present(core::ptr::read_volatile(self.entry))
     }
     pub unsafe fn asr(&self) -> u64 {
-        cte_asr(core::ptr::read_volatile(self.0))
+        cte_asr(core::ptr::read_volatile(self.entry))
     }
     /// An existing PCI requester context may only be extended by its installed domain.
     pub unsafe fn matches_domain(&self, domain_id: u16) -> bool {
+        let owners = &*core::ptr::addr_of!(VTD_DOMAIN_OWNERS);
         context_admits_domain(
-            core::ptr::read_volatile(self.0),
-            core::ptr::read_volatile(self.0.add(1)),
+            core::ptr::read_volatile(self.entry),
+            core::ptr::read_volatile(self.entry.add(1)),
             domain_id,
-        )
+        ) && owners[..VTD_DOMAIN_COUNT].get(usize::from(domain_id)) == Some(&self.requester)
     }
     /// Install this context entry as the root of an IO address space.
-    pub unsafe fn install_root(&self, domain_id: u16, asr_paddr: u64) {
+    pub unsafe fn install_root(&self, domain_id: u16, asr_paddr: u64) -> Result<(), VtdError> {
+        if self.present() {
+            return Err(VtdError::OwnershipConflict);
+        }
+        let (base, iotlb) = invalidation_regs()?;
+        let owners = &mut *core::ptr::addr_of_mut!(VTD_DOMAIN_OWNERS);
+        reserve_domain(&mut owners[..VTD_DOMAIN_COUNT], domain_id, self.requester)?;
         let aw = NUM_IOPT_LEVELS - 2;
-        core::ptr::write_volatile(self.0.add(1), cte_high(aw, domain_id as u64));
-        core::ptr::write_volatile(self.0, cte_low(asr_paddr, 0, true));
-        invalidate_context_and_iotlb().unwrap_or_else(|error| fail_stop(error));
+        core::ptr::write_volatile(self.entry.add(1), cte_high(aw, domain_id as u64));
+        core::ptr::write_volatile(self.entry, cte_low(asr_paddr, 0, true));
+        fence(Ordering::SeqCst);
+        invalidate_context_and_iotlb_at(&mut MmioRegisters(base), iotlb)
+            .unwrap_or_else(|error| fail_stop(error));
+        Ok(())
     }
-    pub unsafe fn clear(&self) {
-        let (base, iotlb) = invalidation_regs().unwrap_or_else(|error| fail_stop(error));
-        retire_context(
-            &mut MmioRegisters(base),
-            iotlb,
-            || core::ptr::write_volatile(self.0, 0),
-            || core::ptr::write_volatile(self.0.add(1), 0),
-        )
-        .unwrap_or_else(|error| fail_stop(error));
+    pub unsafe fn clear(&self) -> Result<(), VtdError> {
+        let domain_id = cte_domain_id(core::ptr::read_volatile(self.entry.add(1)));
+        let owners = &mut *core::ptr::addr_of_mut!(VTD_DOMAIN_OWNERS);
+        retire_owned_domain(&mut owners[..VTD_DOMAIN_COUNT], domain_id, self.requester, || {
+            let (base, iotlb) = invalidation_regs()?;
+            retire_context(
+                &mut MmioRegisters(base),
+                iotlb,
+                || core::ptr::write_volatile(self.entry, 0),
+                || core::ptr::write_volatile(self.entry.add(1), 0),
+            )
+            .unwrap_or_else(|error| fail_stop(error));
+            Ok(())
+        })
     }
 }
 
@@ -459,6 +495,11 @@ pub fn vtd_init() {
         return;
     }
 
+    let Some(domains) = domain_count(cap) else {
+        crate::arch::log("IOMMU: VT-d has a reserved CAP.ND encoding — disabled\n");
+        return;
+    };
+
     // numIOPTLevels = 4 (see module docs); CAP.SAGAW must advertise it.
     unsafe { NUM_IOPT_LEVELS = 4 };
 
@@ -469,6 +510,7 @@ pub fn vtd_init() {
         return;
     };
     unsafe {
+        VTD_DOMAIN_COUNT = domains;
         VTD_ROOT_TABLE_PADDR = root_paddr;
         NUM_DRHU = 1;
         VTD_IOTLB_OFFSET = iotlb_offset;

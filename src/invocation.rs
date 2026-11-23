@@ -1125,6 +1125,17 @@ fn decode_x86_iopt(
             )));
         }
 
+        let domain_error = |error| {
+            let status = match error {
+                iommu::VtdError::Unavailable => seL4_Error::seL4_FailedLookup,
+                iommu::VtdError::OwnershipConflict => seL4_Error::seL4_DeleteFirst,
+                _ => seL4_Error::seL4_InvalidCapability,
+            };
+            KException::SyscallError(SyscallError::new(status))
+        };
+        unsafe { iommu::check_context_domain(pci_request_id, domain_id) }
+            .map_err(domain_error)?;
+
         let ctx = unsafe { iommu::lookup_vtd_context_slot(pci_request_id, true) };
         let Some(ctx) = ctx else {
             // No IOMMU / pool exhausted.
@@ -1135,9 +1146,7 @@ fn decode_x86_iopt(
 
         if !unsafe { ctx.present() } {
             // Install this PT as the context (1st-level) root.
-            unsafe {
-                ctx.install_root(domain_id, base_paddr);
-            }
+            unsafe { ctx.install_root(domain_id, base_paddr) }.map_err(domain_error)?;
             // A device now has an IO-space context — turn on VT-d translation. Until now
             // DMA was identity (TE off); from here it's confined to mapped IOVAs.
             unsafe {
@@ -1319,7 +1328,7 @@ unsafe fn delete_io_page_table(
         if top != base_paddr {
             return Err(iommu::VtdError::OwnershipConflict);
         }
-        ctx.clear();
+        ctx.clear()?;
     } else {
         let lu = iommu::lookup_iopt_slot_levels(
             top,

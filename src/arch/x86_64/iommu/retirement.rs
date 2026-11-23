@@ -26,6 +26,7 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VtdError {
     Unavailable,
+    InvalidDomain,
     TimedOut,
     UnsupportedGranularity,
     OwnershipConflict,
