@@ -12,7 +12,7 @@
 use crate::region::{align_down, align_up, PRegion};
 
 #[path = "boot/direct_map_policy.rs"]
-mod direct_map_policy;
+pub(crate) mod direct_map_policy;
 #[path = "boot/simpleboot_mmap_policy.rs"]
 mod simpleboot_mmap_policy;
 
@@ -316,16 +316,12 @@ fn layout_at(base: u64, layout: &RootserverLayout) -> RootserverMem {
 // and converts each entry into a `MemEntry`.
 // ---------------------------------------------------------------------------
 
-pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
-    use direct_map_policy::{FirmwareKind, FirmwareRange, PhysicalRange};
+fn checked_simpleboot_mmap(
+    raw: &mut [simpleboot_mmap_policy::RawMmapEntry],
+    normalized: &mut [direct_map_policy::FirmwareRange],
+) -> Result<(usize, usize), BootError> {
     use simpleboot_mmap_policy::RawMmapEntry;
 
-    let mut raw = [RawMmapEntry {
-        base_addr: 0,
-        length: 0,
-        entry_type: 0,
-        reserved: 0,
-    }; MAX_BOOT_MMAP_ENTRIES];
     let mut raw_count = 0usize;
     let mut overflow = false;
     crate::simpleboot::try_for_each_mmap_entry(|entry| {
@@ -345,15 +341,38 @@ pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
     if overflow {
         return Err(BootError::InvalidMemoryMap);
     }
-    let mut converted = [FirmwareRange {
+    let normalized_count =
+        simpleboot_mmap_policy::convert_simpleboot_mmap(&raw[..raw_count], normalized)
+            .map_err(|_| BootError::InvalidMemoryMap)?;
+    Ok((raw_count, normalized_count))
+}
+
+fn empty_raw_mmap() -> [simpleboot_mmap_policy::RawMmapEntry; MAX_BOOT_MMAP_ENTRIES] {
+    [simpleboot_mmap_policy::RawMmapEntry {
+        base_addr: 0,
+        length: 0,
+        entry_type: 0,
+        reserved: 0,
+    }; MAX_BOOT_MMAP_ENTRIES]
+}
+
+pub(crate) fn read_simpleboot_firmware_map(
+    out: &mut [direct_map_policy::FirmwareRange],
+) -> Result<usize, BootError> {
+    let mut raw = empty_raw_mmap();
+    let (_, normalized_count) = checked_simpleboot_mmap(&mut raw, out)?;
+    Ok(normalized_count)
+}
+
+pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
+    use direct_map_policy::{FirmwareKind, FirmwareRange, PhysicalRange};
+
+    let mut raw = empty_raw_mmap();
+    let mut normalized = [FirmwareRange {
         range: PhysicalRange { start: 0, end: 0 },
         kind: FirmwareKind::Reserved,
     }; MAX_BOOT_MMAP_ENTRIES];
-    simpleboot_mmap_policy::convert_simpleboot_mmap(
-        &raw[..raw_count],
-        &mut converted,
-    )
-    .map_err(|_| BootError::InvalidMemoryMap)?;
+    let (raw_count, _) = checked_simpleboot_mmap(&mut raw, &mut normalized)?;
     if raw_count > out.len() {
         return Err(BootError::InvalidMemoryMap);
     }
