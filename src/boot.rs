@@ -434,10 +434,16 @@ fn reserve_page_range(free: &mut RegionList, start: u64, end: u64) -> Result<(),
 }
 
 #[cfg(target_arch = "x86_64")]
-fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
+fn visit_live_page_tables(
+    mut visit: impl FnMut(u64, u64) -> Result<(), BootError>,
+) -> Result<(), BootError> {
     const PTE_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-    unsafe fn walk(free: &mut RegionList, table_paddr: u64, level: u8) -> Result<(), BootError> {
+    unsafe fn walk(
+        visit: &mut impl FnMut(u64, u64) -> Result<(), BootError>,
+        table_paddr: u64,
+        level: u8,
+    ) -> Result<(), BootError> {
         const PTE_PRESENT: u64 = 1 << 0;
         const PTE_PS: u64 = 1 << 7;
         const PTE_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -455,18 +461,23 @@ fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
             if child == 0 {
                 continue;
             }
-            reserve_page_range(free, child, child + 4096)?;
+            visit(child, child + 4096)?;
             let child_level = level - 1;
             if child_level > 1 {
-                walk(free, child, child_level)?;
+                walk(visit, child, child_level)?;
             }
         }
         Ok(())
     }
 
     let root = crate::arch::x86_64::paging::read_cr3() & PTE_PADDR_MASK;
-    reserve_page_range(free, root, root + 4096)?;
-    unsafe { walk(free, root, 4) }
+    visit(root, root + 4096)?;
+    unsafe { walk(&mut visit, root, 4) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
+    visit_live_page_tables(|start, end| reserve_page_range(free, start, end))
 }
 
 // ---------------------------------------------------------------------------
