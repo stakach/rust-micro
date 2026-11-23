@@ -11,8 +11,15 @@
 
 use crate::region::{align_down, align_up, PRegion};
 
+#[path = "boot/direct_map_owners.rs"]
+mod direct_map_owners;
 #[path = "boot/direct_map_policy.rs"]
-mod direct_map_policy;
+pub(crate) mod direct_map_policy;
+#[cfg(target_arch = "x86_64")]
+#[path = "boot/direct_map_preflight.rs"]
+mod direct_map_preflight;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use direct_map_preflight::preflight_direct_map;
 #[path = "boot/simpleboot_mmap_policy.rs"]
 mod simpleboot_mmap_policy;
 
@@ -316,16 +323,12 @@ fn layout_at(base: u64, layout: &RootserverLayout) -> RootserverMem {
 // and converts each entry into a `MemEntry`.
 // ---------------------------------------------------------------------------
 
-pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
-    use direct_map_policy::{FirmwareKind, FirmwareRange, PhysicalRange};
+fn checked_simpleboot_mmap(
+    raw: &mut [simpleboot_mmap_policy::RawMmapEntry],
+    normalized: &mut [direct_map_policy::FirmwareRange],
+) -> Result<(usize, usize), BootError> {
     use simpleboot_mmap_policy::RawMmapEntry;
 
-    let mut raw = [RawMmapEntry {
-        base_addr: 0,
-        length: 0,
-        entry_type: 0,
-        reserved: 0,
-    }; MAX_BOOT_MMAP_ENTRIES];
     let mut raw_count = 0usize;
     let mut overflow = false;
     crate::simpleboot::try_for_each_mmap_entry(|entry| {
@@ -345,20 +348,43 @@ pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
     if overflow {
         return Err(BootError::InvalidMemoryMap);
     }
-    let mut converted = [FirmwareRange {
+    let normalized_count =
+        simpleboot_mmap_policy::convert_simpleboot_mmap(&raw[..raw_count], normalized)
+            .map_err(|_| BootError::InvalidMemoryMap)?;
+    Ok((raw_count, normalized_count))
+}
+
+fn empty_raw_mmap() -> [simpleboot_mmap_policy::RawMmapEntry; MAX_BOOT_MMAP_ENTRIES] {
+    [simpleboot_mmap_policy::RawMmapEntry {
+        base_addr: 0,
+        length: 0,
+        entry_type: 0,
+        reserved: 0,
+    }; MAX_BOOT_MMAP_ENTRIES]
+}
+
+pub(crate) fn read_simpleboot_firmware_map(
+    out: &mut [direct_map_policy::FirmwareRange],
+) -> Result<usize, BootError> {
+    let mut raw = empty_raw_mmap();
+    let (_, normalized_count) = checked_simpleboot_mmap(&mut raw, out)?;
+    Ok(normalized_count)
+}
+
+pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
+    use direct_map_policy::{FirmwareKind, FirmwareRange, PhysicalRange};
+
+    let mut raw = empty_raw_mmap();
+    let mut normalized = [FirmwareRange {
         range: PhysicalRange { start: 0, end: 0 },
         kind: FirmwareKind::Reserved,
     }; MAX_BOOT_MMAP_ENTRIES];
-    simpleboot_mmap_policy::convert_simpleboot_mmap(
-        &raw[..raw_count],
-        &mut converted,
-    )
-    .map_err(|_| BootError::InvalidMemoryMap)?;
+    let (raw_count, _) = checked_simpleboot_mmap(&mut raw, &mut normalized)?;
     if raw_count > out.len() {
         return Err(BootError::InvalidMemoryMap);
     }
     // Keep the byte-exact firmware ranges for allocation and BootInfo. The
-    // page-normalized `converted` ranges above are the separate direct-map
+    // page-normalized `normalized` ranges above are the separate direct-map
     // admission view and validate the complete map before any output write.
     for (slot, entry) in out.iter_mut().zip(raw[..raw_count].iter().copied()) {
         let kind = simpleboot_mmap_policy::classify_simpleboot_kind(entry)
@@ -413,10 +439,16 @@ fn reserve_page_range(free: &mut RegionList, start: u64, end: u64) -> Result<(),
 }
 
 #[cfg(target_arch = "x86_64")]
-fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
+fn visit_live_page_tables(
+    mut visit: impl FnMut(u64, u64) -> Result<(), BootError>,
+) -> Result<(), BootError> {
     const PTE_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-    unsafe fn walk(free: &mut RegionList, table_paddr: u64, level: u8) -> Result<(), BootError> {
+    unsafe fn walk(
+        visit: &mut impl FnMut(u64, u64) -> Result<(), BootError>,
+        table_paddr: u64,
+        level: u8,
+    ) -> Result<(), BootError> {
         const PTE_PRESENT: u64 = 1 << 0;
         const PTE_PS: u64 = 1 << 7;
         const PTE_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -434,18 +466,23 @@ fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
             if child == 0 {
                 continue;
             }
-            reserve_page_range(free, child, child + 4096)?;
+            visit(child, child + 4096)?;
             let child_level = level - 1;
             if child_level > 1 {
-                walk(free, child, child_level)?;
+                walk(visit, child, child_level)?;
             }
         }
         Ok(())
     }
 
     let root = crate::arch::x86_64::paging::read_cr3() & PTE_PADDR_MASK;
-    reserve_page_range(free, root, root + 4096)?;
-    unsafe { walk(free, root, 4) }
+    visit(root, root + 4096)?;
+    unsafe { walk(&mut visit, root, 4) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
+    visit_live_page_tables(|start, end| reserve_page_range(free, start, end))
 }
 
 // ---------------------------------------------------------------------------

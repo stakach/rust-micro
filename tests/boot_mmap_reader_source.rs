@@ -8,27 +8,16 @@ use std::process::Command;
 
 fn reader_source(source: &str) -> &str {
     let start = source
-        .find("pub fn read_simpleboot_mmap(")
-        .expect("native boot reader exists");
-    let open = start + source[start..].find('{').expect("reader body");
-    let mut depth = 0usize;
-    for (offset, byte) in source[open..].bytes().enumerate() {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &source[start..open + offset + 1];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unterminated native boot reader")
+        .find("fn checked_simpleboot_mmap(")
+        .expect("native boot reader has one checked raw source");
+    let end = source[start..]
+        .find("fn reserve_simpleboot_allocations(")
+        .expect("native reader boundary");
+    &source[start..start + end]
 }
 
 #[test]
-fn native_reader_rejects_truncation_overflow_and_malformed_final_tag_atomically() {
+fn native_reader_keeps_distinct_checked_views_and_rejects_bad_maps_atomically() {
     let root = std::env::current_dir().unwrap();
     let source = fs::read_to_string(root.join("src/boot.rs")).unwrap();
     let work = std::env::temp_dir().join(format!(
@@ -110,7 +99,28 @@ fn main() {
     let truncated = check_case("241 entries", oversized, false);
     let overflow = check_case("overflowing physical range", vec![entry(0, 4096), entry(u64::MAX - 8, 16)], false);
     let malformed = check_case("malformed final tag", vec![entry(0, 4096)], true);
-    if !(truncated && overflow && malformed) { std::process::exit(1); }
+    simpleboot::set(vec![entry(0x1800, 0x3000),
+        simpleboot::MMapEntry {base_addr:0x8001,length:0x1000,entry_type:2,reserved:0}], false);
+    let sentinel = MemEntry {region:PRegion::new(u64::MAX,u64::MAX),kind:MemKind::Used};
+    let mut exact = [sentinel; MAX_BOOT_MMAP_ENTRIES];
+    let mut normalized = [direct_map_policy::FirmwareRange {
+        range:direct_map_policy::PhysicalRange {start:u64::MAX,end:u64::MAX},
+        kind:direct_map_policy::FirmwareKind::Reserved
+    }; MAX_BOOT_MMAP_ENTRIES];
+    let exact_count = read_simpleboot_mmap(&mut exact).unwrap();
+    let normalized_count = read_simpleboot_firmware_map(&mut normalized).unwrap();
+    let distinct_views = exact_count==2 && normalized_count==2
+        && exact[0].region==PRegion::new(0x1800,0x4800)
+        && normalized[0].range==direct_map_policy::PhysicalRange {start:0x2000,end:0x4000}
+        && exact[1].region==PRegion::new(0x8001,0x9001)
+        && normalized[1].range==direct_map_policy::PhysicalRange {start:0x8000,end:0xA000};
+    simpleboot::set(vec![entry(0,4096)], true);
+    let before = normalized;
+    let malformed_normalized = read_simpleboot_firmware_map(&mut normalized).is_err()
+        && normalized==before;
+    if !(truncated && overflow && malformed && distinct_views && malformed_normalized) {
+        std::process::exit(1);
+    }
 }
 "#);
     program.push_str(reader_source(&source));
