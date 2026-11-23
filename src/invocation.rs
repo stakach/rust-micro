@@ -1184,7 +1184,7 @@ fn decode_x86_iopt(
             )));
         }
         unsafe {
-            iommu::slot_install(lu.slot, base_paddr, true, true);
+            iommu::slot_install_table(lu.slot, base_paddr);
         }
         let new_cap = Cap::IoPageTable {
             ptr: crate::cap::PPtr::new(base_paddr).unwrap(),

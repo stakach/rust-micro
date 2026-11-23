@@ -221,3 +221,141 @@ fn domain_remains_reserved_until_the_retirement_effect_acknowledges() {
     )).unwrap();
     assert_eq!(reserve_domain(&mut owners, 6, 17), Ok(()));
 }
+
+#[path = "../src/arch/x86_64/iommu/visibility.rs"]
+mod visibility;
+
+#[test]
+fn unlinked_table_is_visible_before_the_present_bit_can_be_written() {
+    let log = RefCell::new(Vec::new());
+    let mode = visibility::TableVisibility::new(false, true);
+    let result = mode.prepare_unlinked(
+        || memory(&log, "clean table"),
+        || {
+            memory(&log, "WBF acknowledged");
+            Ok(())
+        },
+    );
+    assert_eq!(result, Ok(()));
+    memory(&log, "publish present");
+    assert_eq!(*log.borrow(), [
+        Event::Memory("clean table"),
+        Event::Memory("WBF acknowledged"),
+        Event::Memory("publish present"),
+    ]);
+    assert_eq!(
+        mode.prepare_unlinked(|| {}, || Err(VtdError::TimedOut)),
+        Err(VtdError::TimedOut)
+    );
+    visibility::TableVisibility::new(true, false)
+        .prepare_unlinked(
+            || unreachable!("coherent tables need no cache clean"),
+            || unreachable!("write-buffer flush is not required"),
+        )
+        .unwrap();
+}
+
+#[test]
+fn write_buffer_command_preserves_only_persistent_global_commands() {
+    assert_eq!(
+        visibility::global_command(u32::MAX, 1 << 27),
+        (1 << 31) | (1 << 27) | (1 << 26) | (1 << 25) | (1 << 23)
+    );
+}
+
+#[test]
+fn noncoherent_table_cache_line_uses_the_advertised_cpu_width() {
+    const CLFSH: u32 = 1 << 19;
+    assert_eq!(visibility::cache_line_bytes(8 << 8, CLFSH), Some(64));
+    assert_eq!(visibility::cache_line_bytes(8 << 8, 0), None);
+    assert_eq!(visibility::cache_line_bytes(0, CLFSH), None);
+    assert_eq!(visibility::cache_line_bytes(3 << 8, CLFSH), None);
+}
+
+struct FakeGlobalRegisters<'a> {
+    log: &'a RefCell<Vec<Event>>,
+    initial_status: u32,
+    acknowledge: bool,
+    issued: bool,
+    polls_after_command: u32,
+}
+
+impl visibility::VtdGlobalRegisters for FakeGlobalRegisters<'_> {
+    fn status(&mut self) -> u32 {
+        const WBFS: u32 = 1 << 27;
+        if !self.issued {
+            return self.initial_status;
+        }
+        self.polls_after_command += 1;
+        if self.acknowledge && self.polls_after_command >= 2 {
+            self.log.borrow_mut().push(Event::Acknowledged(0x1c));
+            self.initial_status & !WBFS
+        } else {
+            self.initial_status | WBFS
+        }
+    }
+
+    fn command(&mut self, value: u32) {
+        assert!(!self.issued, "one command until status acknowledges it");
+        self.issued = true;
+        self.log.borrow_mut().push(Event::Command(0x18, u64::from(value)));
+    }
+}
+
+#[test]
+fn unlinked_table_publication_waits_for_the_global_write_buffer_status() {
+    const TE: u32 = 1 << 31;
+    const RTPS: u32 = 1 << 30;
+    const WBF: u32 = 1 << 27;
+    let log = RefCell::new(Vec::new());
+    let mut regs = FakeGlobalRegisters {
+        log: &log,
+        initial_status: TE | RTPS,
+        acknowledge: true,
+        issued: false,
+        polls_after_command: 0,
+    };
+    visibility::TableVisibility::new(false, true)
+        .prepare_unlinked(
+            || memory(&log, "clean child table"),
+            || visibility::flush_write_buffer(&mut regs),
+        )
+        .unwrap();
+    memory(&log, "publish parent pointer");
+    assert_eq!(*log.borrow(), [
+        Event::Memory("clean child table"),
+        Event::Command(0x18, u64::from(TE | WBF)),
+        Event::Acknowledged(0x1c),
+        Event::Memory("publish parent pointer"),
+    ]);
+    assert_eq!(regs.polls_after_command, 2);
+}
+
+#[test]
+fn busy_write_buffer_status_never_authorizes_publication_or_command_replay() {
+    const WBFS: u32 = 1 << 27;
+    for initial_status in [0, WBFS] {
+        let log = RefCell::new(Vec::new());
+        let mut regs = FakeGlobalRegisters {
+            log: &log,
+            initial_status,
+            acknowledge: false,
+            issued: false,
+            polls_after_command: 0,
+        };
+        let result = visibility::TableVisibility::new(true, true)
+            .prepare_unlinked(
+                || unreachable!("coherent table"),
+                || visibility::flush_write_buffer(&mut regs),
+            );
+        assert_eq!(result, Err(VtdError::TimedOut));
+        // A pre-existing busy status forbids a new command. Once issued, wait
+        // for that command without issuing it again.
+        assert_eq!(regs.issued, initial_status == 0);
+        assert_eq!(log.borrow().len(), if initial_status == 0 { 1 } else { 0 });
+        assert_eq!(
+            regs.polls_after_command,
+            if initial_status == 0 { INVALIDATION_SPINS } else { 0 },
+        );
+    }
+}
