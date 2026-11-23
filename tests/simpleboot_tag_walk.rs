@@ -2,10 +2,42 @@
 
 extern crate self as bootstrap_clock;
 pub struct WallClockSnapshot;
+#[derive(PartialEq)]
+pub struct PcRtcRegisters {
+    second: u8,
+    minute: u8,
+    hour: u8,
+    day: u8,
+    month: u8,
+    year: u8,
+    century: u8,
+}
+
+pub fn decode_pc_rtc_utc(_: PcRtcRegisters, _: u8) -> Result<WallClockSnapshot, ()> {
+    Err(())
+}
 
 mod arch {
     pub fn phys_to_virt(paddr: u64) -> u64 {
         paddr
+    }
+
+    pub fn get_cpu_id() -> u32 {
+        0
+    }
+
+    pub mod x86_64 {
+        pub mod acpi {
+            pub struct PcRtc {
+                pub index_port: u16,
+                pub data_port: u16,
+                pub century_register: Option<u8>,
+            }
+
+            pub fn find_pc_rtc(_: u64) -> Result<PcRtc, ()> {
+                Err(())
+            }
+        }
     }
 }
 
