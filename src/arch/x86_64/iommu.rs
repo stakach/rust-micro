@@ -462,21 +462,23 @@ pub unsafe fn slot_addr(slot: *mut u64) -> u64 {
 }
 /// Install a PTE pointing at a DMA frame. Only the remapper entry needs table writeback.
 pub unsafe fn slot_install(slot: *mut u64, paddr: u64, write: bool, read: bool) {
-    retire_slot(slot, pte_new(paddr, write, read), None);
+    retire_slot(slot, pte_new(paddr, write, read), None)
+        .unwrap_or_else(|error| fail_stop(error));
 }
 
 /// Install a PTE pointing at another table and prepare the table before it becomes reachable.
 pub unsafe fn slot_install_table(slot: *mut u64, table_paddr: u64) {
-    retire_slot(slot, pte_new(table_paddr, true, true), Some(table_paddr));
+    retire_slot(slot, pte_new(table_paddr, true, true), Some(table_paddr))
+        .unwrap_or_else(|error| fail_stop(error));
 }
 
 /// Zero a PTE slot. Returns only after the IOTLB no longer caches the old target.
-pub unsafe fn slot_clear(slot: *mut u64) {
-    retire_slot(slot, 0, None);
+pub unsafe fn slot_clear(slot: *mut u64) -> Result<(), VtdError> {
+    retire_slot(slot, 0, None)
 }
 
-unsafe fn retire_slot(slot: *mut u64, entry: u64, child_table: Option<u64>) {
-    let (base, iotlb) = invalidation_regs().unwrap_or_else(|error| fail_stop(error));
+unsafe fn retire_slot(slot: *mut u64, entry: u64, child_table: Option<u64>) -> Result<(), VtdError> {
+    let (base, iotlb) = invalidation_regs()?;
     if let Some(table_paddr) = child_table {
         prepare_unlinked_table(base, table_paddr);
     }
@@ -485,6 +487,7 @@ unsafe fn retire_slot(slot: *mut u64, entry: u64, child_table: Option<u64>) {
         clean_table_entry(slot, 8);
     })
     .unwrap_or_else(|error| fail_stop(error));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

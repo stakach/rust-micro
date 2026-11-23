@@ -168,8 +168,9 @@ fn cnode_retirement_orders_dma_leaves_before_table_parents() {
 
 #[test]
 fn a_copied_iopt_alias_keeps_the_mapping_until_the_last_cap_deletes() {
-    assert!(!retire_last_iopt_alias(1));
-    assert!(retire_last_iopt_alias(0));
+    assert!(!retire_last_iopt_alias(2));
+    assert!(retire_last_iopt_alias(1));
+    assert!(!retire_last_iopt_alias(0));
 }
 
 #[path = "../src/arch/x86_64/iommu/domain.rs"]
@@ -358,4 +359,26 @@ fn busy_write_buffer_status_never_authorizes_publication_or_command_replay() {
             if initial_status == 0 { INVALIDATION_SPINS } else { 0 },
         );
     }
+}
+
+#[test]
+fn direct_vtd_retirement_precedes_the_capability_and_mdb_release() {
+    let source = include_str!("../src/invocation.rs");
+    let deletion = source
+        .split_once("unsafe fn delete_cap_slot(")
+        .expect("direct deletion")
+        .1
+        .split_once("\nfn cnode_delete(")
+        .expect("end of direct deletion")
+        .0;
+    let retire = deletion
+        .find("retire_vtd_mapping_before_delete(")
+        .expect("direct deletion must retire its DMA mapping while it still owns the cap");
+    let splice = deletion.find("splice_cte_out(").expect("MDB splice");
+    let clear = deletion.find("s.write_cte_cap(").expect("CTE clear");
+    assert!(retire < splice && splice < clear);
+    assert!(
+        deletion[retire..splice].contains("?;"),
+        "a no-effect retirement refusal must return while the CTE and MDB still own the mapping",
+    );
 }

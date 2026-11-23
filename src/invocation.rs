@@ -1061,20 +1061,14 @@ fn decode_x86_iopt(
         };
 
         if label == InvocationLabel::X86IOPageTableUnmap {
-            if is_mapped && unsafe {
-                iopt_mapping_alias_count(base_paddr, ioasid) != 1
-                    || iopt_has_live_descendants(base_paddr, ioasid, level, mapped_address)
-            } {
+            if is_mapped && unsafe { iopt_mapping_alias_count(base_paddr, ioasid) != 1 } {
                 return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_DeleteFirst,
                 )));
             }
             // deleteIOPageTable (iospace.c:397) then clear isMapped.
             unsafe {
-                delete_io_page_table(base_paddr, is_mapped, level, mapped_address, ioasid)
-                    .map_err(|_| KException::SyscallError(SyscallError::new(
-                        seL4_Error::seL4_InvalidCapability,
-                    )))?;
+                delete_io_page_table(base_paddr, is_mapped, level, mapped_address, ioasid)?;
             }
             let new_cap = Cap::IoPageTable {
                 ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
@@ -1307,28 +1301,24 @@ unsafe fn delete_io_page_table(
     level: u8,
     mapped_address: u64,
     ioasid: u16,
-) -> Result<(), crate::arch::x86_64::iommu::VtdError> {
+) -> KResult<()> {
     use crate::arch::x86_64::iommu;
     if !is_mapped {
         return Ok(());
     }
     if iopt_has_live_descendants(base_paddr, ioasid, level, mapped_address) {
-        return Err(iommu::VtdError::OwnershipConflict);
+        return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_DeleteFirst)));
     }
-    let Some(ctx) = iommu::lookup_vtd_context_slot(ioasid, false) else {
-        return Err(iommu::VtdError::OwnershipConflict);
-    };
-    if !ctx.present() {
-        return Err(iommu::VtdError::OwnershipConflict);
-    }
+    let invalid = KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability));
+    let ctx = iommu::lookup_vtd_context_slot(ioasid, false)
+        .filter(|ctx| ctx.present())
+        .ok_or(invalid)?;
     let top = ctx.asr();
-    if level == 0 {
-        // Top-level: this PT is the context root. Only clear if it
-        // still owns the context entry.
+    let retired = if level == 0 {
         if top != base_paddr {
-            return Err(iommu::VtdError::OwnershipConflict);
+            return Err(invalid);
         }
-        ctx.clear()?;
+        ctx.clear()
     } else {
         let lu = iommu::lookup_iopt_slot_levels(
             top,
@@ -1336,15 +1326,12 @@ unsafe fn delete_io_page_table(
             (level - 1) as u64,
             (level - 1) as u64,
         );
-        if !lu.ok || lu.level != 0 {
-            return Err(iommu::VtdError::OwnershipConflict);
+        if !lu.ok || lu.level != 0 || iommu::slot_addr(lu.slot) != base_paddr {
+            return Err(invalid);
         }
-        if iommu::slot_addr(lu.slot) != base_paddr {
-            return Err(iommu::VtdError::OwnershipConflict);
-        }
-        iommu::slot_clear(lu.slot);
-    }
-    Ok(())
+        iommu::slot_clear(lu.slot)
+    };
+    retired.map_err(|_| invalid)
 }
 
 /// unmapIOPage (iospace.c:453). Clears the leaf VT-d PTE for an
@@ -1370,8 +1357,7 @@ unsafe fn unmap_io_page(
     if iommu::slot_addr(lu.slot) != frame_paddr {
         return Err(iommu::VtdError::OwnershipConflict);
     }
-    iommu::slot_clear(lu.slot);
-    Ok(())
+    iommu::slot_clear(lu.slot)
 }
 
 /// `X86Page::MapIO` — decodeX86IOMapInvocation (iospace.c:296). Maps a
@@ -1933,43 +1919,38 @@ fn detach_frame_mapping(cap: &Cap) {
         size,
         mapped: Some(vaddr),
         asid,
-        map_type,
+        map_type: crate::cap::FrameMapType::VSpace,
         ..
     } = *cap
     {
         unsafe {
-            if map_type == crate::cap::FrameMapType::IoSpace {
-                unmap_io_page(asid, vaddr, ptr.addr())
-                    .unwrap_or_else(|error| crate::arch::x86_64::iommu::fail_stop(error));
-            } else if map_type == crate::cap::FrameMapType::VSpace {
-                let pml4_paddr = pml4_paddr_for_asid(asid);
-                if pml4_paddr != 0 {
-                    let unmapped = match size {
-                        crate::cap::FrameSize::Small => {
-                            crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
-                                pml4_paddr,
-                                vaddr,
-                                ptr.addr(),
-                            )
-                        }
-                        crate::cap::FrameSize::Large => {
-                            crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
-                                pml4_paddr,
-                                vaddr,
-                                ptr.addr(),
-                            )
-                        }
-                        crate::cap::FrameSize::Huge => {
-                            crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
-                                pml4_paddr,
-                                vaddr,
-                                ptr.addr(),
-                            )
-                        }
-                    };
-                    if unmapped {
-                        crate::smp::retire_vspace_translations(pml4_paddr);
+            let pml4_paddr = pml4_paddr_for_asid(asid);
+            if pml4_paddr != 0 {
+                let unmapped = match size {
+                    crate::cap::FrameSize::Small => {
+                        crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                            pml4_paddr,
+                            vaddr,
+                            ptr.addr(),
+                        )
                     }
+                    crate::cap::FrameSize::Large => {
+                        crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
+                            pml4_paddr,
+                            vaddr,
+                            ptr.addr(),
+                        )
+                    }
+                    crate::cap::FrameSize::Huge => {
+                        crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
+                            pml4_paddr,
+                            vaddr,
+                            ptr.addr(),
+                        )
+                    }
+                };
+                if unmapped {
+                    crate::smp::retire_vspace_translations(pml4_paddr);
                 }
             }
         }
@@ -5298,34 +5279,31 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
                 let _ = crate::interrupt::release_handler(&mut s.irqs, *irq);
             }
         }
-        Cap::IoPageTable {
-            ptr,
-            is_mapped,
-            level,
-            mapped_address,
-            ioasid,
-        } => {
-            // Phase 44 — deleting a mapped IO page table (e.g. at test
-            // teardown when the child's Untyped is revoked) tears down
-            // its VT-d entry (deleteIOPageTable). Without this, the
-            // context root / intermediate PTE leaks into the next test
-            // that reuses the same PCI request-id, corrupting its tree.
-            #[cfg(target_arch = "x86_64")]
-            if *is_mapped && crate::arch::x86_64::iommu::retire_last_iopt_alias(
-                iopt_mapping_alias_count(ptr.addr(), *ioasid)) {
-                unsafe {
-                    delete_io_page_table(ptr.addr(), *is_mapped, *level, *mapped_address, *ioasid)
-                        .unwrap_or_else(|error| crate::arch::x86_64::iommu::fail_stop(error));
-                }
-            }
-            let _ = (s, ptr, is_mapped, level, mapped_address, ioasid);
-        }
         Cap::CNode { ptr, .. } => {
             if cnode_has_only_self_refs(s, cap) {
                 finalize_object(s, FinalizationObject::CNode(KernelState::cnode_index(*ptr)));
             }
         }
         _ => {}
+    }
+}
+
+/// A no-effect refusal leaves the capability and its derivation links in place.
+#[cfg(target_arch = "x86_64")]
+unsafe fn retire_vtd_mapping_before_delete(cap: &Cap) -> KResult<()> {
+    use crate::arch::x86_64::iommu::retire_last_iopt_alias;
+    match *cap {
+        Cap::Frame {
+            ptr, asid, mapped: Some(address), map_type: crate::cap::FrameMapType::IoSpace, ..
+        } => unmap_io_page(asid, address, ptr.addr()).map_err(|_| {
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+        }),
+        Cap::IoPageTable { ptr, is_mapped: true, level, mapped_address, ioasid }
+            if retire_last_iopt_alias(iopt_mapping_alias_count(ptr.addr(), ioasid)) =>
+        {
+            delete_io_page_table(ptr.addr(), true, level, mapped_address, ioasid)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -5347,6 +5325,8 @@ pub(crate) unsafe fn delete_cap_slot(s: &mut KernelState, id: MdbId) -> KResult<
             return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    retire_vtd_mapping_before_delete(&cap)?;
     // Revoke can withdraw a live TCB's authority while independent aliases keep the
     // underlying object alive. Stop its remote execution before clearing the owned slot.
     if let Some((thread, _)) = id.tcb_slot() {
@@ -6476,6 +6456,8 @@ pub mod spec {
     use crate::cap::{Badge, Cap, EndpointObj, EndpointRights, PPtr};
     include!("invocation/cnode_frame_specs.rs");
     include!("invocation/leaf_revoke_specs.rs");
+    #[cfg(target_arch = "x86_64")]
+    include!("invocation/vtd_delete_specs.rs");
     include!("invocation/asid_specs.rs");
     include!("invocation/frame_mapping_specs.rs");
     include!("invocation/paging_mapping_specs.rs");
@@ -6512,6 +6494,8 @@ pub mod spec {
         cnode_move_clears_source();
         cnode_move_reparents_direct_children();
         cnode_delete_splices_derivation_children();
+        #[cfg(target_arch = "x86_64")]
+        vtd_delete_specs::run();
         cnode_alias_delete_preserves_live_object();
         cnode_finalization_drains_deep_nesting();
         cnode_finalization_splices_external_derivation();

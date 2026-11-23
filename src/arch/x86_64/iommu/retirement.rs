@@ -141,7 +141,7 @@ pub fn dma_retirement_phase(kind: DmaRetirementKind, levels: u8) -> Option<u8> {
     }
 }
 
-/// A copied IO page-table alias keeps the hardware mapping until its last cap is deleted.
-pub fn retire_last_iopt_alias(remaining_mapped_aliases: usize) -> bool {
-    remaining_mapped_aliases == 0
+/// The invoked IO page-table cap remains counted until retirement is acknowledged.
+pub fn retire_last_iopt_alias(live_mapped_aliases: usize) -> bool {
+    live_mapped_aliases == 1
 }
