@@ -11,6 +11,11 @@
 
 use crate::region::{align_down, align_up, PRegion};
 
+#[path = "boot/direct_map_policy.rs"]
+mod direct_map_policy;
+#[path = "boot/simpleboot_mmap_policy.rs"]
+mod simpleboot_mmap_policy;
+
 // ---------------------------------------------------------------------------
 // Memory-map representation. Independent of Simpleboot so the algorithm
 // can be exercised against synthetic maps in specs.
@@ -36,7 +41,7 @@ pub struct MemEntry {
 // in upstream); we pick the same default.
 // ---------------------------------------------------------------------------
 
-pub const MAX_BOOT_MMAP_ENTRIES: usize = 240;
+pub const MAX_BOOT_MMAP_ENTRIES: usize = simpleboot_mmap_policy::MAX_SIMPLEBOOT_MMAP_ENTRIES;
 pub const MAX_FREEMEM_REGIONS: usize = 128;
 pub const MAX_RESERVED_REGIONS: usize = 128;
 
@@ -79,6 +84,8 @@ impl RegionList {
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum BootError {
+    /// The firmware map is incomplete, contradictory, or exceeds fixed capacity.
+    InvalidMemoryMap,
     /// The freemem / reserved-region list is full.
     TooManyRegions,
     /// No contiguous free range big enough for the rootserver.
@@ -86,6 +93,10 @@ pub enum BootError {
     /// Reserved region overlaps with itself or the existing list in
     /// an unexpected way.
     OverlapInternal,
+    /// The required embedded rootserver is not a valid supported ELF image.
+    InvalidRootserverImage,
+    /// Its checked mappings exceed the supported table or address arithmetic.
+    RootserverImageTooLarge,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,36 +316,64 @@ fn layout_at(base: u64, layout: &RootserverLayout) -> RootserverMem {
 // and converts each entry into a `MemEntry`.
 // ---------------------------------------------------------------------------
 
-pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> usize {
-    const EFI_MEMORY_MAPPED_IO: u32 = 11;
-    const EFI_MEMORY_MAPPED_IO_PORT_SPACE: u32 = 12;
+pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
+    use direct_map_policy::{FirmwareKind, FirmwareRange, PhysicalRange};
+    use simpleboot_mmap_policy::RawMmapEntry;
 
-    let mut count = 0usize;
-    crate::simpleboot::for_each_mmap_entry(|entry| {
-        if count >= out.len() {
+    let mut raw = [RawMmapEntry {
+        base_addr: 0,
+        length: 0,
+        entry_type: 0,
+        reserved: 0,
+    }; MAX_BOOT_MMAP_ENTRIES];
+    let mut raw_count = 0usize;
+    let mut overflow = false;
+    crate::simpleboot::try_for_each_mmap_entry(|entry| {
+        if raw_count == raw.len() {
+            overflow = true;
             return;
         }
-        let kind = match entry.entry_type {
-            crate::simpleboot::MULTIBOOT_MEMORY_AVAILABLE => MemKind::Free,
-            crate::simpleboot::MULTIBOOT_MEMORY_ACPI_RECLAIMABLE
-            | crate::simpleboot::MULTIBOOT_MEMORY_NVS => MemKind::Acpi,
-            _ if entry.reserved == EFI_MEMORY_MAPPED_IO
-                || entry.reserved == EFI_MEMORY_MAPPED_IO_PORT_SPACE =>
-            {
-                MemKind::Mmio
-            }
-            _ => MemKind::Used,
+        raw[raw_count] = RawMmapEntry {
+            base_addr: entry.base_addr,
+            length: entry.length,
+            entry_type: entry.entry_type,
+            reserved: entry.reserved,
         };
-        let Some(end) = entry.base_addr.checked_add(entry.length) else {
-            return;
+        raw_count += 1;
+    })
+    .map_err(|_| BootError::InvalidMemoryMap)?;
+    if overflow {
+        return Err(BootError::InvalidMemoryMap);
+    }
+    let mut converted = [FirmwareRange {
+        range: PhysicalRange { start: 0, end: 0 },
+        kind: FirmwareKind::Reserved,
+    }; MAX_BOOT_MMAP_ENTRIES];
+    simpleboot_mmap_policy::convert_simpleboot_mmap(
+        &raw[..raw_count],
+        &mut converted,
+    )
+    .map_err(|_| BootError::InvalidMemoryMap)?;
+    if raw_count > out.len() {
+        return Err(BootError::InvalidMemoryMap);
+    }
+    // Keep the byte-exact firmware ranges for allocation and BootInfo. The
+    // page-normalized `converted` ranges above are the separate direct-map
+    // admission view and validate the complete map before any output write.
+    for (slot, entry) in out.iter_mut().zip(raw[..raw_count].iter().copied()) {
+        let kind = simpleboot_mmap_policy::classify_simpleboot_kind(entry)
+            .map_err(|_| BootError::InvalidMemoryMap)?;
+        *slot = MemEntry {
+            region: PRegion::new(entry.base_addr, entry.base_addr + entry.length),
+            kind: match kind {
+                FirmwareKind::Ram => MemKind::Free,
+                FirmwareKind::AcpiRam => MemKind::Acpi,
+                FirmwareKind::Reserved => MemKind::Used,
+                FirmwareKind::Mmio => MemKind::Mmio,
+            },
         };
-        out[count] = MemEntry {
-            region: PRegion::new(entry.base_addr, end),
-            kind,
-        };
-        count += 1;
-    });
-    count
+    }
+    Ok(raw_count)
 }
 
 fn reserve_simpleboot_allocations(free: &mut RegionList) -> Result<(), BootError> {
@@ -425,7 +464,7 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
         region: PRegion::new(0, 0),
         kind: MemKind::Used,
     }; MAX_BOOT_MMAP_ENTRIES];
-    let n = read_simpleboot_mmap(&mut entries);
+    let n = read_simpleboot_mmap(&mut entries)?;
     arch::log("boot:   ");
     log_count(n);
     arch::log(" map entries\n");
@@ -474,38 +513,59 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
         region: PRegion::new(0, 0),
         kind: MemKind::Used,
     }; MAX_BOOT_MMAP_ENTRIES];
-    let n = read_simpleboot_mmap(&mut entries);
+    let n = read_simpleboot_mmap(&mut entries)?;
     let mut free = extract_free(&entries[..n])?;
     reserve_simpleboot_allocations(&mut free)?;
 
-    const USER_PAGES_SIZE: u64 = 16 * 1024 * 1024;
+    let image = crate::elf::parse(crate::rootserver_image::rootserver_elf())
+        .map_err(|_| BootError::InvalidRootserverImage)?;
+    let mapped_pages = crate::rootserver_page_budget::budget(
+        image.load_segments().map(|segment| crate::rootserver_page_budget::LoadSpan {
+            vaddr: segment.vaddr,
+            mem_size: segment.mem_size,
+        }),
+        crate::rootserver::ROOTSERVER_STACK_PAGES,
+        crate::rootserver::ROOTSERVER_AUX_PAGES,
+        crate::rootserver::IMAGE_PAGES_CAP as u64,
+    ).map_err(|_| BootError::RootserverImageTooLarge)?;
+    #[cfg(target_arch = "x86_64")]
+    let extra_physical_pages = 0;
+    #[cfg(target_arch = "aarch64")]
+    let extra_physical_pages = mapped_pages.checked_mul(3)
+        .and_then(|pages| pages.checked_add(1))
+        .ok_or(BootError::RootserverImageTooLarge)?;
+    let user_pages_size = crate::rootserver_page_budget::reserve_bytes(
+        mapped_pages, extra_physical_pages,
+    ).map_err(|_| BootError::RootserverImageTooLarge)?;
     // Phase 44 — the VT-d IOMMU's root + context tables live in a small
     // pool sliced off the TOP of the user-pages carve. Bundling it with
-    // the 16 MiB user-pages chunk (rather than a separate carve_chunk)
+    // the user-pages chunk (rather than a separate carve_chunk)
     // is deliberate: a standalone small carve would land in the lowest
     // free region (conventional memory at paddr 0), which is exactly
     // where place_rootserver lays down the rootserver — vtd_init would
-    // then zero the rootserver's TCB. The 16 MiB chunk is large enough
+    // then zero the rootserver's TCB. The minimum 16 MiB chunk is large enough
     // that it never fits in that low region, so the pool stays clear.
     #[cfg(target_arch = "x86_64")]
     const IOMMU_POOL_SIZE: u64 = 64 * 1024;
     #[cfg(not(target_arch = "x86_64"))]
     const IOMMU_POOL_SIZE: u64 = 0;
-    let user_pages_base = carve_chunk(&mut free, USER_PAGES_SIZE + IOMMU_POOL_SIZE, 12)?;
+    let carve_size = user_pages_size.checked_add(IOMMU_POOL_SIZE)
+        .ok_or(BootError::RootserverImageTooLarge)?;
+    let user_pages_base = carve_chunk(&mut free, carve_size, 12)?;
 
     arch::log("boot: reserved user-pages @0x");
     log_hex64(user_pages_base);
     arch::log("..");
-    log_hex64(user_pages_base + USER_PAGES_SIZE);
+    log_hex64(user_pages_base + user_pages_size);
     arch::log("\n");
 
     unsafe {
-        crate::rootserver::install_user_page_region(user_pages_base, USER_PAGES_SIZE);
+        crate::rootserver::install_user_page_region(user_pages_base, user_pages_size);
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        let iommu_base = user_pages_base + USER_PAGES_SIZE;
+        let iommu_base = user_pages_base + user_pages_size;
         arch::log("boot: reserved iommu-pool @0x");
         log_hex64(iommu_base);
         arch::log("..");
@@ -535,10 +595,10 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 
     // Phase 42 — backing memory for the rootserver's Untyped cap.
     //
-    // This remains a single power-of-two, power-of-two-aligned seL4 Untyped. Size it from the live
-    // Simpleboot free map instead of hard-coding the old 256 MiB value: the ReactOS desktop workload
-    // now reaches a broader steady-state service/process wave, and the normal QEMU launch gives us
-    // enough RAM to hand the rootserver 512 MiB while preserving smaller spec maps.
+    // This remains a single power-of-two, power-of-two-aligned seL4 Untyped, and it is the
+    // last carve: free memory it does not take is used by nothing. Size it from the live
+    // Simpleboot map, as large as fits, so a guest given more RAM hands the rootserver more
+    // and smaller spec maps still boot.
     let ut_size_bits = choose_rootserver_untyped_size_bits(&free)?;
     let ut_size = 1u64 << ut_size_bits;
     let ut_base = carve_chunk(&mut free, ut_size, ut_size_bits)?;
@@ -559,10 +619,19 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
 }
 
 const ROOTSERVER_UT_MIN_SIZE_BITS: u32 = 28; // 256 MiB
-const ROOTSERVER_UT_TARGET_SIZE_BITS: u32 = 29; // 512 MiB
+/// The largest rootserver Untyped. An aligned power of two needs a free region that contains
+/// a multiple of its own size, so guest RAM maps to it in steps: QEMU's 3 GiB guest has 1 GiB
+/// above the PCI hole at 4 GiB and yields 1 GiB; a 4 GiB guest has 2 GiB there and yields
+/// 2 GiB; a 6 GiB guest yields 4 GiB.
+const ROOTSERVER_UT_MAX_SIZE_BITS: u32 = 32; // 4 GiB
+// Retype clears frames through the kernel's linear map, which must reach the whole Untyped.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    (1u64 << ROOTSERVER_UT_MAX_SIZE_BITS) <= crate::arch::x86_64::paging::LINEAR_MAP_GIB << 30
+);
 
 fn choose_rootserver_untyped_size_bits(free: &RegionList) -> Result<u32, BootError> {
-    let mut size_bits = ROOTSERVER_UT_TARGET_SIZE_BITS;
+    let mut size_bits = ROOTSERVER_UT_MAX_SIZE_BITS;
     loop {
         if rootserver_untyped_fits(free, size_bits) {
             return Ok(size_bits);
@@ -674,10 +743,12 @@ pub mod spec {
         extract_filters_to_free_only();
         sort_and_coalesce();
         reserve_splits_around_overlap();
+        dynamic_rootserver_reserve_refuses_insufficient_ram();
         place_rootserver_carves_region();
         place_rootserver_picks_aligned_address();
         place_rootserver_fails_when_too_small();
-        rootserver_untyped_prefers_target_when_available();
+        rootserver_untyped_takes_the_largest_size_that_fits();
+        rootserver_untyped_uses_512_mib_when_1_gib_does_not_fit();
         rootserver_untyped_falls_back_to_minimum();
         rootserver_untyped_fails_below_minimum();
         #[cfg(target_arch = "x86_64")]
@@ -737,6 +808,17 @@ pub mod spec {
     }
 
     #[inline(never)]
+    fn dynamic_rootserver_reserve_refuses_insufficient_ram() {
+        let size = crate::rootserver_page_budget::reserve_bytes(4104, 0).unwrap();
+        assert_eq!(size, 17 * 1024 * 1024);
+        let map = [entry(0x20_0000, 0x120_0000, MemKind::Free)];
+        let mut free = extract_free(&map).unwrap();
+        assert_eq!(carve_chunk(&mut free, size, 12), Err(BootError::NoSuitableRegion));
+        assert_eq!(free.as_slice(), &[PRegion::new(0x20_0000, 0x120_0000)]);
+        arch::log("  ✓ dynamic rootserver reserve refuses insufficient RAM\n");
+    }
+
+    #[inline(never)]
     fn place_rootserver_carves_region() {
         let map = [entry(0x10_0000, 0x40_0000, MemKind::Free)];
         let mut free = extract_free(&map).unwrap();
@@ -786,14 +868,33 @@ pub mod spec {
     }
 
     #[inline(never)]
-    fn rootserver_untyped_prefers_target_when_available() {
-        let map = [entry(0x10_0000, 0x4010_0000, MemKind::Free)];
+    fn rootserver_untyped_takes_the_largest_size_that_fits() {
+        // Free memory below 2 GiB that starts above zero holds one aligned 1 GiB block.
+        // Each case adds the RAM QEMU places above the PCI hole at 4 GiB for a larger guest.
+        for (high_end, expected) in [
+            (0x1_0000_0000u64, 30u32), // 2 GiB guest: nothing above the hole
+            (0x1_4000_0000, 30),       // 3 GiB guest: 1 GiB above it
+            (0x1_8000_0000, 31),       // 4 GiB guest: 2 GiB
+            (0x1_c000_0000, 31),       // 5 GiB guest: 3 GiB holds no aligned 4 GiB
+            (0x2_0000_0000, 32),       // 6 GiB guest: 4 GiB
+            (0x4_0000_0000, ROOTSERVER_UT_MAX_SIZE_BITS), // more never exceeds the maximum
+        ] {
+            let low = entry(0x10_0000, 0x8000_0000, MemKind::Free);
+            let high = entry(0x1_0000_0000, high_end, MemKind::Free);
+            let both = [low, high];
+            let map = if high_end > 0x1_0000_0000 { &both[..] } else { &both[..1] };
+            let free = extract_free(map).unwrap();
+            assert_eq!(choose_rootserver_untyped_size_bits(&free).unwrap(), expected);
+        }
+        arch::log("  ✓ rootserver Untyped takes the largest size that fits\n");
+    }
+
+    #[inline(never)]
+    fn rootserver_untyped_uses_512_mib_when_1_gib_does_not_fit() {
+        let map = [entry(0x1000_0000, 0x4000_0000, MemKind::Free)];
         let free = extract_free(&map).unwrap();
-        assert_eq!(
-            choose_rootserver_untyped_size_bits(&free).unwrap(),
-            ROOTSERVER_UT_TARGET_SIZE_BITS
-        );
-        arch::log("  ✓ rootserver Untyped prefers target size when available\n");
+        assert_eq!(choose_rootserver_untyped_size_bits(&free).unwrap(), 29);
+        arch::log("  ✓ rootserver Untyped uses 512 MiB when 1 GiB does not fit\n");
     }
 
     #[inline(never)]
@@ -824,8 +925,8 @@ pub mod spec {
         let mut entries = [MemEntry {
             region: PRegion::new(0, 0),
             kind: MemKind::Used,
-        }; 16];
-        let n = read_simpleboot_mmap(&mut entries);
+        }; MAX_BOOT_MMAP_ENTRIES];
+        let n = read_simpleboot_mmap(&mut entries).expect("Simpleboot map must validate");
         assert!(n > 0, "Simpleboot must report at least one mmap entry");
         let any_free = entries[..n].iter().any(|e| e.kind == MemKind::Free);
         assert!(any_free, "Simpleboot must report at least one free region");

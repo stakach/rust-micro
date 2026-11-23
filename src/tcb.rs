@@ -273,6 +273,9 @@ pub struct Tcb {
     /// which copies them into the receiver's CNode at the slots
     /// the receiver named in `receiveIndex`.
     pub pending_extra_caps: [crate::cap::Cap; 3],
+    /// The sender CTE each staged cap was read from. IPC transfer derives the receiver's copy
+    /// from this exact slot (seL4 `cteInsert`), so revoking the source reaches the copy.
+    pub pending_extra_cap_sources: [Option<crate::cte::MdbId>; 3],
     pub pending_extra_caps_count: u8,
     /// Number of extra caps the kernel transferred INTO this thread's
     /// receive slots on its last successful Recv. Surfaced in the
@@ -280,6 +283,9 @@ pub struct Tcb {
     /// userspace (e.g. the serial server's connect handler) can verify
     /// it received the frame caps it expects.
     pub received_extra_caps: u8,
+    /// seL4 `capsUnwrapped`: bit `i` is set when extra cap `i` named the endpoint the message
+    /// arrived on, so only its badge was delivered (in `caps_or_badges[i]`).
+    pub received_caps_unwrapped: u8,
     /// Phase 36d — reply slot the thread offered when it issued
     /// `Recv` (or `Wait`) and is happy to receive Call IPCs. The
     /// pool index points at a `Reply` object that the kernel will
@@ -407,8 +413,10 @@ impl Default for Tcb {
             active_sc: None,
             yield_to: None,
             pending_extra_caps: [crate::cap::Cap::Null; 3],
+            pending_extra_cap_sources: [None; 3],
             pending_extra_caps_count: 0,
             received_extra_caps: 0,
+            received_caps_unwrapped: 0,
             pending_reply: None,
             composite_reply_handoff: None,
             blocked_is_call: false,
@@ -442,6 +450,7 @@ impl Tcb {
         self.ipc_label = 0;
         self.ipc_length = 0;
         self.received_extra_caps = 0;
+        self.received_caps_unwrapped = 0;
         self.ipc_badge = badge;
         self.msg_regs.fill(0);
         crate::arch::set_ipc_return(&mut self.user_context, badge, 0, &[]);

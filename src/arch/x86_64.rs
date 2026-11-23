@@ -7,6 +7,8 @@ pub mod acpi;
 pub mod context;
 pub mod cpu;
 pub mod debug;
+mod debug_output_cost;
+pub mod cpu_exception_vectors;
 pub mod exceptions;
 pub mod fpu_ctx;
 pub mod gdt;
@@ -19,6 +21,7 @@ pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod syscall_entry;
+mod star_selectors;
 pub mod usermode;
 pub mod vspace;
 

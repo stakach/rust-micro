@@ -26,6 +26,7 @@
 
 use core::arch::asm;
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::msr::{rdmsr, IA32_APIC_BASE_MSR};
 
@@ -190,13 +191,14 @@ pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
 /// depends on what the loader installed. The corresponding PML4 index
 /// is stored in `LINEAR_MAP_PML4_IDX`.
 #[no_mangle]
-pub static mut LINEAR_MAP_BASE: u64 = 0;
+pub static LINEAR_MAP_BASE: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub static mut LINEAR_MAP_PML4_IDX: usize = 0;
-/// Coverage in 1 GiB increments. 4 GiB is comfortably above the current
-/// rootserver Untyped target plus the 2 GiB QEMU RAM we configure today;
-/// bumping this just adds a few PDPT entries.
-pub const LINEAR_MAP_GIB: u64 = 4;
+/// Coverage in 1 GiB increments. QEMU places RAM above the PCI hole at
+/// physical 4 GiB when the guest has more than 2 GiB; the rootserver's
+/// 1 GiB Untyped then lives at 4..5 GiB. Keep the whole configured guest
+/// RAM within this map so physical frame clearing cannot fault in the kernel.
+pub const LINEAR_MAP_GIB: u64 = 8;
 
 /// Translate a physical address to its kernel-virtual counterpart
 /// in the linear map. Caller must have invoked
@@ -204,7 +206,7 @@ pub const LINEAR_MAP_GIB: u64 = 4;
 #[inline(always)]
 pub fn phys_to_lin(paddr: u64) -> u64 {
     debug_assert!(paddr < LINEAR_MAP_GIB * (1 << 30));
-    unsafe { LINEAR_MAP_BASE + paddr }
+    LINEAR_MAP_BASE.load(Ordering::Acquire) + paddr
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +253,7 @@ pub fn park_on_kernel_root() {
         let cur: u64;
         asm!("mov {}, cr3", out(reg) cur, options(nomem, nostack, preserves_flags));
         if cur & 0x000F_FFFF_FFFF_F000 != root {
-            asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+            crate::smp::load_root(root);
         }
     }
 }
@@ -380,8 +382,8 @@ pub fn install_kernel_page_tables() {
 /// Build the kernel-half linear map. Scans `PML4[256..510]` for
 /// the first empty slot (PML4[511] is the kernel image), allocates a PDPT page,
 /// and populates it with `LINEAR_MAP_GIB` 1 GiB large-page entries.
-/// Caches the chosen slot's vaddr base in `LINEAR_MAP_BASE` for
-/// `phys_to_lin` to read.
+/// Publishes the chosen slot's vaddr base in `LINEAR_MAP_BASE` for
+/// `phys_to_lin` to read, only once the slot is live.
 unsafe fn install_linear_map(pml4: *mut u64) {
     // Idempotent: `install_kernel_page_tables` is called from spec
     // setup helpers (e.g. `launch_smp_ping_thread`) as well as boot,
@@ -389,9 +391,24 @@ unsafe fn install_linear_map(pml4: *mut u64) {
     // every `phys_to_lin` consumer would then point at the wrong
     // virtual range. The first call sets LINEAR_MAP_BASE; later
     // calls bail.
-    if LINEAR_MAP_BASE != 0 {
+    if LINEAR_MAP_BASE.load(Ordering::Acquire) != 0 {
         return;
     }
+    let (idx, base) = build_linear_map(pml4, alloc_table_va());
+    LINEAR_MAP_PML4_IDX = idx;
+
+    // TLB flush.
+    asm!("mov rax, cr3; mov cr3, rax", out("rax") _,
+        options(nostack, preserves_flags));
+    // APs still in early boot share this PML4 and translate through `phys_to_lin` as soon as
+    // the base is non-zero, while they still run on the loader's IDT. A base published before
+    // its slot is present would let a late AP take a not-present #PF there and triple-fault.
+    LINEAR_MAP_BASE.store(base, Ordering::Release);
+}
+
+/// Fill `pdpt_v` with the linear map and install it in the first free kernel-half slot of
+/// `pml4`. Returns the slot and its base; the slot is present before this returns.
+unsafe fn build_linear_map(pml4: *mut u64, pdpt_v: *mut u64) -> (usize, u64) {
     let mut chosen_idx: Option<usize> = None;
     let shared_alias_idx = super::vspace::decompose_vaddr(
         super::vspace::KUSER_SHARED_DATA_VADDR,
@@ -407,12 +424,9 @@ unsafe fn install_linear_map(pml4: *mut u64) {
         }
     }
     let idx = chosen_idx.expect("no free kernel-half PML4 slot");
-    LINEAR_MAP_PML4_IDX = idx;
     // PML4[idx] vaddr = idx << 39, sign-extended (bit 47 set =>
     // upper 16 bits = 0xFFFF).
-    LINEAR_MAP_BASE = 0xFFFF_0000_0000_0000 | ((idx as u64) << 39);
-
-    let pdpt_v = alloc_table_va();
+    let base = 0xFFFF_0000_0000_0000 | ((idx as u64) << 39);
     let pdpt_p = kernel_virt_to_phys(pdpt_v as u64);
 
     let leaf_flags = PTE_PRESENT | PTE_RW | PTE_PS | PTE_NX;
@@ -423,10 +437,7 @@ unsafe fn install_linear_map(pml4: *mut u64) {
 
     let mid_flags = PTE_PRESENT | PTE_RW;
     ptr::write_volatile(pml4.add(idx), (pdpt_p & !0xFFF) | mid_flags);
-
-    // TLB flush.
-    asm!("mov rax, cr3; mov cr3, rax", out("rax") _,
-        options(nostack, preserves_flags));
+    (idx, base)
 }
 
 /// Map `vaddr -> paddr` (4 KiB) into the page tables rooted at
@@ -481,6 +492,8 @@ pub mod spec {
         cr3_readable();
         existing_pml4_has_kernel_mapping();
         install_then_lapic_reads();
+        linear_map_covers_high_root_untyped();
+        linear_map_slot_is_live_before_its_base_is_published();
         arch::log("Paging tests completed\n");
     }
 
@@ -520,5 +533,48 @@ pub mod spec {
         let id = super::super::lapic::apic_id();
         assert!(id < 256, "LAPIC ID is 8 bits");
         arch::log("  ✓ kernel PT installed; LAPIC MMIO live\n");
+    }
+
+    #[inline(never)]
+    fn linear_map_covers_high_root_untyped() {
+        let root = read_pml4_entry(unsafe { LINEAR_MAP_PML4_IDX });
+        assert_ne!(root & PTE_PRESENT, 0);
+        let pdpt = phys_to_lin(root & !0xfff) as *const u64;
+        let high_ram = unsafe { core::ptr::read_volatile(pdpt.add(4)) };
+        assert_eq!(high_ram & (PTE_PRESENT | PTE_PS), PTE_PRESENT | PTE_PS);
+        assert_eq!(high_ram & 0x000f_ffff_c000_0000, 0x1_0000_0000);
+        arch::log("  ✓ linear map covers root Untyped above 4 GiB\n");
+    }
+
+    #[repr(C, align(4096))]
+    struct ScratchTable([u64; 512]);
+    static mut SCRATCH_PML4: ScratchTable = ScratchTable([0; 512]);
+    static mut SCRATCH_PDPT: ScratchTable = ScratchTable([0; 512]);
+
+    /// Early APs translate through `phys_to_lin` as soon as the base is non-zero, so the base
+    /// a build returns must already name a present slot with its whole PDPT.
+    #[inline(never)]
+    fn linear_map_slot_is_live_before_its_base_is_published() {
+        unsafe {
+            let pml4 = (&raw mut SCRATCH_PML4) as *mut u64;
+            let pdpt = (&raw mut SCRATCH_PDPT) as *mut u64;
+            pml4.add(256).write_volatile(PTE_PRESENT);
+            let (idx, base) = build_linear_map(pml4, pdpt);
+            assert_eq!(idx, 257, "an occupied kernel-half slot is skipped");
+            assert_eq!(base, 0xFFFF_0000_0000_0000 | (257 << 39));
+            let entry = pml4.add(idx).read_volatile();
+            assert_ne!(entry & PTE_PRESENT, 0, "the slot is present when the base is returned");
+            assert_eq!(entry & !0xfff, kernel_virt_to_phys(pdpt as u64));
+            for gib in 0..LINEAR_MAP_GIB {
+                let leaf = pdpt.add(gib as usize).read_volatile();
+                assert_eq!(leaf & (PTE_PRESENT | PTE_PS), PTE_PRESENT | PTE_PS);
+                assert_eq!(leaf & 0x000f_ffff_c000_0000, gib << 30);
+            }
+            // The live map was published only after its own slot became present.
+            let live = LINEAR_MAP_BASE.load(Ordering::Acquire);
+            assert_eq!(live, 0xFFFF_0000_0000_0000 | ((LINEAR_MAP_PML4_IDX as u64) << 39));
+            assert_ne!(read_pml4_entry(LINEAR_MAP_PML4_IDX) & PTE_PRESENT, 0);
+        }
+        arch::log("  linear map slot is present before its base is published\n");
     }
 }

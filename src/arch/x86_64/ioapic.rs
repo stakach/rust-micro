@@ -246,6 +246,16 @@ pub unsafe fn set_route_mask(ordinal: usize, pin: u32, masked: bool) -> Result<(
     Ok(())
 }
 
+/// Read one controller-local redirection entry as (low, high) dwords, for diagnostics. Read-only:
+/// the select/window pair is the only register access, done under the kernel lock.
+pub unsafe fn read_redirection(ordinal: usize, pin: u32) -> Result<(u32, u32), IoApicError> {
+    validate_route(ordinal, pin)?;
+    let controller = published_controller(ordinal)?;
+    let _interrupts = InterruptState::disable();
+    let lo_reg = IOAPIC_REG_REDTBL_BASE + pin * 2;
+    Ok((read_reg(controller, lo_reg), read_reg(controller, lo_reg + 1)))
+}
+
 /// Program one controller-local redirection entry. The route is installed masked; binding the
 /// issued handler to a notification is the commit point that unmasks it.
 pub unsafe fn program_redirection(

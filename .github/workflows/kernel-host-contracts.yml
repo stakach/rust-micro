@@ -10,6 +10,18 @@ on:
       - "src/smp/quiescence.rs"
       - "tests/bkl_contracts.rs"
       - "src/arch/x86_64/syscall_entry.rs"
+      - "src/arch/x86_64/cpu_exception_vectors.rs"
+      - "tests/cpu_exception_vectors.rs"
+      - "src/arch/x86_64/iommu/retirement.rs"
+      - "tests/vtd_retirement.rs"
+      - "src/idle_log_budget.rs"
+      - "tests/idle_log_budget.rs"
+      - "src/arch/x86_64/exceptions.rs"
+      - "src/boot.rs"
+      - "src/boot/**"
+      - "tests/direct_map_policy.rs"
+      - "tests/simpleboot_mmap_policy.rs"
+      - "tests/boot_mmap_reader_source.rs"
   pull_request:
     paths:
       - ".github/workflows/kernel-host-contracts.yml"
@@ -19,6 +31,18 @@ on:
       - "src/smp/quiescence.rs"
       - "tests/bkl_contracts.rs"
       - "src/arch/x86_64/syscall_entry.rs"
+      - "src/arch/x86_64/cpu_exception_vectors.rs"
+      - "tests/cpu_exception_vectors.rs"
+      - "src/arch/x86_64/iommu/retirement.rs"
+      - "tests/vtd_retirement.rs"
+      - "src/idle_log_budget.rs"
+      - "tests/idle_log_budget.rs"
+      - "src/arch/x86_64/exceptions.rs"
+      - "src/boot.rs"
+      - "src/boot/**"
+      - "tests/direct_map_policy.rs"
+      - "tests/simpleboot_mmap_policy.rs"
+      - "tests/boot_mmap_reader_source.rs"
 
 permissions:
   contents: read
@@ -33,3 +57,23 @@ jobs:
         run: |
           rustc --edition 2021 --test tests/bkl_contracts.rs -o /tmp/kernel-bkl-tests
           /tmp/kernel-bkl-tests
+      - name: Test the CPU exception vector routing
+        run: |
+          rustc --edition 2021 --test tests/cpu_exception_vectors.rs -o /tmp/kernel-cpu-exception-vector-tests
+          /tmp/kernel-cpu-exception-vector-tests
+      - name: Test the idle-tag log budget
+        run: |
+          rustc --edition 2021 --test tests/idle_log_budget.rs -o /tmp/kernel-idle-log-budget-tests
+          /tmp/kernel-idle-log-budget-tests
+      - name: Test the VT-d retirement ordering
+        run: |
+          rustc --edition 2021 --test tests/vtd_retirement.rs -o /tmp/kernel-vtd-retirement-tests
+          /tmp/kernel-vtd-retirement-tests
+      - name: Test checked Simpleboot memory map admission
+        run: |
+          for spec in tests/direct_map_policy.rs tests/simpleboot_mmap_policy.rs \
+            tests/boot_mmap_reader_source.rs; do
+            bin="/tmp/$(basename "$spec" .rs)-tests"
+            rustc --edition 2021 --test -Awarnings "$spec" -o "$bin"
+            "$bin"
+          done

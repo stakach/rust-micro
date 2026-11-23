@@ -287,14 +287,82 @@ pub unsafe fn read_dr6() -> u64 {
     v
 }
 
+/// Write DR6 outside the cached load path. The next load rewrites every register.
 #[inline]
 pub unsafe fn write_dr6(v: u64) {
+    LIVE_IMAGE.invalidate();
+    raw_write_dr6(v);
+}
+
+/// Write DR7 outside the cached load path. The next load rewrites every register.
+#[inline]
+pub unsafe fn write_dr7(v: u64) {
+    LIVE_IMAGE.invalidate();
+    raw_write_dr7(v);
+}
+
+#[inline]
+unsafe fn raw_write_dr6(v: u64) {
     core::arch::asm!("mov dr6, {}", in(reg) v, options(nomem, nostack));
 }
 
 #[inline]
-pub unsafe fn write_dr7(v: u64) {
+unsafe fn raw_write_dr7(v: u64) {
     core::arch::asm!("mov dr7, {}", in(reg) v, options(nomem, nostack));
+}
+
+/// The register image this CPU last loaded, or `None` when hardware or a direct write may have
+/// changed a register since. Each MOV DR is a VM exit under KVM, so a return to user mode skips
+/// the whole load when the image already matches. A #DB updates DR6 in hardware; its handler
+/// writes DR6 through [`write_dr6`], which discards the cached image.
+struct LiveDebugImage {
+    valid: [core::sync::atomic::AtomicBool; crate::smp::MAX_CPUS],
+    dr: [[core::sync::atomic::AtomicU64; 6]; crate::smp::MAX_CPUS],
+}
+
+static LIVE_IMAGE: LiveDebugImage = LiveDebugImage {
+    valid: [const { core::sync::atomic::AtomicBool::new(false) }; crate::smp::MAX_CPUS],
+    dr: [const { [const { core::sync::atomic::AtomicU64::new(0) }; 6] }; crate::smp::MAX_CPUS],
+};
+
+impl LiveDebugImage {
+    // Only the owning CPU touches its slot, with IF clear; Relaxed is enough.
+    fn slot() -> usize {
+        crate::arch::get_cpu_id() as usize
+    }
+
+    fn get(&self) -> Option<[u64; 6]> {
+        let cpu = Self::slot();
+        self.valid[cpu].load(core::sync::atomic::Ordering::Relaxed)
+            .then(|| core::array::from_fn(|r| self.dr[cpu][r].load(core::sync::atomic::Ordering::Relaxed)))
+    }
+
+    fn set(&self, image: [u64; 6]) {
+        let cpu = Self::slot();
+        for (slot, value) in self.dr[cpu].iter().zip(image) {
+            slot.store(value, core::sync::atomic::Ordering::Relaxed);
+        }
+        self.valid[cpu].store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn invalidate(&self) {
+        self.valid[Self::slot()].store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A debug exception changed DR6 (and may clear DR7.GD) in hardware. Call first in the #DB path.
+#[inline]
+pub fn hardware_changed_live_registers() {
+    LIVE_IMAGE.invalidate();
+}
+
+#[cfg(feature = "spec")]
+static HARDWARE_LOADS: [core::sync::atomic::AtomicU32; crate::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::smp::MAX_CPUS];
+
+/// Whether loading `target` must touch the hardware, given the image known to be live.
+fn load_required(live: Option<[u64; 6]>, target: &[u64; 6]) -> bool {
+    live.as_ref() != Some(target)
 }
 
 /// Load a thread's full breakpoint context into the live DR registers.
@@ -304,14 +372,23 @@ pub unsafe fn load_breakpoint_state(st: &DebugState) {
 }
 
 unsafe fn load_register_image(st: &DebugState, dr7: u64) {
+    let target = [st.dr[0], st.dr[1], st.dr[2], st.dr[3], st.dr[4], dr7];
+    if !load_required(LIVE_IMAGE.get(), &target) {
+        return;
+    }
+    // A fault between the writes leaves the cache invalid rather than naming a partial image.
+    LIVE_IMAGE.invalidate();
     // Withdraw the previous thread's comparators before changing any address/status register.
-    write_dr7(DR7_INIT);
+    raw_write_dr7(DR7_INIT);
     core::arch::asm!("mov dr0, {}", in(reg) st.dr[0], options(nomem, nostack));
     core::arch::asm!("mov dr1, {}", in(reg) st.dr[1], options(nomem, nostack));
     core::arch::asm!("mov dr2, {}", in(reg) st.dr[2], options(nomem, nostack));
     core::arch::asm!("mov dr3, {}", in(reg) st.dr[3], options(nomem, nostack));
-    write_dr6(st.dr[4]);
-    write_dr7(dr7);
+    raw_write_dr6(st.dr[4]);
+    raw_write_dr7(dr7);
+    LIVE_IMAGE.set(target);
+    #[cfg(feature = "spec")]
+    HARDWARE_LOADS[LiveDebugImage::slot()].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Restore disabled state too: a TF exception must not inherit another thread's live DR6.

@@ -247,6 +247,8 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
         #[cfg(target_arch = "aarch64")]
         Cap::PML4 { .. } => decode_aarch64_vspace(target, label, args),
         #[cfg(target_arch = "x86_64")]
+        Cap::PML4 { .. } => decode_x86_vspace(target, label, args, invoker),
+        #[cfg(target_arch = "x86_64")]
         Cap::PageDirectory { .. } => decode_page_directory(target, label, args, invoker),
         #[cfg(target_arch = "x86_64")]
         Cap::Pdpt { .. } => decode_pdpt(target, label, args, invoker),
@@ -282,6 +284,60 @@ pub fn decode_invocation(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KRe
     };
     inv_log_exit(&result);
     result
+}
+
+#[cfg(target_arch = "x86_64")]
+fn decode_x86_vspace(
+    target: Cap,
+    label: InvocationLabel,
+    args: &SyscallArgs,
+    invoker: TcbId,
+) -> KResult<()> {
+    if label != InvocationLabel::X86VSpaceQueryPage {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_IllegalOperation,
+        )));
+    }
+    let info = crate::types::seL4_MessageInfo_t { words: [args.a1] };
+    if info.length() < 1 {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_TruncatedMessage,
+        )));
+    }
+    let (root, asid) = match target {
+        Cap::PML4 { ptr, mapped: true, asid } if asid != 0 => (ptr.addr(), asid),
+        _ => {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )))
+        }
+    };
+    if pml4_paddr_for_asid(asid) != root {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidCapability,
+        )));
+    }
+
+    // Only the public user half and its explicitly admitted KUSER leaf may
+    // be inspected through this invocation. A caller cannot probe the kernel
+    // half merely by holding a VSpace root capability.
+    let address = args.a2;
+    let page = address & !0xfff;
+    let admitted = crate::arch::x86_64::vspace::user_mapping_range(page, 12)
+        || page == crate::arch::x86_64::vspace::KUSER_SHARED_DATA_VADDR;
+    if !admitted {
+        return Err(KException::SyscallError(SyscallError::new(
+            seL4_Error::seL4_InvalidArgument,
+        )));
+    }
+
+    let present = unsafe { crate::arch::x86_64::usermode::page_present_in_pml4(root, address) };
+    unsafe {
+        let tcb = KERNEL.get().scheduler.slab.get_mut(invoker);
+        tcb.msg_regs[0] = present as u64;
+        tcb.ipc_length = 1;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -853,6 +909,8 @@ fn pml4_paddr_for_asid(asid: u16) -> u64 {
 }
 
 fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<()> {
+    #[cfg(target_arch = "x86_64")]
+    let _ = unsafe { preflight_invoked_mapping_slot(target, args, invoker)? };
     let (frame_ptr, paddr, size, rights, mapped_vaddr, asid, is_device, map_type) = match target {
         Cap::Frame {
             ptr,
@@ -882,7 +940,9 @@ fn decode_frame_unmap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResul
     if map_type == crate::cap::FrameMapType::IoSpace {
         if let Some(io_address) = mapped_vaddr {
             unsafe {
-                unmap_io_page(asid, io_address, paddr);
+                unmap_io_page(asid, io_address, paddr).map_err(|_| {
+                    KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+                })?;
             }
         }
     } else if let Some(vaddr) = mapped_vaddr {
@@ -987,6 +1047,7 @@ fn decode_x86_iopt(
     #[cfg(target_arch = "x86_64")]
     {
         use crate::arch::x86_64::iommu;
+        let _ = unsafe { preflight_invoked_mapping_slot(target, args, invoker)? };
 
         let (base_paddr, is_mapped, level, mapped_address, ioasid) = match target {
             Cap::IoPageTable {
@@ -1000,9 +1061,14 @@ fn decode_x86_iopt(
         };
 
         if label == InvocationLabel::X86IOPageTableUnmap {
+            if is_mapped && unsafe { iopt_mapping_alias_count(base_paddr, ioasid) != 1 } {
+                return Err(KException::SyscallError(SyscallError::new(
+                    seL4_Error::seL4_DeleteFirst,
+                )));
+            }
             // deleteIOPageTable (iospace.c:397) then clear isMapped.
             unsafe {
-                delete_io_page_table(base_paddr, is_mapped, level, mapped_address, ioasid);
+                delete_io_page_table(base_paddr, is_mapped, level, mapped_address, ioasid)?;
             }
             let new_cap = Cap::IoPageTable {
                 ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
@@ -1030,6 +1096,11 @@ fn decode_x86_iopt(
                 seL4_Error::seL4_InvalidCapability,
             )));
         }
+        if unsafe { iopt_has_any_live_mapping(base_paddr) } {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_DeleteFirst,
+            )));
+        }
         let (pci_request_id, domain_id) = match io_space {
             Cap::IoSpace {
                 pci_device,
@@ -1048,6 +1119,17 @@ fn decode_x86_iopt(
             )));
         }
 
+        let domain_error = |error| {
+            let status = match error {
+                iommu::VtdError::Unavailable => seL4_Error::seL4_FailedLookup,
+                iommu::VtdError::OwnershipConflict => seL4_Error::seL4_DeleteFirst,
+                _ => seL4_Error::seL4_InvalidCapability,
+            };
+            KException::SyscallError(SyscallError::new(status))
+        };
+        unsafe { iommu::check_context_domain(pci_request_id, domain_id) }
+            .map_err(domain_error)?;
+
         let ctx = unsafe { iommu::lookup_vtd_context_slot(pci_request_id, true) };
         let Some(ctx) = ctx else {
             // No IOMMU / pool exhausted.
@@ -1058,13 +1140,11 @@ fn decode_x86_iopt(
 
         if !unsafe { ctx.present() } {
             // Install this PT as the context (1st-level) root.
-            unsafe {
-                ctx.install_root(domain_id, base_paddr);
-            }
+            unsafe { ctx.install_root(domain_id, base_paddr) }.map_err(domain_error)?;
             // A device now has an IO-space context — turn on VT-d translation. Until now
             // DMA was identity (TE off); from here it's confined to mapped IOVAs.
             unsafe {
-                iommu::enable_translation();
+                iommu::enable_translation().unwrap_or_else(|error| iommu::fail_stop(error));
             }
             let new_cap = Cap::IoPageTable {
                 ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
@@ -1075,6 +1155,12 @@ fn decode_x86_iopt(
             };
             update_invoked_iopt_slot(args, invoker, base_paddr, new_cap)?;
             return Ok(());
+        }
+
+        if !unsafe { ctx.matches_domain(domain_id) } {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
+            )));
         }
 
         // Context present — install this PT as an intermediate table.
@@ -1092,7 +1178,7 @@ fn decode_x86_iopt(
             )));
         }
         unsafe {
-            iommu::slot_install(lu.slot, base_paddr, true, true);
+            iommu::slot_install_table(lu.slot, base_paddr);
         }
         let new_cap = Cap::IoPageTable {
             ptr: crate::cap::PPtr::new(base_paddr).unwrap(),
@@ -1116,31 +1202,123 @@ fn decode_x86_iopt(
 /// deleteIOPageTable (iospace.c:397). Clears whatever VT-d entry this
 /// PT is installed at, if it still owns it.
 #[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::iommu::iopt_contains_address;
+
+/// Count aliases carrying the same live IO page-table mapping. A copied
+/// page-table cap must not retire hardware until its last alias goes away.
+#[cfg(target_arch = "x86_64")]
+unsafe fn iopt_mapping_alias_count(base_paddr: u64, ioasid: u16) -> usize {
+    let s = KERNEL.get();
+    let mut cursor = CteCursor::new();
+    let mut count = 0;
+    while let Some(id) = cursor.next(s) {
+        if let Some(Cap::IoPageTable { ptr, is_mapped: true, ioasid: rid, .. }) =
+            s.cte(id).map(|slot| slot.cap())
+        {
+            if ptr.addr() == base_paddr && rid == ioasid {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn iopt_has_mapped_alias_outside_cnode(
+    base_paddr: u64,
+    ioasid: u16,
+    owner_cnode: usize,
+) -> bool {
+    let s = KERNEL.get();
+    let mut cursor = CteCursor::new();
+    while let Some(id) = cursor.next(s) {
+        if id.tcb_slot().is_none() && id.cnode_idx() as usize == owner_cnode {
+            continue;
+        }
+        if let Some(Cap::IoPageTable { ptr, is_mapped: true, ioasid: rid, .. }) =
+            s.cte(id).map(|slot| slot.cap())
+        {
+            if ptr.addr() == base_paddr && rid == ioasid {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn iopt_has_any_live_mapping(base_paddr: u64) -> bool {
+    let s = KERNEL.get();
+    let mut cursor = CteCursor::new();
+    while let Some(id) = cursor.next(s) {
+        if let Some(Cap::IoPageTable { ptr, is_mapped: true, .. }) =
+            s.cte(id).map(|slot| slot.cap())
+        {
+            if ptr.addr() == base_paddr {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Retiring a table while a descendant cap still names a DMA mapping could
+/// let a later owner reuse the RID and IOVA while an old cap is still live.
+#[cfg(target_arch = "x86_64")]
+unsafe fn iopt_has_live_descendants(
+    base_paddr: u64,
+    ioasid: u16,
+    level: u8,
+    mapped_address: u64,
+) -> bool {
+    let s = KERNEL.get();
+    let mut cursor = CteCursor::new();
+    while let Some(id) = cursor.next(s) {
+        let Some(cap) = s.cte(id).map(|slot| slot.cap()) else { continue };
+        match cap {
+            Cap::Frame { mapped: Some(address), asid, map_type: crate::cap::FrameMapType::IoSpace, .. }
+                if asid == ioasid && iopt_contains_address(level, mapped_address, address) =>
+            {
+                return true;
+            }
+            Cap::IoPageTable { ptr, is_mapped: true, level: child_level,
+                mapped_address: child_address, ioasid: rid }
+                if rid == ioasid && ptr.addr() != base_paddr && child_level > level
+                    && iopt_contains_address(level, mapped_address, child_address) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn delete_io_page_table(
     base_paddr: u64,
     is_mapped: bool,
     level: u8,
     mapped_address: u64,
     ioasid: u16,
-) {
+) -> KResult<()> {
     use crate::arch::x86_64::iommu;
     if !is_mapped {
-        return;
+        return Ok(());
     }
-    let Some(ctx) = iommu::lookup_vtd_context_slot(ioasid, false) else {
-        return;
-    };
-    if !ctx.present() {
-        return;
+    if iopt_has_live_descendants(base_paddr, ioasid, level, mapped_address) {
+        return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_DeleteFirst)));
     }
+    let invalid = KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability));
+    let ctx = iommu::lookup_vtd_context_slot(ioasid, false)
+        .filter(|ctx| ctx.present())
+        .ok_or(invalid)?;
     let top = ctx.asr();
-    if level == 0 {
-        // Top-level: this PT is the context root. Only clear if it
-        // still owns the context entry.
+    let retired = if level == 0 {
         if top != base_paddr {
-            return;
+            return Err(invalid);
         }
-        ctx.clear();
+        ctx.clear()
     } else {
         let lu = iommu::lookup_iopt_slot_levels(
             top,
@@ -1148,36 +1326,38 @@ unsafe fn delete_io_page_table(
             (level - 1) as u64,
             (level - 1) as u64,
         );
-        if !lu.ok || lu.level != 0 {
-            return;
+        if !lu.ok || lu.level != 0 || iommu::slot_addr(lu.slot) != base_paddr {
+            return Err(invalid);
         }
-        if iommu::slot_addr(lu.slot) != base_paddr {
-            return;
-        }
-        iommu::slot_clear(lu.slot);
-    }
+        iommu::slot_clear(lu.slot)
+    };
+    retired.map_err(|_| invalid)
 }
 
 /// unmapIOPage (iospace.c:453). Clears the leaf VT-d PTE for an
 /// IO-mapped frame, if the frame still owns it.
 #[cfg(target_arch = "x86_64")]
-unsafe fn unmap_io_page(pci_request_id: u16, io_address: u64, frame_paddr: u64) {
+unsafe fn unmap_io_page(
+    pci_request_id: u16,
+    io_address: u64,
+    frame_paddr: u64,
+) -> Result<(), crate::arch::x86_64::iommu::VtdError> {
     use crate::arch::x86_64::iommu;
     let Some(ctx) = iommu::lookup_vtd_context_slot(pci_request_id, false) else {
-        return;
+        return Err(iommu::VtdError::OwnershipConflict);
     };
     if !ctx.present() {
-        return;
+        return Err(iommu::VtdError::OwnershipConflict);
     }
     let top = ctx.asr();
     let lu = iommu::lookup_iopt_slot(top, io_address);
     if !lu.ok || lu.level != 0 {
-        return;
+        return Err(iommu::VtdError::OwnershipConflict);
     }
     if iommu::slot_addr(lu.slot) != frame_paddr {
-        return;
+        return Err(iommu::VtdError::OwnershipConflict);
     }
-    iommu::slot_clear(lu.slot);
+    iommu::slot_clear(lu.slot)
 }
 
 /// `X86Page::MapIO` — decodeX86IOMapInvocation (iospace.c:296). Maps a
@@ -1186,6 +1366,7 @@ fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
     #[cfg(target_arch = "x86_64")]
     {
         use crate::arch::x86_64::iommu;
+        let _ = unsafe { preflight_invoked_mapping_slot(target, args, invoker)? };
 
         let (frame_paddr, size, frame_rights, frame_mapped, frame_device) = match target {
             Cap::Frame {
@@ -1216,8 +1397,11 @@ fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         let io_address = args.a3 & !((1u64 << iommu::PAGE_BITS) - 1);
 
         let io_space = take_single_extra_cap(invoker);
-        let pci_request_id = match io_space {
-            Cap::IoSpace { pci_device, .. } => pci_device,
+        let (pci_request_id, domain_id) = match io_space {
+            Cap::IoSpace {
+                pci_device,
+                domain_id,
+            } => (pci_device, domain_id),
             _ => {
                 return Err(KException::SyscallError(SyscallError::new(
                     seL4_Error::seL4_InvalidCapability,
@@ -1239,6 +1423,11 @@ fn decode_x86_iomap(target: Cap, args: &SyscallArgs, invoker: TcbId) -> KResult<
         if !unsafe { ctx.present() } {
             return Err(KException::SyscallError(SyscallError::new(
                 seL4_Error::seL4_FailedLookup,
+            )));
+        }
+        if !unsafe { ctx.matches_domain(domain_id) } {
+            return Err(KException::SyscallError(SyscallError::new(
+                seL4_Error::seL4_InvalidCapability,
             )));
         }
 
@@ -1642,6 +1831,23 @@ unsafe fn finalise_cap_mapping(s: &crate::kernel::KernelState, cap: &Cap) {
     }
 }
 
+/// seL4 `deriveCap` as CNode Copy/Mint and IPC transfer apply it to the cap held in `source`:
+/// an Untyped with children cannot be derived (`ensureNoChildren`: seL4_RevokeFirst), paging
+/// structures derive only while mapped, and a derived Frame starts unmapped.
+pub(crate) fn derive_cap(source: &crate::cte::Cte) -> KResult<Cap> {
+    let mut cap = source.cap();
+    if matches!(cap, Cap::Untyped { .. }) && source.child_count() != 0 {
+        return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_RevokeFirst)));
+    }
+    derive_paging_structure(&cap)?;
+    if let Cap::Frame { mapped, asid, map_type, .. } = &mut cap {
+        *mapped = None;
+        *asid = 0;
+        *map_type = crate::cap::FrameMapType::None;
+    }
+    Ok(cap)
+}
+
 fn derive_paging_structure(cap: &Cap) -> KResult<()> {
     if matches!(
         cap,
@@ -1713,42 +1919,38 @@ fn detach_frame_mapping(cap: &Cap) {
         size,
         mapped: Some(vaddr),
         asid,
-        map_type,
+        map_type: crate::cap::FrameMapType::VSpace,
         ..
     } = *cap
     {
         unsafe {
-            if map_type == crate::cap::FrameMapType::IoSpace {
-                unmap_io_page(asid, vaddr, ptr.addr());
-            } else if map_type == crate::cap::FrameMapType::VSpace {
-                let pml4_paddr = pml4_paddr_for_asid(asid);
-                if pml4_paddr != 0 {
-                    let unmapped = match size {
-                        crate::cap::FrameSize::Small => {
-                            crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
-                                pml4_paddr,
-                                vaddr,
-                                ptr.addr(),
-                            )
-                        }
-                        crate::cap::FrameSize::Large => {
-                            crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
-                                pml4_paddr,
-                                vaddr,
-                                ptr.addr(),
-                            )
-                        }
-                        crate::cap::FrameSize::Huge => {
-                            crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
-                                pml4_paddr,
-                                vaddr,
-                                ptr.addr(),
-                            )
-                        }
-                    };
-                    if unmapped {
-                        crate::smp::retire_vspace_translations(pml4_paddr);
+            let pml4_paddr = pml4_paddr_for_asid(asid);
+            if pml4_paddr != 0 {
+                let unmapped = match size {
+                    crate::cap::FrameSize::Small => {
+                        crate::arch::x86_64::usermode::unmap_user_4k_in_pml4(
+                            pml4_paddr,
+                            vaddr,
+                            ptr.addr(),
+                        )
                     }
+                    crate::cap::FrameSize::Large => {
+                        crate::arch::x86_64::usermode::unmap_user_2m_in_pml4(
+                            pml4_paddr,
+                            vaddr,
+                            ptr.addr(),
+                        )
+                    }
+                    crate::cap::FrameSize::Huge => {
+                        crate::arch::x86_64::usermode::unmap_user_1g_in_pml4(
+                            pml4_paddr,
+                            vaddr,
+                            ptr.addr(),
+                        )
+                    }
+                };
+                if unmapped {
+                    crate::smp::retire_vspace_translations(pml4_paddr);
                 }
             }
         }
@@ -1911,7 +2113,54 @@ unsafe fn cnode_release_mappings_valid(
     let Some(remaining_self_refs) = self_refs.checked_sub(cleared_self_refs) else {
         return false;
     };
-    remaining_refs != remaining_self_refs || cnode_tree_registered(s, cap)
+    if remaining_refs != remaining_self_refs {
+        return true;
+    }
+    cnode_tree_registered(s, cap) && cnode_dma_release_valid(s, vi)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn cnode_dma_release_valid(_: &KernelState, _: usize) -> bool {
+    true
+}
+
+/// The CNode finalizer can order mappings within this CNode. Descendants
+/// stored in another CNode need explicit unmap before this object is retired.
+#[cfg(target_arch = "x86_64")]
+unsafe fn cnode_dma_release_valid(s: &KernelState, cnode_index: usize) -> bool {
+    let Some(slots) = s.cnode_slots_at(cnode_index) else { return false };
+    for slot in slots {
+        let Cap::IoPageTable { ptr, is_mapped: true, level,
+            mapped_address, ioasid } = slot.cap() else { continue };
+        if iopt_has_mapped_alias_outside_cnode(ptr.addr(), ioasid, cnode_index) {
+            continue;
+        }
+        let mut cursor = CteCursor::new();
+        while let Some(id) = cursor.next(s) {
+            let descendant_cnode = if id.tcb_slot().is_some() {
+                usize::MAX
+            } else {
+                id.cnode_idx() as usize
+            };
+            let Some(cap) = s.cte(id).map(|entry| entry.cap()) else { continue };
+            let external_descendant = match cap {
+                Cap::Frame { mapped: Some(address), asid,
+                    map_type: crate::cap::FrameMapType::IoSpace, .. } =>
+                    asid == ioasid && crate::arch::x86_64::iommu::external_descendant_needs_explicit_unmap(
+                        cnode_index, descendant_cnode, level, mapped_address, address),
+                Cap::IoPageTable { ptr: child, is_mapped: true, level: child_level,
+                    mapped_address: child_address, ioasid: rid } =>
+                    rid == ioasid && child.addr() != ptr.addr() && child_level > level
+                        && crate::arch::x86_64::iommu::external_descendant_needs_explicit_unmap(
+                            cnode_index, descendant_cnode, level, mapped_address, child_address),
+                _ => false,
+            };
+            if external_descendant {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 unsafe fn revoke_cnode_clear_counts(
@@ -1919,12 +2168,13 @@ unsafe fn revoke_cnode_clear_counts(
     object_vi: usize,
     revoke_epoch: u32,
     source: MdbId,
+    source_removed: bool,
 ) -> (u32, u32) {
     let mut references = 0u32;
     let mut self_references = 0u32;
     let mut cursor = CteCursor::new();
     while let Some(id) = cursor.next(s) {
-        if id == source || !cte_revoke_marked(s, id, revoke_epoch) {
+        if (id == source && !source_removed) || !cte_revoke_marked(s, id, revoke_epoch) {
             continue;
         }
         let Cap::CNode { ptr, .. } = s.cte(id).unwrap().cap() else { continue; };
@@ -4326,6 +4576,9 @@ fn cte_revoke_marked(s: &KernelState, id: MdbId, epoch: u32) -> bool {
     s.cte(id).is_some_and(|slot| slot.revoke_epoch() == epoch)
 }
 
+#[cfg(target_arch = "x86_64")]
+include!("invocation/revoke_dma.rs");
+
 fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
     let Cap::CNode { ptr, .. } = target else { unreachable!() };
     unsafe {
@@ -4361,26 +4614,112 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 }
             }
         }
+        #[cfg(target_arch = "x86_64")]
+        let (has_finalizers, initial_dma) = {
+            let mut finalizers = false;
+            let mut dma = false;
+            let mut cursor = CteCursor::new();
+            while let Some(id) = cursor.next(s) {
+                if id == source || !cte_revoke_marked(s, id, epoch) { continue; }
+                match s.cte(id).unwrap().cap() {
+                    Cap::CNode { .. } | Cap::Thread { .. } => finalizers = true,
+                    Cap::Frame { mapped: Some(_), map_type: crate::cap::FrameMapType::IoSpace, .. }
+                    | Cap::IoPageTable { is_mapped: true, .. } => dma = true,
+                    _ => {}
+                }
+            }
+            (finalizers, dma)
+        };
+        #[cfg(target_arch = "x86_64")]
+        let source_removed = has_finalizers && project_revoke_finalizers(s, source, epoch, false);
+        #[cfg(target_arch = "x86_64")]
+        let has_mapped_dma = if has_finalizers {
+            let mut cursor = CteCursor::new();
+            let mut found = false;
+            while let Some(id) = cursor.next(s) {
+                if (id == source && !source_removed) || !cte_revoke_marked(s, id, epoch) { continue; }
+                found = matches!(s.cte(id).unwrap().cap(),
+                    Cap::Frame { mapped: Some(_), map_type: crate::cap::FrameMapType::IoSpace, .. }
+                    | Cap::IoPageTable { is_mapped: true, .. });
+                if found { break; }
+            }
+            found
+        } else { initial_dma };
+        #[cfg(target_arch = "x86_64")]
+        if has_mapped_dma { preflight_revoke_dma(s, source, source_removed, epoch)?; }
+        #[cfg(not(target_arch = "x86_64"))]
+        let source_removed = false;
+        #[cfg(not(target_arch = "x86_64"))]
+        let has_mapped_dma = false;
         // Validate every complex object before any marked ownership edge is retired.
         let mut cursor = CteCursor::new();
         while let Some(id) = cursor.next(s) {
-            if id == source || !cte_revoke_marked(s, id, epoch) {
+            if (id == source && !source_removed) || !cte_revoke_marked(s, id, epoch) {
                 continue;
             }
             let cap = s.cte(id).unwrap().cap();
             if let Cap::CNode { ptr, .. } = cap {
                 let vi = KernelState::cnode_index(ptr);
-                let (references, self_references) = revoke_cnode_clear_counts(s, vi, epoch, source);
-                if !cnode_release_mappings_valid(s, &cap, references, self_references) {
+                let (references, self_references) =
+                    revoke_cnode_clear_counts(s, vi, epoch, source, source_removed);
+                #[cfg(target_arch = "x86_64")]
+                let valid = if projected_cnode_finalizes(vi) {
+                    cnode_tree_registered(s, &cap)
+                } else {
+                    cnode_release_mappings_valid(s, &cap, references, self_references)
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let valid = cnode_release_mappings_valid(s, &cap, references, self_references);
+                if !valid {
                     return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
                 }
             }
         }
-        let mut cursor = CteCursor::new();
-        while let Some(id) = cursor.next(s) {
-            if id != source && cte_revoke_marked(s, id, epoch) {
-                delete_cap_slot(s, id).expect("prevalidated revoke slot remains finalizable under BKL");
+        #[cfg(target_arch = "x86_64")]
+        let _retirement_reset = RevokeRetirementReset;
+        #[cfg(target_arch = "x86_64")]
+        set_revoke_retirement_active(true);
+        if !has_mapped_dma {
+            let mut cursor = CteCursor::new();
+            while let Some(id) = cursor.next(s) {
+                if (id != source || source_removed) && cte_revoke_marked(s, id, epoch) {
+                    delete_cap_slot(s, id).expect("prevalidated revoke slot remains finalizable under BKL");
+                }
             }
+        } else {
+        // Retire DMA leaves before page tables, deepest tables before their
+        // parents, and the context root last. The CSpace scan order does not
+        // encode the VT-d hierarchy and must not decide DMA teardown order.
+        #[cfg(target_arch = "x86_64")]
+        let dma_levels = crate::arch::x86_64::iommu::num_iopt_levels() as u8;
+        #[cfg(not(target_arch = "x86_64"))]
+        let dma_levels = 0u8;
+        for phase in 0..=(dma_levels + 1) {
+            let mut cursor = CteCursor::new();
+            while let Some(id) = cursor.next(s) {
+                if (id == source && !source_removed) || !cte_revoke_marked(s, id, epoch) {
+                    continue;
+                }
+                let cap = s.cte(id).unwrap().cap();
+                #[cfg(target_arch = "x86_64")]
+                let selected = match cap {
+                    Cap::Frame { mapped: Some(_), map_type: crate::cap::FrameMapType::IoSpace, .. }
+                        => crate::arch::x86_64::iommu::dma_retirement_phase(
+                            crate::arch::x86_64::iommu::DmaRetirementKind::Frame, dma_levels)
+                            == Some(phase),
+                    Cap::IoPageTable { is_mapped: true, level, .. }
+                        => crate::arch::x86_64::iommu::dma_retirement_phase(
+                            crate::arch::x86_64::iommu::DmaRetirementKind::Table(level), dma_levels)
+                            == Some(phase),
+                    _ => phase == dma_levels + 1,
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let selected = phase == dma_levels + 1;
+                if selected {
+                    delete_cap_slot(s, id).expect("prevalidated revoke slot remains finalizable under BKL");
+                }
+            }
+        }
         }
         // The source may live inside a CNode retired by this revoke. Only the still-marked
         // original slot may be reset; absence is a completed destructive traversal, not an error.
@@ -4488,15 +4827,9 @@ fn cnode_copy_or_mint(target: Cap, args: &SyscallArgs, invoker: TcbId, mint: boo
         // unmapped structure. Every mapped alias therefore names the same hardware edge, and only
         // the final alias may explicitly unmap or detach it during deletion. Frame derivation is
         // different: its mapping metadata is cleared in the derived cap.
-        derive_paging_structure(&copy)?;
-        match &mut copy {
-            Cap::Frame { mapped, asid, map_type, .. } => {
-                *mapped = None;
-                *asid = 0;
-                *map_type = crate::cap::FrameMapType::None;
-            }
-            _ => {}
-        }
+        copy = derive_cap(
+            s.cnode_slot(src_cnode_idx, src_res.slot_index).expect("resolved copy source"),
+        )?;
         // Mask rights against `rights_word`. Mirrors upstream
         // `maskCapRights` — applies to BOTH Copy and Mint, regardless
         // of badge. Bit layout matches `seL4_CapRights_t`:
@@ -4983,32 +5316,31 @@ unsafe fn maybe_free_object(s: &mut crate::kernel::KernelState, cap: &Cap) {
                 let _ = crate::interrupt::release_handler(&mut s.irqs, *irq);
             }
         }
-        Cap::IoPageTable {
-            ptr,
-            is_mapped,
-            level,
-            mapped_address,
-            ioasid,
-        } => {
-            // Phase 44 — deleting a mapped IO page table (e.g. at test
-            // teardown when the child's Untyped is revoked) tears down
-            // its VT-d entry (deleteIOPageTable). Without this, the
-            // context root / intermediate PTE leaks into the next test
-            // that reuses the same PCI request-id, corrupting its tree.
-            #[cfg(target_arch = "x86_64")]
-            if *is_mapped {
-                unsafe {
-                    delete_io_page_table(ptr.addr(), *is_mapped, *level, *mapped_address, *ioasid);
-                }
-            }
-            let _ = (s, ptr, is_mapped, level, mapped_address, ioasid);
-        }
         Cap::CNode { ptr, .. } => {
             if cnode_has_only_self_refs(s, cap) {
                 finalize_object(s, FinalizationObject::CNode(KernelState::cnode_index(*ptr)));
             }
         }
         _ => {}
+    }
+}
+
+/// A no-effect refusal leaves the capability and its derivation links in place.
+#[cfg(target_arch = "x86_64")]
+unsafe fn retire_vtd_mapping_before_delete(cap: &Cap) -> KResult<()> {
+    use crate::arch::x86_64::iommu::retire_last_iopt_alias;
+    match *cap {
+        Cap::Frame {
+            ptr, asid, mapped: Some(address), map_type: crate::cap::FrameMapType::IoSpace, ..
+        } => unmap_io_page(asid, address, ptr.addr()).map_err(|_| {
+            KException::SyscallError(SyscallError::new(seL4_Error::seL4_InvalidCapability))
+        }),
+        Cap::IoPageTable { ptr, is_mapped: true, level, mapped_address, ioasid }
+            if retire_last_iopt_alias(iopt_mapping_alias_count(ptr.addr(), ioasid)) =>
+        {
+            delete_io_page_table(ptr.addr(), true, level, mapped_address, ioasid)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -5023,13 +5355,31 @@ pub(crate) unsafe fn delete_cap_slot(s: &mut KernelState, id: MdbId) -> KResult<
         s.cte_mut(id).unwrap().set_revoke_epoch(0);
         return Ok(());
     }
+    #[cfg(target_arch = "x86_64")]
+    let finalizer_plan = !revoke_retirement_active()
+        && direct_finalizer_is_last(s, id, &cap)
+        && direct_finalizer_may_own_dma(s, &cap);
+    #[cfg(target_arch = "x86_64")]
+    let _retirement_reset = finalizer_plan.then_some(RevokeRetirementReset);
+    #[cfg(target_arch = "x86_64")]
+    if finalizer_plan { preflight_direct_finalizer(s, id)?; }
     if let Cap::CNode { ptr, .. } = cap {
         let index = KernelState::cnode_index(ptr);
         let self_reference = id.tcb_slot().is_none() && id.cnode_idx() as usize == index;
-        if !cnode_release_mappings_valid(s, &cap, 1, u32::from(self_reference)) {
+        let valid = cnode_release_mappings_valid(s, &cap, 1, u32::from(self_reference));
+        #[cfg(target_arch = "x86_64")]
+        if finalizer_plan {
+            assert!(valid, "prevalidated final CNode remains releasable after DMA retirement");
+        } else if !valid {
+            return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        if !valid {
             return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    retire_vtd_mapping_before_delete(&cap)?;
     // Revoke can withdraw a live TCB's authority while independent aliases keep the
     // underlying object alive. Stop its remote execution before clearing the owned slot.
     if let Some((thread, _)) = id.tcb_slot() {
@@ -5126,9 +5476,12 @@ unsafe fn release_parent_edge(s: &mut KernelState, parent_id: Option<crate::cte:
 // ---------------------------------------------------------------------------
 
 include!("invocation/tcb_cap_ownership.rs");
+#[path = "invocation/tcb_debug_reply_observation.rs"]
+mod tcb_debug_reply_observation;
 
-const TCB_DEBUG_STATE_WORDS: usize = 29;
+const TCB_DEBUG_STATE_WORDS: usize = 34;
 const TCB_DEBUG_NONE: Word = Word::MAX;
+const TCB_DEBUG_AMBIGUOUS: Word = tcb_debug_reply_observation::AMBIGUOUS;
 
 #[inline]
 fn debug_opt_tcb(v: Option<TcbId>) -> Word {
@@ -5138,6 +5491,51 @@ fn debug_opt_tcb(v: Option<TcbId>) -> Word {
 #[inline]
 fn debug_opt_u16(v: Option<u16>) -> Word {
     v.map(|id| id as Word).unwrap_or(TCB_DEBUG_NONE)
+}
+
+#[inline]
+fn debug_cspace_index(t: &crate::tcb::Tcb) -> Word {
+    match t.cspace_root() {
+        Cap::CNode { ptr, .. } => KernelState::cnode_index(ptr) as Word,
+        _ => TCB_DEBUG_NONE,
+    }
+}
+
+/// Raw Call Reply identity plus a receiver only when both sides still name this Call.
+/// Inconsistent state is diagnostic data, never a reason to panic in debug inspection.
+fn debug_call_reply(s: &KernelState, id: TcbId) -> [Word; 5] {
+    use crate::reply::ReplyNode;
+    let t = s.scheduler.slab.get(id);
+    let Some(node) = t.call_reply else {
+        return [0, TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE];
+    };
+    let (kind, index, bound) = match node {
+        ReplyNode::Object(index) => (
+            1,
+            index as Word,
+            s.replies.get(index as usize),
+        ),
+        ReplyNode::Legacy(caller) => (
+            2,
+            caller.0 as Word,
+            s.scheduler.slab.try_get(caller).map(|t| &t.legacy_reply),
+        ),
+    };
+    let reciprocal = t.state == crate::tcb::ThreadStateType::BlockedOnReply
+        && !matches!(node, ReplyNode::Legacy(caller) if caller != id)
+        && bound.is_some_and(|reply| reply.bound_tcb == Some(id) && reply.offered_tcb.is_none());
+    let receivers = s.scheduler.slab.entries.iter().enumerate().filter_map(|(index, slot)| {
+        let receiver = slot.as_ref()?;
+        (receiver.reply_to == Some(id)).then(|| {
+            tcb_debug_reply_observation::ReceiverObservation {
+                tcb: index as Word,
+                cspace: debug_cspace_index(receiver),
+                state: receiver.state as Word,
+            }
+        })
+    });
+    let receiver = tcb_debug_reply_observation::select_exact_receiver(reciprocal, receivers);
+    [kind, index, receiver.tcb, receiver.cspace, receiver.state]
 }
 
 #[inline]
@@ -5245,6 +5643,28 @@ fn decode_tcb(
     unsafe {
         let s = KERNEL.get();
         match label {
+            InvocationLabel::TCBYieldTo => {
+                if args.a1 != (InvocationLabel::TCBYieldTo as u64) << 12
+                    || s.scheduler.slab.get(invoker).pending_extra_caps_count != 0
+                {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidArgument,
+                    )));
+                }
+                let target = u16::try_from(tcb_ptr.addr())
+                    .ok()
+                    .map(TcbId)
+                    .filter(|&candidate| s.scheduler.slab.try_get(candidate).is_some())
+                    .ok_or_else(|| KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_InvalidCapability,
+                    )))?;
+                if !s.scheduler.request_one_shot_handoff(invoker, target) {
+                    return Err(KException::SyscallError(SyscallError::new(
+                        seL4_Error::seL4_IllegalOperation,
+                    )));
+                }
+                Ok(())
+            }
             InvocationLabel::TCBReadLegacyContext | InvocationLabel::TCBWriteLegacyContext => {
                 legacy_context::invoke(s, tcb_ptr.addr(), label, args, invoker)
             }
@@ -5316,10 +5736,7 @@ fn decode_tcb(
                     TCB_DEBUG_NONE
                 };
                 let t = s.scheduler.slab.get(id);
-                let cspace_idx = match t.cspace_root() {
-                    Cap::CNode { ptr, .. } => KernelState::cnode_index(ptr) as Word,
-                    _ => TCB_DEBUG_NONE,
-                };
+                let cspace_idx = debug_cspace_index(t);
                 let fault_slot = debug_tcb_fault_slot(s, cspace_idx);
                 let queue_top_priority = s.scheduler.nodes[t.affinity as usize].queues
                     [t.domain as usize]
@@ -5328,6 +5745,9 @@ fn decode_tcb(
                     .unwrap_or(TCB_DEBUG_NONE);
                 let direct_handoff =
                     debug_opt_tcb(s.scheduler.nodes[t.affinity as usize].direct_handoff);
+                let call_reply = debug_call_reply(s, id);
+                // Keep the original 29 words stable. Appended words 29..34 are the
+                // Call Reply kind/index and reciprocal receiver TCB/CSpace/state.
                 let words: [Word; TCB_DEBUG_STATE_WORDS] = [
                     t.state as Word,
                     t.is_schedulable() as Word,
@@ -5358,6 +5778,11 @@ fn decode_tcb(
                     s.scheduler.cur_domain as Word,
                     queue_top_priority,
                     direct_handoff,
+                    call_reply[0],
+                    call_reply[1],
+                    call_reply[2],
+                    call_reply[3],
+                    call_reply[4],
                 ];
                 let ipc_paddr = s.scheduler.slab.get(invoker).ipc_buffer_receive_paddr();
                 let inv = s.scheduler.slab.get_mut(invoker);
@@ -6084,6 +6509,8 @@ pub mod spec {
     use crate::cap::{Badge, Cap, EndpointObj, EndpointRights, PPtr};
     include!("invocation/cnode_frame_specs.rs");
     include!("invocation/leaf_revoke_specs.rs");
+    #[cfg(target_arch = "x86_64")]
+    include!("invocation/vtd_delete_specs.rs");
     include!("invocation/asid_specs.rs");
     include!("invocation/frame_mapping_specs.rs");
     include!("invocation/paging_mapping_specs.rs");
@@ -6094,6 +6521,7 @@ pub mod spec {
     include!("invocation/execution_hold_specs.rs");
     include!("invocation/reply_binding_specs.rs");
     include!("invocation/vspace_binding_specs.rs");
+    include!("invocation/yield_to_specs.rs");
 
     #[cfg(target_arch = "x86_64")]
     pub(super) fn observe_untyped_release(parent_id: crate::cte::MdbId) {
@@ -6102,6 +6530,9 @@ pub mod spec {
 
     pub fn test_invocation() {
         let _guard = crate::spec::KernelGuard::acquire();
+        // Fixture VSpaces are never loaded; keep their retirements reaching every online CPU.
+        #[cfg(target_arch = "x86_64")]
+        let _remote = crate::smp::AssumeRemoteUserTranslations::new();
         unsafe { KERNEL.get().scheduler.reset_queues(); }
         unsafe { INVOKER_CAP_OWNERS = Some(crate::asid::spec::RootOwners::new()); }
         arch::log("Running invocation tests...\n");
@@ -6116,6 +6547,8 @@ pub mod spec {
         cnode_move_clears_source();
         cnode_move_reparents_direct_children();
         cnode_delete_splices_derivation_children();
+        #[cfg(target_arch = "x86_64")]
+        vtd_delete_specs::run();
         cnode_alias_delete_preserves_live_object();
         cnode_finalization_drains_deep_nesting();
         cnode_finalization_splices_external_derivation();
@@ -6145,6 +6578,7 @@ pub mod spec {
         execution_hold_specs::run();
         reply_binding_specs::run();
         vspace_binding_specs::run();
+        yield_to_specs::run();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
         reply_delete_clears_receiver_call_state();
         reply_alias_move_and_delete_preserve_unrelated_call();
@@ -8328,10 +8762,49 @@ pub mod spec {
             assert_eq!(inv.msg_regs[16], target.0 as u64);
             assert_eq!(inv.msg_regs[17], TCB_DEBUG_NONE);
             assert_eq!(inv.msg_regs[18], 0);
+            assert_eq!(inv.msg_regs[29], 1); // object-backed Call Reply
+            assert_eq!(inv.msg_regs[30], reply_idx as u64);
+            assert_eq!(inv.msg_regs[31], invoker.0 as u64); // reciprocal receiver
+            assert_eq!(inv.msg_regs[32], 0); // receiver CSpace
+            assert_eq!(inv.msg_regs[33], crate::tcb::ThreadStateType::Running as u64);
             for index in 4..TCB_DEBUG_STATE_WORDS {
                 assert_eq!((core::ptr::addr_of!(BUFFER) as *const u64).add(index + 1).read_volatile(),
                     inv.msg_regs[index]);
             }
+            // A stale receiver link or Reply binding must be reported as unknown, not guessed.
+            s.scheduler.slab.get_mut(invoker).reply_to = None;
+            decode_invocation(target_cap, &args, invoker).expect("debug missing receiver");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[1, reply_idx as u64,
+                TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE]);
+            s.scheduler.slab.get_mut(invoker).reply_to = Some(target);
+            let bound = s.replies[reply_idx];
+            s.replies[reply_idx].bound_tcb = None;
+            decode_invocation(target_cap, &args, invoker).expect("debug stale Reply");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[1, reply_idx as u64,
+                TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE]);
+            s.replies[reply_idx] = bound;
+            let mut duplicate = crate::tcb::Tcb::default();
+            duplicate.reply_to = Some(target);
+            let duplicate = s.scheduler.admit(duplicate);
+            decode_invocation(target_cap, &args, invoker).expect("debug ambiguous receiver");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[1, reply_idx as u64,
+                TCB_DEBUG_AMBIGUOUS, TCB_DEBUG_AMBIGUOUS, TCB_DEBUG_AMBIGUOUS]);
+            s.scheduler.slab.get_mut(duplicate).reply_to = None;
+            teardown_thread_in(s, duplicate);
+            crate::reply::unlink(s, crate::reply::ReplyNode::Object(reply_idx as u16));
+            crate::reply::bind_call(s, target, invoker, None);
+            decode_invocation(target_cap, &args, invoker).expect("debug legacy Call");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[2, target.0 as u64,
+                invoker.0 as u64, 0, crate::tcb::ThreadStateType::Running as u64]);
+            crate::reply::unlink(s, crate::reply::ReplyNode::Legacy(target));
+            decode_invocation(target_cap, &args, invoker).expect("debug unbound Call");
+            let inv = s.scheduler.slab.get(invoker);
+            assert_eq!(&inv.msg_regs[29..34], &[0, TCB_DEBUG_NONE,
+                TCB_DEBUG_NONE, TCB_DEBUG_NONE, TCB_DEBUG_NONE]);
             crate::invocation::delete_cap_slot(s, crate::cte::MdbId::pack(0, 2)).unwrap();
             s.replies[reply_idx] = crate::reply::Reply::new();
             teardown_thread_in(s, target);

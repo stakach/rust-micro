@@ -168,10 +168,14 @@ function) is at VA `0x78e77d30`, and a fault reported by the kernel as
 
 Workflow to root-cause a userspace fault:
 
-1. The kernel prints `[user #PF: tcb=N cr2=... err=... rip=VA]` on the serial log
-   (`/tmp/gdb-serial.log`). Note `rip` (where it faulted) and `cr2` (the bad
-   address). `err` bits: `1`=present, `2`=write, `4`=user — e.g. `err=7` is a
-   user-mode write to a present (read-only) page.
+1. For per-fault details, build the kernel with the
+   `trace-user-page-faults` feature (add it to the arguments for
+   `scripts/build_kernel.sh`). The serial log (`/tmp/gdb-serial.log`) then
+   prints `[user #PF: tcb=N cr2=... err=... rip=VA]` for every user fault.
+   Normal builds print a count every 4096 faults and retain full details for
+   faults that cannot reach a handler. Note `rip` (where it faulted) and `cr2`
+   (the bad address). `err` bits: `1`=present, `2`=write, `4`=user — e.g.
+   `err=7` is a user-mode write to a present (read-only) page.
 2. Break at `rip`, `disassemble` around it to see the faulting instruction and
    which register is bad.
 3. Follow that register back: `disassemble` earlier, or break at the `call` that

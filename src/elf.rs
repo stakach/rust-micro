@@ -211,6 +211,7 @@ impl<'a> Image<'a> {
     }
 }
 
+#[derive(Clone)]
 pub struct LoadSegments<'a> {
     bytes: &'a [u8],
     phoff: u64,

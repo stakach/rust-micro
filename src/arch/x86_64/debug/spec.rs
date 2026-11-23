@@ -5,6 +5,7 @@ pub(crate) fn run() {
     local_and_global_enables();
     installation_preserves_stepping();
     unsafe { disabled_hardware_state_and_status(); }
+    unsafe { cached_loads_never_leave_stale_breakpoints(); }
     crate::arch::log("  raw debug context validates hardware state and preserves stepping policy\n");
 }
 
@@ -130,4 +131,63 @@ unsafe fn disabled_hardware_state_and_status() {
     assert_eq!(thread.debug.dr[4], actual[4], "cache preserves the actual hardware status word");
     assert_eq!(thread.debug.n_instructions, 1);
     assert!(thread.deferred_debug.is_none());
+}
+
+fn image(st: &DebugState, dr7: u64) -> [u64; 6] {
+    [st.dr[0], st.dr[1], st.dr[2], st.dr[3], st.dr[4], dr7]
+}
+
+fn hardware_loads() -> u32 {
+    HARDWARE_LOADS[crate::arch::get_cpu_id() as usize].load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Skipping an unchanged load is safe only if the cache names exactly what hardware holds.
+unsafe fn cached_loads_never_leave_stale_breakpoints() {
+    let plain = DebugState::new();
+    let plain_image = image(&plain, plain.dr[5] & !ALL_ENABLE_BITS);
+    assert!(load_required(None, &plain_image), "an unknown live image is always rewritten");
+    assert!(!load_required(Some(plain_image), &plain_image));
+    for register in 0..6 {
+        let mut changed = plain_image;
+        changed[register] ^= 0x10;
+        assert!(load_required(Some(plain_image), &changed), "any differing register is rewritten");
+    }
+
+    let _guard = crate::spec::KernelGuard::acquire();
+    let saved = DebugState { dr: live_registers(), ..DebugState::new() };
+    // An instruction comparator on a user page the kernel never executes.
+    let mut armed = DebugState::new();
+    set_breakpoint(&mut armed, 0, 0x1000, SEL4_INSTRUCTION_BREAKPOINT, 0, SEL4_BREAK_ON_READ);
+    assert!(armed.any_breakpoint_used());
+
+    load_breakpoint_state(&armed);
+    assert_eq!(live_registers(), image(&armed, armed.dr[5]));
+    let before = hardware_loads();
+    load_breakpoint_state(&armed);
+    assert_eq!(hardware_loads(), before, "an unchanged image skips every MOV DR");
+
+    // Switching to a thread with no breakpoints must withdraw the comparator.
+    load_all_disabled(&plain);
+    let live = live_registers();
+    assert_eq!(live, plain_image);
+    assert_eq!(live[5] & ALL_ENABLE_BITS, 0);
+    let before = hardware_loads();
+    load_all_disabled(&plain);
+    assert_eq!(hardware_loads(), before, "repeated returns without breakpoints skip the writes");
+
+    // A direct DR7 write re-enables the comparator behind the cache; the next load must undo it.
+    write_dr7(armed.dr[5]);
+    assert_ne!(live_registers()[5] & ALL_ENABLE_BITS, 0);
+    load_all_disabled(&plain);
+    assert_eq!(live_registers(), plain_image, "a direct write invalidates the cached image");
+
+    // A #DB changes DR6 in hardware; the next load must restore the thread's status word.
+    hardware_changed_live_registers();
+    raw_write_dr6(DR6_INIT | DR6_SINGLE_STEP | DR6_B0);
+    load_all_disabled(&plain);
+    assert_eq!(live_registers(), plain_image, "a debug exception invalidates the cached image");
+
+    load_breakpoint_state(&saved);
+    assert_eq!(live_registers(), saved.dr);
+    crate::arch::log("  cached debug-register loads skip unchanged images and never keep stale breakpoints\n");
 }

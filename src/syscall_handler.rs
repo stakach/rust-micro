@@ -404,7 +404,14 @@ pub fn handle_syscall(
             }
             Ok(())
         }
-        Syscall::SysDebugSnapshot | Syscall::SysDebugNameThread | Syscall::SysDebugSendIPI => {
+        Syscall::SysDebugSnapshot => {
+            // Read-only: one line per IOAPIC-routed IRQ with its kernel binding state and the
+            // live redirection entry (mask, remote IRR, delivery status).
+            #[cfg(target_arch = "x86_64")]
+            unsafe { debug_snapshot_irq_routes(&crate::kernel::KERNEL.get().irqs) };
+            Ok(())
+        }
+        Syscall::SysDebugNameThread | Syscall::SysDebugSendIPI => {
             // Best-effort no-ops. Names would print to serial; we
             // skip for now.
             Ok(())
@@ -726,14 +733,16 @@ fn handle_send(
             if buf_paddr != 0 {
                 let buf = crate::arch::phys_to_virt(buf_paddr) as *const u64;
                 let mut staged: [crate::cap::Cap; 3] = [crate::cap::Cap::Null; 3];
+                let mut sources: [Option<crate::cte::MdbId>; 3] = [None; 3];
                 let mut count = 0u8;
                 let n = n_caps.min(staged.len());
                 for i in 0..n {
                     let cptr = core::ptr::read_volatile(
                         buf.add(crate::ipc_buffer::CAPS_OR_BADGES_OFFSET + i),
                     );
-                    if let Ok(c) = crate::cspace::lookup_cap(s, &snd_cspace, cptr) {
+                    if let Ok((c, source)) = crate::cspace::lookup_cap_and_slot(s, &snd_cspace, cptr) {
                         staged[i] = c;
+                        sources[i] = Some(source);
                         count += 1;
                     } else {
                         break;
@@ -741,6 +750,7 @@ fn handle_send(
                 }
                 let snd = s.scheduler.slab.get_mut(current);
                 snd.pending_extra_caps = staged;
+                snd.pending_extra_cap_sources = sources;
                 snd.pending_extra_caps_count = count;
             }
         }
@@ -890,6 +900,7 @@ fn handle_recv(args: &SyscallArgs, blocking: bool) -> KResult<()> {
         // receive slots so it reflects only THIS receive (a sender's
         // transfer_extra_caps sets it before we return).
         s.scheduler.slab.get_mut(current).received_extra_caps = 0;
+        s.scheduler.slab.get_mut(current).received_caps_unwrapped = 0;
         let cspace_root = s.scheduler.slab.get(current).cspace_root();
         let target = lookup_cap(s, &cspace_root, args.a0)?;
         // A running thread must not carry a stale receive-side reply
@@ -1052,6 +1063,40 @@ pub fn handle_unknown_syscall(
         // kernel; if we land here with one, treat it as an unknown
         // syscall fault.
         _ => Err(KException::Fault(FaultKind::UnknownSyscall { number })),
+    }
+}
+
+/// `SysDebugSnapshot`: the kernel side of an interrupt that never arrives. For every IRQ with an
+/// IOAPIC source, print its binding state, whether a delivery awaits its Ack, and the redirection
+/// entry: bit 16 masked, bit 14 remote IRR (level lines), bit 12 delivery pending.
+#[cfg(target_arch = "x86_64")]
+unsafe fn debug_snapshot_irq_routes(irqs: &crate::interrupt::IrqTable) {
+    use crate::invocation::log_hex_u64;
+    for (irq, entry) in irqs.entries.iter().enumerate() {
+        let crate::interrupt::IrqSource::IoApic { controller, pin } = entry.source else { continue };
+        crate::arch::log("[kernel-irq-route] irq=0x");
+        log_hex_u64(irq as u64);
+        crate::arch::log(" ioapic=0x");
+        log_hex_u64(u64::from(controller));
+        crate::arch::log(" pin=0x");
+        log_hex_u64(u64::from(pin));
+        crate::arch::log(match entry.state {
+            crate::interrupt::IrqState::Inactive => " state=inactive",
+            crate::interrupt::IrqState::Signal => " state=signal",
+            crate::interrupt::IrqState::Reserved => " state=reserved",
+        });
+        crate::arch::log(if entry.pending { " awaiting-ack=1" } else { " awaiting-ack=0" });
+        match crate::arch::x86_64::ioapic::read_redirection(controller as usize, u32::from(pin)) {
+            Ok((low, high)) => {
+                crate::arch::log(" rte=0x");
+                log_hex_u64((u64::from(high) << 32) | u64::from(low));
+                crate::arch::log(if low & (1 << 16) != 0 { " masked=1" } else { " masked=0" });
+                crate::arch::log(if low & (1 << 14) != 0 { " remote-irr=1" } else { " remote-irr=0" });
+                crate::arch::log(if low & (1 << 12) != 0 { " delivery-pending=1" } else { " delivery-pending=0" });
+                crate::arch::log(if low & (1 << 15) != 0 { " trigger=level\n" } else { " trigger=edge\n" });
+            }
+            Err(_) => crate::arch::log(" rte=unreadable\n"),
+        }
     }
 }
 
