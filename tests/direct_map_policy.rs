@@ -263,3 +263,30 @@ fn invalid_sources_and_overflow_refuse_before_publishing_a_budget() {
     );
     assert_eq!(result, sentinel);
 }
+
+#[test]
+fn malformed_device_apertures_refuse_without_changing_either_output() {
+    let map = [firmware(0, MIB2, FirmwareKind::Ram)];
+    let cases = [
+        range(MIB2, MIB2),
+        range(MIB2 + 1, MIB2 + KIB4),
+        range(MIB2, MIB2 + KIB4 - 1),
+    ];
+    for device in cases {
+        let mut leaves = output();
+        let before_leaves = leaves;
+        assert_eq!(
+            plan_direct_map(&map, &[], &[device], LIMIT, &mut leaves),
+            Err(PlanError::InvalidRange),
+        );
+        assert_eq!(leaves, before_leaves);
+
+        let sentinel = demand(99, 99, 99);
+        let mut tables = sentinel;
+        assert_eq!(
+            count_direct_map_tables(&map, &[], &[device], LIMIT, pool(0, 3), &mut tables),
+            Err(PlanError::InvalidRange),
+        );
+        assert_eq!(tables, sentinel);
+    }
+}
