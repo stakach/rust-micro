@@ -6,7 +6,8 @@
 mod direct_map_policy;
 
 use direct_map_policy::{
-    plan_direct_map, FirmwareKind, FirmwareRange, MapLeaf, PageSize, PhysicalRange, PlanError,
+    count_direct_map_tables, plan_direct_map, FirmwareKind, FirmwareRange, MapLeaf, PageSize,
+    PhysicalRange, PlanError, TableDemand, TablePool,
 };
 
 const KIB4: u64 = 1 << 12;
@@ -152,4 +153,113 @@ fn ambiguous_ram_device_or_firmware_overlaps_fail_before_output_changes() {
         );
         assert_eq!(leaves, before, "failure must precede page-table effects");
     }
+}
+
+fn pool(used: usize, reserved: usize) -> TablePool {
+    TablePool {
+        used,
+        reserved,
+        capacity: 64,
+    }
+}
+
+fn demand(pdpt_pages: usize, pd_pages: usize, pt_pages: usize) -> TableDemand {
+    TableDemand {
+        pdpt_pages,
+        pd_pages,
+        pt_pages,
+    }
+}
+
+#[test]
+fn full_gib_leaves_need_only_one_pdpt() {
+    let map = [firmware(0, 3 * GIB1, FirmwareKind::Ram)];
+    let mut result = demand(99, 99, 99);
+    count_direct_map_tables(&map, &[], &[], LIMIT, pool(0, 3), &mut result).unwrap();
+    assert_eq!(result, demand(1, 0, 0));
+}
+
+#[test]
+fn split_gib_and_two_mib_boundaries_count_distinct_pd_and_pt_pages() {
+    let map = [firmware(GIB1 - KIB4, GIB1 + MIB2 + KIB4, FirmwareKind::Ram)];
+    let mut result = demand(99, 99, 99);
+    count_direct_map_tables(&map, &[], &[], LIMIT, pool(0, 3), &mut result).unwrap();
+    assert_eq!(result, demand(1, 2, 2));
+}
+
+#[test]
+fn fragmented_ram_deduplicates_pt_pages_within_each_two_mib_window() {
+    let map = [
+        firmware(0, KIB4, FirmwareKind::Ram),
+        firmware(KIB4, 2 * KIB4, FirmwareKind::Reserved),
+        firmware(2 * KIB4, 3 * KIB4, FirmwareKind::Ram),
+        firmware(2 * MIB2, 2 * MIB2 + KIB4, FirmwareKind::Ram),
+    ];
+    let mut result = demand(99, 99, 99);
+    count_direct_map_tables(&map, &[], &[], LIMIT, pool(0, 3), &mut result).unwrap();
+    assert_eq!(result, demand(1, 1, 2));
+}
+
+#[test]
+fn proven_reserved_ram_counts_a_pt_while_device_holes_remain_unmapped() {
+    let map = [firmware(0, 2 * MIB2, FirmwareKind::Reserved)];
+    let retained = [range(MIB2, MIB2 + KIB4)];
+    let devices = [range(MIB2 + KIB4, MIB2 + 2 * KIB4)];
+    let mut result = demand(99, 99, 99);
+    count_direct_map_tables(&map, &retained, &devices, LIMIT, pool(0, 3), &mut result).unwrap();
+    assert_eq!(result, demand(1, 1, 1));
+}
+
+#[test]
+fn pool_boundary_includes_existing_and_early_reserved_tables_without_partial_output() {
+    let map = [firmware(0, MIB2, FirmwareKind::Ram)];
+    let sentinel = demand(99, 99, 99);
+    let mut result = sentinel;
+    assert_eq!(
+        count_direct_map_tables(&map, &[], &[], LIMIT, pool(60, 3), &mut result),
+        Err(PlanError::PoolExhausted),
+    );
+    assert_eq!(result, sentinel);
+    count_direct_map_tables(&map, &[], &[], LIMIT, pool(59, 3), &mut result).unwrap();
+    assert_eq!(result, demand(1, 1, 0));
+}
+
+#[test]
+fn invalid_sources_and_overflow_refuse_before_publishing_a_budget() {
+    let map = [firmware(0, MIB2, FirmwareKind::Ram)];
+    let sentinel = demand(99, 99, 99);
+    let mut result = sentinel;
+    assert_eq!(
+        count_direct_map_tables(
+            &map,
+            &[],
+            &[range(KIB4, 2 * KIB4)],
+            LIMIT,
+            pool(0, 3),
+            &mut result
+        ),
+        Err(PlanError::AmbiguousOverlap),
+    );
+    assert_eq!(result, sentinel);
+    assert_eq!(
+        count_direct_map_tables(
+            &map,
+            &[],
+            &[],
+            LIMIT,
+            TablePool {
+                used: usize::MAX,
+                reserved: 3,
+                capacity: 64
+            },
+            &mut result
+        ),
+        Err(PlanError::PoolExhausted),
+    );
+    assert_eq!(result, sentinel);
+    assert_eq!(
+        count_direct_map_tables(&map, &[], &[], 513 * GIB1, pool(0, 3), &mut result),
+        Err(PlanError::InvalidRange),
+    );
+    assert_eq!(result, sentinel);
 }

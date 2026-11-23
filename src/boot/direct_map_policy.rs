@@ -63,6 +63,84 @@ pub enum PlanError {
     AmbiguousOverlap,
     UnprovenReservedRam,
     OutputTooSmall,
+    PoolExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TableDemand {
+    pub pdpt_pages: usize,
+    pub pd_pages: usize,
+    pub pt_pages: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TablePool {
+    pub used: usize,
+    pub reserved: usize,
+    pub capacity: usize,
+}
+
+/// Count table pages for a direct map before any page-table allocation.
+///
+/// One PML4 slot has one PDPT. A 1 GiB leaf ends there; smaller leaves
+/// share one PD per 1 GiB window, and 4 KiB leaves share one PT per 2 MiB
+/// window. `pool.reserved` accounts for early mappings outside this map.
+/// The output changes only after the checked map and whole pool fit.
+pub fn count_direct_map_tables(
+    firmware: &[FirmwareRange],
+    reserved_ram: &[PhysicalRange],
+    devices: &[PhysicalRange],
+    limit: u64,
+    pool: TablePool,
+    output: &mut TableDemand,
+) -> Result<(), PlanError> {
+    // This policy budgets one PDPT/PML4 slot, which covers at most 512 GiB.
+    if limit > 512 * PAGE_1G {
+        return Err(PlanError::InvalidRange);
+    }
+    validate(firmware, reserved_ram, devices, limit)?;
+    let mut demand = TableDemand {
+        pdpt_pages: 1,
+        pd_pages: 0,
+        pt_pages: 0,
+    };
+    let mut last_pd_window = None;
+    let mut last_pt_window = None;
+    walk_leaves(firmware, reserved_ram, limit, |leaf| {
+        if leaf.size != PageSize::Size1G {
+            let window = leaf.start / PAGE_1G;
+            if last_pd_window != Some(window) {
+                demand.pd_pages = demand
+                    .pd_pages
+                    .checked_add(1)
+                    .ok_or(PlanError::PoolExhausted)?;
+                last_pd_window = Some(window);
+            }
+        }
+        if leaf.size == PageSize::Size4K {
+            let window = leaf.start / PAGE_2M;
+            if last_pt_window != Some(window) {
+                demand.pt_pages = demand
+                    .pt_pages
+                    .checked_add(1)
+                    .ok_or(PlanError::PoolExhausted)?;
+                last_pt_window = Some(window);
+            }
+        }
+        Ok(())
+    })?;
+    let total = pool
+        .used
+        .checked_add(pool.reserved)
+        .and_then(|pages| pages.checked_add(demand.pdpt_pages))
+        .and_then(|pages| pages.checked_add(demand.pd_pages))
+        .and_then(|pages| pages.checked_add(demand.pt_pages))
+        .ok_or(PlanError::PoolExhausted)?;
+    if total > pool.capacity {
+        return Err(PlanError::PoolExhausted);
+    }
+    *output = demand;
+    Ok(())
 }
 
 fn valid_range(range: PhysicalRange) -> bool {
