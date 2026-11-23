@@ -100,16 +100,11 @@ fn published_controller(ordinal: usize) -> Result<IoApicController, IoApicError>
     Ok(unsafe { IOAPICS[ordinal] })
 }
 
-/// Discover every MADT IOAPIC, map its register page uncached, read its hardware table size, and
-/// publish the catalog only after the complete topology validates.
-pub unsafe fn initialize(sdt_addr: u64, bsp_apic_id: u32) -> Result<usize, IoApicError> {
-    let _interrupt_state = InterruptState::disable();
-    if IOAPIC_COUNT.load(Ordering::Acquire) != 0 {
-        return Err(IoApicError::AlreadyInitialized);
-    }
-    if bsp_apic_id > u8::MAX as u32 {
-        return Err(IoApicError::InvalidHardware);
-    }
+/// Validate the firmware IOAPIC catalog without mapping or touching controller registers.
+/// Both early aperture admission and live initialization use this exact parser.
+fn discover_topology(
+    sdt_addr: u64,
+) -> Result<([IoApicController; MAX_IOAPICS], usize), IoApicError> {
     let madt = super::acpi::find_madt(sdt_addr).map_err(|_| IoApicError::MalformedMadt)?;
     let mut staged = [EMPTY_CONTROLLER; MAX_IOAPICS];
     let mut count = 0usize;
@@ -168,6 +163,33 @@ pub unsafe fn initialize(sdt_addr: u64, bsp_apic_id: u32) -> Result<usize, IoApi
     if count == 0 {
         return Err(IoApicError::NoTopology);
     }
+    Ok((staged, count))
+}
+
+/// List the validated physical IOAPIC pages before the first kernel mapping.
+/// Output remains untouched if the firmware topology or caller capacity fails.
+pub(crate) fn preflight_apertures(sdt_addr: u64, out: &mut [u64]) -> Result<usize, IoApicError> {
+    let (staged, count) = discover_topology(sdt_addr)?;
+    if count > out.len() {
+        return Err(IoApicError::TooManyControllers);
+    }
+    for (slot, controller) in out.iter_mut().zip(staged[..count].iter()) {
+        *slot = controller.paddr;
+    }
+    Ok(count)
+}
+
+/// Discover every MADT IOAPIC, map its register page uncached, read its hardware table size, and
+/// publish the catalog only after the complete topology validates.
+pub unsafe fn initialize(sdt_addr: u64, bsp_apic_id: u32) -> Result<usize, IoApicError> {
+    let _interrupt_state = InterruptState::disable();
+    if IOAPIC_COUNT.load(Ordering::Acquire) != 0 {
+        return Err(IoApicError::AlreadyInitialized);
+    }
+    if bsp_apic_id > u8::MAX as u32 {
+        return Err(IoApicError::InvalidHardware);
+    }
+    let (mut staged, count) = discover_topology(sdt_addr)?;
 
     for controller in &mut staged[..count] {
         map_kernel_mmio_page(controller.vaddr, controller.paddr);

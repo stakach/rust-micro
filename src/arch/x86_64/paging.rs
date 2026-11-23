@@ -331,10 +331,18 @@ pub fn kernel_virt_to_phys(v: u64) -> u64 {
     unsafe { v.wrapping_sub(KERNEL_VIRT_TO_PHYS_OFFSET) }
 }
 
+/// Decode the whole physical LAPIC page from the architectural APIC-base MSR.
+/// Keep the same identity for early admission and the live uncached mapping.
+fn lapic_physical_page() -> Option<u64> {
+    let page = unsafe { rdmsr(IA32_APIC_BASE_MSR) } & 0x000F_FFFF_FFFF_F000;
+    (page != 0).then_some(page)
+}
+
 /// Public entry point — call once at boot, after init_serial etc.
 /// but before any code that needs MMIO mappings (the LAPIC, IOAPIC).
 pub fn install_kernel_page_tables() {
     unsafe {
+        let lapic_paddr = lapic_physical_page().expect("LAPIC physical page must be nonzero");
         // Cache the kernel virt→phys offset by translating a known-
         // mapped kernel virtual symbol. Done BEFORE install_linear_map
         // because that needs `kernel_virt_to_phys` to compute the
@@ -362,7 +370,6 @@ pub fn install_kernel_page_tables() {
         // (in this function and elsewhere) can use `phys_to_lin`.
         install_linear_map(pml4);
 
-        let lapic_paddr = rdmsr(IA32_APIC_BASE_MSR) & 0xFFFF_F000;
         map_4k_into(
             pml4,
             KERNEL_LAPIC_VBASE,
