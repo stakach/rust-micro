@@ -11,10 +11,15 @@
 
 use crate::region::{align_down, align_up, PRegion};
 
-#[path = "boot/direct_map_policy.rs"]
-pub(crate) mod direct_map_policy;
 #[path = "boot/direct_map_owners.rs"]
 mod direct_map_owners;
+#[path = "boot/direct_map_policy.rs"]
+pub(crate) mod direct_map_policy;
+#[cfg(target_arch = "x86_64")]
+#[path = "boot/direct_map_preflight.rs"]
+mod direct_map_preflight;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use direct_map_preflight::preflight_direct_map;
 #[path = "boot/simpleboot_mmap_policy.rs"]
 mod simpleboot_mmap_policy;
 

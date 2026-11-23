@@ -43,7 +43,7 @@ pub struct PtPage(pub [u64; 512]);
 // installed for the rootserver's vaddr range comes from this pool,
 // plus large-page splits when the loader exposes 2 MiB identity
 // entries. 64 pages is generous for current needs.
-const POOL_SIZE: usize = 64;
+pub(crate) const POOL_SIZE: usize = 64;
 
 #[no_mangle]
 pub static mut KPT_POOL: [PtPage; POOL_SIZE] = [const { PtPage([0; 512]) }; POOL_SIZE];
@@ -343,6 +343,29 @@ fn lapic_physical_page() -> Option<u64> {
 pub fn install_kernel_page_tables() {
     unsafe {
         let lapic_paddr = lapic_physical_page().expect("LAPIC physical page must be nonzero");
+        if LINEAR_MAP_BASE.load(Ordering::Acquire) == 0 {
+            let mut ioapic_pages = [0u64; super::ioapic::MAX_IOAPICS];
+            let ioapic_count = super::ioapic::preflight_apertures(
+                crate::simpleboot::acpi_table_address(),
+                &mut ioapic_pages,
+            )
+            .expect("early IOAPIC topology must validate");
+            // The LAPIC and adjacent IOAPIC virtual pages need at most a
+            // PDPT, PD and PT outside the direct map. Count them before
+            // allocating from the 64-page kernel table pool.
+            let _demand = crate::boot::preflight_direct_map(
+                lapic_paddr,
+                &ioapic_pages[..ioapic_count],
+                LINEAR_MAP_GIB << 30,
+                crate::boot::direct_map_policy::TablePool {
+                    used: KPT_USED,
+                    reserved: 3,
+                    capacity: POOL_SIZE,
+                },
+            )
+            .expect("direct-map table capacity must validate before install");
+            crate::arch::log("paging: direct-map capacity preflight passed\n");
+        }
         // Cache the kernel virt→phys offset by translating a known-
         // mapped kernel virtual symbol. Done BEFORE install_linear_map
         // because that needs `kernel_virt_to_phys` to compute the

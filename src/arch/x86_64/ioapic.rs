@@ -16,7 +16,7 @@ const IOAPIC_REG_ID: u32 = 0x00;
 const IOAPIC_REG_VERSION: u32 = 0x01;
 const IOAPIC_REG_REDTBL_BASE: u32 = 0x10;
 const IOAPIC_PAGE_SIZE: u64 = 0x1000;
-const MAX_IOAPICS: usize = 16;
+pub(crate) const MAX_IOAPICS: usize = 16;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum IoApicError {
