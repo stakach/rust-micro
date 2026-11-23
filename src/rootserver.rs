@@ -307,7 +307,6 @@ fn rootserver_device_untypeds() -> DeviceUntypedList {
 }
 
 fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryRange]) -> usize {
-    const MAX_SIMPLEBOOT_MMAP_ENTRIES: usize = 240;
     const E820_USABLE: u32 = 1;
     const E820_RESERVED: u32 = 2;
     const E820_ACPI_RECLAIMABLE: u32 = 3;
@@ -316,8 +315,9 @@ fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryR
     let mut entries = [crate::boot::MemEntry {
         region: crate::region::PRegion::new(0, 0),
         kind: crate::boot::MemKind::Used,
-    }; MAX_SIMPLEBOOT_MMAP_ENTRIES];
-    let count = crate::boot::read_simpleboot_mmap(&mut entries);
+    }; crate::boot::MAX_BOOT_MMAP_ENTRIES];
+    let count = crate::boot::read_simpleboot_mmap(&mut entries)
+        .expect("Simpleboot memory map must validate before BootInfo publication");
     let mut published = 0usize;
     for entry in entries[..count].iter().copied() {
         let length = entry.region.end.saturating_sub(entry.region.start);
@@ -541,12 +541,12 @@ fn append_device_region(list: &mut DeviceUntypedList, start: u64, end: u64) -> b
 
 #[cfg(feature = "extern-rootserver")]
 fn append_acpi_device_untypeds(list: &mut DeviceUntypedList) -> bool {
-    const MAX_SIMPLEBOOT_MMAP_ENTRIES: usize = 240;
     let mut entries = [crate::boot::MemEntry {
         region: crate::region::PRegion::new(0, 0),
         kind: crate::boot::MemKind::Used,
-    }; MAX_SIMPLEBOOT_MMAP_ENTRIES];
-    let count = crate::boot::read_simpleboot_mmap(&mut entries);
+    }; crate::boot::MAX_BOOT_MMAP_ENTRIES];
+    let count = crate::boot::read_simpleboot_mmap(&mut entries)
+        .expect("Simpleboot memory map must validate before ACPI publication");
     entries[..count]
         .iter()
         .filter(|entry| entry.kind == crate::boot::MemKind::Acpi)

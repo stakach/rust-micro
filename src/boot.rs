@@ -11,6 +11,18 @@
 
 use crate::region::{align_down, align_up, PRegion};
 
+#[path = "boot/direct_map_owners.rs"]
+mod direct_map_owners;
+#[path = "boot/direct_map_policy.rs"]
+pub(crate) mod direct_map_policy;
+#[cfg(target_arch = "x86_64")]
+#[path = "boot/direct_map_preflight.rs"]
+mod direct_map_preflight;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use direct_map_preflight::preflight_direct_map;
+#[path = "boot/simpleboot_mmap_policy.rs"]
+mod simpleboot_mmap_policy;
+
 // ---------------------------------------------------------------------------
 // Memory-map representation. Independent of Simpleboot so the algorithm
 // can be exercised against synthetic maps in specs.
@@ -36,7 +48,7 @@ pub struct MemEntry {
 // in upstream); we pick the same default.
 // ---------------------------------------------------------------------------
 
-pub const MAX_BOOT_MMAP_ENTRIES: usize = 240;
+pub const MAX_BOOT_MMAP_ENTRIES: usize = simpleboot_mmap_policy::MAX_SIMPLEBOOT_MMAP_ENTRIES;
 pub const MAX_FREEMEM_REGIONS: usize = 128;
 pub const MAX_RESERVED_REGIONS: usize = 128;
 
@@ -79,6 +91,8 @@ impl RegionList {
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum BootError {
+    /// The firmware map is incomplete, contradictory, or exceeds fixed capacity.
+    InvalidMemoryMap,
     /// The freemem / reserved-region list is full.
     TooManyRegions,
     /// No contiguous free range big enough for the rootserver.
@@ -305,36 +319,83 @@ fn layout_at(base: u64, layout: &RootserverLayout) -> RootserverMem {
 // and converts each entry into a `MemEntry`.
 // ---------------------------------------------------------------------------
 
-pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> usize {
-    const EFI_MEMORY_MAPPED_IO: u32 = 11;
-    const EFI_MEMORY_MAPPED_IO_PORT_SPACE: u32 = 12;
+fn checked_simpleboot_mmap(
+    raw: &mut [simpleboot_mmap_policy::RawMmapEntry],
+    normalized: &mut [direct_map_policy::FirmwareRange],
+) -> Result<(usize, usize), BootError> {
+    use simpleboot_mmap_policy::RawMmapEntry;
 
-    let mut count = 0usize;
-    crate::simpleboot::for_each_mmap_entry(|entry| {
-        if count >= out.len() {
+    let mut raw_count = 0usize;
+    let mut overflow = false;
+    crate::simpleboot::try_for_each_mmap_entry(|entry| {
+        if raw_count == raw.len() {
+            overflow = true;
             return;
         }
-        let kind = match entry.entry_type {
-            crate::simpleboot::MULTIBOOT_MEMORY_AVAILABLE => MemKind::Free,
-            crate::simpleboot::MULTIBOOT_MEMORY_ACPI_RECLAIMABLE
-            | crate::simpleboot::MULTIBOOT_MEMORY_NVS => MemKind::Acpi,
-            _ if entry.reserved == EFI_MEMORY_MAPPED_IO
-                || entry.reserved == EFI_MEMORY_MAPPED_IO_PORT_SPACE =>
-            {
-                MemKind::Mmio
-            }
-            _ => MemKind::Used,
+        raw[raw_count] = RawMmapEntry {
+            base_addr: entry.base_addr,
+            length: entry.length,
+            entry_type: entry.entry_type,
+            reserved: entry.reserved,
         };
-        let Some(end) = entry.base_addr.checked_add(entry.length) else {
-            return;
+        raw_count += 1;
+    })
+    .map_err(|_| BootError::InvalidMemoryMap)?;
+    if overflow {
+        return Err(BootError::InvalidMemoryMap);
+    }
+    let normalized_count =
+        simpleboot_mmap_policy::convert_simpleboot_mmap(&raw[..raw_count], normalized)
+            .map_err(|_| BootError::InvalidMemoryMap)?;
+    Ok((raw_count, normalized_count))
+}
+
+fn empty_raw_mmap() -> [simpleboot_mmap_policy::RawMmapEntry; MAX_BOOT_MMAP_ENTRIES] {
+    [simpleboot_mmap_policy::RawMmapEntry {
+        base_addr: 0,
+        length: 0,
+        entry_type: 0,
+        reserved: 0,
+    }; MAX_BOOT_MMAP_ENTRIES]
+}
+
+pub(crate) fn read_simpleboot_firmware_map(
+    out: &mut [direct_map_policy::FirmwareRange],
+) -> Result<usize, BootError> {
+    let mut raw = empty_raw_mmap();
+    let (_, normalized_count) = checked_simpleboot_mmap(&mut raw, out)?;
+    Ok(normalized_count)
+}
+
+pub fn read_simpleboot_mmap(out: &mut [MemEntry]) -> Result<usize, BootError> {
+    use direct_map_policy::{FirmwareKind, FirmwareRange, PhysicalRange};
+
+    let mut raw = empty_raw_mmap();
+    let mut normalized = [FirmwareRange {
+        range: PhysicalRange { start: 0, end: 0 },
+        kind: FirmwareKind::Reserved,
+    }; MAX_BOOT_MMAP_ENTRIES];
+    let (raw_count, _) = checked_simpleboot_mmap(&mut raw, &mut normalized)?;
+    if raw_count > out.len() {
+        return Err(BootError::InvalidMemoryMap);
+    }
+    // Keep the byte-exact firmware ranges for allocation and BootInfo. The
+    // page-normalized `normalized` ranges above are the separate direct-map
+    // admission view and validate the complete map before any output write.
+    for (slot, entry) in out.iter_mut().zip(raw[..raw_count].iter().copied()) {
+        let kind = simpleboot_mmap_policy::classify_simpleboot_kind(entry)
+            .map_err(|_| BootError::InvalidMemoryMap)?;
+        *slot = MemEntry {
+            region: PRegion::new(entry.base_addr, entry.base_addr + entry.length),
+            kind: match kind {
+                FirmwareKind::Ram => MemKind::Free,
+                FirmwareKind::AcpiRam => MemKind::Acpi,
+                FirmwareKind::Reserved => MemKind::Used,
+                FirmwareKind::Mmio => MemKind::Mmio,
+            },
         };
-        out[count] = MemEntry {
-            region: PRegion::new(entry.base_addr, end),
-            kind,
-        };
-        count += 1;
-    });
-    count
+    }
+    Ok(raw_count)
 }
 
 fn reserve_simpleboot_allocations(free: &mut RegionList) -> Result<(), BootError> {
@@ -374,10 +435,16 @@ fn reserve_page_range(free: &mut RegionList, start: u64, end: u64) -> Result<(),
 }
 
 #[cfg(target_arch = "x86_64")]
-fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
+fn visit_live_page_tables(
+    mut visit: impl FnMut(u64, u64) -> Result<(), BootError>,
+) -> Result<(), BootError> {
     const PTE_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-    unsafe fn walk(free: &mut RegionList, table_paddr: u64, level: u8) -> Result<(), BootError> {
+    unsafe fn walk(
+        visit: &mut impl FnMut(u64, u64) -> Result<(), BootError>,
+        table_paddr: u64,
+        level: u8,
+    ) -> Result<(), BootError> {
         const PTE_PRESENT: u64 = 1 << 0;
         const PTE_PS: u64 = 1 << 7;
         const PTE_PADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -395,18 +462,23 @@ fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
             if child == 0 {
                 continue;
             }
-            reserve_page_range(free, child, child + 4096)?;
+            visit(child, child + 4096)?;
             let child_level = level - 1;
             if child_level > 1 {
-                walk(free, child, child_level)?;
+                walk(visit, child, child_level)?;
             }
         }
         Ok(())
     }
 
     let root = crate::arch::x86_64::paging::read_cr3() & PTE_PADDR_MASK;
-    reserve_page_range(free, root, root + 4096)?;
-    unsafe { walk(free, root, 4) }
+    visit(root, root + 4096)?;
+    unsafe { walk(&mut visit, root, 4) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn reserve_live_page_tables(free: &mut RegionList) -> Result<(), BootError> {
+    visit_live_page_tables(|start, end| reserve_page_range(free, start, end))
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +497,7 @@ pub fn kernel_init() -> Result<RootserverMem, BootError> {
         region: PRegion::new(0, 0),
         kind: MemKind::Used,
     }; MAX_BOOT_MMAP_ENTRIES];
-    let n = read_simpleboot_mmap(&mut entries);
+    let n = read_simpleboot_mmap(&mut entries)?;
     arch::log("boot:   ");
     log_count(n);
     arch::log(" map entries\n");
@@ -474,7 +546,7 @@ pub fn reserve_user_page_region() -> Result<(), BootError> {
         region: PRegion::new(0, 0),
         kind: MemKind::Used,
     }; MAX_BOOT_MMAP_ENTRIES];
-    let n = read_simpleboot_mmap(&mut entries);
+    let n = read_simpleboot_mmap(&mut entries)?;
     let mut free = extract_free(&entries[..n])?;
     reserve_simpleboot_allocations(&mut free)?;
 
@@ -824,8 +896,8 @@ pub mod spec {
         let mut entries = [MemEntry {
             region: PRegion::new(0, 0),
             kind: MemKind::Used,
-        }; 16];
-        let n = read_simpleboot_mmap(&mut entries);
+        }; MAX_BOOT_MMAP_ENTRIES];
+        let n = read_simpleboot_mmap(&mut entries).expect("Simpleboot map must validate");
         assert!(n > 0, "Simpleboot must report at least one mmap entry");
         let any_free = entries[..n].iter().any(|e| e.kind == MemKind::Free);
         assert!(any_free, "Simpleboot must report at least one free region");
