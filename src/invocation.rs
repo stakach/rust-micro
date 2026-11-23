@@ -2168,12 +2168,13 @@ unsafe fn revoke_cnode_clear_counts(
     object_vi: usize,
     revoke_epoch: u32,
     source: MdbId,
+    source_removed: bool,
 ) -> (u32, u32) {
     let mut references = 0u32;
     let mut self_references = 0u32;
     let mut cursor = CteCursor::new();
     while let Some(id) = cursor.next(s) {
-        if id == source || !cte_revoke_marked(s, id, revoke_epoch) {
+        if (id == source && !source_removed) || !cte_revoke_marked(s, id, revoke_epoch) {
             continue;
         }
         let Cap::CNode { ptr, .. } = s.cte(id).unwrap().cap() else { continue; };
@@ -4575,6 +4576,9 @@ fn cte_revoke_marked(s: &KernelState, id: MdbId, epoch: u32) -> bool {
     s.cte(id).is_some_and(|slot| slot.revoke_epoch() == epoch)
 }
 
+#[cfg(target_arch = "x86_64")]
+include!("invocation/revoke_dma.rs");
+
 fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()> {
     let Cap::CNode { ptr, .. } = target else { unreachable!() };
     unsafe {
@@ -4610,42 +4614,75 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
                 }
             }
         }
-        // Validate every complex object before any marked ownership edge is retired.
-        let mut cursor = CteCursor::new();
-        while let Some(id) = cursor.next(s) {
-            if id == source || !cte_revoke_marked(s, id, epoch) {
-                continue;
-            }
-            let cap = s.cte(id).unwrap().cap();
-            if let Cap::CNode { ptr, .. } = cap {
-                let vi = KernelState::cnode_index(ptr);
-                let (references, self_references) = revoke_cnode_clear_counts(s, vi, epoch, source);
-                if !cnode_release_mappings_valid(s, &cap, references, self_references) {
-                    return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
+        #[cfg(target_arch = "x86_64")]
+        let (has_finalizers, initial_dma) = {
+            let mut finalizers = false;
+            let mut dma = false;
+            let mut cursor = CteCursor::new();
+            while let Some(id) = cursor.next(s) {
+                if id == source || !cte_revoke_marked(s, id, epoch) { continue; }
+                match s.cte(id).unwrap().cap() {
+                    Cap::CNode { .. } | Cap::Thread { .. } => finalizers = true,
+                    Cap::Frame { mapped: Some(_), map_type: crate::cap::FrameMapType::IoSpace, .. }
+                    | Cap::IoPageTable { is_mapped: true, .. } => dma = true,
+                    _ => {}
                 }
             }
-        }
+            (finalizers, dma)
+        };
         #[cfg(target_arch = "x86_64")]
-        let has_mapped_dma = {
+        let source_removed = has_finalizers && project_revoke_finalizers(s, source, epoch, false);
+        #[cfg(target_arch = "x86_64")]
+        let has_mapped_dma = if has_finalizers {
             let mut cursor = CteCursor::new();
             let mut found = false;
             while let Some(id) = cursor.next(s) {
-                if id == source || !cte_revoke_marked(s, id, epoch) {
-                    continue;
-                }
+                if (id == source && !source_removed) || !cte_revoke_marked(s, id, epoch) { continue; }
                 found = matches!(s.cte(id).unwrap().cap(),
                     Cap::Frame { mapped: Some(_), map_type: crate::cap::FrameMapType::IoSpace, .. }
                     | Cap::IoPageTable { is_mapped: true, .. });
                 if found { break; }
             }
             found
-        };
+        } else { initial_dma };
+        #[cfg(target_arch = "x86_64")]
+        if has_mapped_dma { preflight_revoke_dma(s, source, source_removed, epoch)?; }
+        #[cfg(not(target_arch = "x86_64"))]
+        let source_removed = false;
         #[cfg(not(target_arch = "x86_64"))]
         let has_mapped_dma = false;
+        // Validate every complex object before any marked ownership edge is retired.
+        let mut cursor = CteCursor::new();
+        while let Some(id) = cursor.next(s) {
+            if (id == source && !source_removed) || !cte_revoke_marked(s, id, epoch) {
+                continue;
+            }
+            let cap = s.cte(id).unwrap().cap();
+            if let Cap::CNode { ptr, .. } = cap {
+                let vi = KernelState::cnode_index(ptr);
+                let (references, self_references) =
+                    revoke_cnode_clear_counts(s, vi, epoch, source, source_removed);
+                #[cfg(target_arch = "x86_64")]
+                let valid = if projected_cnode_finalizes(vi) {
+                    cnode_tree_registered(s, &cap)
+                } else {
+                    cnode_release_mappings_valid(s, &cap, references, self_references)
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let valid = cnode_release_mappings_valid(s, &cap, references, self_references);
+                if !valid {
+                    return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        let _retirement_reset = RevokeRetirementReset;
+        #[cfg(target_arch = "x86_64")]
+        set_revoke_retirement_active(true);
         if !has_mapped_dma {
             let mut cursor = CteCursor::new();
             while let Some(id) = cursor.next(s) {
-                if id != source && cte_revoke_marked(s, id, epoch) {
+                if (id != source || source_removed) && cte_revoke_marked(s, id, epoch) {
                     delete_cap_slot(s, id).expect("prevalidated revoke slot remains finalizable under BKL");
                 }
             }
@@ -4660,7 +4697,7 @@ fn cnode_revoke(target: Cap, args: &SyscallArgs, _invoker: TcbId) -> KResult<()>
         for phase in 0..=(dma_levels + 1) {
             let mut cursor = CteCursor::new();
             while let Some(id) = cursor.next(s) {
-                if id == source || !cte_revoke_marked(s, id, epoch) {
+                if (id == source && !source_removed) || !cte_revoke_marked(s, id, epoch) {
                     continue;
                 }
                 let cap = s.cte(id).unwrap().cap();
@@ -5318,10 +5355,26 @@ pub(crate) unsafe fn delete_cap_slot(s: &mut KernelState, id: MdbId) -> KResult<
         s.cte_mut(id).unwrap().set_revoke_epoch(0);
         return Ok(());
     }
+    #[cfg(target_arch = "x86_64")]
+    let finalizer_plan = !revoke_retirement_active()
+        && direct_finalizer_is_last(s, id, &cap)
+        && direct_finalizer_may_own_dma(s, &cap);
+    #[cfg(target_arch = "x86_64")]
+    let _retirement_reset = finalizer_plan.then_some(RevokeRetirementReset);
+    #[cfg(target_arch = "x86_64")]
+    if finalizer_plan { preflight_direct_finalizer(s, id)?; }
     if let Cap::CNode { ptr, .. } = cap {
         let index = KernelState::cnode_index(ptr);
         let self_reference = id.tcb_slot().is_none() && id.cnode_idx() as usize == index;
-        if !cnode_release_mappings_valid(s, &cap, 1, u32::from(self_reference)) {
+        let valid = cnode_release_mappings_valid(s, &cap, 1, u32::from(self_reference));
+        #[cfg(target_arch = "x86_64")]
+        if finalizer_plan {
+            assert!(valid, "prevalidated final CNode remains releasable after DMA retirement");
+        } else if !valid {
+            return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        if !valid {
             return Err(KException::SyscallError(SyscallError::new(seL4_Error::seL4_IllegalOperation)));
         }
     }
