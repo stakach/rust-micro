@@ -17,6 +17,19 @@ on:
       - "src/idle_log_budget.rs"
       - "tests/idle_log_budget.rs"
       - "src/arch/x86_64/exceptions.rs"
+      - "src/arch/x86_64/ioapic.rs"
+      - "src/arch/x86_64/paging.rs"
+      - "src/boot.rs"
+      - "src/boot/**"
+      - "src/simpleboot.rs"
+      - "src/rootserver.rs"
+      - "src/main.rs"
+      - "tests/boot_mmap_reader_source.rs"
+      - "tests/direct_map_*.rs"
+      - "tests/ioapic_preflight_source.rs"
+      - "tests/lapic_preflight_source.rs"
+      - "tests/simpleboot_mmap_policy.rs"
+      - "tests/simpleboot_tag_walk.rs"
   pull_request:
     paths:
       - ".github/workflows/kernel-host-contracts.yml"
@@ -33,6 +46,19 @@ on:
       - "src/idle_log_budget.rs"
       - "tests/idle_log_budget.rs"
       - "src/arch/x86_64/exceptions.rs"
+      - "src/arch/x86_64/ioapic.rs"
+      - "src/arch/x86_64/paging.rs"
+      - "src/boot.rs"
+      - "src/boot/**"
+      - "src/simpleboot.rs"
+      - "src/rootserver.rs"
+      - "src/main.rs"
+      - "tests/boot_mmap_reader_source.rs"
+      - "tests/direct_map_*.rs"
+      - "tests/ioapic_preflight_source.rs"
+      - "tests/lapic_preflight_source.rs"
+      - "tests/simpleboot_mmap_policy.rs"
+      - "tests/simpleboot_tag_walk.rs"
 
 permissions:
   contents: read
@@ -59,3 +85,14 @@ jobs:
         run: |
           rustc --edition 2021 --test tests/vtd_retirement.rs -o /tmp/kernel-vtd-retirement-tests
           /tmp/kernel-vtd-retirement-tests
+      - name: Test boot map and first-install direct-map preflight
+        run: |
+          for spec in tests/direct_map_policy.rs tests/direct_map_owners.rs \
+            tests/simpleboot_mmap_policy.rs tests/boot_mmap_reader_source.rs \
+            tests/ioapic_preflight_source.rs tests/lapic_preflight_source.rs \
+            tests/direct_map_preflight_source.rs tests/direct_map_runtime_builder_source.rs \
+            tests/simpleboot_tag_walk.rs; do
+            bin="/tmp/$(basename "$spec" .rs)-tests"
+            rustc --edition 2021 --test -Awarnings "$spec" -o "$bin"
+            "$bin"
+          done

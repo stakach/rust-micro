@@ -353,6 +353,7 @@ fn bsp_main_big_stack() -> ! {
     if let Err(e) = boot::reserve_user_page_region() {
         arch::log("boot: reserve_user_page_region failed: ");
         match e {
+            boot::BootError::InvalidMemoryMap => arch::log("InvalidMemoryMap"),
             boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
             boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
             boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
@@ -383,6 +384,7 @@ fn bsp_main_big_stack() -> ! {
         Err(e) => {
             arch::log("boot: kernel_init failed: ");
             match e {
+                boot::BootError::InvalidMemoryMap => arch::log("InvalidMemoryMap"),
                 boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
                 boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
                 boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
@@ -390,6 +392,9 @@ fn bsp_main_big_stack() -> ! {
                 boot::BootError::RootserverImageTooLarge => arch::log("RootserverImageTooLarge"),
             }
             arch::log("\n");
+            loop {
+                arch::halt_cpu();
+            }
         }
     }
 
