@@ -27,6 +27,13 @@ mod arch {
     }
 
     pub mod x86_64 {
+        #[cfg(target_arch = "x86_64")]
+        pub mod cpu {
+            pub fn get_hardware_cpu_id() -> u32 {
+                0
+            }
+        }
+
         pub mod acpi {
             pub struct PcRtc {
                 pub index_port: u16,
