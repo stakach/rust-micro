@@ -6,16 +6,16 @@ pub fn get_cpu_id() -> CpuId {
     //   * Pre-`install_kernel_page_tables` (very-early boot, before
     //     we have the kernel-half linear map): use the loader's
     //     initial low-memory/MMIO mappings.
-    //   * After `install_kernel_page_tables`: the linear map is up
-    //     and `phys_to_lin` returns a kernel-half vaddr that's
-    //     reachable from any vspace (including user vspaces that
-    //     strip PML4[0] for sel4test).
-    // `phys_to_lin` returns the bare paddr when `LINEAR_MAP_BASE`
-    // is still zero, so a single call covers both regimes.
+    //   * After `install_kernel_page_tables`: use the explicit strong-UC
+    //     LAPIC aperture. The RAM direct map deliberately excludes MMIO.
     let apic_base = get_apic_base();
     const APIC_ID_OFFSET: u64 = 0x20;
     let apic_id_reg = unsafe {
-        let kva = super::paging::phys_to_lin(apic_base + APIC_ID_OFFSET);
+        let kva = if super::paging::LINEAR_MAP_BASE == 0 {
+            apic_base + APIC_ID_OFFSET
+        } else {
+            super::paging::KERNEL_LAPIC_VBASE + APIC_ID_OFFSET
+        };
         core::ptr::read_volatile(kva as *const u32)
     };
     (apic_id_reg >> 24) & 0xFF

@@ -19,7 +19,7 @@ pub(crate) mod direct_map_policy;
 #[path = "boot/direct_map_preflight.rs"]
 mod direct_map_preflight;
 #[cfg(target_arch = "x86_64")]
-pub(crate) use direct_map_preflight::preflight_direct_map;
+pub(crate) use direct_map_preflight::{preflight_direct_map, DirectMapPlan};
 #[path = "boot/simpleboot_mmap_policy.rs"]
 mod simpleboot_mmap_policy;
 

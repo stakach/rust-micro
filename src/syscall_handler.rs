@@ -77,7 +77,11 @@ pub(crate) fn handle_debug_write(
     let length = usize::try_from(args.a1).map_err(|_| invalid())?;
     crate::debug_record::capture_and_emit(args.a0, length, |address, destination| {
         let read_entry = |table: u64, index: usize| unsafe {
-            Some(core::ptr::read_volatile((crate::arch::phys_to_virt(table) as *const u64).add(index)))
+            #[cfg(target_arch = "x86_64")]
+            let table_va = crate::arch::x86_64::paging::try_phys_to_lin(table)?;
+            #[cfg(target_arch = "aarch64")]
+            let table_va = crate::arch::phys_to_virt(table);
+            Some(core::ptr::read_volatile((table_va as *const u64).add(index)))
         };
         #[cfg(target_arch = "x86_64")]
         let mapping = crate::debug_record::translate_x86_user(root, address, read_entry);
@@ -87,9 +91,14 @@ pub(crate) fn handle_debug_write(
         if destination.len() as u64 > available {
             return Err(crate::debug_record::DebugRecordError::Unreadable);
         }
+        #[cfg(target_arch = "x86_64")]
+        let linear = crate::arch::x86_64::paging::try_phys_to_lin(physical)
+            .ok_or(crate::debug_record::DebugRecordError::Unreadable)?;
+        #[cfg(target_arch = "aarch64")]
+        let linear = crate::arch::phys_to_virt(physical);
         unsafe {
             core::ptr::copy_nonoverlapping(
-                crate::arch::phys_to_virt(physical) as *const u8,
+                linear as *const u8,
                 destination.as_mut_ptr(), destination.len(),
             );
         }

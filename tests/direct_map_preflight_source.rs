@@ -7,7 +7,7 @@ use std::process::Command;
 fn first_install_counts_exact_boot_owners_before_page_table_mutation() {
     let root = std::env::current_dir().unwrap();
     let boot = fs::read_to_string(root.join("src/boot.rs")).unwrap();
-    assert!(boot.contains("pub(crate) use direct_map_preflight::preflight_direct_map;"));
+    assert!(boot.contains("preflight_direct_map, DirectMapPlan"));
     let preflight = fs::read_to_string(root.join("src/boot/direct_map_preflight.rs")).unwrap();
     let start = preflight
         .find("fn push_boot_owner(")
@@ -113,16 +113,26 @@ fn all_boot_owners_and_both_controller_apertures_fit() {
         PhysicalRange{start:0x20_3000,end:0x20_4000},
     ]);
     let pool=TablePool{used:0,reserved:3,capacity:64};
-    let budget=preflight_direct_map(0x40_0000,&[0x40_1000],0x80_0000,pool).unwrap();
+    let mut plan=DirectMapPlan::new();
+    let budget=preflight_direct_map(0x40_0000,&[0x40_1000],0x80_0000,pool,&mut plan).unwrap();
     assert_eq!(budget,TableDemand{pdpt_pages:1,pd_pages:1,pt_pages:1});
+    assert!(plan.checked());
+    assert!(plan.contains(0x1000));
+    assert!(plan.contains(0x20_1000));
+    assert!(!plan.contains(0x40_0000));
+    assert!(!plan.contains(0x40_1000));
 }
 #[test]
 fn a_controller_in_ram_or_insufficient_pool_refuses() {
     let pool=TablePool{used:0,reserved:3,capacity:64};
-    assert_eq!(preflight_direct_map(0,&[0x40_1000],0x80_0000,pool),Err(PreflightError::InvalidAperture));
-    assert_eq!(preflight_direct_map(0x1000,&[0x40_1000],0x80_0000,pool),
+    let mut plan=DirectMapPlan::new();
+    assert_eq!(preflight_direct_map(0,&[0x40_1000],0x80_0000,pool,&mut plan),Err(PreflightError::InvalidAperture));
+    assert!(!plan.checked());
+    assert_eq!(preflight_direct_map(0x1000,&[0x40_1000],0x80_0000,pool,&mut plan),
         Err(PreflightError::Policy(PlanError::AmbiguousOverlap)));
+    assert!(!plan.checked());
     assert_eq!(preflight_direct_map(0x40_0000,&[0x40_1000],0x80_0000,
-        TablePool{used:0,reserved:3,capacity:5}),Err(PreflightError::Policy(PlanError::PoolExhausted)));
+        TablePool{used:0,reserved:3,capacity:5},&mut plan),Err(PreflightError::Policy(PlanError::PoolExhausted)));
+    assert!(!plan.checked());
 }
 "#;

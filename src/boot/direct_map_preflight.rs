@@ -76,48 +76,106 @@ fn preflight_device_page(paddr: u64) -> Result<direct_map_policy::PhysicalRange,
     Ok(direct_map_policy::PhysicalRange { start: paddr, end })
 }
 
-/// Count a possible RAM-only direct map while the loader identity map is still live.
-/// This is a first-install admission check; the current broad map remains unchanged.
+/// Retain exactly the sources whose leaves passed the first-install capacity check.
+/// The native builder and `phys_to_lin` consume this plan after publication.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct DirectMapPlan {
+    firmware: [direct_map_policy::FirmwareRange; MAX_BOOT_MMAP_ENTRIES],
+    firmware_count: usize,
+    reserved_ram: [direct_map_policy::PhysicalRange; MAX_RESERVED_REGIONS],
+    reserved_count: usize,
+    devices: [direct_map_policy::PhysicalRange; 1 + crate::arch::x86_64::ioapic::MAX_IOAPICS],
+    device_count: usize,
+    runs: [direct_map_policy::PhysicalRange; MAX_BOOT_MMAP_ENTRIES + MAX_RESERVED_REGIONS],
+    run_count: usize,
+    limit: u64,
+    checked: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl DirectMapPlan {
+    pub(crate) const fn new() -> Self {
+        use direct_map_policy::{FirmwareKind, FirmwareRange, PhysicalRange};
+        const EMPTY: PhysicalRange = PhysicalRange { start: 0, end: 0 };
+        Self {
+            firmware: [FirmwareRange { range: EMPTY, kind: FirmwareKind::Reserved };
+                MAX_BOOT_MMAP_ENTRIES],
+            firmware_count: 0,
+            reserved_ram: [EMPTY; MAX_RESERVED_REGIONS],
+            reserved_count: 0,
+            devices: [EMPTY; 1 + crate::arch::x86_64::ioapic::MAX_IOAPICS],
+            device_count: 0,
+            runs: [EMPTY; MAX_BOOT_MMAP_ENTRIES + MAX_RESERVED_REGIONS],
+            run_count: 0,
+            limit: 0,
+            checked: false,
+        }
+    }
+
+    pub(crate) fn checked(&self) -> bool { self.checked }
+    pub(crate) fn firmware(&self) -> &[direct_map_policy::FirmwareRange] {
+        &self.firmware[..self.firmware_count]
+    }
+    pub(crate) fn reserved_ram(&self) -> &[direct_map_policy::PhysicalRange] {
+        &self.reserved_ram[..self.reserved_count]
+    }
+    pub(crate) fn devices(&self) -> &[direct_map_policy::PhysicalRange] {
+        &self.devices[..self.device_count]
+    }
+    pub(crate) fn limit(&self) -> u64 { self.limit }
+
+    pub(crate) fn contains(&self, paddr: u64) -> bool {
+        if !self.checked || paddr >= self.limit { return false; }
+        let mut low = 0;
+        let mut high = self.run_count;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let run = self.runs[mid];
+            if paddr < run.start { high = mid; }
+            else if paddr >= run.end { low = mid + 1; }
+            else { return true; }
+        }
+        false
+    }
+}
+
+/// Validate the whole physical policy and retain the exact sources used by native construction.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn preflight_direct_map(
     lapic_paddr: u64,
     ioapic_paddrs: &[u64],
     limit: u64,
     pool: direct_map_policy::TablePool,
+    plan: &mut DirectMapPlan,
 ) -> Result<direct_map_policy::TableDemand, PreflightError> {
-    use direct_map_policy::{FirmwareKind, FirmwareRange, PhysicalRange, TableDemand};
+    use direct_map_policy::{PhysicalRange, TableDemand};
 
-    let mut firmware = [FirmwareRange {
-        range: PhysicalRange { start: 0, end: 0 },
-        kind: FirmwareKind::Reserved,
-    }; MAX_BOOT_MMAP_ENTRIES];
-    let firmware_count =
-        read_simpleboot_firmware_map(&mut firmware).map_err(PreflightError::Boot)?;
+    plan.checked = false;
+    plan.run_count = 0;
+    let firmware_count = read_simpleboot_firmware_map(&mut plan.firmware)
+        .map_err(PreflightError::Boot)?;
     let mut owners = [PhysicalRange { start: 0, end: 0 }; MAX_RESERVED_REGIONS];
     let owner_count = collect_boot_owner_ranges(&mut owners).map_err(PreflightError::Boot)?;
-    let mut reserved_ram = [PhysicalRange { start: 0, end: 0 }; MAX_RESERVED_REGIONS];
     let reserved_count = direct_map_owners::collect_reserved_ram(
-        &firmware[..firmware_count],
+        &plan.firmware[..firmware_count],
         &owners[..owner_count],
-        &mut reserved_ram,
+        &mut plan.reserved_ram,
     )
     .map_err(PreflightError::Policy)?;
 
-    let mut devices =
-        [PhysicalRange { start: 0, end: 0 }; 1 + crate::arch::x86_64::ioapic::MAX_IOAPICS];
-    if ioapic_paddrs.len() + 1 > devices.len() {
+    if ioapic_paddrs.len() + 1 > plan.devices.len() {
         return Err(PreflightError::InvalidAperture);
     }
-    devices[0] = preflight_device_page(lapic_paddr)?;
+    plan.devices[0] = preflight_device_page(lapic_paddr)?;
     for (index, paddr) in ioapic_paddrs.iter().copied().enumerate() {
         let page = preflight_device_page(paddr)?;
-        if devices[..index + 1]
+        if plan.devices[..index + 1]
             .iter()
             .any(|prior| prior.start == page.start)
         {
             return Err(PreflightError::InvalidAperture);
         }
-        devices[index + 1] = page;
+        plan.devices[index + 1] = page;
     }
     let mut demand = TableDemand {
         pdpt_pages: 0,
@@ -125,13 +183,36 @@ pub(crate) fn preflight_direct_map(
         pt_pages: 0,
     };
     direct_map_policy::count_direct_map_tables(
-        &firmware[..firmware_count],
-        &reserved_ram[..reserved_count],
-        &devices[..ioapic_paddrs.len() + 1],
+        &plan.firmware[..firmware_count],
+        &plan.reserved_ram[..reserved_count],
+        &plan.devices[..ioapic_paddrs.len() + 1],
         limit,
         pool,
         &mut demand,
     )
     .map_err(PreflightError::Policy)?;
+    let mut run_count = 0;
+    let runs = &mut plan.runs;
+    direct_map_policy::for_each_direct_map_run(
+        &plan.firmware[..firmware_count],
+        &plan.reserved_ram[..reserved_count],
+        &plan.devices[..ioapic_paddrs.len() + 1],
+        limit,
+        |run| {
+            if run_count == runs.len() {
+                return Err(direct_map_policy::PlanError::OutputTooSmall);
+            }
+            runs[run_count] = run;
+            run_count += 1;
+            Ok(())
+        },
+    )
+    .map_err(PreflightError::Policy)?;
+    plan.firmware_count = firmware_count;
+    plan.reserved_count = reserved_count;
+    plan.device_count = ioapic_paddrs.len() + 1;
+    plan.run_count = run_count;
+    plan.limit = limit;
+    plan.checked = true;
     Ok(demand)
 }

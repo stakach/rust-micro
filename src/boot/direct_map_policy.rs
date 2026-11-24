@@ -272,6 +272,36 @@ fn walk_leaves(
     Ok(())
 }
 
+/// Visit the same admitted leaves counted by `count_direct_map_tables`.
+/// Native construction must consume this policy instead of rebuilding a broad map.
+pub(crate) fn for_each_direct_map_leaf(
+    firmware: &[FirmwareRange],
+    reserved_ram: &[PhysicalRange],
+    devices: &[PhysicalRange],
+    limit: u64,
+    emit: impl FnMut(MapLeaf) -> Result<(), PlanError>,
+) -> Result<(), PlanError> {
+    validate(firmware, reserved_ram, devices, limit)?;
+    walk_leaves(firmware, reserved_ram, limit, emit)
+}
+
+/// Visit coalesced admitted runs in physical order for fast address admission.
+pub(crate) fn for_each_direct_map_run(
+    firmware: &[FirmwareRange],
+    reserved_ram: &[PhysicalRange],
+    devices: &[PhysicalRange],
+    limit: u64,
+    mut emit: impl FnMut(PhysicalRange) -> Result<(), PlanError>,
+) -> Result<(), PlanError> {
+    validate(firmware, reserved_ram, devices, limit)?;
+    let mut cursor = 0;
+    while let Some(run) = next_run(firmware, reserved_ram, cursor, limit) {
+        emit(run)?;
+        cursor = run.end;
+    }
+    Ok(())
+}
+
 /// Validate all sources, count leaves, then fill `output` atomically with respect
 /// to admission and capacity errors. Missing firmware coverage remains a hole.
 pub fn plan_direct_map(

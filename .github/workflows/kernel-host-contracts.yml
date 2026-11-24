@@ -64,7 +64,8 @@ jobs:
           for spec in tests/direct_map_policy.rs tests/direct_map_owners.rs \
             tests/simpleboot_mmap_policy.rs tests/boot_mmap_reader_source.rs \
             tests/ioapic_preflight_source.rs tests/lapic_preflight_source.rs \
-            tests/direct_map_preflight_source.rs tests/simpleboot_tag_walk.rs; do
+            tests/direct_map_preflight_source.rs tests/direct_map_runtime_builder_source.rs \
+            tests/simpleboot_tag_walk.rs; do
             bin="/tmp/$(basename "$spec" .rs)-tests"
             rustc --edition 2021 --test -Awarnings "$spec" -o "$bin"
             "$bin"

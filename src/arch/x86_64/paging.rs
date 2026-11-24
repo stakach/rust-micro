@@ -179,9 +179,9 @@ pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
     );
 }
 
-/// Base of the kernel-half "linear map": every physical address `p`
-/// in the range [0, LINEAR_MAP_GIB·1 GiB) is reachable from kernel
-/// mode at vaddr `LINEAR_MAP_BASE + p`. Replaces the loader-provided
+/// Base of the kernel-half direct map: only physical pages admitted by
+/// the checked firmware and boot-owner plan are reachable at base + p.
+/// Replaces the loader-provided
 /// PML4[0] identity map for kernel paddr-as-vaddr accesses, so
 /// user vspaces can free PML4[0] for their own mappings.
 ///
@@ -193,18 +193,31 @@ pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
 pub static mut LINEAR_MAP_BASE: u64 = 0;
 #[no_mangle]
 pub static mut LINEAR_MAP_PML4_IDX: usize = 0;
-/// Coverage in 1 GiB increments. 4 GiB is comfortably above the current
-/// rootserver Untyped target plus the 2 GiB QEMU RAM we configure today;
-/// bumping this just adds a few PDPT entries.
-pub const LINEAR_MAP_GIB: u64 = 4;
+static mut DIRECT_MAP_PLAN: crate::boot::DirectMapPlan = crate::boot::DirectMapPlan::new();
+/// Retain the pinned kernel's 8 GiB physical-address bound. Sparse admission
+/// maps only proven RAM inside it; addresses above the bound remain unavailable.
+pub const LINEAR_MAP_GIB: u64 = 8;
 
-/// Translate a physical address to its kernel-virtual counterpart
-/// in the linear map. Caller must have invoked
-/// `install_kernel_page_tables` first.
+/// Translate only a checked direct-map address. Early boot retains the loader's
+/// identity mapping until first-install publication completes.
+#[inline]
+pub fn try_phys_to_lin(paddr: u64) -> Option<u64> {
+    unsafe {
+        if LINEAR_MAP_BASE == 0 {
+            return Some(paddr);
+        }
+        if !(&*ptr::addr_of!(DIRECT_MAP_PLAN)).contains(paddr) {
+            return None;
+        }
+        LINEAR_MAP_BASE.checked_add(paddr)
+    }
+}
+
+/// Kernel RAM callers must provide an admitted physical address. Device register
+/// files use their explicit cache-typed aperture instead of this direct map.
 #[inline(always)]
 pub fn phys_to_lin(paddr: u64) -> u64 {
-    debug_assert!(paddr < LINEAR_MAP_GIB * (1 << 30));
-    unsafe { LINEAR_MAP_BASE + paddr }
+    try_phys_to_lin(paddr).expect("physical address has no admitted kernel direct map")
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +245,7 @@ pub static KERNEL_ROOT_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// Physical CR3 value of the kernel root, or 0 if not yet captured.
 #[inline]
 pub fn kernel_root_cr3() -> u64 {
-    KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed)
+    KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Switch this CPU to the kernel root page table if it isn't already on
@@ -360,6 +373,7 @@ pub fn install_kernel_page_tables() {
                     reserved: 3,
                     capacity: POOL_SIZE,
                 },
+                &mut *ptr::addr_of_mut!(DIRECT_MAP_PLAN),
             )
             .expect("direct-map table capacity must validate before install");
             crate::arch::log("paging: direct-map capacity preflight passed\n");
@@ -377,19 +391,11 @@ pub fn install_kernel_page_tables() {
         // entries for the linear map, the LAPIC, and (in later
         // phases) user-mode pages.
         let root_cr3 = read_cr3();
-        // Remember the kernel root so idle cores can park on it instead
-        // of a user vspace that may be freed under them.
-        if KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-            KERNEL_ROOT_CR3.store(
-                root_cr3 & 0x000F_FFFF_FFFF_F000,
-                core::sync::atomic::Ordering::Relaxed,
-            );
-        }
         let pml4 = (root_cr3 & 0x000F_FFFF_FFFF_F000) as *mut u64;
 
         // Linear map first, so subsequent paddr-as-vaddr accesses
         // (in this function and elsewhere) can use `phys_to_lin`.
-        install_linear_map(pml4);
+        let direct_map = install_linear_map(pml4);
 
         map_4k_into(
             pml4,
@@ -404,15 +410,24 @@ pub fn install_kernel_page_tables() {
             addr = in(reg) KERNEL_LAPIC_VBASE,
             options(nostack, preserves_flags),
         );
+        // Publish only after the checked direct map and uncached LAPIC aperture
+        // are live. Idle cores may then inherit this completed kernel root.
+        if let Some((slot, base)) = direct_map {
+            LINEAR_MAP_PML4_IDX = slot;
+            LINEAR_MAP_BASE = base;
+        }
+        if KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+            KERNEL_ROOT_CR3.store(
+                root_cr3 & 0x000F_FFFF_FFFF_F000,
+                core::sync::atomic::Ordering::Release,
+            );
+        }
     }
 }
 
-/// Build the kernel-half linear map. Scans `PML4[256..510]` for
-/// the first empty slot (PML4[511] is the kernel image), allocates a PDPT page,
-/// and populates it with `LINEAR_MAP_GIB` 1 GiB large-page entries.
-/// Caches the chosen slot's vaddr base in `LINEAR_MAP_BASE` for
-/// `phys_to_lin` to read.
-unsafe fn install_linear_map(pml4: *mut u64) {
+/// Build exactly the direct-map leaves admitted and counted during first install.
+/// Return the chosen slot for publication after the LAPIC aperture is installed.
+unsafe fn install_linear_map(pml4: *mut u64) -> Option<(usize, u64)> {
     // Idempotent: `install_kernel_page_tables` is called from spec
     // setup helpers (e.g. `launch_smp_ping_thread`) as well as boot,
     // and we must NOT pick a different slot on the second call —
@@ -420,8 +435,10 @@ unsafe fn install_linear_map(pml4: *mut u64) {
     // virtual range. The first call sets LINEAR_MAP_BASE; later
     // calls bail.
     if LINEAR_MAP_BASE != 0 {
-        return;
+        return None;
     }
+    let plan = &*ptr::addr_of!(DIRECT_MAP_PLAN);
+    assert!(plan.checked(), "direct-map sources must pass preflight before native effects");
     let mut chosen_idx: Option<usize> = None;
     let shared_alias_idx = super::vspace::decompose_vaddr(
         super::vspace::KUSER_SHARED_DATA_VADDR,
@@ -437,26 +454,46 @@ unsafe fn install_linear_map(pml4: *mut u64) {
         }
     }
     let idx = chosen_idx.expect("no free kernel-half PML4 slot");
-    LINEAR_MAP_PML4_IDX = idx;
-    // PML4[idx] vaddr = idx << 39, sign-extended (bit 47 set =>
-    // upper 16 bits = 0xFFFF).
-    LINEAR_MAP_BASE = 0xFFFF_0000_0000_0000 | ((idx as u64) << 39);
+    let base = 0xFFFF_0000_0000_0000 | ((idx as u64) << 39);
 
     let pdpt_v = alloc_table_va();
     let pdpt_p = kernel_virt_to_phys(pdpt_v as u64);
 
-    let leaf_flags = PTE_PRESENT | PTE_RW | PTE_PS | PTE_NX;
-    for i in 0..LINEAR_MAP_GIB {
-        let paddr_1gib = i * (1 << 30);
-        ptr::write_volatile(pdpt_v.add(i as usize), paddr_1gib | leaf_flags);
-    }
-
     let mid_flags = PTE_PRESENT | PTE_RW;
+    let leaf_flags = PTE_PRESENT | PTE_RW | PTE_NX;
+    crate::boot::direct_map_policy::for_each_direct_map_leaf(
+        plan.firmware(), plan.reserved_ram(), plan.devices(), plan.limit(),
+        |leaf| {
+            use crate::boot::direct_map_policy::PageSize;
+            let pdpt = pdpt_v.add((leaf.start >> 30) as usize);
+            match leaf.size {
+                PageSize::Size1G => {
+                    assert_eq!(ptr::read_volatile(pdpt), 0, "duplicate direct-map 1 GiB leaf");
+                    ptr::write_volatile(pdpt, leaf.start | leaf_flags | PTE_PS);
+                }
+                PageSize::Size2M => {
+                    let pd = ensure_table_into(pdpt, mid_flags);
+                    let slot = pd.add(((leaf.start >> 21) & 511) as usize);
+                    assert_eq!(ptr::read_volatile(slot), 0, "duplicate direct-map 2 MiB leaf");
+                    ptr::write_volatile(slot, leaf.start | leaf_flags | PTE_PS);
+                }
+                PageSize::Size4K => {
+                    let pd = ensure_table_into(pdpt, mid_flags);
+                    let pt = ensure_table_into(pd.add(((leaf.start >> 21) & 511) as usize), mid_flags);
+                    let slot = pt.add(((leaf.start >> 12) & 511) as usize);
+                    assert_eq!(ptr::read_volatile(slot), 0, "duplicate direct-map 4 KiB leaf");
+                    ptr::write_volatile(slot, leaf.start | leaf_flags);
+                }
+            }
+            Ok(())
+        },
+    ).expect("checked direct-map plan changed before native construction");
     ptr::write_volatile(pml4.add(idx), (pdpt_p & !0xFFF) | mid_flags);
 
     // TLB flush.
     asm!("mov rax, cr3; mov cr3, rax", out("rax") _,
         options(nostack, preserves_flags));
+    Some((idx, base))
 }
 
 /// Map `vaddr -> paddr` (4 KiB) into the page tables rooted at
