@@ -19,6 +19,7 @@ on:
       - "src/arch/x86_64/exceptions.rs"
       - "src/arch/x86_64/ioapic.rs"
       - "src/arch/x86_64/paging.rs"
+      - "src/arch/x86_64/cache_type.rs"
       - "src/boot.rs"
       - "src/boot/**"
       - "src/simpleboot.rs"
@@ -27,6 +28,7 @@ on:
       - "tests/boot_mmap_reader_source.rs"
       - "tests/direct_map_*.rs"
       - "tests/low_alias_cache_policy.rs"
+      - "tests/x86_cache_type_policy.rs"
       - "tests/ioapic_preflight_source.rs"
       - "tests/lapic_preflight_source.rs"
       - "tests/simpleboot_mmap_policy.rs"
@@ -49,6 +51,7 @@ on:
       - "src/arch/x86_64/exceptions.rs"
       - "src/arch/x86_64/ioapic.rs"
       - "src/arch/x86_64/paging.rs"
+      - "src/arch/x86_64/cache_type.rs"
       - "src/boot.rs"
       - "src/boot/**"
       - "src/simpleboot.rs"
@@ -57,6 +60,7 @@ on:
       - "tests/boot_mmap_reader_source.rs"
       - "tests/direct_map_*.rs"
       - "tests/low_alias_cache_policy.rs"
+      - "tests/x86_cache_type_policy.rs"
       - "tests/ioapic_preflight_source.rs"
       - "tests/lapic_preflight_source.rs"
       - "tests/simpleboot_mmap_policy.rs"
@@ -91,6 +95,7 @@ jobs:
         run: |
           for spec in tests/direct_map_policy.rs tests/direct_map_owners.rs \
             tests/low_alias_cache_policy.rs \
+            tests/x86_cache_type_policy.rs \
             tests/simpleboot_mmap_policy.rs tests/boot_mmap_reader_source.rs \
             tests/ioapic_preflight_source.rs tests/lapic_preflight_source.rs \
             tests/direct_map_preflight_source.rs tests/direct_map_runtime_builder_source.rs \

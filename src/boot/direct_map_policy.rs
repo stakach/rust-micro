@@ -72,6 +72,7 @@ pub enum PlanError {
 pub enum EffectiveCacheType {
     WriteBack,
     Uncached,
+    WriteCombining,
     Unknown,
 }
 
