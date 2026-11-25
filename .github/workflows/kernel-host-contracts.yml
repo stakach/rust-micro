@@ -26,6 +26,7 @@ on:
       - "src/main.rs"
       - "tests/boot_mmap_reader_source.rs"
       - "tests/direct_map_*.rs"
+      - "tests/low_alias_cache_policy.rs"
       - "tests/ioapic_preflight_source.rs"
       - "tests/lapic_preflight_source.rs"
       - "tests/simpleboot_mmap_policy.rs"
@@ -55,6 +56,7 @@ on:
       - "src/main.rs"
       - "tests/boot_mmap_reader_source.rs"
       - "tests/direct_map_*.rs"
+      - "tests/low_alias_cache_policy.rs"
       - "tests/ioapic_preflight_source.rs"
       - "tests/lapic_preflight_source.rs"
       - "tests/simpleboot_mmap_policy.rs"
@@ -88,6 +90,7 @@ jobs:
       - name: Test boot map and first-install direct-map preflight
         run: |
           for spec in tests/direct_map_policy.rs tests/direct_map_owners.rs \
+            tests/low_alias_cache_policy.rs \
             tests/simpleboot_mmap_policy.rs tests/boot_mmap_reader_source.rs \
             tests/ioapic_preflight_source.rs tests/lapic_preflight_source.rs \
             tests/direct_map_preflight_source.rs tests/direct_map_runtime_builder_source.rs \

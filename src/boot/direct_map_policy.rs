@@ -66,6 +66,50 @@ pub enum PlanError {
     PoolExhausted,
 }
 
+/// Cache type proven for a physical mapping after architecture-specific
+/// PAT/MTRR interpretation. Unclassified leaves remain unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectiveCacheType {
+    WriteBack,
+    Uncached,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheAliasError {
+    InvalidRange,
+    ConflictingType,
+    UnprovenType,
+}
+
+/// Admit a requested physical mapping only when an overlapping existing alias
+/// has the same proven effective cache type. Disjoint aliases cannot conflict.
+/// The caller must obtain the existing leaf and both effective types from the
+/// native page-table/cache-state inspection before relying on this decision.
+pub fn cache_alias_admission(
+    existing: PhysicalRange,
+    existing_type: EffectiveCacheType,
+    requested: PhysicalRange,
+    requested_type: EffectiveCacheType,
+) -> Result<(), CacheAliasError> {
+    if !valid_range(existing) || !valid_range(requested) {
+        return Err(CacheAliasError::InvalidRange);
+    }
+    if requested_type == EffectiveCacheType::Unknown {
+        return Err(CacheAliasError::UnprovenType);
+    }
+    if !existing.overlaps(requested) {
+        return Ok(());
+    }
+    if existing_type == EffectiveCacheType::Unknown {
+        return Err(CacheAliasError::UnprovenType);
+    }
+    if existing_type != requested_type {
+        return Err(CacheAliasError::ConflictingType);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TableDemand {
     pub pdpt_pages: usize,
