@@ -4,6 +4,7 @@ pub mod serial;
 pub mod qemu;
 
 pub mod acpi;
+pub(crate) mod cache_type;
 pub mod context;
 pub mod cpu;
 pub mod debug;
