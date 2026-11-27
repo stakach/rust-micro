@@ -68,3 +68,12 @@
         <description>Exact zero-word request without extra caps. The invoked TCB capability names the sole eligible target. Reject self-target, stale, blocked, unschedulable, different-affinity or different-domain targets before effects. A successful request gives the target one dispatch opportunity without changing any TCB priority, IPC binding, Reply ownership or scheduling context. Normal priority scheduling resumes immediately afterward.</description>
     </method>
 </interface>
+<interface name="seL4_SchedContext_PassiveWorker" manual_name="SchedContext Passive Worker">
+    <method id="SchedContextUnbindPassiveWorker" name="UnbindPassiveWorker" manual_name="Unbind Passive Worker" manual_label="schedcontext_unbindpassiveworker">
+        <brief>Atomically retire the bootstrap SC of an exact first-receive worker.</brief>
+        <description>Exact three-word request without extra caps: worker TCB, private Endpoint and offered Reply cptrs in the invoker's CSpace. Requires reciprocal SC binding, the worker as the sole blocked receiver on that Endpoint, and the exact unbound Reply offered to that worker. Rejects any active reply/donation chain, notification binding or pending fault before effects. Success only removes the SC binding; it preserves the receive queue and Reply offer so a later Call can donate the caller's SC.</description>
+        <param dir="in" name="worker" type="seL4_CPtr" description="Worker TCB cap."/>
+        <param dir="in" name="endpoint" type="seL4_CPtr" description="Private Endpoint cap."/>
+        <param dir="in" name="reply" type="seL4_CPtr" description="Reply cap offered to the worker."/>
+    </method>
+</interface>

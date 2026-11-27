@@ -84,7 +84,9 @@ pub mod reply_binding;
 pub const LBL_TCB_QUERY_VSPACE_BINDING: u64 = 74;
 pub const LBL_TCB_YIELD_TO: u64 = 76;
 pub const LBL_X86_VSPACE_QUERY_PAGE: u64 = 75;
+pub const LBL_SCHED_CONTEXT_UNBIND_PASSIVE_WORKER: u64 = 77;
 pub mod vspace_binding;
+pub mod passive_worker_unbind;
 pub mod legacy_context;
 pub mod execution_hold;
 

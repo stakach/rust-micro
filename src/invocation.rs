@@ -35,6 +35,8 @@ mod execution_hold;
 mod reply_binding;
 #[path = "invocation/vspace_binding.rs"]
 mod vspace_binding;
+#[path = "invocation/passive_worker_unbind.rs"]
+mod passive_worker_unbind;
 
 /// Single-letter tag for the cap kind — used by `inv_log` so the
 /// trace fits on one line and is easy to grep for. Keep in sync
@@ -2834,6 +2836,12 @@ fn decode_sched_context(
             }
             Ok(())
         }
+        InvocationLabel::SchedContextUnbindPassiveWorker => unsafe {
+            let Cap::SchedContext { ptr, .. } = target else { unreachable!() };
+            passive_worker_unbind::invoke(
+                KERNEL.get(), KernelState::sched_context_index(ptr), args, invoker,
+            )
+        },
         // SchedContext_UnbindObject — unbind ONE specific object (a
         // TCB or a notification) from this SC (SCHED_CONTEXT_0003).
         // Object via extraCaps[0] (upstream) or a2 (legacy). Non
@@ -6520,6 +6528,7 @@ pub mod spec {
     include!("invocation/legacy_context_specs.rs");
     include!("invocation/execution_hold_specs.rs");
     include!("invocation/reply_binding_specs.rs");
+    include!("invocation/passive_worker_unbind_specs.rs");
     include!("invocation/vspace_binding_specs.rs");
     include!("invocation/yield_to_specs.rs");
 
@@ -6577,6 +6586,7 @@ pub mod spec {
         legacy_context_specs::run();
         execution_hold_specs::run();
         reply_binding_specs::run();
+        passive_worker_unbind_specs::run();
         vspace_binding_specs::run();
         yield_to_specs::run();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
