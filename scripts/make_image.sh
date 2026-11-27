@@ -156,9 +156,9 @@ stage_file() {
 }
 
 IMAGE_MIB="${IMAGE_MIB:-1024}"
-PERSIST_IMAGE_MIB="${PERSIST_IMAGE_MIB:-32}"
-if [ "$PERSIST_IMAGE_MIB" -ne 0 ] && [ "$PERSIST_IMAGE_MIB" -ne 16 ] && [ "$PERSIST_IMAGE_MIB" -lt 32 ]; then
-  echo "error: PERSIST_IMAGE_MIB must be 0, 16 (legacy snapshots), or at least 32 (snapshots plus append area)" >&2
+PERSIST_IMAGE_MIB="${PERSIST_IMAGE_MIB:-96}"
+if [ "$PERSIST_IMAGE_MIB" -ne 0 ] && [ "$PERSIST_IMAGE_MIB" -ne 96 ]; then
+  echo "error: PERSIST_IMAGE_MIB must be 0 or 96 (16 MiB legacy slots, 16 MiB WAL, 64 MiB current slots)" >&2
   exit 1
 fi
 if [ "$IMAGE_MIB" -lt 35 ]; then
@@ -329,7 +329,7 @@ rm -f "$IMAGE"
 
 if [ "$PERSIST_IMAGE_MIB" -gt 0 ]; then
   dd if=/dev/zero bs=1M count="$PERSIST_IMAGE_MIB" status=none >> "$IMAGE"
-  echo "persistent reserve appended: ${PERSIST_IMAGE_MIB} MiB after Simpleboot image (first 16 MiB snapshots; next 16 MiB reserved for append when present)"
+  echo "persistent reserve appended: ${PERSIST_IMAGE_MIB} MiB after Simpleboot image (16 MiB legacy slots, 16 MiB WAL, two 32 MiB current snapshot slots)"
 fi
 
 echo "disk image ready: $IMAGE ($((IMAGE_MIB + PERSIST_IMAGE_MIB)) MiB; ESP ${BOOT_PARTITION_MIB} MiB)"
