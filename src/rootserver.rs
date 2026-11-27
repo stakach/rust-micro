@@ -128,12 +128,15 @@ pub unsafe fn reset_page_pool() {
 
 /// Number of 4 KiB pages reserved for the rootserver's user stack.
 #[cfg(not(feature = "extern-rootserver"))]
-const ROOTSERVER_STACK_PAGES: u64 = 16;
+pub(crate) const ROOTSERVER_STACK_PAGES: u64 = 16;
 /// The external NT executive root task has deep loader, service-dispatch, hosted-driver and
-/// user-callback chains. Keep its guarded root-task stack large enough that regular ReactOS process
-/// bring-up does not depend on optimizer spill placement.
+/// user-callback chains. A pinned LiberNT keyboard START boot reached the guard below the former
+/// 128-page stack, after earlier nested work had already used roughly 477 KiB. Preserve both
+/// guard pages and provide room for the bounded nested dispatcher frames.
 #[cfg(feature = "extern-rootserver")]
-const ROOTSERVER_STACK_PAGES: u64 = 128;
+pub(crate) const ROOTSERVER_STACK_PAGES: u64 = 256;
+/// IPC buffer, BootInfo page, and its extension page are mapped after the stack.
+pub(crate) const ROOTSERVER_AUX_PAGES: u64 = 3;
 
 /// Kernel-side CNode index reserved for the rootserver's CSpace.
 ///
@@ -141,7 +144,7 @@ const ROOTSERVER_STACK_PAGES: u64 = 128;
 ///   index 3 (radix 12 = 4096 slots). Matches the AY-demo convention
 ///   (CNodes 1, 2 went to sender/receiver); cnode_ptr(3) backs
 ///   `Cap::CNode` slot 2 in the rootserver's own CNode.
-/// * extern-rootserver (the NT executive): descriptor zero names a radix-18 CNode whose exact
+/// * extern-rootserver (the NT executive): descriptor zero names a radix-19 CNode whose exact
 ///   physical storage is reserved from boot RAM. It carries no fixed CTE array in the kernel ELF.
 #[cfg(not(feature = "extern-rootserver"))]
 pub const ROOTSERVER_CNODE_IDX: usize = 3;
@@ -156,7 +159,7 @@ pub const ROOTSERVER_CNODE_IDX: usize = crate::kernel::DYNAMIC_CNODE_BASE;
 #[cfg(not(feature = "extern-rootserver"))]
 pub const ROOTSERVER_CNODE_RADIX: u8 = crate::kernel::CNODE_RADIX;
 #[cfg(feature = "extern-rootserver")]
-pub const ROOTSERVER_CNODE_RADIX: u8 = 18;
+pub const ROOTSERVER_CNODE_RADIX: u8 = 19;
 #[cfg(feature = "extern-rootserver")]
 pub const ROOTSERVER_CNODE_SIZE_BITS: u32 =
     ROOTSERVER_CNODE_RADIX as u32 + crate::object_type::CTE_SIZE_BITS;
@@ -307,7 +310,6 @@ fn rootserver_device_untypeds() -> DeviceUntypedList {
 }
 
 fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryRange]) -> usize {
-    const MAX_SIMPLEBOOT_MMAP_ENTRIES: usize = 240;
     const E820_USABLE: u32 = 1;
     const E820_RESERVED: u32 = 2;
     const E820_ACPI_RECLAIMABLE: u32 = 3;
@@ -316,8 +318,9 @@ fn boot_firmware_memory_ranges(out: &mut [crate::types::seL4_BootFirmwareMemoryR
     let mut entries = [crate::boot::MemEntry {
         region: crate::region::PRegion::new(0, 0),
         kind: crate::boot::MemKind::Used,
-    }; MAX_SIMPLEBOOT_MMAP_ENTRIES];
-    let count = crate::boot::read_simpleboot_mmap(&mut entries);
+    }; crate::boot::MAX_BOOT_MMAP_ENTRIES];
+    let count = crate::boot::read_simpleboot_mmap(&mut entries)
+        .expect("Simpleboot memory map must validate before BootInfo publication");
     let mut published = 0usize;
     for entry in entries[..count].iter().copied() {
         let length = entry.region.end.saturating_sub(entry.region.start);
@@ -541,12 +544,12 @@ fn append_device_region(list: &mut DeviceUntypedList, start: u64, end: u64) -> b
 
 #[cfg(feature = "extern-rootserver")]
 fn append_acpi_device_untypeds(list: &mut DeviceUntypedList) -> bool {
-    const MAX_SIMPLEBOOT_MMAP_ENTRIES: usize = 240;
     let mut entries = [crate::boot::MemEntry {
         region: crate::region::PRegion::new(0, 0),
         kind: crate::boot::MemKind::Used,
-    }; MAX_SIMPLEBOOT_MMAP_ENTRIES];
-    let count = crate::boot::read_simpleboot_mmap(&mut entries);
+    }; crate::boot::MAX_BOOT_MMAP_ENTRIES];
+    let count = crate::boot::read_simpleboot_mmap(&mut entries)
+        .expect("Simpleboot memory map must validate before ACPI publication");
     entries[..count]
         .iter()
         .filter(|entry| entry.kind == crate::boot::MemKind::Acpi)
@@ -1471,11 +1474,7 @@ pub unsafe fn launch_rootserver() -> ! {
         crate::arch::x86_64::pit::install_irq_handler();
 
         // Swap CR3 to the rootserver's PML4 (kernel half preserved).
-        core::arch::asm!(
-            "mov cr3, {}",
-            in(reg) img.pml4_paddr,
-            options(nostack, preserves_flags),
-        );
+        crate::smp::load_root(img.pml4_paddr);
 
         // Establish the rootserver as this core's FPU owner so its
         // x87/SSE state is tracked from first entry (otherwise a later
@@ -1510,6 +1509,8 @@ pub unsafe fn launch_rootserver() -> ! {
         log_rootserver_hex(s.scheduler.slab.get(id).cpu_context.fs_base);
         crate::arch::log(" gs-shadow=0x");
         log_rootserver_hex(s.scheduler.slab.get(id).cpu_context.gs_base);
+        crate::arch::log(" pml4=0x");
+        log_rootserver_hex(img.pml4_paddr);
         crate::arch::log("\n");
     }
     #[cfg(target_arch = "aarch64")]
@@ -1601,6 +1602,9 @@ unsafe fn build_bootinfo(
     #[cfg(feature = "extern-rootserver")]
     let acpi_root =
         crate::arch::x86_64::acpi::root_table_info(crate::simpleboot::acpi_table_address()).ok();
+    #[cfg(all(feature = "extern-rootserver", target_arch = "x86_64"))]
+    let processor_apic_ids = crate::smp::started_boot_apic_ids()
+        .expect("started APIC IDs must match the dense x86 scheduler topology");
     seL4_BootInfo {
         extraLen: extra_bi_size,
         nodeID: 0,
@@ -1715,6 +1719,8 @@ unsafe fn build_bootinfo(
         acpiRootTableFlags: acpi_root.map(|_| BOOT_ACPI_ROOT_VALID).unwrap_or(0),
         #[cfg(feature = "extern-rootserver")]
         tscFrequencyHz: 0,
+        #[cfg(all(feature = "extern-rootserver", target_arch = "x86_64"))]
+        processorApicIds: processor_apic_ids,
     }
 }
 
@@ -1746,7 +1752,7 @@ pub struct PageMapping {
 #[cfg(not(feature = "extern-rootserver"))]
 pub const IMAGE_PAGES_CAP: usize = 2048;
 #[cfg(feature = "extern-rootserver")]
-pub const IMAGE_PAGES_CAP: usize = 4096;
+pub const IMAGE_PAGES_CAP: usize = 8192;
 
 /// All user-image pages the loader installed in the rootserver's
 /// PML4. Populated by `load()`, consumed by `install_rootserver_initial_caps`
@@ -1764,6 +1770,7 @@ unsafe fn load_segment(
     seen: &mut [PageMapping],
     n_seen: &mut usize,
 ) -> Result<(), LoadError> {
+    if seg.mem_size == 0 { return Ok(()); }
     // Iterate every 4 KiB page that the segment touches. We don't
     // require `vaddr` to be page-aligned (lld emits overlapping R-only
     // segments mid-page).
@@ -1933,7 +1940,7 @@ pub mod spec {
             let aux_pages = super::IMAGE_PAGE_COUNT as u64 - result.elf_page_count as u64;
             assert_eq!(
                 aux_pages,
-                super::ROOTSERVER_STACK_PAGES + 3,
+                super::ROOTSERVER_STACK_PAGES + super::ROOTSERVER_AUX_PAGES,
                 "aux mappings must be stack pages plus IPC/BootInfo/extra-BI",
             );
 

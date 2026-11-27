@@ -14,6 +14,8 @@ default = ["arch-x86_64"]
 spec = []
 arch-x86_64 = []
 arch-aarch64 = []
+# Hosted QEMU keeps kernel diagnostics off COM1 so an NT serial driver owns the UART.
+qemu-debugcon = []
 # Mixed-Criticality Systems is the only scheduler model. The
 # `mcs` cargo feature is retained as a no-op so existing
 # `--features mcs` invocations don't break; nothing is gated on
@@ -22,6 +24,9 @@ mcs = []
 # Compatibility alias. CPU count is discovered at boot; ownership, IPI and
 # FPU safeguards must remain active even when callers omit this feature.
 smp = []
+# Print every user page fault for debugging. Normal builds retain a count and
+# report faults that cannot be delivered without serializing every page-in.
+trace-user-page-faults = []
 # Hot-path IPC bypassing the slowpath. Phase 10c.
 fastpath = []
 # Lazy FPU state-switch. Phase 10d.

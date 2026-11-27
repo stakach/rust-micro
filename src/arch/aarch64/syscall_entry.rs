@@ -24,11 +24,13 @@ impl DebugSink for SerialSink {
     }
 }
 
-fn may_consume_direct_handoff(syscall: Syscall, reply: u64) -> bool {
+fn may_consume_direct_handoff(syscall: Syscall, reply: u64, msginfo: u64) -> bool {
     matches!(
         syscall,
         Syscall::SysReplyRecv | Syscall::SysNBSendRecv | Syscall::SysNBSendWait
-    ) || (matches!(syscall, Syscall::SysCall) && reply == crate::invocation::REPLY_HANDOFF_MAGIC)
+    ) || (matches!(syscall, Syscall::SysCall)
+        && (reply == crate::invocation::REPLY_HANDOFF_MAGIC
+            || msginfo == (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12))
 }
 
 fn completed_receive(
@@ -95,6 +97,7 @@ fn choose_next(may_handoff: bool) -> Option<TcbId> {
 
 fn publish_receive(context: &mut UserContext, tcb: &crate::tcb::Tcb) {
     let info = (tcb.ipc_label << 12)
+        | (((tcb.received_caps_unwrapped as u64) & 0x7) << 9)
         | (((tcb.received_extra_caps as u64) & 0x3) << 7)
         | (tcb.ipc_length as u64 & 0x7f);
     crate::arch::set_ipc_return(context, tcb.ipc_badge, info, &tcb.msg_regs[..4]);
@@ -205,7 +208,7 @@ pub fn dispatch(frame: *mut UserContext) {
         invoker,
         syscall,
         result.is_ok(),
-        may_consume_direct_handoff(syscall, context.x[6]),
+        may_consume_direct_handoff(syscall, context.x[6], args.a1),
     );
 }
 

@@ -26,6 +26,7 @@
 
 use core::arch::asm;
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::msr::{rdmsr, IA32_APIC_BASE_MSR};
 
@@ -42,7 +43,7 @@ pub struct PtPage(pub [u64; 512]);
 // installed for the rootserver's vaddr range comes from this pool,
 // plus large-page splits when the loader exposes 2 MiB identity
 // entries. 64 pages is generous for current needs.
-const POOL_SIZE: usize = 64;
+pub(crate) const POOL_SIZE: usize = 64;
 
 #[no_mangle]
 pub static mut KPT_POOL: [PtPage; POOL_SIZE] = [const { PtPage([0; 512]) }; POOL_SIZE];
@@ -179,9 +180,9 @@ pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
     );
 }
 
-/// Base of the kernel-half "linear map": every physical address `p`
-/// in the range [0, LINEAR_MAP_GIB·1 GiB) is reachable from kernel
-/// mode at vaddr `LINEAR_MAP_BASE + p`. Replaces the loader-provided
+/// Base of the kernel-half direct map: only physical pages admitted by
+/// the checked firmware and boot-owner plan are reachable at base + p.
+/// Replaces the loader-provided
 /// PML4[0] identity map for kernel paddr-as-vaddr accesses, so
 /// user vspaces can free PML4[0] for their own mappings.
 ///
@@ -190,21 +191,37 @@ pub unsafe fn map_kernel_mmio_page(vaddr: u64, paddr: u64) {
 /// depends on what the loader installed. The corresponding PML4 index
 /// is stored in `LINEAR_MAP_PML4_IDX`.
 #[no_mangle]
-pub static mut LINEAR_MAP_BASE: u64 = 0;
+pub static LINEAR_MAP_BASE: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
 pub static mut LINEAR_MAP_PML4_IDX: usize = 0;
-/// Coverage in 1 GiB increments. 4 GiB is comfortably above the current
-/// rootserver Untyped target plus the 2 GiB QEMU RAM we configure today;
-/// bumping this just adds a few PDPT entries.
-pub const LINEAR_MAP_GIB: u64 = 4;
+/// Physical-address ceiling. QEMU places RAM above the PCI hole at
+/// physical 4 GiB when the guest has more than 2 GiB; the rootserver's
+/// 1 GiB Untyped then lives at 4..5 GiB. Admit proven memory up to this
+/// bound so physical frame clearing can reach the high Untyped.
+static mut DIRECT_MAP_PLAN: crate::boot::DirectMapPlan = crate::boot::DirectMapPlan::new();
+pub const LINEAR_MAP_GIB: u64 = 8;
 
-/// Translate a physical address to its kernel-virtual counterpart
-/// in the linear map. Caller must have invoked
-/// `install_kernel_page_tables` first.
+/// Translate only a checked direct-map address. Early boot retains the loader's
+/// identity mapping until first-install publication completes.
+#[inline]
+pub fn try_phys_to_lin(paddr: u64) -> Option<u64> {
+    let base = LINEAR_MAP_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return Some(paddr);
+    }
+    unsafe {
+        if !(&*ptr::addr_of!(DIRECT_MAP_PLAN)).contains(paddr) {
+            return None;
+        }
+        base.checked_add(paddr)
+    }
+}
+
+/// Kernel RAM callers must provide an admitted physical address. Device register
+/// files use their explicit cache-typed aperture instead of this direct map.
 #[inline(always)]
 pub fn phys_to_lin(paddr: u64) -> u64 {
-    debug_assert!(paddr < LINEAR_MAP_GIB * (1 << 30));
-    unsafe { LINEAR_MAP_BASE + paddr }
+    try_phys_to_lin(paddr).expect("physical address has no admitted kernel direct map")
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +249,7 @@ pub static KERNEL_ROOT_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// Physical CR3 value of the kernel root, or 0 if not yet captured.
 #[inline]
 pub fn kernel_root_cr3() -> u64 {
-    KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed)
+    KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Switch this CPU to the kernel root page table if it isn't already on
@@ -251,7 +268,7 @@ pub fn park_on_kernel_root() {
         let cur: u64;
         asm!("mov {}, cr3", out(reg) cur, options(nomem, nostack, preserves_flags));
         if cur & 0x000F_FFFF_FFFF_F000 != root {
-            asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+            crate::smp::load_root(root);
         }
     }
 }
@@ -329,10 +346,42 @@ pub fn kernel_virt_to_phys(v: u64) -> u64 {
     unsafe { v.wrapping_sub(KERNEL_VIRT_TO_PHYS_OFFSET) }
 }
 
+/// Decode the whole physical LAPIC page from the architectural APIC-base MSR.
+/// Keep the same identity for early admission and the live uncached mapping.
+fn lapic_physical_page() -> Option<u64> {
+    let page = unsafe { rdmsr(IA32_APIC_BASE_MSR) } & 0x000F_FFFF_FFFF_F000;
+    (page != 0).then_some(page)
+}
+
 /// Public entry point — call once at boot, after init_serial etc.
 /// but before any code that needs MMIO mappings (the LAPIC, IOAPIC).
 pub fn install_kernel_page_tables() {
     unsafe {
+        let lapic_paddr = lapic_physical_page().expect("LAPIC physical page must be nonzero");
+        if LINEAR_MAP_BASE.load(Ordering::Acquire) == 0 {
+            let mut ioapic_pages = [0u64; super::ioapic::MAX_IOAPICS];
+            let ioapic_count = super::ioapic::preflight_apertures(
+                crate::simpleboot::acpi_table_address(),
+                &mut ioapic_pages,
+            )
+            .expect("early IOAPIC topology must validate");
+            // The LAPIC and adjacent IOAPIC virtual pages need at most a
+            // PDPT, PD and PT outside the direct map. Count them before
+            // allocating from the 64-page kernel table pool.
+            let _demand = crate::boot::preflight_direct_map(
+                lapic_paddr,
+                &ioapic_pages[..ioapic_count],
+                LINEAR_MAP_GIB << 30,
+                crate::boot::direct_map_policy::TablePool {
+                    used: KPT_USED,
+                    reserved: 3,
+                    capacity: POOL_SIZE,
+                },
+                &mut *ptr::addr_of_mut!(DIRECT_MAP_PLAN),
+            )
+            .expect("direct-map table capacity must validate before install");
+            crate::arch::log("paging: direct-map capacity preflight passed\n");
+        }
         // Cache the kernel virt→phys offset by translating a known-
         // mapped kernel virtual symbol. Done BEFORE install_linear_map
         // because that needs `kernel_virt_to_phys` to compute the
@@ -346,21 +395,12 @@ pub fn install_kernel_page_tables() {
         // entries for the linear map, the LAPIC, and (in later
         // phases) user-mode pages.
         let root_cr3 = read_cr3();
-        // Remember the kernel root so idle cores can park on it instead
-        // of a user vspace that may be freed under them.
-        if KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-            KERNEL_ROOT_CR3.store(
-                root_cr3 & 0x000F_FFFF_FFFF_F000,
-                core::sync::atomic::Ordering::Relaxed,
-            );
-        }
         let pml4 = (root_cr3 & 0x000F_FFFF_FFFF_F000) as *mut u64;
 
         // Linear map first, so subsequent paddr-as-vaddr accesses
         // (in this function and elsewhere) can use `phys_to_lin`.
-        install_linear_map(pml4);
+        let direct_map = install_linear_map(pml4);
 
-        let lapic_paddr = rdmsr(IA32_APIC_BASE_MSR) & 0xFFFF_F000;
         map_4k_into(
             pml4,
             KERNEL_LAPIC_VBASE,
@@ -374,24 +414,46 @@ pub fn install_kernel_page_tables() {
             addr = in(reg) KERNEL_LAPIC_VBASE,
             options(nostack, preserves_flags),
         );
+        // Publish only after the checked direct map and uncached LAPIC aperture
+        // are live. Idle cores may then inherit this completed kernel root.
+        if KERNEL_ROOT_CR3.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+            KERNEL_ROOT_CR3.store(
+                root_cr3 & 0x000F_FFFF_FFFF_F000,
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+        if let Some((slot, base)) = direct_map {
+            LINEAR_MAP_PML4_IDX = slot;
+            LINEAR_MAP_BASE.store(base, Ordering::Release);
+        }
     }
 }
 
-/// Build the kernel-half linear map. Scans `PML4[256..510]` for
-/// the first empty slot (PML4[511] is the kernel image), allocates a PDPT page,
-/// and populates it with `LINEAR_MAP_GIB` 1 GiB large-page entries.
-/// Caches the chosen slot's vaddr base in `LINEAR_MAP_BASE` for
-/// `phys_to_lin` to read.
-unsafe fn install_linear_map(pml4: *mut u64) {
+/// Build the checked direct-map leaves and flush stale translations. Return
+/// the installed slot for publication after the LAPIC aperture is live.
+unsafe fn install_linear_map(pml4: *mut u64) -> Option<(usize, u64)> {
     // Idempotent: `install_kernel_page_tables` is called from spec
     // setup helpers (e.g. `launch_smp_ping_thread`) as well as boot,
     // and we must NOT pick a different slot on the second call —
     // every `phys_to_lin` consumer would then point at the wrong
     // virtual range. The first call sets LINEAR_MAP_BASE; later
     // calls bail.
-    if LINEAR_MAP_BASE != 0 {
-        return;
+    if LINEAR_MAP_BASE.load(Ordering::Acquire) != 0 {
+        return None;
     }
+    let (idx, base) = build_linear_map(pml4, alloc_table_va());
+    // The PML4 slot is present before the caller publishes LINEAR_MAP_BASE.
+    // APs may then use the completed map through Acquire loads.
+    asm!("mov rax, cr3; mov cr3, rax", out("rax") _,
+        options(nostack, preserves_flags));
+    Some((idx, base))
+}
+
+/// Fill `pdpt_v` with only admitted RAM leaves and install it in the first free
+/// kernel-half slot of `pml4`. The slot is present before this returns.
+unsafe fn build_linear_map(pml4: *mut u64, pdpt_v: *mut u64) -> (usize, u64) {
+    let plan = &*ptr::addr_of!(DIRECT_MAP_PLAN);
+    assert!(plan.checked(), "direct-map sources must pass preflight before native effects");
     let mut chosen_idx: Option<usize> = None;
     let shared_alias_idx = super::vspace::decompose_vaddr(
         super::vspace::KUSER_SHARED_DATA_VADDR,
@@ -407,26 +469,40 @@ unsafe fn install_linear_map(pml4: *mut u64) {
         }
     }
     let idx = chosen_idx.expect("no free kernel-half PML4 slot");
-    LINEAR_MAP_PML4_IDX = idx;
-    // PML4[idx] vaddr = idx << 39, sign-extended (bit 47 set =>
-    // upper 16 bits = 0xFFFF).
-    LINEAR_MAP_BASE = 0xFFFF_0000_0000_0000 | ((idx as u64) << 39);
-
-    let pdpt_v = alloc_table_va();
+    let base = 0xFFFF_0000_0000_0000 | ((idx as u64) << 39);
     let pdpt_p = kernel_virt_to_phys(pdpt_v as u64);
 
-    let leaf_flags = PTE_PRESENT | PTE_RW | PTE_PS | PTE_NX;
-    for i in 0..LINEAR_MAP_GIB {
-        let paddr_1gib = i * (1 << 30);
-        ptr::write_volatile(pdpt_v.add(i as usize), paddr_1gib | leaf_flags);
-    }
-
     let mid_flags = PTE_PRESENT | PTE_RW;
+    let leaf_flags = PTE_PRESENT | PTE_RW | PTE_NX;
+    crate::boot::direct_map_policy::for_each_direct_map_leaf(
+        plan.firmware(), plan.reserved_ram(), plan.devices(), plan.limit(),
+        |leaf| {
+            use crate::boot::direct_map_policy::PageSize;
+            let pdpt = pdpt_v.add((leaf.start >> 30) as usize);
+            match leaf.size {
+                PageSize::Size1G => {
+                    assert_eq!(ptr::read_volatile(pdpt), 0, "duplicate direct-map 1 GiB leaf");
+                    ptr::write_volatile(pdpt, leaf.start | leaf_flags | PTE_PS);
+                }
+                PageSize::Size2M => {
+                    let pd = ensure_table_into(pdpt, mid_flags);
+                    let slot = pd.add(((leaf.start >> 21) & 511) as usize);
+                    assert_eq!(ptr::read_volatile(slot), 0, "duplicate direct-map 2 MiB leaf");
+                    ptr::write_volatile(slot, leaf.start | leaf_flags | PTE_PS);
+                }
+                PageSize::Size4K => {
+                    let pd = ensure_table_into(pdpt, mid_flags);
+                    let pt = ensure_table_into(pd.add(((leaf.start >> 21) & 511) as usize), mid_flags);
+                    let slot = pt.add(((leaf.start >> 12) & 511) as usize);
+                    assert_eq!(ptr::read_volatile(slot), 0, "duplicate direct-map 4 KiB leaf");
+                    ptr::write_volatile(slot, leaf.start | leaf_flags);
+                }
+            }
+            Ok(())
+        },
+    ).expect("checked direct-map plan changed before native construction");
     ptr::write_volatile(pml4.add(idx), (pdpt_p & !0xFFF) | mid_flags);
-
-    // TLB flush.
-    asm!("mov rax, cr3; mov cr3, rax", out("rax") _,
-        options(nostack, preserves_flags));
+    (idx, base)
 }
 
 /// Map `vaddr -> paddr` (4 KiB) into the page tables rooted at
@@ -481,6 +557,8 @@ pub mod spec {
         cr3_readable();
         existing_pml4_has_kernel_mapping();
         install_then_lapic_reads();
+        linear_map_covers_high_root_untyped();
+        linear_map_slot_is_live_for_published_base();
         arch::log("Paging tests completed\n");
     }
 
@@ -520,5 +598,28 @@ pub mod spec {
         let id = super::super::lapic::apic_id();
         assert!(id < 256, "LAPIC ID is 8 bits");
         arch::log("  ✓ kernel PT installed; LAPIC MMIO live\n");
+    }
+
+    #[inline(never)]
+    fn linear_map_covers_high_root_untyped() {
+        let high_ram = 0x1_0000_0000;
+        assert!(unsafe { (&*ptr::addr_of!(DIRECT_MAP_PLAN)).contains(high_ram) },
+            "firmware must admit the high root Untyped as RAM");
+        assert_eq!(live_virt_to_phys(phys_to_lin(high_ram)), Some(high_ram));
+        arch::log("  ✓ linear map covers root Untyped above 4 GiB\n");
+    }
+
+    /// The published base must point at a present root entry. The host fixture
+    /// checks the unpublished builder transition without allocating a second
+    /// native table hierarchy during the spec run.
+    #[inline(never)]
+    fn linear_map_slot_is_live_for_published_base() {
+        unsafe {
+            let live = LINEAR_MAP_BASE.load(Ordering::Acquire);
+            assert_ne!(live, 0, "direct-map base is published");
+            assert_eq!(live, 0xFFFF_0000_0000_0000 | ((LINEAR_MAP_PML4_IDX as u64) << 39));
+            assert_ne!(read_pml4_entry(LINEAR_MAP_PML4_IDX) & PTE_PRESENT, 0);
+        }
+        arch::log("  linear map slot is present before its base is published\n");
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_specs.sh — boot the disk image in QEMU with serial-on-stdio and exit
+# run_specs.sh — boot the disk image in QEMU and exit
 # via the isa-debug-exit device once the spec runner finishes.
 #
 # Pass `--debug` to dump interrupts and CPU resets (useful for triple-fault
@@ -40,13 +40,13 @@ if [ ! -f "$IMAGE" ]; then
   echo "error: $IMAGE missing — run scripts/build_kernel.sh first" >&2
   exit 1
 fi
-QEMU_MEMORY="${QEMU_MEMORY:-2048M}"
+QEMU_MEMORY="${QEMU_MEMORY:-3072M}"
 QEMU_CPUS="${QEMU_CPUS:-4}"
 
 DEBUG_FLAGS=()
 # GRAPHICS=1 (or the `--display`/`--graphics` flag) boots with a real QEMU
 # display WINDOW instead of the headless `-nographic` gate, so you can SEE the
-# Simpleboot GOP framebuffer that win32k paints (the ReactOS desktop background).
+# Simpleboot GOP framebuffer that win32k paints.
 # Default stays headless so the CI/spec gate is unchanged.
 GRAPHICS="${GRAPHICS:-0}"
 while [ $# -gt 0 ]; do
@@ -81,12 +81,25 @@ if [ "$EXPLICIT_ACCEL" = 0 ]; then
   fi
 fi
 
-# Display vs headless. Graphics mode selects a real display backend, keeps std
-# VGA so OVMF's GOP framebuffer is shown, and keeps serial on stdio. Both lanes
-# retain isa-debug-exit: the guest's explicit final verdict must terminate QEMU
+# Display vs headless. Graphics mode selects a real display backend and keeps std
+# VGA so OVMF's GOP framebuffer is shown. The kernel debug transport determines
+# whether COM1 goes to stdio or a guest log file. Both lanes retain
+# isa-debug-exit: the guest's explicit final verdict must terminate QEMU
 # instead of falling through to the post-verdict spin loop indefinitely.
 DISPLAY_FLAGS=()
 EXIT_DEVICE=(-device isa-debug-exit,iobase=0x501,iosize=0x2)
+SERIAL_FLAGS=(-serial stdio)
+DEBUGCON_FLAGS=()
+if [ -f .tmp/kernel-debug-output ]; then
+  case "$(cat .tmp/kernel-debug-output)" in
+    debugcon)
+      SERIAL_FLAGS=(-serial file:.tmp/guest-com1.log)
+      DEBUGCON_FLAGS=(-chardev stdio,id=ntdebugcon,mux=off -device isa-debugcon,iobase=0xe9,chardev=ntdebugcon)
+      ;;
+    uart) ;;
+    *) echo "error: unknown kernel debug transport marker" >&2; exit 1 ;;
+  esac
+fi
 case "$GRAPHICS" in
   1|true|yes|on)
     DISP="${QEMU_DISPLAY:-}"
@@ -117,6 +130,8 @@ esac
 # need. Under q35 the boot disk lands on AHCI/SATA and OVMF won't
 # auto-boot it from a bare `-drive`, so we attach it explicitly with
 # `bootindex=0`. intremap=off: we only do DMA remapping, not IRQ remap.
+# The kernel's VT-d context and IO page tables require four levels. Explicitly
+# request 48-bit IOVA support: older QEMU defaults to 39-bit/three-level VT-d.
 qemu_status=0
 qemu-system-x86_64 \
   -machine q35 \
@@ -127,10 +142,11 @@ qemu-system-x86_64 \
   -device ide-hd,drive=bootdisk,bus=ahci0.0,bootindex=0 \
   -netdev user,id=ntnet0 \
   -device e1000,netdev=ntnet0 \
-  -device intel-iommu,intremap=off \
+  -device intel-iommu,intremap=off,aw-bits=48 \
   -m "$QEMU_MEMORY" \
   -smp "$QEMU_CPUS" \
-  -serial stdio \
+  "${SERIAL_FLAGS[@]}" \
+  "${DEBUGCON_FLAGS[@]}" \
   -no-reboot \
   ${DISPLAY_FLAGS[@]+"${DISPLAY_FLAGS[@]}"} \
   ${EXIT_DEVICE[@]+"${EXIT_DEVICE[@]}"} \

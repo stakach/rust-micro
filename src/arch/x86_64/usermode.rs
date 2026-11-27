@@ -73,6 +73,38 @@ pub unsafe fn unmap_user_4k_in_pml4(pml4_paddr: u64, vaddr: u64, expected_paddr:
     true
 }
 
+/// Read the actual page-table chain rooted at a live PML4. The caller must
+/// authenticate that root against its ASID before calling this function.
+/// Huge (1 GiB) and large (2 MiB) leaves are present at their own levels.
+pub unsafe fn page_present_in_pml4(pml4_paddr: u64, vaddr: u64) -> bool {
+    use super::paging::{PTE_PRESENT, PTE_PS};
+    let idx = super::vspace::decompose_vaddr(vaddr);
+    let pml4 = super::paging::phys_to_lin(pml4_paddr & 0x000F_FFFF_FFFF_F000) as *const u64;
+    let pml4e = core::ptr::read_volatile(pml4.add(idx.pml4 as usize));
+    if pml4e & PTE_PRESENT == 0 || pml4e & PTE_PS != 0 {
+        return false;
+    }
+    let pdpt = super::paging::phys_to_lin(pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
+    let pdpte = core::ptr::read_volatile(pdpt.add(idx.pdpt as usize));
+    if pdpte & PTE_PRESENT == 0 {
+        return false;
+    }
+    if pdpte & PTE_PS != 0 {
+        return true;
+    }
+    let pd = super::paging::phys_to_lin(pdpte & 0x000F_FFFF_FFFF_F000) as *const u64;
+    let pde = core::ptr::read_volatile(pd.add(idx.pd as usize));
+    if pde & PTE_PRESENT == 0 {
+        return false;
+    }
+    if pde & PTE_PS != 0 {
+        return true;
+    }
+    let pt = super::paging::phys_to_lin(pde & 0x000F_FFFF_FFFF_F000) as *const u64;
+    let pte = core::ptr::read_volatile(pt.add(idx.pt as usize));
+    pte & PTE_PRESENT != 0
+}
+
 /// Phase 24 — install a 4 KiB mapping into an explicit PML4
 /// (used at thread-spawn time before we've switched CR3 to it).
 pub unsafe fn map_user_4k_into_pml4(

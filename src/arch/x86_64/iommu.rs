@@ -1,29 +1,46 @@
 //! Intel VT-d IOMMU (CONFIG_IOMMU). Mirrors seL4
 //! `src/plat/pc99/machine/intel-vtd.c` + `src/arch/x86/object/iospace.c`.
 //!
-//! Phase 44 — full root / context / IO-page-table support backing the
-//! sel4test IOPT family. The VT-d hardware data structures are built
-//! in low RAM (linear-map-covered, so the kernel can read/write them
-//! through `phys_to_lin`); the in-memory bookkeeping matches what
-//! upstream seL4 maintains. The sel4test IOPT tests perform no real
-//! DMA, so translation-enable (the GCMD TE bit) is best-effort and
-//! never blocked on.
+//! VT-d root, context, and IO-page-table support. The hardware data
+//! structures are built in low RAM (linear-map-covered, so the kernel
+//! can read/write them through `phys_to_lin`). DMA now uses these tables:
+//! translation enable and every required invalidation must complete
+//! before a mapping or its backing frame can be reused.
 //!
-//! Key decision: `numIOPTLevels = 4`. QEMU's TCG VT-d unit advertises
-//! SAGAW with 4-level support; the sel4test IOPT0008/0011 cases index
+//! Key decision: `numIOPTLevels = 4`. The QEMU launcher requests 48-bit
+//! VT-d so CAP.SAGAW advertises four-level support; older QEMU defaults to
+//! 39-bit/three-level VT-d. The sel4test IOPT0008/0011 cases index
 //! `pts[EXPECTED_PT_DEPTH = 3]`, which only exists when the map loop
 //! allocates 4 page tables. The context-entry address-width field is
 //! `aw = numIOPTLevels - 2 = 2`.
 
 use super::acpi;
 use super::paging::{self, phys_to_lin, KERNEL_IOMMU_VBASE};
+use core::sync::atomic::{fence, Ordering};
+
+mod domain;
+mod retirement;
+mod visibility;
+use domain::{check_domain, domain_count, reserve_domain, retire_owned_domain, MAX_DOMAINS};
+use retirement::INVALIDATION_SPINS;
+use retirement::{
+    context_admits_domain, cte_asr, cte_domain_id, cte_high, cte_low, cte_present,
+    invalidate_context_and_iotlb_at, retire_context, retire_leaf, VtdRegisters,
+};
+pub use retirement::{dma_retirement_phase, retire_last_iopt_alias, DmaRetirementKind, VtdError};
+use visibility::{
+    cache_line_bytes, flush_write_buffer, global_command, TableVisibility, VtdGlobalRegisters,
+};
 
 // VT-d register offsets (intel-vtd.c:21-37).
 const VER_REG: u64 = 0x00;
 const CAP_REG: u64 = 0x08;
+const ECAP_REG: u64 = 0x10;
 const GCMD_REG: u64 = 0x18;
 const GSTS_REG: u64 = 0x1C;
 const RTADDR_REG: u64 = 0x20;
+const IOTLB_REG: u64 = 0x08;
+// Register-based global IOTLB invalidation, with DMA read and write drain.
 const SRTP: u32 = 30; // Set Root Table Pointer (GCMD, one-shot)
 const RTPS: u32 = 30; // Root Table Pointer Status (GSTS)
 const TE: u32 = 31; // Translation Enable (GCMD, persistent)
@@ -32,6 +49,7 @@ const TES: u32 = 31; // Translation Enable Status (GSTS)
 /// VT-d second-level page-table index bits (9) and 4 KiB page bits.
 pub const VTD_PT_INDEX_BITS: u64 = 9;
 pub const PAGE_BITS: u64 = 12;
+const TABLE_BYTES: usize = 1 << PAGE_BITS;
 
 // ---------------------------------------------------------------------------
 // Boot-discovered state.
@@ -45,6 +63,25 @@ static mut NUM_DRHU: u32 = 0;
 static mut VTD_ROOT_TABLE_PADDR: u64 = 0;
 /// Kernel-virtual base of the first DRHD's register block.
 static mut VTD_REGS: u64 = 0;
+/// Offset of the IOTLB invalidation register, discovered from ECAP.IRO.
+static mut VTD_IOTLB_OFFSET: u64 = 0;
+/// Exact PCI requester IDs copied from the boot DMAR endpoint scopes.
+/// Kernel BSS remains mapped in every user CR3; the ACPI physical pointer does not.
+static mut VTD_ALLOWED_RIDS: [u64; 1024] = [0; 1024];
+static mut VTD_INCLUDE_ALL_RIDS: bool = false;
+/// Exclusive upper bound for domain IDs on the discovered remapping unit.
+static mut VTD_DOMAIN_COUNT: usize = 0;
+/// BKL-owned domain reservations. Nonzero entries hold the context's requester ID.
+static mut VTD_DOMAIN_OWNERS: [u16; MAX_DOMAINS] = [0; MAX_DOMAINS];
+/// Set during boot before publishing the remapping unit.
+static mut VTD_VISIBILITY: TableVisibility = TableVisibility::new(true, false);
+/// Nonzero only when the remapper requires CPU cache writeback.
+static mut VTD_CACHE_LINE_BYTES: usize = 0;
+
+#[cold]
+pub fn fail_stop(error: VtdError) -> ! {
+    panic!("VT-d translation retirement failed: {error:?}")
+}
 
 pub fn num_iopt_levels() -> u64 {
     unsafe { NUM_IOPT_LEVELS }
@@ -53,6 +90,96 @@ pub fn num_iopt_levels() -> u64 {
 pub fn iommu_present() -> bool {
     unsafe { NUM_DRHU > 0 }
 }
+
+pub fn iopt_contains_address(level: u8, mapped_address: u64, address: u64) -> bool {
+    if level == 0 || level as u64 >= num_iopt_levels() {
+        return true;
+    }
+    let shift = PAGE_BITS + VTD_PT_INDEX_BITS * (num_iopt_levels() - level as u64);
+    (mapped_address >> shift) == (address >> shift)
+}
+
+/// A copied mapped IOPT cap is an alias of the same hardware edge.
+pub fn external_descendant_needs_explicit_unmap(
+    owner_cnode: usize,
+    descendant_cnode: usize,
+    level: u8,
+    mapped_address: u64,
+    descendant_address: u64,
+) -> bool {
+    owner_cnode != descendant_cnode
+        && iopt_contains_address(level, mapped_address, descendant_address)
+}
+
+struct MmioRegisters(u64);
+
+impl VtdRegisters for MmioRegisters {
+    fn read64(&mut self, offset: u64) -> u64 {
+        unsafe { core::ptr::read_volatile((self.0 + offset) as *const u64) }
+    }
+
+    fn write64(&mut self, offset: u64, value: u64) {
+        unsafe { core::ptr::write_volatile((self.0 + offset) as *mut u64, value) }
+    }
+}
+
+impl VtdGlobalRegisters for MmioRegisters {
+    fn status(&mut self) -> u32 {
+        unsafe { core::ptr::read_volatile((self.0 + GSTS_REG) as *const u32) }
+    }
+
+    fn command(&mut self, value: u32) {
+        unsafe { core::ptr::write_volatile((self.0 + GCMD_REG) as *mut u32, value) }
+    }
+}
+
+/// Call only on the noncoherent path, after validating the CLFLUSH line width.
+unsafe fn clean_cache_range(address: usize, length: usize) {
+    let line_bytes = VTD_CACHE_LINE_BYTES;
+    let first_line = address & !(line_bytes - 1);
+    let end = address + length;
+    for line in (first_line..end).step_by(line_bytes) {
+        core::arch::asm!("clflush [{}]", in(reg) line, options(nostack, preserves_flags));
+    }
+}
+
+unsafe fn clean_table_entry(entry: *mut u64, bytes: usize) {
+    VTD_VISIBILITY.clean_noncoherent(|| clean_cache_range(entry as usize, bytes));
+}
+
+unsafe fn prepare_unlinked_table(regs: u64, table_paddr: u64) {
+    VTD_VISIBILITY.prepare_unlinked(
+        || clean_cache_range(phys_to_lin(table_paddr) as usize, TABLE_BYTES),
+        || flush_write_buffer(&mut MmioRegisters(regs)),
+    )
+    .unwrap_or_else(|error| fail_stop(error));
+}
+
+/// Register-based invalidation is available only while queued invalidation is off.
+/// Global granularity is deliberately used: the kernel currently discovers one
+/// DRHD and does not have a hardware-scope-to-requester index.
+unsafe fn invalidation_regs() -> Result<(u64, u64), VtdError> {
+    let regs = VTD_REGS;
+    let iotlb = VTD_IOTLB_OFFSET;
+    if regs == 0 || iotlb == 0 {
+        return Err(VtdError::Unavailable);
+    }
+    // GSTS.QIES: register invalidation is prohibited while the queue is enabled.
+    if core::ptr::read_volatile((regs + GSTS_REG) as *const u32) & (1 << 26) != 0 {
+        return Err(VtdError::Unavailable);
+    }
+    Ok((regs, iotlb))
+}
+
+/// The caller has already updated a present context entry or a root entry.
+/// Intel VT-d requires the context-cache command to finish before the IOTLB
+/// command, because cached context information may tag IOTLB entries.
+pub unsafe fn invalidate_context_and_iotlb() -> Result<(), VtdError> {
+    let (base, iotlb) = invalidation_regs()?;
+    fence(Ordering::SeqCst);
+    invalidate_context_and_iotlb_at(&mut MmioRegisters(base), iotlb)
+}
+
 
 // ---------------------------------------------------------------------------
 // IOMMU page pool — root + context tables. Seeded at boot from a small
@@ -98,10 +225,7 @@ unsafe fn alloc_iommu_page() -> Option<u64> {
 
 // ---------------------------------------------------------------------------
 // Hardware entry encode / decode. Hand-coded to the Intel VT-d layout
-// (mirrors seL4's vtd_rte / vtd_cte / vtd_pte bitfield blocks). The
-// kernel is the only reader/writer for the IOPT tests (no DMA), so the
-// encoding only needs to be self-consistent — it also happens to match
-// the architectural layout.
+// (mirrors seL4's vtd_rte / vtd_cte / vtd_pte bitfield blocks).
 //
 //   Root entry  (16 B): low qword  bit0 = present, bits[63:12] = CTP.
 //   Context     (16 B): low qword  bit0 = present, bits[3:2] = transl.
@@ -123,23 +247,6 @@ fn rte_present(w: u64) -> bool {
 #[inline]
 fn rte_ctp(w: u64) -> u64 {
     w & ADDR_MASK
-}
-
-#[inline]
-fn cte_low(asr_paddr: u64, tt: u64, present: bool) -> u64 {
-    (asr_paddr & ADDR_MASK) | ((tt & 0x3) << 2) | (present as u64)
-}
-#[inline]
-fn cte_high(aw: u64, did: u64) -> u64 {
-    (aw & 0x7) | ((did & 0xFFFF) << 8)
-}
-#[inline]
-fn cte_present(low: u64) -> bool {
-    low & 1 != 0
-}
-#[inline]
-fn cte_asr(low: u64) -> u64 {
-    low & ADDR_MASK
 }
 
 #[inline]
@@ -172,11 +279,28 @@ fn get_pci_bus(rid: u16) -> usize {
 // first map). With `allocate == false`, an absent table yields `None`.
 // ---------------------------------------------------------------------------
 
-/// Pointer to a context entry: `[0]` = low qword, `[1]` = high qword.
-pub struct CtxSlot(pub *mut u64);
+/// Context entry and the requester whose root/context table lookup produced it.
+pub struct CtxSlot {
+    entry: *mut u64,
+    requester: u16,
+}
+
+/// Refuse invalid domains and foreign owners before a lazy context-table allocation.
+pub unsafe fn check_context_domain(requester: u16, domain_id: u16) -> Result<(), VtdError> {
+    if VTD_ROOT_TABLE_PADDR == 0 {
+        return Err(VtdError::Unavailable);
+    }
+    let owners = &*core::ptr::addr_of!(VTD_DOMAIN_OWNERS);
+    check_domain(&owners[..VTD_DOMAIN_COUNT], domain_id, requester)
+}
 
 pub unsafe fn lookup_vtd_context_slot(pci_request_id: u16, allocate: bool) -> Option<CtxSlot> {
     if VTD_ROOT_TABLE_PADDR == 0 {
+        return None;
+    }
+    let word = (pci_request_id as usize) >> 6;
+    let bit = 1u64 << (pci_request_id & 63);
+    if !VTD_INCLUDE_ALL_RIDS && VTD_ALLOWED_RIDS[word] & bit == 0 {
         return None;
     }
     let bus = get_pci_bus(pci_request_id);
@@ -188,8 +312,11 @@ pub unsafe fn lookup_vtd_context_slot(pci_request_id: u16, allocate: bool) -> Op
         rte_ctp(rte)
     } else if allocate {
         let ct_paddr = alloc_iommu_page()?;
-        core::ptr::write_volatile(rte_slot, rte_new(ct_paddr, true));
+        prepare_unlinked_table(VTD_REGS, ct_paddr);
         core::ptr::write_volatile(rte_slot.add(1), 0);
+        core::ptr::write_volatile(rte_slot, rte_new(ct_paddr, true));
+        clean_table_entry(rte_slot, 16);
+        invalidate_context_and_iotlb().unwrap_or_else(|error| fail_stop(error));
         ct_paddr
     } else {
         return None;
@@ -197,25 +324,64 @@ pub unsafe fn lookup_vtd_context_slot(pci_request_id: u16, allocate: bool) -> Op
     let ct_lin = phys_to_lin(ctp) as *mut u64;
     // Context index = (dev << 3) | fun = RID & 0xff; each CTE = 16 B.
     let ctx_index = (pci_request_id & 0xff) as usize;
-    Some(CtxSlot(ct_lin.add(ctx_index * 2)))
+    Some(CtxSlot {
+        entry: ct_lin.add(ctx_index * 2),
+        requester: pci_request_id,
+    })
 }
 
 impl CtxSlot {
     pub unsafe fn present(&self) -> bool {
-        cte_present(core::ptr::read_volatile(self.0))
+        cte_present(core::ptr::read_volatile(self.entry))
     }
     pub unsafe fn asr(&self) -> u64 {
-        cte_asr(core::ptr::read_volatile(self.0))
+        cte_asr(core::ptr::read_volatile(self.entry))
+    }
+    /// An existing PCI requester context may only be extended by its installed domain.
+    pub unsafe fn matches_domain(&self, domain_id: u16) -> bool {
+        let owners = &*core::ptr::addr_of!(VTD_DOMAIN_OWNERS);
+        context_admits_domain(
+            core::ptr::read_volatile(self.entry),
+            core::ptr::read_volatile(self.entry.add(1)),
+            domain_id,
+        ) && owners[..VTD_DOMAIN_COUNT].get(usize::from(domain_id)) == Some(&self.requester)
     }
     /// Install this context entry as the root of an IO address space.
-    pub unsafe fn install_root(&self, domain_id: u16, asr_paddr: u64) {
+    pub unsafe fn install_root(&self, domain_id: u16, asr_paddr: u64) -> Result<(), VtdError> {
+        if self.present() {
+            return Err(VtdError::OwnershipConflict);
+        }
+        let (base, iotlb) = invalidation_regs()?;
+        let owners = &mut *core::ptr::addr_of_mut!(VTD_DOMAIN_OWNERS);
+        reserve_domain(&mut owners[..VTD_DOMAIN_COUNT], domain_id, self.requester)?;
+        prepare_unlinked_table(base, asr_paddr);
         let aw = NUM_IOPT_LEVELS - 2;
-        core::ptr::write_volatile(self.0, cte_low(asr_paddr, 0, true));
-        core::ptr::write_volatile(self.0.add(1), cte_high(aw, domain_id as u64));
+        core::ptr::write_volatile(self.entry.add(1), cte_high(aw, domain_id as u64));
+        core::ptr::write_volatile(self.entry, cte_low(asr_paddr, 0, true));
+        clean_table_entry(self.entry, 16);
+        fence(Ordering::SeqCst);
+        invalidate_context_and_iotlb_at(&mut MmioRegisters(base), iotlb)
+            .unwrap_or_else(|error| fail_stop(error));
+        Ok(())
     }
-    pub unsafe fn clear(&self) {
-        core::ptr::write_volatile(self.0, 0);
-        core::ptr::write_volatile(self.0.add(1), 0);
+    pub unsafe fn clear(&self) -> Result<(), VtdError> {
+        let domain_id = cte_domain_id(core::ptr::read_volatile(self.entry.add(1)));
+        let owners = &mut *core::ptr::addr_of_mut!(VTD_DOMAIN_OWNERS);
+        retire_owned_domain(&mut owners[..VTD_DOMAIN_COUNT], domain_id, self.requester, || {
+            let (base, iotlb) = invalidation_regs()?;
+            retire_context(
+                &mut MmioRegisters(base),
+                iotlb,
+                || {
+                    core::ptr::write_volatile(self.entry, 0);
+                    clean_table_entry(self.entry, 8);
+                },
+                // The absent entry's domain word will also be cleaned on its next publication.
+                || core::ptr::write_volatile(self.entry.add(1), 0),
+            )
+            .unwrap_or_else(|error| fail_stop(error));
+            Ok(())
+        })
     }
 }
 
@@ -294,13 +460,34 @@ pub unsafe fn lookup_iopt_slot_levels(
 pub unsafe fn slot_addr(slot: *mut u64) -> u64 {
     pte_addr(core::ptr::read_volatile(slot))
 }
-/// Install a read/write PTE pointing at `paddr`.
+/// Install a PTE pointing at a DMA frame. Only the remapper entry needs table writeback.
 pub unsafe fn slot_install(slot: *mut u64, paddr: u64, write: bool, read: bool) {
-    core::ptr::write_volatile(slot, pte_new(paddr, write, read));
+    retire_slot(slot, pte_new(paddr, write, read), None)
+        .unwrap_or_else(|error| fail_stop(error));
 }
-/// Zero a PTE slot.
-pub unsafe fn slot_clear(slot: *mut u64) {
-    core::ptr::write_volatile(slot, 0);
+
+/// Install a PTE pointing at another table and prepare the table before it becomes reachable.
+pub unsafe fn slot_install_table(slot: *mut u64, table_paddr: u64) {
+    retire_slot(slot, pte_new(table_paddr, true, true), Some(table_paddr))
+        .unwrap_or_else(|error| fail_stop(error));
+}
+
+/// Zero a PTE slot. Returns only after the IOTLB no longer caches the old target.
+pub unsafe fn slot_clear(slot: *mut u64) -> Result<(), VtdError> {
+    retire_slot(slot, 0, None)
+}
+
+unsafe fn retire_slot(slot: *mut u64, entry: u64, child_table: Option<u64>) -> Result<(), VtdError> {
+    let (base, iotlb) = invalidation_regs()?;
+    if let Some(table_paddr) = child_table {
+        prepare_unlinked_table(base, table_paddr);
+    }
+    retire_leaf(&mut MmioRegisters(base), iotlb, || {
+        core::ptr::write_volatile(slot, entry);
+        clean_table_entry(slot, 8);
+    })
+    .unwrap_or_else(|error| fail_stop(error));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -322,8 +509,8 @@ fn log_hex(v: u64) {
     }
 }
 
-/// Discover the first DRHD, map its register block, allocate the root
-/// table, and (best-effort) point the unit at it. Must run after the
+/// Discover the single segment-zero DRHD, map its register block, allocate the root
+/// table, and point the unit at it. Must run after the
 /// IOMMU page pool is installed (`install_iommu_pool`). Idempotent-ish:
 /// safe to call once.
 pub fn vtd_init() {
@@ -336,32 +523,59 @@ pub fn vtd_init() {
             return;
         }
     };
-    let base = match acpi::dmar_first_drhd_base(dmar) {
-        Some(b) => b,
+    let unit = match acpi::dmar_single_drhd(dmar) {
+        Some(unit) => unit,
         None => {
-            crate::arch::log("IOMMU: DMAR has no DRHD unit\n");
+            crate::arch::log("IOMMU: DMAR lacks one valid DRHD for PCI segment 0\n");
             return;
         }
     };
+    let base = unit.base;
+    if !unsafe { unit.populate_allowed_rids(&mut *core::ptr::addr_of_mut!(VTD_ALLOWED_RIDS)) } {
+        crate::arch::log("IOMMU: malformed DRHD endpoint scopes\n");
+        return;
+    }
 
     unsafe {
         paging::map_kernel_mmio_page(KERNEL_IOMMU_VBASE, base);
     }
     let off = base & 0xFFF;
     let regs = KERNEL_IOMMU_VBASE + off;
-    unsafe { VTD_REGS = regs };
 
     let ver = unsafe { core::ptr::read_volatile((regs + VER_REG) as *const u32) };
     let cap = unsafe { core::ptr::read_volatile((regs + CAP_REG) as *const u64) };
+    let ecap = unsafe { core::ptr::read_volatile((regs + ECAP_REG) as *const u64) };
     let sagaw = (cap >> 8) & 0x1F;
-    if ver == 0 || ver == 0xFFFF_FFFF || cap == u64::MAX || sagaw == 0 {
+    let iotlb_offset = ((ecap >> 8) & 0x3ff) * 16 + IOTLB_REG;
+    if ver == 0 || ver == 0xFFFF_FFFF || cap == u64::MAX
+        || iotlb_offset == IOTLB_REG || (base & 0xfff) + iotlb_offset + 8 > 4096
+    {
         crate::arch::log("IOMMU: VT-d register file dead — disabled\n");
         return;
     }
+    if sagaw & 0x4 == 0 {
+        crate::arch::log("IOMMU: VT-d lacks four-level IO page tables — disabled\n");
+        return;
+    }
 
-    // numIOPTLevels = 4 (see module docs). Verify SAGAW advertises the
-    // 4-level width (bit 2); fall back to whatever's there but keep 4
-    // since QEMU TCG supports it.
+    let Some(domains) = domain_count(cap) else {
+        crate::arch::log("IOMMU: VT-d has a reserved CAP.ND encoding — disabled\n");
+        return;
+    };
+
+    let coherent = ecap & 1 != 0;
+    let line_bytes = if coherent {
+        0
+    } else {
+        let cpu = core::arch::x86_64::__cpuid(1);
+        let Some(bytes) = cache_line_bytes(cpu.ebx, cpu.edx) else {
+            crate::arch::log("IOMMU: noncoherent VT-d requires usable CLFLUSH — disabled\n");
+            return;
+        };
+        bytes
+    };
+
+    // numIOPTLevels = 4 (see module docs); CAP.SAGAW must advertise it.
     unsafe { NUM_IOPT_LEVELS = 4 };
 
     // Allocate the root table.
@@ -371,30 +585,42 @@ pub fn vtd_init() {
         return;
     };
     unsafe {
+        VTD_VISIBILITY = TableVisibility::new(coherent, cap & (1 << 4) != 0);
+        VTD_CACHE_LINE_BYTES = line_bytes;
+        prepare_unlinked_table(regs, root_paddr);
+        VTD_REGS = regs;
+        VTD_DOMAIN_COUNT = domains;
         VTD_ROOT_TABLE_PADDR = root_paddr;
-        NUM_DRHU = 1;
+        VTD_IOTLB_OFFSET = iotlb_offset;
+        VTD_INCLUDE_ALL_RIDS = unit.include_all;
     }
 
-    // Best-effort: point the unit at the root table (SRTP). The IOPT
-    // tests do no DMA, so we deliberately do NOT set the Translation
-    // Enable (TE) bit, and we bound every status spin so a flaky TCG
-    // unit can never hang the kernel.
+    // Point the unit at the root table (SRTP). Translation is enabled
+    // when a requester installs its first context; status waits are bounded.
     unsafe {
         core::ptr::write_volatile((regs + RTADDR_REG) as *mut u64, root_paddr);
-        let status = core::ptr::read_volatile((regs + GSTS_REG) as *const u32);
-        core::ptr::write_volatile((regs + GCMD_REG) as *mut u32, status | (1 << SRTP));
+        let mut global = MmioRegisters(regs);
+        let status = global.status();
+        global.command(global_command(status, 1 << SRTP));
         let mut spins = 0u32;
-        while spins < 100_000 {
-            let s = core::ptr::read_volatile((regs + GSTS_REG) as *const u32);
+        while spins < INVALIDATION_SPINS {
+            let s = global.status();
             if (s >> RTPS) & 1 != 0 {
                 break;
             }
             spins += 1;
         }
+        if spins == INVALIDATION_SPINS {
+            fail_stop(VtdError::TimedOut);
+        }
+        invalidate_context_and_iotlb().unwrap_or_else(|error| fail_stop(error));
+        NUM_DRHU = 1;
     }
 
     crate::arch::log("IOMMU: VT-d initialised; CAP=0x");
     log_hex(cap);
+    crate::arch::log(" ECAP=0x");
+    log_hex(ecap);
     crate::arch::log(" levels=4 root=0x");
     log_hex(root_paddr);
     crate::arch::log("\n");
@@ -408,25 +634,26 @@ pub fn vtd_init() {
 /// working right up until the moment a driver builds a confined mapping. Once TE is on,
 /// any device WITHOUT a present context entry has its DMA blocked (faulted) — which is
 /// the whole point: a driver can only DMA into the frames it was granted.
-pub unsafe fn enable_translation() {
+pub unsafe fn enable_translation() -> Result<(), VtdError> {
     if VTD_REGS == 0 {
-        return;
+        return Err(VtdError::Unavailable);
     }
     let regs = VTD_REGS;
-    let status = core::ptr::read_volatile((regs + GSTS_REG) as *const u32);
+    let mut global = MmioRegisters(regs);
+    let status = global.status();
     if (status >> TES) & 1 != 0 {
-        return; // already enabled
+        return Ok(()); // already enabled
     }
-    // Write TE only (SRTP bit 30 = 0 so the already-set root pointer isn't re-triggered).
-    core::ptr::write_volatile((regs + GCMD_REG) as *mut u32, 1 << TE);
+    global.command(global_command(status, 1 << TE));
     let mut spins = 0u32;
-    while spins < 100_000 {
-        let s = core::ptr::read_volatile((regs + GSTS_REG) as *const u32);
+    while spins < INVALIDATION_SPINS {
+        let s = global.status();
         if (s >> TES) & 1 != 0 {
             crate::arch::log("IOMMU: translation ENABLED (TE)\n");
-            return;
+            return Ok(());
         }
         spins += 1;
     }
     crate::arch::log("IOMMU: TE enable timed out\n");
+    Err(VtdError::TimedOut)
 }

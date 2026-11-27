@@ -89,7 +89,7 @@ fn service_quiescence(cpu: AcquisitionCpu, entry: &mut Option<UserEntrySnapshot>
     unsafe {
         let root = crate::arch::x86_64::paging::kernel_root_cr3();
         assert_ne!(root, 0);
-        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+        crate::smp::load_root(root);
     }
     #[cfg(target_arch = "aarch64")]
     crate::arch::aarch64::vspace::park_on_kernel_root();

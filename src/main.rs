@@ -73,6 +73,7 @@ mod error;
 // Syscall dispatcher (handle_syscall + handle_unknown_syscall).
 mod syscall_handler;
 mod debug_record;
+mod idle_log_budget;
 
 // Phase 34c — IPC-buffer layout offsets (mirrors libsel4's
 // seL4_IPCBuffer struct in u64-word offsets).
@@ -126,6 +127,7 @@ mod initrd;
 // Pre-39 this was an `include_bytes!` of a sibling crate's output;
 // now it's a runtime `initrd::find_file("boot/rootserver")`.
 mod rootserver_image;
+mod rootserver_page_budget;
 
 // Phase 29b — minimal ELF64 parser. Reads the embedded
 // rootserver image and exposes its entry point + PT_LOAD segments.
@@ -178,6 +180,7 @@ _arm64_image_start:
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 extern "C" fn _start(magic: u64, mbi_addr: u64) -> ! {
+    arch::x86_64::cpu::prepare_entry();
     simpleboot::init(magic, mbi_addr);
     kernel_entry()
 }
@@ -225,8 +228,17 @@ extern "C" fn aarch64_start(magic: u64, mbi_addr: u64) -> ! {
 fn kernel_entry() -> ! {
     // Only initialize on the bootstrap processor
     // Check if the current architectural CPU ID matches Simpleboot's BSP ID.
+    #[cfg(target_arch = "x86_64")]
+    let current_cpu_id = arch::x86_64::cpu::get_hardware_cpu_id();
+    #[cfg(not(target_arch = "x86_64"))]
     let current_cpu_id = arch::get_cpu_id();
     let simpleboot_bsp_id = simpleboot::get_bootstrap_processor_id() as arch::CpuId;
+
+    // The shared GDT and SMP scheduler currently index the BSP as CPU 0.
+    // Catch an incompatible boot topology before loading CPU 0's TSS on
+    // another physical CPU.
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(simpleboot_bsp_id, 0, "x86 BSP APIC ID must be 0");
 
     if current_cpu_id == simpleboot_bsp_id {
         bsp_main();
@@ -341,11 +353,15 @@ fn bsp_main_big_stack() -> ! {
     if let Err(e) = boot::reserve_user_page_region() {
         arch::log("boot: reserve_user_page_region failed: ");
         match e {
+            boot::BootError::InvalidMemoryMap => arch::log("InvalidMemoryMap"),
             boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
             boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
             boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
+            boot::BootError::InvalidRootserverImage => arch::log("InvalidRootserverImage"),
+            boot::BootError::RootserverImageTooLarge => arch::log("RootserverImageTooLarge"),
         }
         arch::log("\n");
+        loop { arch::halt_cpu(); }
     }
 
     // Phase 44 — initialise the VT-d IOMMU now that the IOMMU table
@@ -368,11 +384,17 @@ fn bsp_main_big_stack() -> ! {
         Err(e) => {
             arch::log("boot: kernel_init failed: ");
             match e {
+                boot::BootError::InvalidMemoryMap => arch::log("InvalidMemoryMap"),
                 boot::BootError::TooManyRegions => arch::log("TooManyRegions"),
                 boot::BootError::NoSuitableRegion => arch::log("NoSuitableRegion"),
                 boot::BootError::OverlapInternal => arch::log("OverlapInternal"),
+                boot::BootError::InvalidRootserverImage => arch::log("InvalidRootserverImage"),
+                boot::BootError::RootserverImageTooLarge => arch::log("RootserverImageTooLarge"),
             }
             arch::log("\n");
+            loop {
+                arch::halt_cpu();
+            }
         }
     }
 
@@ -555,11 +577,7 @@ fn ap_scheduler_loop() -> ! {
                         );
                         let next_cr3 = tcb.vm_root_cr3();
                         if was_idle || cur_cr3 != next_cr3 {
-                            core::arch::asm!(
-                                "mov cr3, {}",
-                                in(reg) next_cr3,
-                                options(nostack, preserves_flags),
-                            );
+                            crate::smp::load_root(next_cr3);
                         }
 
                         // Restore per-thread FS_BASE so userspace TLS

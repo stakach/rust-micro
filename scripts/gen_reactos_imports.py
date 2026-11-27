@@ -85,10 +85,13 @@ for iat_rva, name in imports:
         continue
     entries.append((r2o(secs, iat_rva), rva))
 
+print("resolved %d/%d ntdll imports (%d bytes)%s" %
+      (len(entries), len(imports), 4 + 8 * len(entries),
+       ("; MISSING: " + ",".join(missing)) if missing else ""))
+if missing:
+    sys.exit("error: ntdll import fixups incomplete")
+
 buf = struct.pack("<I", len(entries))
 for off, rva in entries:
     buf += struct.pack("<II", off, rva)
 open(out, "wb").write(buf)
-print("resolved %d/%d ntdll imports (%d bytes)%s" %
-      (len(entries), len(imports), len(buf),
-       ("; MISSING: " + ",".join(missing)) if missing else ""))

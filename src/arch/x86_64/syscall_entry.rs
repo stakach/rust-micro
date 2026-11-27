@@ -31,6 +31,185 @@ use crate::arch::x86_64::msr::*;
 /// anyway).
 struct BklGuard;
 
+// Temporary, exact-record boot diagnostic. Remove after the Hook return is explained.
+const HOOK_REDRIVE_EXIT_RECORD: &[u8] =
+    b"[hook-redrive] stage/index/owner/entered/published/key/unowned=7/";
+const HOOK_USER_RETURN_RECORD: &[u8] = b"[hook-user-return] print-record resumed";
+static HOOK_DEBUG_TAIL_PROBE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static HOOK_DEBUG_USER_RIP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static HOOK_DEBUG_SAME_RIP_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static HOOK_DEBUG_RIP_CHANGES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+extern "C" fn trace_hook_syscall_tail() {
+    if HOOK_DEBUG_TAIL_PROBE.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        crate::arch::log("[hook-debug-return] after-dispatch\n");
+    }
+}
+
+fn hook_debug_number(mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 { break; }
+    }
+    if let Ok(number) = core::str::from_utf8(&digits[start..]) {
+        crate::arch::log(number);
+    }
+}
+
+fn trace_hook_debug_return(stage: &'static str, invoker: Option<crate::tcb::TcbId>) {
+    use crate::kernel::KERNEL;
+    let s = unsafe { KERNEL.get() };
+    crate::arch::log("[hook-debug-return] ");
+    crate::arch::log(stage);
+    crate::arch::log(" invoker=");
+    hook_debug_number(invoker.map_or(u64::MAX, |id| u64::from(id.0)));
+    crate::arch::log(" current=");
+    hook_debug_number(s.scheduler.current().map_or(u64::MAX, |id| u64::from(id.0)));
+    if let Some(id) = invoker.and_then(|id| s.scheduler.slab.try_get(id).map(|_| id)) {
+        let tcb = s.scheduler.slab.get(id);
+        crate::arch::log(" hold/sc/active/donated/state/sched=");
+        hook_debug_number(tcb.execution_hold);
+        crate::arch::log("/");
+        hook_debug_number(tcb.sc.map_or(u64::MAX, u64::from));
+        crate::arch::log("/");
+        hook_debug_number(tcb.active_sc.map_or(u64::MAX, u64::from));
+        crate::arch::log("/");
+        hook_debug_number(tcb.donated_sc.map_or(u64::MAX, u64::from));
+        crate::arch::log("/");
+        hook_debug_number(tcb.state as u64);
+        crate::arch::log("/");
+        hook_debug_number(u64::from(tcb.is_schedulable()));
+        crate::arch::log(" enqueued/affinity/domain/qtop=");
+        hook_debug_number(u64::from(tcb.enqueued));
+        crate::arch::log("/");
+        hook_debug_number(u64::from(tcb.affinity));
+        crate::arch::log("/");
+        hook_debug_number(u64::from(tcb.domain));
+        crate::arch::log("/");
+        let cpu = crate::arch::get_cpu_id() as usize;
+        hook_debug_number(s.scheduler.nodes[cpu].queues[s.scheduler.cur_domain as usize]
+            .peek_highest().map_or(u64::MAX, u64::from));
+    }
+    crate::arch::log("\n");
+}
+
+fn trace_hook_user_return_slot(invoker: crate::tcb::TcbId, rsp: u64) {
+    let values = (|| {
+        let s = unsafe { crate::kernel::KERNEL.get() };
+        let tcb = s.scheduler.slab.try_get(invoker)?;
+        let root = match tcb.vspace_root() {
+            crate::cap::Cap::PML4 { ptr, .. } => ptr.addr(),
+            _ => return None,
+        };
+        let read_word = |offset: u64| {
+            let address = rsp.checked_add(offset)?;
+            let read_entry = |table: u64, index: usize| unsafe {
+                Some(core::ptr::read_volatile(
+                    (crate::arch::phys_to_virt(table) as *const u64).add(index),
+                ))
+            };
+            let (physical, available) =
+                crate::debug_record::translate_x86_user(root, address, read_entry)?;
+            if available < core::mem::size_of::<u64>() as u64 { return None; }
+            Some(unsafe {
+                core::ptr::read_unaligned(crate::arch::phys_to_virt(physical) as *const u64)
+            })
+        };
+        // This exact image's nested input runner pushes three registers and
+        // its enclosing File runner pushes five words. Their caller returns
+        // follow the redrive return at offsets 248 and 296 respectively.
+        // The shared receiver's exact image frame allocates 0x4b98 bytes
+        // after six pushes. The later slots unwind its ordinary pump loop and
+        // the three possible callers of that loop in this exact artifact.
+        Some((read_word(24), read_word(88), read_word(216), read_word(248),
+            read_word(296), read_word(0x4cf8), read_word(0x4d60),
+            read_word(0x4d78), read_word(0x9638), read_word(0xdc08),
+            read_word(0xf698), read_word(0xfa88), read_word(0xfaf8),
+            read_word(0xfb18), read_word(0x12828), read_word(0x154a8)))
+    })();
+    crate::arch::log("[hook-user-stack] rsp/record-return/line-return/redrive-return/parent-return/file-runner-return/receive-return/seh-parent/ordinary-parent/loop-parent/autonomous-parent/continue-parent/enter-parent/inner-parent/pump-parent/scheduler-parent/callback-parent=");
+    hook_debug_number(rsp);
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.0).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.1).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.2).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.3).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.4).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.5).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.6).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.7).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.8).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.9).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.10).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.11).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.12).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.13).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.14).unwrap_or(u64::MAX));
+    crate::arch::log("/");
+    hook_debug_number(values.and_then(|pair| pair.15).unwrap_or(u64::MAX));
+    crate::arch::log("\n");
+}
+
+pub(crate) fn trace_hook_user_timer(
+    from_user: bool, interrupted: Option<crate::tcb::TcbId>, rip: u64,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if crate::arch::get_cpu_id() != 0 || !from_user
+        || interrupted != Some(crate::tcb::TcbId(1))
+    {
+        return;
+    }
+    let previous = HOOK_DEBUG_USER_RIP.load(Relaxed);
+    if previous == 0 { return; }
+    if previous == rip {
+        let count = HOOK_DEBUG_SAME_RIP_COUNT.fetch_add(1, Relaxed) + 1;
+        if matches!(count, 1 | 10 | 100 | 1_000 | 10_000) {
+            crate::arch::log("[hook-user-rip] same/rip=");
+            hook_debug_number(count);
+            crate::arch::log("/");
+            hook_debug_number(rip);
+            crate::arch::log("\n");
+        }
+    } else {
+        let changes = HOOK_DEBUG_RIP_CHANGES.fetch_add(1, Relaxed) + 1;
+        if changes > 12 {
+            HOOK_DEBUG_USER_RIP.store(0, Relaxed);
+            return;
+        }
+        crate::arch::log("[hook-user-rip] change/old/new=");
+        hook_debug_number(changes);
+        crate::arch::log("/");
+        hook_debug_number(previous);
+        crate::arch::log("/");
+        hook_debug_number(rip);
+        crate::arch::log("\n");
+        HOOK_DEBUG_SAME_RIP_COUNT.store(0, Relaxed);
+        HOOK_DEBUG_USER_RIP.store(rip, Relaxed);
+    }
+}
+
 impl Drop for BklGuard {
     fn drop(&mut self) {
         crate::smp::bkl_release();
@@ -73,6 +252,7 @@ const fn is_hosted_nt_native_call_msginfo(msginfo: u64) -> bool {
 fn syscall_may_consume_direct_handoff(
     syscall: crate::syscalls::Syscall,
     reply_register: u64,
+    msginfo: u64,
 ) -> bool {
     use crate::syscalls::Syscall;
 
@@ -80,7 +260,8 @@ fn syscall_may_consume_direct_handoff(
         syscall,
         Syscall::SysReplyRecv | Syscall::SysNBSendRecv | Syscall::SysNBSendWait
     ) || (matches!(syscall, Syscall::SysCall)
-        && reply_register == crate::invocation::REPLY_HANDOFF_MAGIC)
+        && (reply_register == crate::invocation::REPLY_HANDOFF_MAGIC
+            || msginfo == (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12))
 }
 
 fn syscall_prefers_entry_invoker_return(
@@ -234,26 +415,19 @@ pub(crate) fn resolve_live_user_thread() -> Option<crate::tcb::TcbId> {
 /// CS / SS selectors in IA32_STAR refer to a real GDT entry).
 pub fn init_syscall_msrs() {
     unsafe {
-        // Enable SYSCALL/SYSRET via IA32_EFER.SCE, and No-eXecute
-        // page-table support via EFER.NXE so PTEs with bit 63 set
-        // don't trip a reserved-bit fault on this CPU. Firmware and
-        // bootloader setup is BSP-centric, so per-CPU setup makes APs
-        // match.
+        // Enable SYSCALL/SYSRET via IA32_EFER.SCE. EFER.NXE was already set at entry
+        // (`cpu::prepare_entry`), before this CPU could walk an NX kernel mapping.
         let efer = rdmsr(IA32_EFER);
-        wrmsr(
-            IA32_EFER,
-            efer | EFER_SCE | crate::arch::x86_64::msr::EFER_NXE,
-        );
+        wrmsr(IA32_EFER, efer | EFER_SCE);
 
         // IA32_STAR layout:
         //   bits 31..0  = legacy SYSCALL target EIP (32-bit; unused
         //                 in long mode)
         //   bits 47..32 = CS selector for SYSCALL: kernel CS at
         //                 entry; SS = entry+8.
-        //   bits 63..48 = base for SYSRET: SS = base+8, CS = base+16.
-        let kernel_cs = KERNEL_CS as u64;
-        let user_base = USER32_CS as u64; // 0x18 → SS=0x20+3, CS=0x28+3
-        let star = (kernel_cs << 32) | (user_base << 48);
+        //   bits 63..48 = user base including RPL 3: SYSRET SS =
+        //                 base+8 (0x23), CS = base+16 (0x2b).
+        let star = super::star_selectors::star_value(KERNEL_CS, USER32_CS);
         wrmsr(IA32_STAR, star);
 
         // SYSCALL entry RIP.
@@ -710,6 +884,7 @@ pub unsafe extern "C" fn syscall_entry() {
         "mov rdi, gs:[16 + 24]",
         "mov rsi, 1",
         "call {handler}",
+        "call {tail_probe}",
 
         // Restore user GPRs (rcx and r11 carry the SYSRET targets).
         "mov rax, gs:[16 + 0]",
@@ -740,6 +915,7 @@ pub unsafe extern "C" fn syscall_entry() {
         "swapgs",
         "sysretq",
         handler = sym rust_syscall_dispatch,
+        tail_probe = sym trace_hook_syscall_tail,
     );
 }
 
@@ -781,7 +957,11 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
     // we look it up by APIC ID here.
     let ctx: &mut UserContext = current_cpu_user_ctx_mut();
 
-    struct SerialSink;
+    struct SerialSink {
+        invoker: Option<crate::tcb::TcbId>,
+        hook_redrive_exit: bool,
+        hook_user_marker: bool,
+    }
     impl DebugSink for SerialSink {
         fn put_byte(&mut self, b: u8) {
             // Tiny wrapper: arch::log takes a &str; we route through
@@ -789,6 +969,23 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             let buf = [b];
             if let Ok(s) = core::str::from_utf8(&buf) {
                 arch::log(s);
+            }
+        }
+
+        fn put_record(&mut self, bytes: &[u8]) {
+            let started = super::debug_output_cost::start();
+            for &byte in bytes { self.put_byte(byte); }
+            super::debug_output_cost::finish(
+                super::debug_output_cost::Channel::Record,
+                started,
+                bytes.len(),
+            );
+            if bytes.starts_with(HOOK_REDRIVE_EXIT_RECORD)
+                || bytes.starts_with(HOOK_USER_RETURN_RECORD)
+            {
+                self.hook_redrive_exit = true;
+                self.hook_user_marker = bytes.starts_with(HOOK_USER_RETURN_RECORD);
+                trace_hook_debug_return("emitted", self.invoker);
             }
         }
     }
@@ -944,10 +1141,15 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             return;
         }
     };
-    let may_consume_direct_handoff = syscall_may_consume_direct_handoff(syscall, ctx.r13);
-    let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13);
+    let may_consume_direct_handoff = syscall_may_consume_direct_handoff(syscall, ctx.r13, args.a1);
+    let prefer_entry_invoker_return = syscall_prefers_entry_invoker_return(syscall, ctx.r13)
+        && args.a1 != (crate::syscalls::InvocationLabel::TCBYieldTo as u64) << 12;
     let transparent_debug_return = syscall_debug_return_is_transparent(syscall);
-    let mut sink = SerialSink;
+    let mut sink = SerialSink {
+        invoker: entry_invoker,
+        hook_redrive_exit: false,
+        hook_user_marker: false,
+    };
     let result = if matches!(syscall, Syscall::SysDebugWrite) {
         crate::syscall_handler::handle_debug_write(&args, entry_invoker, &mut sink)
     } else {
@@ -1050,10 +1252,28 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
         }
     }
 
+    if sink.hook_redrive_exit {
+        trace_hook_debug_return("decision", entry_invoker);
+    }
     if transparent_debug_return && !entry_invoker.is_some_and(|id| unsafe {
         KERNEL.get().scheduler.slab.get(id).execution_held()
     }) {
         if let Some(invoker) = entry_invoker {
+            if sink.hook_redrive_exit {
+                trace_hook_debug_return("direct", entry_invoker);
+                crate::arch::log("[hook-debug-return] sysret-rip/rsp=");
+                hook_debug_number(ctx.rcx);
+                crate::arch::log("/");
+                hook_debug_number(ctx.rsp);
+                crate::arch::log("\n");
+                HOOK_DEBUG_TAIL_PROBE.store(true, core::sync::atomic::Ordering::Relaxed);
+                if sink.hook_user_marker {
+                    trace_hook_user_return_slot(invoker, ctx.rsp);
+                    HOOK_DEBUG_USER_RIP.store(ctx.rcx, core::sync::atomic::Ordering::Relaxed);
+                    HOOK_DEBUG_SAME_RIP_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+                    HOOK_DEBUG_RIP_CHANGES.store(0, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
             unsafe {
                 let s = KERNEL.get();
                 let cpu = arch::get_cpu_id() as usize;
@@ -1072,8 +1292,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 s.scheduler.set_current(Some(invoker));
                 s.scheduler.set_active_user(Some(invoker));
                 let root = s.scheduler.slab.get(invoker).vm_root_cr3();
-                core::arch::asm!("mov cr3, {}", in(reg) root,
-                    options(nostack, preserves_flags));
+                crate::smp::load_root(root);
             }
             return;
         }
@@ -1087,6 +1306,10 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
             }
             return;
         }
+    }
+
+    if sink.hook_redrive_exit {
+        trace_hook_debug_return("scheduler", entry_invoker);
     }
 
     // If the current thread blocked on a Send/Recv, scheduler.current
@@ -1164,8 +1387,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                     options(nomem, nostack, preserves_flags));
                 if next_cr3 != cur_cr3 {
-                    core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                        options(nostack, preserves_flags));
+                    crate::smp::load_root(next_cr3);
                 }
             }
             // Restore per-thread FS_BASE so userspace TLS (`%fs:0`)
@@ -1210,6 +1432,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                 // slots — SERSERV's connect handler asserts on this),
                 // top bits label.
                 let mi = (tcb.ipc_label << 12)
+                    | (((tcb.received_caps_unwrapped as u64) & 0x7) << 9)
                     | (((tcb.received_extra_caps as u64) & 0x3) << 7)
                     | (tcb.ipc_length as u64 & 0x7F);
                 new_ctx.rsi = mi;
@@ -1350,8 +1573,7 @@ pub extern "C" fn rust_syscall_dispatch(number: u64, from_user: u64) {
                         core::arch::asm!("mov {}, cr3", out(reg) cur_cr3,
                             options(nomem, nostack, preserves_flags));
                         if was_idle || next_cr3 != cur_cr3 {
-                            core::arch::asm!("mov cr3, {}", in(reg) next_cr3,
-                                options(nostack, preserves_flags));
+                            crate::smp::load_root(next_cr3);
                         }
                     }
                     crate::arch::x86_64::msr::wrmsr(
@@ -1555,8 +1777,10 @@ pub mod spec {
         let kcs = ((star >> 32) & 0xFFFF) as u16;
         let ucb = ((star >> 48) & 0xFFFF) as u16;
         assert_eq!(kcs, KERNEL_CS);
-        assert_eq!(ucb, USER32_CS);
-        arch::log("  ✓ STAR holds kernel CS + user-base selectors\n");
+        assert_eq!(ucb, USER32_CS | 3);
+        assert_eq!(ucb + 8, crate::arch::x86_64::gdt::USER_DS);
+        assert_eq!(ucb + 16, crate::arch::x86_64::gdt::USER_CS);
+        arch::log("  ✓ STAR produces ring-3 SYSRET SS + CS selectors\n");
     }
 
     #[inline(never)]

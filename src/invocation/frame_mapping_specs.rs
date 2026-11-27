@@ -127,6 +127,7 @@ mod frame_mapping_specs {
         table_clear_retirement_specs::run();
         retirement_specs::run();
         unsafe {
+            vspace_query_reports_exact_live_leaf_presence();
             permissions_and_replacement();
             unmap_preserves_pat_leaf_semantics();
             zero_address_retains_mapping();
@@ -134,6 +135,76 @@ mod frame_mapping_specs {
             subtree_and_missing_parent_rejections();
         }
         arch::log("  frame map/remap applies real permissions with exact authority\n");
+    }
+
+    /// A VSpace query must read the named live root, including leaf removal,
+    /// rather than infer presence from the virtual range or a frame cap.
+    unsafe fn vspace_query_reports_exact_live_leaf_presence() {
+        let f = Fixture::new(FrameSize::Small, VA);
+        let query = |root: Cap, address: u64| {
+            let args = SyscallArgs {
+                a1: ((InvocationLabel::X86VSpaceQueryPage as u64) << 12) | 1,
+                a2: address,
+                ..Default::default()
+            };
+            let result = decode_invocation(root, &args, f.invoker);
+            let tcb = KERNEL.get().scheduler.slab.get(f.invoker);
+            (result, tcb.msg_regs[0], tcb.ipc_length)
+        };
+
+        let (absent, value, length) = query(f.root, VA);
+        absent.unwrap();
+        assert_eq!((value, length), (0, 1));
+        f.upstream(1, 3, 0, f.root, VA).unwrap();
+        let (present, value, length) = query(f.root, VA + 37);
+        present.unwrap();
+        assert_eq!((value, length), (1, 1));
+        let (adjacent, value, length) = query(f.root, VA + 4096);
+        adjacent.unwrap();
+        assert_eq!((value, length), (0, 1));
+
+        let root_ptr = match f.other_root {
+            Cap::PML4 { ptr, .. } => ptr,
+            _ => unreachable!(),
+        };
+        let forged = Cap::PML4 {
+            ptr: root_ptr,
+            mapped: true,
+            asid: ASID,
+        };
+        assert!(query(forged, VA).0.is_err(), "mismatched ASID/root was accepted");
+        assert!(
+            query(f.root, 0xffff_8000_0000_0000).0.is_err(),
+            "kernel-half address was admitted"
+        );
+
+        let unmap = SyscallArgs {
+            a0: 1,
+            a1: (InvocationLabel::X86PageUnmap as u64) << 12,
+            ..Default::default()
+        };
+        decode_invocation(f.frame(1), &unmap, f.invoker).unwrap();
+        let (absent, value, length) = query(f.root, VA);
+        absent.unwrap();
+        assert_eq!((value, length), (0, 1));
+        f.finish();
+
+        for (size, span) in [(FrameSize::Large, 1u64 << 21), (FrameSize::Huge, 1u64 << 30)] {
+            let f = Fixture::new(size, VA);
+            f.upstream(1, 3, 0, f.root, VA).unwrap();
+            let query = |address| {
+                let args = SyscallArgs {
+                    a1: ((InvocationLabel::X86VSpaceQueryPage as u64) << 12) | 1,
+                    a2: address,
+                    ..Default::default()
+                };
+                decode_invocation(f.root, &args, f.invoker).unwrap();
+                KERNEL.get().scheduler.slab.get(f.invoker).msg_regs[0]
+            };
+            assert_eq!(query(VA + 4096), 1, "covering large leaf was missed");
+            assert_eq!(query(VA + span), 0, "query crossed a large leaf boundary");
+            f.finish();
+        }
     }
 
     unsafe fn permissions_and_replacement() {

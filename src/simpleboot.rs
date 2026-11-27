@@ -220,34 +220,80 @@ pub struct MMapEntry {
     pub reserved: u32,
 }
 
-pub fn for_each_mmap_entry(mut f: impl FnMut(MMapEntry)) {
-    for tag in tags() {
-        if tag.tag_type() != MULTIBOOT_TAG_TYPE_MMAP || tag.size() < 16 {
-            continue;
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MMapReadError {
+    MissingMap,
+    MalformedTag,
+    MalformedMap,
+}
+
+/// Walk the entire tag stream so a malformed or truncated map cannot look
+/// like a shorter valid one to boot memory admission.
+pub fn try_for_each_mmap_entry(mut f: impl FnMut(MMapEntry)) -> Result<(), MMapReadError> {
+    let start = mbi_addr() as usize;
+    let end = start
+        .checked_add(mbi_total_size())
+        .ok_or(MMapReadError::MalformedTag)?;
+    let mut cursor = start.checked_add(8).ok_or(MMapReadError::MalformedTag)?;
+    let mut found = false;
+    let mut entries = 0usize;
+    loop {
+        let header_end = cursor.checked_add(8).ok_or(MMapReadError::MalformedTag)?;
+        if header_end > end {
+            return Err(MMapReadError::MalformedTag);
         }
-        let entry_size = tag.read_u32(8) as usize;
-        if entry_size < 24 {
-            continue;
-        }
-        let mut off = 16usize;
+        let tag = TagRef { paddr: cursor as u64 };
+        let tag_type = tag.tag_type();
         let tag_size = tag.size() as usize;
-        while off
-            .checked_add(24)
-            .map(|end| end <= tag_size)
-            .unwrap_or(false)
-        {
-            f(MMapEntry {
-                base_addr: tag.read_u64(off),
-                length: tag.read_u64(off + 8),
-                entry_type: tag.read_u32(off + 16),
-                reserved: tag.read_u32(off + 20),
-            });
-            off = match off.checked_add(entry_size) {
-                Some(next) => next,
-                None => break,
+        if tag_type == MULTIBOOT_TAG_TYPE_END {
+            if tag_size != 8 || header_end != end {
+                return Err(MMapReadError::MalformedTag);
+            }
+            return if found && entries > 0 {
+                Ok(())
+            } else {
+                Err(MMapReadError::MissingMap)
             };
         }
+        if tag_size < 8 {
+            return Err(MMapReadError::MalformedTag);
+        }
+        let tag_end = cursor
+            .checked_add(tag_size)
+            .ok_or(MMapReadError::MalformedTag)?;
+        let next = cursor
+            .checked_add(align8(tag_size))
+            .ok_or(MMapReadError::MalformedTag)?;
+        if tag_end > end || next > end {
+            return Err(MMapReadError::MalformedTag);
+        }
+        if tag_type == MULTIBOOT_TAG_TYPE_MMAP {
+            if found || tag_size < 16 {
+                return Err(MMapReadError::MalformedMap);
+            }
+            found = true;
+            let entry_size = tag.read_u32(8) as usize;
+            if entry_size < 24 || (tag_size - 16) % entry_size != 0 {
+                return Err(MMapReadError::MalformedMap);
+            }
+            let count = (tag_size - 16) / entry_size;
+            entries = count;
+            for index in 0..count {
+                let off = 16 + index * entry_size;
+                f(MMapEntry {
+                    base_addr: tag.read_u64(off),
+                    length: tag.read_u64(off + 8),
+                    entry_type: tag.read_u32(off + 16),
+                    reserved: tag.read_u32(off + 20),
+                });
+            }
+        }
+        cursor = next;
     }
+}
+
+pub fn for_each_mmap_entry(f: impl FnMut(MMapEntry)) {
+    try_for_each_mmap_entry(f).expect("Simpleboot memory map must be complete");
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -288,7 +334,7 @@ pub fn get_bootstrap_processor_id() -> u16 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::arch::get_cpu_id() as u16
+        crate::arch::x86_64::cpu::get_hardware_cpu_id() as u16
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

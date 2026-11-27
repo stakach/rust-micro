@@ -159,11 +159,7 @@ extern "C" fn ipi_isr(ctx: &mut super::interrupts::IretqContext) {
         IpiKind::InvalidateVspace { pml4_paddr } => unsafe {
             let live = super::paging::read_cr3() & 0x000F_FFFF_FFFF_F000;
             if live == pml4_paddr & 0x000F_FFFF_FFFF_F000 {
-                core::arch::asm!(
-                    "mov cr3, {}",
-                    in(reg) live,
-                    options(nostack, preserves_flags),
-                );
+                crate::smp::load_root(live);
             }
         },
         IpiKind::Stop => {
@@ -471,9 +467,19 @@ pub unsafe extern "C" fn lapic_timer_irq_entry() {
         "pop r11", "pop r10", "pop r9",  "pop r8",
         "pop rbp", "pop rdi", "pop rsi", "pop rdx",
         "pop rcx", "pop rbx", "pop rax",
+        ".global lapic_timer_irq_iretq_site",
+        "lapic_timer_irq_iretq_site:",
         "iretq",
         handler = sym lapic_timer_irq_dispatch,
     );
+}
+
+unsafe extern "C" {
+    static lapic_timer_irq_iretq_site: u8;
+}
+
+pub(crate) fn timer_irq_iretq_site() -> u64 {
+    &raw const lapic_timer_irq_iretq_site as u64
 }
 
 /// LAPIC kernel-tick ISR: advance the tick clock, charge the
@@ -525,6 +531,7 @@ extern "C" fn lapic_timer_irq_dispatch(ctx: &mut super::interrupts::IretqContext
             scheduler.current()
         }
     };
+    super::syscall_entry::trace_hook_user_timer(from_user, interrupted, ctx.rip);
 
     if charge_ms > 0 {
         unsafe {

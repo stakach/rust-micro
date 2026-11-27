@@ -89,6 +89,36 @@ unsafe fn destroy_cnode(s: &mut KernelState, index: usize) {
     let cap = Cap::CNode { ptr: KernelState::cnode_ptr(index),
         radix: count.trailing_zeros() as u8, guard_size: 0, guard: 0 };
     assert!(cnode_has_only_self_refs(s, &cap), "queued CNode gained an external reference");
+    #[cfg(target_arch = "x86_64")]
+    {
+        let has_mapped_dma = (0..count).any(|slot| matches!(
+            s.cnode_slot(index, slot).map(|entry| entry.cap()),
+            Some(Cap::Frame { mapped: Some(_), map_type: crate::cap::FrameMapType::IoSpace, .. })
+                | Some(Cap::IoPageTable { is_mapped: true, .. })
+        ));
+        if has_mapped_dma {
+            let levels = crate::arch::x86_64::iommu::num_iopt_levels() as u8;
+            for phase in 0..=levels {
+                for slot in 0..count {
+                    let selected = match s.cnode_slot(index, slot).map(|entry| entry.cap()) {
+                        Some(Cap::Frame { mapped: Some(_), map_type: crate::cap::FrameMapType::IoSpace, .. })
+                            => crate::arch::x86_64::iommu::dma_retirement_phase(
+                                crate::arch::x86_64::iommu::DmaRetirementKind::Frame, levels)
+                                == Some(phase),
+                        Some(Cap::IoPageTable { is_mapped: true, level, .. })
+                            => crate::arch::x86_64::iommu::dma_retirement_phase(
+                                crate::arch::x86_64::iommu::DmaRetirementKind::Table(level), levels)
+                                == Some(phase),
+                        _ => false,
+                    };
+                    if selected {
+                        delete_cap_slot(s, MdbId::pack(index as u32, slot as u32))
+                            .expect("owned DMA cap remains finalizable under BKL");
+                    }
+                }
+            }
+        }
+    }
     for slot in 0..count {
         delete_cap_slot(s, MdbId::pack(index as u32, slot as u32))
             .expect("owned CNode slots remain finalizable under BKL");

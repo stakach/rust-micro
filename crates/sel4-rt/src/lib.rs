@@ -36,6 +36,7 @@ mod generated_syscalls {
     include!(concat!(env!("OUT_DIR"), "/syscalls.rs"));
 }
 pub const SYS_DEBUG_WRITE: i64 = generated_syscalls::Syscall::SysDebugWrite as i32 as i64;
+pub const SYS_DEBUG_SNAPSHOT: i64 = generated_syscalls::Syscall::SysDebugSnapshot as i32 as i64;
 
 #[path = "../../../src/ipc_buffer.rs"]
 mod ipc_buffer_layout;
@@ -81,7 +82,11 @@ pub const LBL_TCB_RELEASE_EXECUTION_HOLD: u64 = 72;
 pub const LBL_TCB_QUERY_REPLY_BINDING: u64 = 73;
 pub mod reply_binding;
 pub const LBL_TCB_QUERY_VSPACE_BINDING: u64 = 74;
+pub const LBL_TCB_YIELD_TO: u64 = 76;
+pub const LBL_X86_VSPACE_QUERY_PAGE: u64 = 75;
+pub const LBL_SCHED_CONTEXT_UNBIND_PASSIVE_WORKER: u64 = 77;
 pub mod vspace_binding;
+pub mod passive_worker_unbind;
 pub mod legacy_context;
 pub mod execution_hold;
 
@@ -225,6 +230,14 @@ pub unsafe fn syscall5_call_mr2(
     (reply >> 12, mr0, mr1)
 }
 
+/// Ask the kernel to print its IRQ route snapshot (binding state and live IOAPIC redirection
+/// entry of every IOAPIC-routed IRQ) to the debug log. Read-only; no IPC-buffer or Reply effect.
+pub fn debug_snapshot() {
+    unsafe {
+        syscall0(SYS_DEBUG_SNAPSHOT);
+    }
+}
+
 #[inline(always)]
 pub fn debug_put_char(c: u8) {
     unsafe {
@@ -247,6 +260,10 @@ pub fn print_record(record: &[u8]) {
             lateout("r11") _,
             options(nostack, preserves_flags),
         );
+    }
+    // Temporary exact-record diagnostic: prove the first user instruction after SYSRET ran.
+    if record.starts_with(b"[hook-redrive] stage/index/owner/entered/published/key/unowned=7/") {
+        print_record(b"[hook-user-return] print-record resumed\n");
     }
 }
 
@@ -322,6 +339,13 @@ pub fn tcb_write_registers(target: u64, rip: u64, rsp: u64, arg0: u64) -> u64 {
 pub fn tcb_resume(target: u64) -> u64 {
     let msg_info = LBL_TCB_RESUME << 12;
     unsafe { syscall5(SYS_SEND, target, msg_info, 0, 0, 0) }
+}
+
+/// Give the exact TCB named by `target` one dispatch opportunity. Returns the invocation
+/// error label; a nonzero label means that no handoff was scheduled.
+#[inline(always)]
+pub fn tcb_yield_to(target: u64) -> u64 {
+    unsafe { syscall5_call(target, LBL_TCB_YIELD_TO << 12, 0, 0, 0) }
 }
 
 /// `TCB::SetPriority(target, prio)`.
@@ -660,9 +684,36 @@ pub struct BootInfo {
     pub acpi_root_table_kind: u16,
     pub acpi_root_table_flags: u16,
     pub tsc_frequency_hz: u64,
+    /// APIC IDs of started CPUs in logical scheduler order; `num_nodes` is the length.
+    #[cfg(target_arch = "x86_64")]
+    pub processor_apic_ids: [u32; 4],
 }
 
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    core::mem::offset_of!(BootInfo, processor_apic_ids)
+        == core::mem::offset_of!(BootInfo, tsc_frequency_hz) + core::mem::size_of::<u64>()
+);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(core::mem::size_of::<BootInfo>() <= 4096);
+
 impl BootInfo {
+    /// The running x86 kernel indexes scheduler state and IPI destinations by APIC ID.
+    /// Refuse a malformed or sparse topology before an NT processor number is published.
+    #[cfg(target_arch = "x86_64")]
+    pub fn started_processor_apic_ids(&self) -> Option<&[u32]> {
+        let count = usize::try_from(self.num_nodes).ok()?;
+        if !(1..=self.processor_apic_ids.len()).contains(&count)
+            || self.node_id != 0
+            || self.processor_apic_ids[..count]
+                .iter().enumerate().any(|(logical, &apic)| apic != logical as u32)
+            || self.processor_apic_ids[count..].iter().any(|&apic| apic != 0)
+        {
+            return None;
+        }
+        Some(&self.processor_apic_ids[..count])
+    }
+
     pub fn wall_clock(&self) -> Option<BootWallClock> {
         let required = BOOT_WALL_CLOCK_VALID | BOOT_WALL_CLOCK_UTC;
         if self.wall_clock_flags & required != required {
@@ -805,6 +856,38 @@ impl BootInfo {
             offset = end;
         }
         None
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod boot_processor_identity_tests {
+    use super::BootInfo;
+
+    fn boot_info(num_nodes: u64, node_id: u64, apic_ids: [u32; 4]) -> BootInfo {
+        // BootInfo contains only plain C ABI fields; all-zero is a valid test fixture.
+        let mut info: BootInfo = unsafe { core::mem::zeroed() };
+        info.num_nodes = num_nodes;
+        info.node_id = node_id;
+        info.processor_apic_ids = apic_ids;
+        info
+    }
+
+    #[test]
+    fn accepts_exact_started_dense_apic_prefix() {
+        let four = boot_info(4, 0, [0, 1, 2, 3]);
+        assert_eq!(four.started_processor_apic_ids(), Some(&[0, 1, 2, 3][..]));
+        let one = boot_info(1, 0, [0, 0, 0, 0]);
+        assert_eq!(one.started_processor_apic_ids(), Some(&[0][..]));
+    }
+
+    #[test]
+    fn rejects_sparse_count_mismatch_tail_and_wrong_bsp() {
+        assert!(boot_info(4, 0, [0, 1, 3, 4]).started_processor_apic_ids().is_none());
+        assert!(boot_info(3, 0, [0, 1, 2, 3]).started_processor_apic_ids().is_none());
+        assert!(boot_info(2, 0, [0, 1, 9, 0]).started_processor_apic_ids().is_none());
+        assert!(boot_info(4, 1, [0, 1, 2, 3]).started_processor_apic_ids().is_none());
+        assert!(boot_info(0, 0, [0; 4]).started_processor_apic_ids().is_none());
+        assert!(boot_info(5, 0, [0, 1, 2, 3]).started_processor_apic_ids().is_none());
     }
 }
 
