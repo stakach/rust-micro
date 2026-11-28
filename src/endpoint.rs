@@ -653,6 +653,42 @@ fn ep_queue_contains(ep: &Endpoint, sched: &Scheduler, thread: TcbId) -> bool {
     false
 }
 
+/// Read-only proof that an exact receiver belongs to a consistent endpoint receive queue.
+/// Inspect the whole bounded chain: a corrupt neighbor or stale tail cannot authenticate a
+/// worker that happens to appear earlier in the queue. This does not reserve the endpoint.
+pub(crate) fn receive_queue_contains_exact(
+    ep: &Endpoint,
+    sched: &Scheduler,
+    receiver: TcbId,
+) -> bool {
+    if ep.state != EpState::Recv || ep.head.is_none() || ep.tail.is_none() {
+        return false;
+    }
+    let mut current = ep.head;
+    let mut previous = None;
+    let mut found = false;
+    let mut visited = 0;
+    while let Some(id) = current {
+        if visited == crate::tcb::MAX_TCBS {
+            return false;
+        }
+        visited += 1;
+        let Some(tcb) = sched.slab.try_get(id) else {
+            return false;
+        };
+        if tcb.state != ThreadStateType::BlockedOnReceive
+            || tcb.enqueued
+            || tcb.ep_prev != previous
+        {
+            return false;
+        }
+        found |= id == receiver;
+        previous = Some(id);
+        current = tcb.ep_next;
+    }
+    found && ep.tail == previous
+}
+
 /// Cancel an in-flight IPC: remove the thread from whichever
 /// endpoint queue it's parked on, mark it Restart so the caller can
 /// retry. Mirrors `cancelIPC` in seL4 for the endpoint case only.

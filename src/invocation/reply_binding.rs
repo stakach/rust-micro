@@ -8,7 +8,8 @@ pub(super) fn invoke(
 ) -> KResult<()> {
     #[cfg(target_arch = "x86_64")]
     const _: () = assert!(InvocationLabel::TCBQueryReplyBinding as u64 == 73);
-    if args.a1 != (((InvocationLabel::TCBQueryReplyBinding as u64) << 12) | 1) {
+    let label = (InvocationLabel::TCBQueryReplyBinding as u64) << 12;
+    if args.a1 != (label | 1) && args.a1 != (label | 2) {
         return Err(tcb_cap_error(seL4_Error::seL4_InvalidArgument));
     }
     let target = u16::try_from(target)
@@ -25,6 +26,35 @@ pub(super) fn invoke(
         .replies
         .get(index)
         .ok_or_else(|| tcb_cap_error(seL4_Error::seL4_InvalidCapability))?;
+    if args.a1 == (label | 2) {
+        if s.scheduler.slab.get(invoker).pending_extra_caps_count != 0 {
+            return Err(tcb_cap_error(seL4_Error::seL4_InvalidArgument));
+        }
+        let Cap::Endpoint { ptr, rights, .. } = lookup_cap(s, &root, args.a3)? else {
+            return Err(tcb_cap_error(seL4_Error::seL4_InvalidCapability));
+        };
+        if !rights.can_receive {
+            return Err(tcb_cap_error(seL4_Error::seL4_InvalidCapability));
+        }
+        let endpoint = s
+            .endpoints
+            .get(KernelState::endpoint_index(ptr))
+            .ok_or_else(|| tcb_cap_error(seL4_Error::seL4_InvalidCapability))?;
+        let reply_id = u16::try_from(index)
+            .map_err(|_| tcb_cap_error(seL4_Error::seL4_InvalidCapability))?;
+        let worker = s.scheduler.slab.get(target);
+        let exact = reply.offered_tcb == Some(target)
+            && reply.bound_tcb.is_none()
+            && reply.prev.is_none()
+            && reply.next.is_none()
+            && worker.pending_reply == Some(reply_id)
+            && crate::endpoint::receive_queue_contains_exact(endpoint, &s.scheduler, target);
+        let response = s.scheduler.slab.get_mut(invoker);
+        response.ipc_label = 0;
+        response.ipc_length = 1;
+        response.msg_regs[0] = u64::from(exact);
+        return Ok(());
+    }
     let invalid = || tcb_cap_error(seL4_Error::seL4_IllegalOperation);
     let state = if *reply == crate::reply::Reply::new() {
         0
