@@ -80,6 +80,7 @@ pub const LBL_TCB_WRITE_LEGACY_CONTEXT: u64 = 70;
 pub const LBL_TCB_ACQUIRE_EXECUTION_HOLD: u64 = 71;
 pub const LBL_TCB_RELEASE_EXECUTION_HOLD: u64 = 72;
 pub const LBL_TCB_QUERY_REPLY_BINDING: u64 = 73;
+mod reply_binding_decoder;
 pub mod reply_binding;
 pub const LBL_TCB_QUERY_VSPACE_BINDING: u64 = 74;
 pub const LBL_TCB_YIELD_TO: u64 = 76;
