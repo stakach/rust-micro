@@ -24,6 +24,10 @@ on:
       - "src/simpleboot.rs"
       - "src/rootserver.rs"
       - "src/main.rs"
+      - "src/endpoint.rs"
+      - "src/invocation/reply_binding.rs"
+      - "src/invocation/passive_worker_unbind_specs.rs"
+      - "crates/sel4-rt/src/reply_binding.rs"
       - "tests/boot_mmap_reader_source.rs"
       - "tests/direct_map_*.rs"
       - "tests/ioapic_preflight_source.rs"
@@ -53,6 +57,10 @@ on:
       - "src/simpleboot.rs"
       - "src/rootserver.rs"
       - "src/main.rs"
+      - "src/endpoint.rs"
+      - "src/invocation/reply_binding.rs"
+      - "src/invocation/passive_worker_unbind_specs.rs"
+      - "crates/sel4-rt/src/reply_binding.rs"
       - "tests/boot_mmap_reader_source.rs"
       - "tests/direct_map_*.rs"
       - "tests/ioapic_preflight_source.rs"
@@ -69,6 +77,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Test exact Reply offer response decoding
+        run: |
+          rustc --edition 2021 --test crates/sel4-rt/src/reply_binding.rs -o /tmp/reply-binding-tests
+          /tmp/reply-binding-tests
       - name: Test the native BKL ownership module
         run: |
           rustc --edition 2021 --test tests/bkl_contracts.rs -o /tmp/kernel-bkl-tests
