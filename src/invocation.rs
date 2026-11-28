@@ -6529,6 +6529,7 @@ pub mod spec {
     include!("invocation/execution_hold_specs.rs");
     include!("invocation/reply_binding_specs.rs");
     include!("invocation/passive_worker_unbind_specs.rs");
+    include!("invocation/supervised_fault_chain_specs.rs");
     include!("invocation/vspace_binding_specs.rs");
     include!("invocation/yield_to_specs.rs");
 
@@ -6587,6 +6588,7 @@ pub mod spec {
         execution_hold_specs::run();
         reply_binding_specs::run();
         passive_worker_unbind_specs::run();
+        supervised_fault_chain_specs::run();
         vspace_binding_specs::run();
         yield_to_specs::run();
         tcb_read_debug_state_reports_scheduler_and_reply_binding();
