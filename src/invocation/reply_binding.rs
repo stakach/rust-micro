@@ -48,7 +48,7 @@ pub(super) fn invoke(
             && reply.prev.is_none()
             && reply.next.is_none()
             && worker.pending_reply == Some(reply_id)
-            && crate::endpoint::receive_queue_contains_exact(endpoint, &s.scheduler, target);
+            && crate::endpoint::receive_queue_head_is_exact(endpoint, &s.scheduler, target);
         let response = s.scheduler.slab.get_mut(invoker);
         response.ipc_label = 0;
         response.ipc_length = 1;

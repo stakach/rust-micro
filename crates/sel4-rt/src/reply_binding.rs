@@ -25,7 +25,7 @@ pub unsafe fn query(expected_tcb: u64, reply: u64) -> Result<Binding, Error> {
     decode_response(info, word)
 }
 
-/// Query whether `reply` is offered to `expected_tcb` while that TCB is blocked in the
+/// Query whether `reply` is offered to `expected_tcb` while that TCB heads the blocked
 /// receive queue of `endpoint`. All three CPtrs are resolved in the invoker's CSpace.
 /// This is a non-mutating observation, not a reservation: the caller must retain the exact
 /// physical objects and prevent their reuse until the next Call is admitted or refused.

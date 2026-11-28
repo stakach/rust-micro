@@ -499,9 +499,8 @@ mod passive_worker_unbind_specs {
             );
             assert_eq!(snapshot(root_sc, worker, endpoint, reply), before_query);
 
-            // Rearm proof is membership of this exact worker in the receive queue, not
-            // proof that its endpoint has no other receivers. A higher-priority receiver
-            // can join ahead of it without taking its pending Reply offer.
+            // A higher-priority receiver ahead of the worker would take root's next Call.
+            // The worker's pending Reply and queue membership alone cannot authorize reuse.
             s.scheduler.slab.get_mut(other).priority = 255;
             assert_eq!(
                 crate::endpoint::receive_ipc(
@@ -517,11 +516,18 @@ mod passive_worker_unbind_specs {
             assert_eq!(s.scheduler.slab.get(worker).ep_prev, Some(other));
             let before_query = snapshot(root_sc, worker, endpoint, reply);
             decode_invocation(tcb_cap(worker), &exact, invoker)
-                .expect("exact rearm proof with another receiver ahead");
-            assert_eq!(s.scheduler.slab.get(invoker).msg_regs[0], 1);
+                .expect("worker is not next while another receiver is ahead");
+            assert_eq!(s.scheduler.slab.get(invoker).msg_regs[0], 0);
             assert_eq!(snapshot(root_sc, worker, endpoint, reply), before_query);
             crate::endpoint::cancel_ipc_anywhere(&mut s.scheduler, other);
             s.scheduler.block(other, ThreadStateType::Inactive);
+            assert_eq!(s.endpoints[endpoint].head, Some(worker));
+            assert_eq!(s.endpoints[endpoint].tail, Some(worker));
+            let before_query = snapshot(root_sc, worker, endpoint, reply);
+            decode_invocation(tcb_cap(worker), &exact, invoker)
+                .expect("worker becomes next after other receiver leaves");
+            assert_eq!(s.scheduler.slab.get(invoker).msg_regs[0], 1);
+            assert_eq!(snapshot(root_sc, worker, endpoint, reply), before_query);
 
             crate::reply::remove(s, ReplyNode::Object(reply as u16));
             teardown_thread_in(s, worker);
